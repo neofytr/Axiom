@@ -22,6 +22,8 @@ set(AXIOM_SOURCES
     src/core/init.c
     src/core/layer.c
     src/core/model.c
+    src/core/serialize.c
+    src/core/data.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
 )
@@ -52,6 +54,8 @@ set(TEST_SOURCES
     tests/test_losses.c
     tests/test_optim.c
     tests/test_layer.c
+    tests/test_serialize.c
+    tests/test_data.c
 )
 
 foreach(test_src ${TEST_SOURCES})

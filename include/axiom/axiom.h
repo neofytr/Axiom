@@ -17,6 +17,8 @@
 #include "init.h"
 #include "layer.h"
 #include "model.h"
+#include "serialize.h"
+#include "data.h"
 
 /* initialize axiom — must be called before any other axiom functions.
    sets up compute backends, memory systems, etc. */
