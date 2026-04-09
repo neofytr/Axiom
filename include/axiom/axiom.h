@@ -11,6 +11,12 @@
 #include "broadcast.h"
 #include "ops.h"
 #include "autograd.h"
+#include "activations.h"
+#include "losses.h"
+#include "optim.h"
+#include "init.h"
+#include "layer.h"
+#include "model.h"
 
 /* initialize axiom — must be called before any other axiom functions.
    sets up compute backends, memory systems, etc. */

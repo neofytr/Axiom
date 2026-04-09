@@ -16,6 +16,12 @@ set(AXIOM_SOURCES
     src/core/ops.c
     src/core/autograd.c
     src/core/autograd_ops.c
+    src/core/activations.c
+    src/core/losses.c
+    src/core/optim.c
+    src/core/init.c
+    src/core/layer.c
+    src/core/model.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
 )
@@ -42,6 +48,10 @@ set(TEST_SOURCES
     tests/test_compute.c
     tests/test_autograd.c
     tests/test_ops.c
+    tests/test_activations.c
+    tests/test_losses.c
+    tests/test_optim.c
+    tests/test_layer.c
 )
 
 foreach(test_src ${TEST_SOURCES})

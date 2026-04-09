@@ -428,6 +428,10 @@ src/core/
   ops.c            user-facing ops (allocates output, records autograd)
   autograd.c       backward engine (topo sort, backward traversal)
   autograd_ops.c   backward functions for every differentiable op
+  activations.c    leaky relu, elu, selu, gelu, swish, softplus, mish, softmax
+  losses.c         mse, mae, cross-entropy, bce, huber loss
+  optim.c          sgd, adam, adamw, rmsprop, adagrad
+  init.c           xavier, kaiming, lecun, uniform, normal initialization
 
 src/compute/
   dispatch.c       routes calls to active backend
@@ -435,26 +439,336 @@ src/compute/
     cpu_naive.c    pure C reference implementation of all ops
 
 tests/
-  test.h           minimal test harness (assert macros)
-  test_error.c     error handling tests
-  test_memory.c    arena allocator tests
-  test_tensor.c    tensor creation and shape manipulation tests
-  test_compute.c   compute backend tests (every op individually)
-  test_ops.c       high-level ops tests (broadcasting, chaining)
-  test_autograd.c  gradient correctness tests for every differentiable op
+  test.h              minimal test harness (assert macros)
+  test_error.c        error handling tests
+  test_memory.c       arena allocator tests
+  test_tensor.c       tensor creation and shape manipulation tests
+  test_compute.c      compute backend tests (every op individually)
+  test_ops.c          high-level ops tests (broadcasting, chaining)
+  test_autograd.c     gradient correctness tests for every differentiable op
+  test_activations.c  activation function forward + gradient tests
+  test_losses.c       loss function value and gradient tests
+  test_optim.c        optimizer convergence tests + init tests
 ```
+
+
+## Lesson 9: Loss Functions (Measuring How Wrong You Are)
+
+A loss function measures the gap between your model's predictions and
+the true answer. Training is about minimizing this number.
+
+### MSE (Mean Squared Error)
+
+```
+L = (1/n) * sum((pred_i - target_i)^2)
+```
+
+Squares the errors, so large errors are penalized much more than small ones.
+The gradient is `2*(pred - target) / n`. This pulls predictions toward
+their targets proportionally to the error.
+
+Good for regression. Bad for classification (doesn't understand probabilities).
+
+### Cross-Entropy (The Classification Loss)
+
+This is the most important loss for classification and understanding it
+requires understanding softmax first.
+
+**Softmax** converts raw logits (any real numbers) into probabilities:
+
+```
+softmax(x_i) = exp(x_i) / sum(exp(x_j))
+```
+
+The outputs are all positive and sum to 1. The largest logit gets the
+highest probability. Numerically, we subtract max(x) before exp to
+avoid overflow:
+
+```
+softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+```
+
+**Cross-entropy** then measures how different the predicted distribution is
+from the target distribution:
+
+```
+L = -(1/batch) * sum(target_i * log(softmax(pred_i)))
+```
+
+If target is one-hot (e.g., [0, 0, 1, 0] for class 2), only the true
+class contributes to the loss. High confidence in the correct class = low loss.
+
+The beautiful thing: the gradient of cross-entropy + softmax simplifies to:
+
+```
+dL/d(pred) = (softmax(pred) - target) / batch_size
+```
+
+This is one of the cleanest results in deep learning. No complicated
+chain rule needed. The gradient is just "what you predicted minus what
+you should have predicted." See `ce_backward` in `losses.c`.
+
+### Binary Cross-Entropy
+
+For binary (yes/no) classification:
+
+```
+L = -mean(target * log(sigmoid(pred)) + (1-target) * log(1-sigmoid(pred)))
+```
+
+Numerically stable version avoids computing log(sigmoid) directly:
+
+```
+L = mean(max(pred, 0) - pred*target + log(1 + exp(-|pred|)))
+```
+
+Gradient: `sigmoid(pred) - target` (same elegant simplification).
+
+### Huber Loss
+
+A blend of MSE and MAE. Quadratic for small errors (smooth, easy to optimize),
+linear for large errors (robust to outliers):
+
+```
+L = 0.5 * x^2           if |x| <= delta
+    delta * (|x| - 0.5*delta)  otherwise
+```
+
+
+## Lesson 10: Optimizers (How to Use Gradients)
+
+Once you have gradients from backward, you need to update the weights.
+The simplest approach is `w = w - lr * grad`, but modern optimizers
+do much better.
+
+### SGD (Stochastic Gradient Descent)
+
+```
+w = w - lr * grad
+```
+
+Simple, but can oscillate in narrow valleys and gets stuck at saddle points.
+
+### SGD with Momentum
+
+Imagine a ball rolling down a hill. It accumulates speed in consistent directions
+and dampens oscillations.
+
+```
+v = momentum * v + grad        (velocity accumulates past gradients)
+w = w - lr * v                 (update using velocity, not raw gradient)
+```
+
+Typical momentum = 0.9 means 90% of the previous velocity is retained.
+This smooths out the zigzag and accelerates in consistent directions.
+
+### Adam (Adaptive Moment Estimation)
+
+The most popular optimizer. Combines momentum with per-parameter learning rates.
+
+```
+m = beta1 * m + (1 - beta1) * grad          (1st moment: mean of gradients)
+v = beta2 * v + (1 - beta2) * grad^2        (2nd moment: mean of squared gradients)
+m_hat = m / (1 - beta1^t)                    (bias correction for early steps)
+v_hat = v / (1 - beta2^t)                    (bias correction for early steps)
+w = w - lr * m_hat / (sqrt(v_hat) + eps)     (update)
+```
+
+Why this works:
+- `m` is like momentum (smooths gradient direction)
+- `v` estimates the variance of gradients (how noisy each parameter is)
+- Dividing by `sqrt(v)` gives each parameter its own effective learning rate:
+  noisy parameters get smaller updates, stable ones get larger updates
+- Bias correction handles the fact that m and v start at zero
+
+Default: beta1=0.9, beta2=0.999, eps=1e-8.
+
+### AdamW (Decoupled Weight Decay)
+
+Standard Adam applies weight decay through the gradient: `grad += wd * w`.
+AdamW applies it directly to the weights: `w *= (1 - lr * wd)`.
+
+This seems trivial but makes a real difference. With standard Adam, the
+adaptive learning rate interferes with weight decay. Decoupling them
+gives better generalization.
+
+### RMSProp
+
+A precursor to Adam. Keeps a running average of squared gradients:
+
+```
+v = rho * v + (1 - rho) * grad^2
+w = w - lr * grad / (sqrt(v) + eps)
+```
+
+Like Adam without the momentum (first moment). Parameters with large
+recent gradients get smaller effective learning rates.
+
+
+## Lesson 11: Weight Initialization (Why It Matters)
+
+### The problem
+
+If weights are too large, activations explode exponentially through layers.
+If too small, they shrink to zero and gradients vanish (the network can't learn).
+
+We need the variance of activations to stay roughly constant as data flows
+through the network.
+
+### Xavier/Glorot initialization
+
+Analyzed for linear layers with sigmoid/tanh activation.
+
+For a layer with `fan_in` inputs and `fan_out` outputs, we want:
+```
+Var(output) = Var(input)
+```
+
+This gives us:
+```
+Var(weight) = 2 / (fan_in + fan_out)
+```
+
+Uniform version: sample from `U[-limit, limit]` where `limit = sqrt(6 / (fan_in + fan_out))`
+Normal version: sample from `N(0, std)` where `std = sqrt(2 / (fan_in + fan_out))`
+
+### He/Kaiming initialization
+
+ReLU kills half the values (sets negatives to 0), so Xavier underestimates the needed variance by a factor of 2.
+
+```
+Var(weight) = 2 / fan_in
+```
+
+This is the standard for networks using ReLU.
+
+### Why only fan_in?
+
+When doing forward propagation, output variance depends on fan_in.
+When doing backward propagation, gradient variance depends on fan_out.
+He init focuses on forward stability. Xavier balances both.
+
+
+## Lesson 12: Layers and the Module System
+
+### Why layers?
+
+Without layers, building a model looks like this:
+
+```c
+ax_tensor_t *w1 = ax_tensor_rand(...);
+ax_tensor_t *b1 = ax_tensor_zeros(...);
+ax_tensor_t *w2 = ax_tensor_rand(...);
+// ... manually init each, manually track each, manually wire forward pass
+```
+
+With layers:
+
+```c
+ax_layer_t *model = ax_sequential_create();
+ax_sequential_add(model, ax_dense_create(784, 128, true));
+ax_sequential_add(model, ax_relu_layer_create());
+ax_sequential_add(model, ax_dense_create(128, 10, true));
+
+ax_tensor_t *output = ax_layer_forward(model, input);
+```
+
+Layers encapsulate weights, initialization, and the forward computation.
+Sequential chains them. The model API adds optimizer and loss on top.
+
+### How it works in C (polymorphism without classes)
+
+C doesn't have classes, but we fake it with the same trick the Linux kernel uses:
+embed a "base struct" as the first field of every concrete struct, then cast between them.
+
+```c
+/* base */
+struct ax_layer {
+    ax_layer_ops_t ops;    /* vtable: forward(), destroy() */
+    ax_layer_type_t type;
+    ax_tensor_t *params[AX_LAYER_MAX_PARAMS];
+    int n_params;
+    ...
+};
+
+/* concrete */
+typedef struct {
+    ax_layer_t base;       /* MUST be first field */
+    ax_tensor_t *weight;
+    ax_tensor_t *bias;
+} ax_dense_t;
+```
+
+Because `base` is at offset 0, a pointer to `ax_dense_t` is also a valid
+pointer to `ax_layer_t`. We can pass it to any function expecting a layer:
+
+```c
+ax_dense_t *d = ...;
+ax_layer_forward((ax_layer_t *)d, input);  /* calls d->base.ops.forward */
+```
+
+The `ops.forward` function pointer was set to `dense_forward` during creation,
+so the right implementation runs. This is exactly how C++ vtables work under
+the hood, minus the compiler magic.
+
+### The Dense layer
+
+The fundamental building block. Computes:
+
+```
+output = input @ weight + bias
+```
+
+Where `input` is `[batch, in_features]`, `weight` is `[in_features, out_features]`,
+and `bias` is `[out_features]`. The bias gets broadcast across the batch dimension.
+
+Weight is initialized with Kaiming uniform (good for ReLU networks).
+Bias is initialized to zeros.
+
+### Sequential container
+
+Just an array of layer pointers. Forward pass chains them:
+
+```c
+x = input;
+for each layer:
+    x = layer.forward(x);
+return x;
+```
+
+Parameter collection recurses into sublayers, so `ax_layer_get_params`
+on a sequential gives you every trainable tensor in the whole model.
+
+### The Model API
+
+Wraps a network + optimizer + loss into a single object:
+
+```c
+ax_model_t *m = ax_model_create(net);
+ax_model_compile(m, optimizer, ax_mse_loss);
+ax_model_fit(m, train_x, train_y, epochs, print_every);
+```
+
+`train_step` does the full loop: zero grad -> forward -> loss -> backward -> step.
+`predict` switches to eval mode and disables gradient tracking.
+
+### Embedded considerations
+
+All arrays are fixed-size (no malloc during forward pass for layer bookkeeping).
+`AX_SEQ_MAX_LAYERS` (64) and `AX_MODEL_MAX_PARAMS` (256) are compile-time
+constants that can be tuned down for memory-constrained targets.
+No strings, no dynamic dispatch beyond the function pointer call.
 
 
 ## Coming Next
 
 As the project grows, new lessons will be added:
 
-- **Lesson 9**: Optimizers (SGD, Adam) and why momentum helps
-- **Lesson 10**: Loss functions (cross-entropy, why MSE isn't always best)
-- **Lesson 11**: Layers and the module system
-- **Lesson 12**: Convolutions (im2col trick, how CNNs see)
-- **Lesson 13**: Batch normalization (why deep networks need it)
-- **Lesson 14**: Recurrent networks (LSTM gates, backprop through time)
-- **Lesson 15**: Attention and transformers (the mechanism behind modern AI)
-- **Lesson 16**: SIMD optimization (how AVX makes math 8x faster)
-- **Lesson 17**: GPU compute (CUDA kernels, memory coalescing)
+- **Lesson 13**: Serialization (saving/loading models for deployment)
+- **Lesson 14**: Convolutions (im2col trick, how CNNs see)
+- **Lesson 15**: Batch normalization (why deep networks need it)
+- **Lesson 16**: Recurrent networks (LSTM gates, backprop through time)
+- **Lesson 17**: Attention and transformers (the mechanism behind modern AI)
+- **Lesson 18**: SIMD optimization (how AVX makes math 8x faster)
+- **Lesson 19**: Quantization (INT8 inference for embedded deployment)
+- **Lesson 20**: GPU compute (CUDA kernels, memory coalescing)
