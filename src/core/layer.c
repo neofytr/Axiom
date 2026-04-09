@@ -44,8 +44,10 @@ static ax_tensor_t *dense_forward(ax_layer_t *self, ax_tensor_t *input)
     if (d->use_bias && d->bias)
     {
         ax_tensor_t *biased = ax_add(out, d->bias);
-        /* can't destroy out here if autograd is tracking it...
-           same issue as in losses.c. leave it for now. */
+        /* in inference mode we can free the matmul intermediate.
+           in training mode, backward needs it, so leave it. */
+        if (!ax_grad_enabled() && !out->grad_fn)
+            ax_tensor_destroy(out);
         if (biased) return biased;
     }
     return out;
@@ -182,11 +184,28 @@ static ax_tensor_t *sequential_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_sequential_t *seq = (ax_sequential_t *)self;
     ax_tensor_t *x = input;
+    ax_tensor_t *prev = NULL;
 
     for (int i = 0; i < seq->n_layers; i++)
     {
-        x = ax_layer_forward(seq->layers[i], x);
-        if (!x) return NULL;
+        ax_tensor_t *next = ax_layer_forward(seq->layers[i], x);
+        if (!next)
+        {
+            /* clean up previous intermediate on failure */
+            if (prev && !prev->grad_fn) ax_tensor_destroy(prev);
+            return NULL;
+        }
+
+        /* in inference mode (no grad tracking), free the previous
+           intermediate since nobody else references it.
+           in training mode, leave it alone — backward needs it. */
+        if (prev && !ax_grad_enabled() && !prev->grad_fn)
+        {
+            ax_tensor_destroy(prev);
+        }
+
+        prev = next;
+        x = next;
     }
     return x;
 }

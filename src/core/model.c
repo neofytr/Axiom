@@ -61,6 +61,12 @@ float ax_model_train_step(ax_model_t *model, ax_tensor_t *input, ax_tensor_t *ta
     /* update weights */
     ax_optimizer_step(model->opt);
 
+    /* free the computation graph (intermediates from this step).
+       parameters and their grads survive because they have no grad_fn.
+       cleanup frees intermediates but not the root, so we destroy it after. */
+    ax_graph_cleanup(loss);
+    ax_tensor_destroy(loss);
+
     return loss_val;
 }
 

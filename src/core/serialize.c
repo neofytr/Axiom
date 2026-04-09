@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #define TENSOR_MAGIC 0x41585430  /* "AXT0" */
 
@@ -63,7 +64,8 @@ static bool write_tensor(FILE *f, ax_tensor_t *t)
 
     /* make contiguous before writing (in case of transposed/strided tensor) */
     int64_t n = ax_tensor_numel(t);
-    size_t bytes = n * ax_dtype_size(t->dtype);
+    if (n < 0) return false; /* overflow in numel */
+    size_t bytes = (size_t)n * ax_dtype_size(t->dtype);
 
     if (ax_tensor_is_contiguous(t) && t->offset == 0)
     {
@@ -81,24 +83,68 @@ static bool write_tensor(FILE *f, ax_tensor_t *t)
     return true;
 }
 
-/* read a tensor from file */
+/* safe multiply for serialization validation */
+static bool ser_safe_mul(int64_t a, int64_t b, int64_t *result) {
+    if (a == 0 || b == 0) { *result = 0; return true; }
+    if (a > 0 && b > 0 && a > INT64_MAX / b) return false;
+    *result = a * b;
+    return true;
+}
+
+/* read a tensor from file, with full validation of untrusted data */
 static ax_tensor_t *read_tensor(FILE *f)
 {
     uint32_t dtype, ndim;
     if (!read_u32(f, &dtype)) return NULL;
     if (!read_u32(f, &ndim)) return NULL;
 
+    /* validate dtype */
+    if (dtype >= AX_DTYPE_COUNT) {
+        ax_err_set(AX_ERR_INVALID_DTYPE,
+                   "invalid dtype %u in file (max %d)", dtype, AX_DTYPE_COUNT - 1);
+        return NULL;
+    }
+
+    /* validate ndim */
+    if (ndim > AX_MAX_DIMS) {
+        ax_err_set(AX_ERR_INVALID_SHAPE,
+                   "ndim %u exceeds AX_MAX_DIMS (%d)", ndim, AX_MAX_DIMS);
+        return NULL;
+    }
+
     int64_t shape[AX_MAX_DIMS];
+    int64_t numel = 1;
     for (uint32_t i = 0; i < ndim; i++)
     {
         if (!read_i64(f, &shape[i])) return NULL;
+        /* validate each shape dimension is positive */
+        if (shape[i] <= 0) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "shape[%u] = %ld is non-positive in file", i, shape[i]);
+            return NULL;
+        }
+        /* check for overflow in numel computation */
+        if (!ser_safe_mul(numel, shape[i], &numel)) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "integer overflow computing numel at dim %u", i);
+            return NULL;
+        }
+    }
+
+    /* check that numel * dtype_size doesn't overflow size_t */
+    size_t elem_size = ax_dtype_size((ax_dtype_t)dtype);
+    if (elem_size > 0 && (size_t)numel > SIZE_MAX / elem_size) {
+        ax_err_set(AX_ERR_INVALID_SHAPE,
+                   "allocation size overflow: %ld elements * %zu bytes", numel, elem_size);
+        return NULL;
     }
 
     ax_tensor_t *t = ax_tensor_create(shape, (int)ndim, (ax_dtype_t)dtype);
     if (!t) return NULL;
 
     int64_t n = ax_tensor_numel(t);
-    size_t bytes = n * ax_dtype_size(t->dtype);
+    if (n < 0) { ax_tensor_destroy(t); return NULL; }
+    size_t bytes = (size_t)n * ax_dtype_size(t->dtype);
     if (fread(t->storage->data, 1, bytes, f) != bytes)
     {
         ax_tensor_destroy(t);
@@ -248,9 +294,12 @@ ax_model_t *ax_model_load(const char *path)
 
     /* header */
     uint32_t magic, version, n_layers;
-    read_u32(f, &magic);
-    read_u32(f, &version);
-    read_u32(f, &n_layers);
+    if (!read_u32(f, &magic) || !read_u32(f, &version) || !read_u32(f, &n_layers))
+    {
+        ax_err_set(AX_ERR_INTERNAL, "truncated model file header");
+        fclose(f);
+        return NULL;
+    }
 
     if (magic != AX_MAGIC)
     {
@@ -267,18 +316,60 @@ ax_model_t *ax_model_load(const char *path)
         return NULL;
     }
 
+    /* validate n_layers against maximum */
+    if (n_layers == 0 || n_layers > AX_SEQ_MAX_LAYERS)
+    {
+        ax_err_set(AX_ERR_INVALID_SHAPE,
+                   "n_layers %u invalid (max %d)", n_layers, AX_SEQ_MAX_LAYERS);
+        fclose(f);
+        return NULL;
+    }
+
     /* read layer descriptors */
     typedef struct { uint32_t type, n_params; int64_t in_f, out_f; float extra; uint8_t flags; } layer_desc_t;
     layer_desc_t *descs = calloc(n_layers, sizeof(layer_desc_t));
+    if (!descs)
+    {
+        ax_err_set(AX_ERR_ALLOC, "failed to allocate layer descriptors");
+        fclose(f);
+        return NULL;
+    }
 
     for (uint32_t i = 0; i < n_layers; i++)
     {
-        read_u32(f, &descs[i].type);
-        read_u32(f, &descs[i].n_params);
-        read_i64(f, &descs[i].in_f);
-        read_i64(f, &descs[i].out_f);
-        read_f32(f, &descs[i].extra);
-        read_u8(f, &descs[i].flags);
+        if (!read_u32(f, &descs[i].type) ||
+            !read_u32(f, &descs[i].n_params) ||
+            !read_i64(f, &descs[i].in_f) ||
+            !read_i64(f, &descs[i].out_f) ||
+            !read_f32(f, &descs[i].extra) ||
+            !read_u8(f, &descs[i].flags))
+        {
+            ax_err_set(AX_ERR_INTERNAL,
+                       "truncated layer descriptor at layer %u", i);
+            free(descs);
+            fclose(f);
+            return NULL;
+        }
+
+        /* validate n_params per layer */
+        if (descs[i].n_params > AX_LAYER_MAX_PARAMS) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "layer %u has %u params (max %d)",
+                       i, descs[i].n_params, AX_LAYER_MAX_PARAMS);
+            free(descs);
+            fclose(f);
+            return NULL;
+        }
+
+        /* validate feature dimensions are positive for parameterized layers */
+        if (descs[i].type == AX_LAYER_DENSE && (descs[i].in_f <= 0 || descs[i].out_f <= 0)) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "layer %u has invalid features: in=%ld out=%ld",
+                       i, descs[i].in_f, descs[i].out_f);
+            free(descs);
+            fclose(f);
+            return NULL;
+        }
     }
 
     /* reconstruct layers */
@@ -339,12 +430,24 @@ ax_model_t *ax_model_load(const char *path)
                 return NULL;
             }
 
-            /* overwrite the randomly-initialized weights with loaded data */
+            /* validate loaded tensor matches existing parameter shape */
             ax_tensor_t *existing = layer->params[p];
             if (existing && existing->storage)
             {
-                int64_t n = ax_tensor_numel(existing);
-                size_t bytes = n * ax_dtype_size(existing->dtype);
+                int64_t n_existing = ax_tensor_numel(existing);
+                int64_t n_loaded = ax_tensor_numel(loaded);
+                if (n_existing < 0 || n_loaded < 0 || n_existing != n_loaded)
+                {
+                    ax_err_set(AX_ERR_SHAPE_MISMATCH,
+                               "layer %u param %d: expected %ld elements, file has %ld",
+                               i, p, n_existing, n_loaded);
+                    ax_tensor_destroy(loaded);
+                    free(descs);
+                    ax_layer_destroy(seq);
+                    fclose(f);
+                    return NULL;
+                }
+                size_t bytes = (size_t)n_existing * ax_dtype_size(existing->dtype);
                 memcpy(existing->storage->data, loaded->storage->data, bytes);
             }
             ax_tensor_destroy(loaded);

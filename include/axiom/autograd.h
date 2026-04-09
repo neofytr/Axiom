@@ -55,6 +55,12 @@ ax_status_t ax_backward(ax_tensor_t *loss);
 /* zero out the gradient of a tensor (call before each training step) */
 void ax_zero_grad(ax_tensor_t *t);
 
+/* free the computation graph reachable from this tensor.
+   destroys all intermediate (non-leaf) tensors created during the forward pass.
+   leaf tensors (those without grad_fn, i.e. parameters and user-created tensors)
+   are NOT destroyed. call this after backward to prevent memory leaks. */
+void ax_graph_cleanup(ax_tensor_t *root);
+
 /* gradient context: disable/enable gradient tracking.
    useful during inference when you don't want the overhead. */
 void ax_no_grad(void);

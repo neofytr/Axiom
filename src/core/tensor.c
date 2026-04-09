@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
+#include <limits.h>
 
 /* track whether rng has been seeded */
 static bool rng_seeded = false;
@@ -44,25 +45,66 @@ void ax_storage_release(ax_storage_t *s) {
 
 /* internal helpers */
 
-/* compute total element count from shape */
+/* safe multiply that checks for overflow. returns false on overflow. */
+static bool safe_mul_i64(int64_t a, int64_t b, int64_t *result) {
+    if (a == 0 || b == 0) { *result = 0; return true; }
+    if (a > 0 && b > 0 && a > INT64_MAX / b) return false;
+    if (a > 0 && b < 0 && b < INT64_MIN / a) return false;
+    if (a < 0 && b > 0 && a < INT64_MIN / b) return false;
+    if (a < 0 && b < 0 && a < INT64_MAX / b) return false;
+    *result = a * b;
+    return true;
+}
+
+/* compute total element count from shape. returns -1 on overflow. */
 static int64_t compute_numel(const int64_t *shape, int ndim) {
     int64_t n = 1;
-    for (int i = 0; i < ndim; i++) n *= shape[i];
+    for (int i = 0; i < ndim; i++) {
+        if (shape[i] <= 0) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "shape dimension %d is non-positive: %ld", i, shape[i]);
+            return -1;
+        }
+        if (!safe_mul_i64(n, shape[i], &n)) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "integer overflow computing numel at dim %d", i);
+            return -1;
+        }
+    }
     return n;
 }
 
-/* compute default row-major (c-contiguous) strides from shape */
-static void compute_strides(const int64_t *shape, int ndim, int64_t *strides) {
-    if (ndim == 0) return;
+/* compute default row-major (c-contiguous) strides from shape.
+   returns false on overflow. */
+static bool compute_strides(const int64_t *shape, int ndim, int64_t *strides) {
+    if (ndim == 0) return true;
     strides[ndim - 1] = 1;
     for (int i = ndim - 2; i >= 0; i--) {
-        strides[i] = strides[i + 1] * shape[i + 1];
+        if (!safe_mul_i64(strides[i + 1], shape[i + 1], &strides[i])) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "integer overflow computing strides at dim %d", i);
+            return false;
+        }
     }
+    return true;
 }
 
 /* allocate tensor struct and fill metadata (no storage allocation) */
 static ax_tensor_t *tensor_alloc_meta(const int64_t *shape, int ndim, ax_dtype_t dtype) {
     if (ndim < 0 || ndim > AX_MAX_DIMS) return NULL;
+    if ((int)dtype < 0 || dtype >= AX_DTYPE_COUNT) {
+        ax_err_set(AX_ERR_INVALID_DTYPE, "invalid dtype value: %d", (int)dtype);
+        return NULL;
+    }
+
+    /* validate all shape dimensions are positive */
+    for (int i = 0; i < ndim; i++) {
+        if (shape[i] <= 0) {
+            ax_err_set(AX_ERR_INVALID_SHAPE,
+                       "shape dimension %d must be positive, got %ld", i, shape[i]);
+            return NULL;
+        }
+    }
 
     ax_tensor_t *t = (ax_tensor_t *)calloc(1, sizeof(ax_tensor_t));
     if (!t) return NULL;
@@ -77,7 +119,10 @@ static ax_tensor_t *tensor_alloc_meta(const int64_t *shape, int ndim, ax_dtype_t
     for (int i = 0; i < ndim; i++) {
         t->shape[i] = shape[i];
     }
-    compute_strides(shape, ndim, t->strides);
+    if (!compute_strides(shape, ndim, t->strides)) {
+        free(t);
+        return NULL;
+    }
 
     return t;
 }
@@ -89,8 +134,18 @@ ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype) 
     if (!t) return NULL;
 
     int64_t n = compute_numel(shape, ndim);
-    size_t bytes = (size_t)n * ax_dtype_size(dtype);
-    if (bytes == 0) bytes = ax_dtype_size(dtype); /* scalar: at least one element */
+    if (n < 0) { free(t); return NULL; } /* overflow in numel */
+
+    size_t elem_size = ax_dtype_size(dtype);
+    /* check for size_t overflow: n * elem_size */
+    if (elem_size > 0 && (size_t)n > SIZE_MAX / elem_size) {
+        ax_err_set(AX_ERR_INVALID_SHAPE,
+                   "allocation size overflow: %ld elements * %zu bytes", n, elem_size);
+        free(t);
+        return NULL;
+    }
+    size_t bytes = (size_t)n * elem_size;
+    if (bytes == 0) bytes = elem_size; /* scalar: at least one element */
 
     t->storage = ax_storage_create(bytes, AX_DEVICE_CPU);
     if (!t->storage) {
@@ -119,10 +174,12 @@ ax_tensor_t *ax_tensor_full(const int64_t *shape, int ndim, ax_dtype_t dtype, do
 }
 
 ax_tensor_t *ax_tensor_from_array(const void *data, const int64_t *shape, int ndim, ax_dtype_t dtype) {
+    if (!data) return NULL;
     ax_tensor_t *t = ax_tensor_create(shape, ndim, dtype);
     if (!t) return NULL;
 
     int64_t n = compute_numel(shape, ndim);
+    if (n < 0) { ax_tensor_destroy(t); return NULL; }
     size_t bytes = (size_t)n * ax_dtype_size(dtype);
     memcpy(t->storage->data, data, bytes);
     return t;
@@ -183,6 +240,7 @@ ax_tensor_t *ax_tensor_scalar(float value) {
 void ax_tensor_destroy(ax_tensor_t *t) {
     if (!t) return;
     if (t->grad) ax_tensor_destroy(t->grad);
+    if (t->grad_fn) free(t->grad_fn);
     ax_storage_release(t->storage);
     free(t);
 }
@@ -191,7 +249,8 @@ void ax_tensor_destroy(ax_tensor_t *t) {
 
 int64_t ax_tensor_numel(const ax_tensor_t *t) {
     if (!t) return 0;
-    return compute_numel(t->shape, t->ndim);
+    int64_t n = compute_numel(t->shape, t->ndim);
+    return n < 0 ? 0 : n;
 }
 
 bool ax_tensor_is_contiguous(const ax_tensor_t *t) {
@@ -351,6 +410,16 @@ ax_tensor_t *ax_tensor_unsqueeze(ax_tensor_t *t, int dim) {
 /* element access */
 
 float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
+#if !defined(NDEBUG) || defined(AX_DEBUG)
+    for (int i = 0; i < t->ndim; i++) {
+        if (indices[i] < 0 || indices[i] >= t->shape[i]) {
+            ax_err_set(AX_ERR_OUT_OF_BOUNDS,
+                       "get_f32: index %ld out of bounds for dim %d (size %ld)",
+                       indices[i], i, t->shape[i]);
+            return 0.0f;
+        }
+    }
+#endif
     size_t offset = t->offset;
     for (int i = 0; i < t->ndim; i++) {
         offset += indices[i] * t->strides[i];
@@ -359,6 +428,16 @@ float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
 }
 
 void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
+#if !defined(NDEBUG) || defined(AX_DEBUG)
+    for (int i = 0; i < t->ndim; i++) {
+        if (indices[i] < 0 || indices[i] >= t->shape[i]) {
+            ax_err_set(AX_ERR_OUT_OF_BOUNDS,
+                       "set_f32: index %ld out of bounds for dim %d (size %ld)",
+                       indices[i], i, t->shape[i]);
+            return;
+        }
+    }
+#endif
     size_t offset = t->offset;
     for (int i = 0; i < t->ndim; i++) {
         offset += indices[i] * t->strides[i];

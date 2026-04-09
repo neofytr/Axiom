@@ -39,6 +39,7 @@ static void test_mse_loss(void)
     AX_TEST_ASSERT_NEAR(ax_tensor_get_f32(loss, i0), 2.0f / 3.0f, 1e-4, "mse value");
 
     ax_backward(loss);
+    ax_graph_cleanup(loss);
 
     /* grad of mse w.r.t. pred: 2*(pred-target)/n */
     int64_t ii0[] = {0}, ii1[] = {1}, ii2[] = {2};
@@ -75,6 +76,7 @@ static void test_cross_entropy(void)
     AX_TEST_ASSERT(lv < 2.0f, "ce loss should be reasonable");
 
     ax_backward(loss);
+    ax_graph_cleanup(loss);
 
     /* gradient should exist */
     AX_TEST_ASSERT(logits->grad != NULL, "logits should have gradient");
@@ -104,6 +106,7 @@ static void test_bce_loss(void)
     AX_TEST_ASSERT(lv >= 0.0f, "bce loss should be non-negative");
 
     ax_backward(loss);
+    ax_graph_cleanup(loss);
     AX_TEST_ASSERT(logits->grad != NULL, "logits should have gradient");
 
     /* for logit=10, target=1: grad = sigmoid(10) - 1 ~ 0 (almost perfect) */
@@ -133,6 +136,7 @@ static void test_huber_loss(void)
     AX_TEST_ASSERT_NEAR(lv, 4.0f, 1e-4, "huber loss value");
 
     ax_backward(loss);
+    ax_graph_cleanup(loss);
     AX_TEST_ASSERT(pred->grad != NULL, "pred should have gradient");
 
     ax_tensor_destroy(loss);
@@ -152,6 +156,7 @@ static void test_mae_loss(void)
     AX_TEST_ASSERT_NEAR(ax_tensor_get_f32(loss, i0), 1.0f, 1e-4, "mae value");
 
     ax_backward(loss);
+    ax_graph_cleanup(loss);
 
     /* grad: sign(pred - target) / n */
     int64_t g0[] = {0}, g1[] = {1}, g2[] = {2};

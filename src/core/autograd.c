@@ -56,28 +56,62 @@ static bool in_list(topo_list_t *list, ax_tensor_t *t)
     return false;
 }
 
-/* dfs to build reverse topological order */
+/* iterative dfs to build reverse topological order.
+   avoids stack overflow on deep computation graphs. */
+typedef struct {
+    ax_tensor_t *node;
+    int child_idx;  /* next child to visit; -1 means node just pushed */
+} dfs_frame_t;
+
 static void topo_sort_dfs(ax_tensor_t *t, topo_list_t *visited, topo_list_t *order)
 {
-    if (!t || in_list(visited, t)) return;
-    if (visited->count >= MAX_GRAPH_NODES) return; /* bail if graph is huge */
+    if (!t) return;
 
-    visited->nodes[visited->count++] = t;
+    /* explicit stack for iterative DFS */
+    dfs_frame_t stack[MAX_GRAPH_NODES];
+    int stack_top = 0;
 
-    /* recurse into inputs */
-    ax_grad_fn_t *gf = (ax_grad_fn_t *)t->grad_fn;
-    if (gf)
+    stack[stack_top++] = (dfs_frame_t){ .node = t, .child_idx = 0 };
+
+    while (stack_top > 0)
     {
-        for (int i = 0; i < gf->n_inputs; i++)
+        dfs_frame_t *frame = &stack[stack_top - 1];
+        ax_tensor_t *node = frame->node;
+
+        /* first visit: mark as visited */
+        if (frame->child_idx == 0)
         {
-            topo_sort_dfs(gf->inputs[i], visited, order);
+            if (in_list(visited, node) || visited->count >= MAX_GRAPH_NODES)
+            {
+                stack_top--;
+                continue;
+            }
+            visited->nodes[visited->count++] = node;
         }
-    }
 
-    /* post-order: append after visiting children */
-    if (order->count < MAX_GRAPH_NODES)
-    {
-        order->nodes[order->count++] = t;
+        /* find next child to visit */
+        ax_grad_fn_t *gf = (ax_grad_fn_t *)node->grad_fn;
+        int n_children = gf ? gf->n_inputs : 0;
+
+        if (frame->child_idx < n_children)
+        {
+            ax_tensor_t *child = gf->inputs[frame->child_idx];
+            frame->child_idx++;
+
+            if (child && !in_list(visited, child) && stack_top < MAX_GRAPH_NODES)
+            {
+                stack[stack_top++] = (dfs_frame_t){ .node = child, .child_idx = 0 };
+            }
+        }
+        else
+        {
+            /* all children visited: post-order append */
+            if (order->count < MAX_GRAPH_NODES)
+            {
+                order->nodes[order->count++] = node;
+            }
+            stack_top--;
+        }
     }
 }
 
@@ -125,6 +159,36 @@ ax_status_t ax_backward(ax_tensor_t *loss)
     }
 
     return AX_OK;
+}
+
+void ax_graph_cleanup(ax_tensor_t *root)
+{
+    if (!root) return;
+
+    /* collect all nodes in the graph */
+    topo_list_t visited = { .count = 0 };
+    topo_list_t order = { .count = 0 };
+    topo_sort_dfs(root, &visited, &order);
+
+    /* destroy non-leaf intermediate nodes. skip the root tensor
+       since the caller still holds a reference and will destroy it.
+       a leaf has no grad_fn (parameters, user-created tensors). */
+    for (int i = 0; i < order.count; i++)
+    {
+        ax_tensor_t *node = order.nodes[i];
+        if (node != root && node->grad_fn)
+        {
+            ax_tensor_destroy(node);
+        }
+    }
+
+    /* detach root from the graph so it can be destroyed safely
+       without walking into freed memory */
+    if (root->grad_fn)
+    {
+        free(root->grad_fn);
+        root->grad_fn = NULL;
+    }
 }
 
 /* gradient checking utility: compare analytical vs numerical gradient.

@@ -78,6 +78,7 @@ int main(void)
         printf("  %d xor %d = %.4f  (expected %d)\n",
                (int)in[0], (int)in[1], val, (int)y_data[i]);
 
+        ax_tensor_destroy(pred);
         ax_tensor_destroy(input);
     }
 
@@ -101,12 +102,14 @@ int main(void)
             float val = ax_tensor_get_f32(pred, idx);
 
             printf("  %d xor %d = %.4f\n", (int)in[0], (int)in[1], val);
+            ax_tensor_destroy(pred);
             ax_tensor_destroy(input);
         }
         ax_model_destroy(loaded);
     }
 
     /* cleanup */
+    remove("xor_model.axm");
     ax_tensor_destroy(train_x);
     ax_tensor_destroy(train_y);
     ax_model_destroy(model);

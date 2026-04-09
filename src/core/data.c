@@ -79,6 +79,22 @@ static void tensor_ds_get_item(ax_dataset_t *self, int64_t idx,
     {
         ds->input_views = calloc(ds->n_samples, sizeof(ax_tensor_t *));
         ds->target_views = calloc(ds->n_samples, sizeof(ax_tensor_t *));
+        if (!ds->input_views || !ds->target_views)
+        {
+            *input = NULL;
+            *target = NULL;
+            return;
+        }
+    }
+
+    /* bounds check on idx */
+    if (idx < 0 || idx >= ds->n_samples)
+    {
+        ax_err_set(AX_ERR_OUT_OF_BOUNDS,
+                   "dataset index %ld out of range [0, %ld)", idx, ds->n_samples);
+        *input = NULL;
+        *target = NULL;
+        return;
     }
 
     if (!ds->input_views[idx])
@@ -170,6 +186,22 @@ static void csv_ds_get_item(ax_dataset_t *self, int64_t idx,
     {
         ds->input_views = calloc(ds->n_rows, sizeof(ax_tensor_t *));
         ds->target_views = calloc(ds->n_rows, sizeof(ax_tensor_t *));
+        if (!ds->input_views || !ds->target_views)
+        {
+            *input = NULL;
+            *target = NULL;
+            return;
+        }
+    }
+
+    /* bounds check on idx */
+    if (idx < 0 || idx >= ds->n_rows)
+    {
+        ax_err_set(AX_ERR_OUT_OF_BOUNDS,
+                   "csv dataset index %ld out of range [0, %ld)", idx, ds->n_rows);
+        *input = NULL;
+        *target = NULL;
+        return;
     }
 
     if (!ds->input_views[idx])
@@ -236,36 +268,57 @@ ax_dataset_t *ax_csv_dataset_load(const char *path,
     FILE *f = fopen(path, "r");
     if (!f) { ax_tensor_destroy(inputs); ax_tensor_destroy(targets); return NULL; }
 
-    char line[8192];
+    #define CSV_LINE_MAX 8192
+    #define CSV_FIELDS_MAX 256
+    char line[CSV_LINE_MAX];
     if (has_header) fgets(line, sizeof(line), f); /* skip header */
 
     int64_t row = 0;
     while (fgets(line, sizeof(line), f) && row < n_rows)
     {
+        /* check for line truncation: if line fills buffer and has no newline,
+           the line was too long and data may be corrupt */
+        size_t line_len = strlen(line);
+        if (line_len == CSV_LINE_MAX - 1 && line[line_len - 1] != '\n')
+        {
+            ax_err_set(AX_ERR_INTERNAL,
+                       "csv line %ld exceeds maximum length (%d bytes)",
+                       (long)(row + (has_header ? 2 : 1)), CSV_LINE_MAX);
+            /* skip rest of truncated line */
+            int ch;
+            while ((ch = fgetc(f)) != '\n' && ch != EOF) {}
+            continue;
+        }
+
         /* tokenize by comma */
-        char *fields[256];
+        char *fields[CSV_FIELDS_MAX];
         int n_fields = 0;
         char *tok = strtok(line, ",\n\r");
-        while (tok && n_fields < 256)
+        while (tok && n_fields < CSV_FIELDS_MAX)
         {
             fields[n_fields++] = tok;
             tok = strtok(NULL, ",\n\r");
         }
 
+        /* validate column indices don't exceed parsed fields */
         /* fill feature columns */
-        for (int c = 0; c < n_features && feature_cols[c] < n_fields; c++)
+        for (int c = 0; c < n_features; c++)
         {
-            in_data[row * n_features + c] = parse_float(fields[feature_cols[c]]);
+            if (feature_cols[c] >= 0 && feature_cols[c] < n_fields)
+                in_data[row * n_features + c] = parse_float(fields[feature_cols[c]]);
         }
 
         /* fill target columns */
-        for (int c = 0; c < n_targets && target_cols[c] < n_fields; c++)
+        for (int c = 0; c < n_targets; c++)
         {
-            tgt_data[row * n_targets + c] = parse_float(fields[target_cols[c]]);
+            if (target_cols[c] >= 0 && target_cols[c] < n_fields)
+                tgt_data[row * n_targets + c] = parse_float(fields[target_cols[c]]);
         }
 
         row++;
     }
+    #undef CSV_LINE_MAX
+    #undef CSV_FIELDS_MAX
     fclose(f);
 
     /* build dataset */
