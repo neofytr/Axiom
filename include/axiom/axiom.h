@@ -20,6 +20,7 @@
 #include "serialize.h"
 #include "data.h"
 #include "conv.h"
+#include "norm.h"
 
 /* initialize axiom — must be called before any other axiom functions.
    sets up compute backends, memory systems, etc. */
