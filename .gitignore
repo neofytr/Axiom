@@ -42,3 +42,4 @@ lessons/
 # raylib build artifacts
 raylib/src/*.o
 raylib/src/libraylib.a
+Testing/
