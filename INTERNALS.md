@@ -1,665 +1,824 @@
-# Axiom Internals: A Complete Guide
+# Axiom Internals: Deep Learning from Scratch
 
-This document teaches you everything inside Axiom, from the ground up.
-Each lesson builds on the previous one. By the end, you'll understand
-every line of code in this project and the math behind it.
+This document teaches you deep learning — the math, the intuition, and the
+implementation — from zero. It's structured as a course. Each unit builds
+on the last. By the end, you'll understand every line of code in this
+project and the theory behind it.
 
-This is a living document. As new modules are added, new lessons appear.
+This is a living document. New units are added as the project grows.
 
----
 
-## Lesson 1: Tensors (What They Are and Why They Matter)
+# Part 1: Foundations
 
-### The concept
 
-A **tensor** is just a multi-dimensional array of numbers. That's it.
+## Unit 1: Vectors, Matrices, and Tensors
 
-- A scalar (single number) is a 0-dimensional tensor: `42`
-- A vector is a 1D tensor: `[1, 2, 3]`
-- A matrix is a 2D tensor: `[[1, 2], [3, 4]]`
-- An image is a 3D tensor: height x width x channels (e.g., 224x224x3)
-- A batch of images is 4D: batch x height x width x channels
+Everything in deep learning is a tensor operation. If you understand
+tensors, you understand the data structures. If you understand the
+operations on tensors, you understand the algorithms.
 
-Neural networks do nothing but multiply, add, and transform tensors.
-Every weight, every input, every output is a tensor.
+### Scalars, vectors, matrices
 
-### Shape and strides
+A **scalar** is a single number. Temperature: 23.5. Price: 49.99.
 
-A tensor's **shape** tells you its dimensions: `[2, 3]` means 2 rows, 3 columns.
-
-**Strides** tell you how many elements to skip to move one step along each dimension.
-For a `[2, 3]` tensor stored in row-major order (C layout):
+A **vector** is an ordered list of numbers. It represents a point in space,
+or a direction, or a collection of features.
 
 ```
-Data in memory: [a, b, c, d, e, f]
-
-shape   = [2, 3]
-strides = [3, 1]   (skip 3 to move down a row, skip 1 to move right a column)
-
-a b c     [0,0]=a  [0,1]=b  [0,2]=c
-d e f     [1,0]=d  [1,1]=e  [1,2]=f
+v = [height, weight, age] = [170, 65, 25]
 ```
 
-To access element `[i, j]`, you compute: `data[i * stride[0] + j * stride[1]]`
+This vector lives in 3-dimensional space. Each element is a **component**.
+The number of components is the **dimension** of the vector.
 
-Why strides? Because they let us do **zero-copy operations**:
-- **Transpose**: just swap the strides. `strides = [1, 3]` instead of `[3, 1]`.
-  The data doesn't move in memory, we just read it differently.
-- **Reshape**: if the data is contiguous, just change the shape and recompute strides.
-  Again, no data is copied.
-- **Slicing/views**: adjust the offset and strides. Still no copy.
-
-This is how NumPy and PyTorch work internally.
-
-### In our code
-
-Look at `include/axiom/tensor.h`:
-
-```c
-typedef struct ax_tensor {
-    ax_storage_t *storage;     // the actual data buffer (shared across views)
-    int64_t shape[AX_MAX_DIMS];
-    int64_t strides[AX_MAX_DIMS];
-    int ndim;
-    ax_dtype_t dtype;
-    size_t offset;             // where our data starts within storage
-    ...
-} ax_tensor_t;
-```
-
-The `storage` is reference-counted. When you transpose a tensor, the new tensor
-points to the same storage with different strides. When both tensors are destroyed,
-the storage is freed only when the last reference goes away.
-
-See `src/core/tensor.c`: `ax_tensor_transpose()` just swaps shape and strides,
-increments the storage refcount, and returns. No data is ever copied.
-
-
-## Lesson 2: Memory Management (Arenas and Alignment)
-
-### Why not just malloc/free everywhere?
-
-During a neural network's forward pass, you create hundreds of temporary tensors
-(intermediate results). Each one needs a malloc and a free. This is:
-1. Slow (malloc has overhead per call)
-2. Fragmenting (lots of small allocations scatter your data in memory)
-
-### Arena allocator
-
-An arena is a bulk allocator. You grab a big chunk of memory upfront, then
-"allocate" from it by just bumping a pointer forward. When you're done,
-you reset the whole thing at once. No individual frees.
+A **matrix** is a 2D grid of numbers. Rows and columns.
 
 ```
-Before any allocations:
-[                           big block                            ]
-^
-used = 0
-
-After alloc(128):
-[####128 bytes####|                                              ]
-                  ^
-                  used = 128
-
-After alloc(64):
-[####128 bytes####|##64##|                                       ]
-                         ^
-                         used = 192
-
-After reset():
-[                           big block                            ]
-^
-used = 0    (memory is reusable, not freed)
+M = [[1, 2, 3],
+     [4, 5, 6]]
 ```
 
-See `src/core/memory.c`. If an allocation doesn't fit in the current block,
-a new block is allocated and linked into the chain.
+This is a 2x3 matrix (2 rows, 3 columns). We write its **shape** as [2, 3].
 
-### Alignment
+A **tensor** generalizes this to any number of dimensions:
+- 0D tensor = scalar: `42`
+- 1D tensor = vector: `[1, 2, 3]`
+- 2D tensor = matrix: `[[1, 2], [3, 4]]`
+- 3D tensor = a "cube" of numbers. An RGB image is 3D: [height, width, 3]
+- 4D tensor: a batch of images is [batch_size, height, width, channels]
 
-SIMD instructions (AVX, SSE) require data to be aligned to specific boundaries
-(16, 32, or 64 bytes). Even without SIMD, aligned data is faster because of
-how CPU caches work. We default to 64-byte alignment for everything.
+In Axiom, `ax_tensor_t` handles all of these. The `ndim` field tells you
+how many dimensions, and `shape[i]` tells you the size along dimension `i`.
 
-`ax_aligned_alloc()` over-allocates, aligns the pointer, and stashes the
-original pointer just before the aligned address so `ax_aligned_free()` can
-find it and pass it to `free()`.
+### Why matrices matter: the dot product
 
+The **dot product** of two vectors is the sum of element-wise products:
 
-## Lesson 3: The Compute Backend System
+```
+a = [1, 2, 3]
+b = [4, 5, 6]
 
-### The problem
+a · b = 1*4 + 2*5 + 3*6 = 4 + 10 + 18 = 32
+```
 
-You want `ax_matmul(a, b)` to work. But the actual multiplication could happen
-in many ways:
-- Pure C triple loop (slow but correct)
-- AVX2 SIMD (fast on modern x86 CPUs)
-- cuBLAS on GPU (very fast for large matrices)
-- OpenBLAS (optimized CPU BLAS library)
+Geometrically, the dot product measures how much two vectors point in the
+same direction. If they're perpendicular, the dot product is zero. If they
+point the same way, it's large and positive. Opposite: large and negative.
 
-### The solution: a vtable
+This matters because a **neuron** computes a dot product. The input is a
+vector, the weights are a vector, and the neuron measures "how much does
+this input match these weights?"
 
-Every math operation is a function pointer in a struct:
+### Matrix multiplication
+
+**Matrix multiplication** is many dot products at once.
+
+If A is [m, k] and B is [k, n], then C = A @ B is [m, n], where:
+
+```
+C[i, j] = sum over p from 0 to k-1 of: A[i, p] * B[p, j]
+```
+
+Each element of C is a dot product of a row of A with a column of B.
+
+Worked example:
+
+```
+A = [[1, 2],    B = [[5, 6],
+     [3, 4]]         [7, 8]]
+
+C[0,0] = 1*5 + 2*7 = 5 + 14 = 19
+C[0,1] = 1*6 + 2*8 = 6 + 16 = 22
+C[1,0] = 3*5 + 4*7 = 15 + 28 = 43
+C[1,1] = 3*6 + 4*8 = 18 + 32 = 50
+
+C = [[19, 22],
+     [43, 50]]
+```
+
+In our code, this is `ax_compute_gemm()` in `src/compute/backends/cpu_naive.c`.
+The naive implementation is three nested loops, exactly matching the formula.
+
+### Why matrix multiply is the core operation
+
+A neural network layer computes:
+
+```
+output = input @ weight + bias
+```
+
+If input is [batch_size, input_features] and weight is [input_features, output_features],
+then output is [batch_size, output_features].
+
+Each sample in the batch gets transformed. Each row of the weight matrix defines
+one output feature — it's a set of "what to look for" coefficients. The matrix
+multiply applies all these detectors to all samples simultaneously.
+
+This is why GPUs are fast for deep learning: they're designed for massively
+parallel matrix multiplication.
+
+### Strides: how tensors live in memory
+
+A 2D tensor is stored as a flat 1D array in memory. To find element [i, j],
+you need to know how many elements to skip per row. This is the **stride**.
+
+For a [2, 3] tensor stored in **row-major** order (C convention):
+
+```
+Memory: [a, b, c, d, e, f]
+
+Element [0, 0] is at position 0*3 + 0 = 0  -> a
+Element [0, 2] is at position 0*3 + 2 = 2  -> c
+Element [1, 1] is at position 1*3 + 1 = 4  -> e
+
+strides = [3, 1]   (skip 3 elements to advance one row, 1 to advance one column)
+```
+
+The formula: `element[i, j] = data[i * stride[0] + j * stride[1]]`
+
+For N dimensions: `element[i0, i1, ..., in] = data[i0*s0 + i1*s1 + ... + in*sn]`
+
+Why do we care? Because strides enable **zero-copy operations**:
+
+**Transpose**: instead of physically rearranging the data, just swap the strides.
+A [2, 3] matrix with strides [3, 1] becomes a [3, 2] matrix with strides [1, 3].
+Same data in memory, read differently.
+
+**Reshape**: if the data is contiguous, just change the shape and recompute strides.
+A [2, 3] tensor becomes [6] or [3, 2] without moving any data.
+
+**Slicing**: take a subset by adjusting the offset and shape. Still no copy.
+
+In Axiom, see `ax_tensor_transpose()` in `src/core/tensor.c` — it literally just
+swaps two shape and stride values and returns.
+
+### Broadcasting: making shapes compatible
+
+What happens when you add a [2, 3] tensor and a [3] tensor? The shapes don't match,
+but the operation should still make sense — add the [3] vector to each row.
+
+Broadcasting rules (same as NumPy):
+
+1. Right-align the shapes:
+   ```
+   [2, 3]
+      [3]
+   ```
+
+2. Pad the shorter one with 1s on the left:
+   ```
+   [2, 3]
+   [1, 3]
+   ```
+
+3. For each dimension, they must be equal or one of them must be 1:
+   ```
+   2 vs 1 -> ok, the 1 stretches to 2
+   3 vs 3 -> ok, equal
+   ```
+
+4. Result shape: [2, 3]
+
+The "stretching" doesn't copy data. When accessing element [i, j] of the
+broadcast tensor, if a dimension has size 1, the index for that dimension
+is always 0. See `bcast_get_f32()` in `cpu_naive.c`.
+
+This is critical for the bias add in a dense layer: bias is [output_features]
+and gets broadcast across the [batch_size, output_features] output.
+
+### Storage and reference counting
+
+In Axiom, the actual data lives in an `ax_storage_t`:
 
 ```c
 typedef struct {
-    const char *name;
-    ax_status_t (*add)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
-    ax_status_t (*gemm)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
-    ax_status_t (*relu)(const ax_tensor_t *in, ax_tensor_t *out);
-    // ... every operation
-} ax_backend_ops_t;
+    void *data;
+    size_t size_bytes;
+    int refcount;
+    ax_device_t device;
+} ax_storage_t;
 ```
 
-Each backend fills in this struct with its implementations:
+Multiple tensors can share the same storage. When you transpose a tensor,
+the new tensor points to the same storage with different strides. The refcount
+tracks how many tensors share it. When the last one is destroyed, the data
+is freed.
 
-```c
-// in cpu_naive.c:
-const ax_backend_ops_t ax_cpu_naive_ops = {
-    .name = "cpu_naive",
-    .add  = cpu_add,
-    .gemm = cpu_gemm,
-    ...
-};
-```
-
-At runtime, one backend is active. All operations route through it:
-
-```c
-// in dispatch.c:
-static const ax_backend_ops_t *active_ops = &ax_cpu_naive_ops;
-
-ax_status_t ax_compute_add(a, b, out) {
-    return active_ops->add(a, b, out);
-}
-```
-
-This is one function pointer dereference. The cost is negligible.
-But it means everything above (autograd, layers, models) doesn't
-care what's doing the actual math. Swap in a CUDA backend and
-the same training code runs on GPU.
-
-### How the naive backend does things
-
-`src/compute/backends/cpu_naive.c` is the reference implementation.
-It uses macros to avoid repeating boilerplate:
-
-```c
-#define DEFINE_BINOP(name, op_expr) \
-static ax_status_t cpu_##name(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { \
-    int64_t n = tensor_numel(out); \
-    for (int64_t i = 0; i < n; i++) { \
-        float va = bcast_get_f32(a, out, i); \
-        float vb = bcast_get_f32(b, out, i); \
-        tensor_set_f32(out, i, (op_expr)); \
-    } \
-    return AX_OK; \
-}
-
-DEFINE_BINOP(add, va + vb)
-DEFINE_BINOP(mul, va * vb)
-```
-
-The `bcast_get_f32` function handles broadcasting: it maps an output index
-back to the input index, collapsing dimensions that were broadcast.
+This is the same pattern used by PyTorch (`torch.Storage`) and NumPy
+(`ndarray.base`).
 
 
-## Lesson 4: Broadcasting
+## Unit 2: Calculus for Deep Learning
 
-### The rules (same as NumPy)
+You need exactly three things from calculus: derivatives, partial derivatives,
+and the chain rule. That's it. Everything else in deep learning's math follows
+from these three.
 
-When you add a `[2, 3]` tensor and a `[3]` tensor, broadcasting makes them
-compatible by "stretching" the smaller one:
+### Derivatives: the rate of change
+
+The derivative of f(x) at a point tells you how fast f is changing there.
 
 ```
-a: [2, 3]    b: [3]
+f(x) = x^2
 
-Step 1: right-align the shapes
-  a: 2  3
-  b:    3
+f'(x) = 2x
 
-Step 2: pad with 1s
-  a: 2  3
-  b: 1  3
-
-Step 3: for each dimension, they must be equal or one of them must be 1
-  2 vs 1 -> ok (1 broadcasts to 2)
-  3 vs 3 -> ok (equal)
-
-Result shape: [2, 3]
+At x=3: f'(3) = 6. If x increases by a tiny amount ε, f increases by about 6ε.
 ```
 
-The key insight: **broadcasting never copies data**. The "stretched" values
-are computed on the fly by repeating indices. When dimension size is 1,
-that index is always 0 regardless of the output position.
-
-### In the gradient computation
-
-Broadcasting creates a problem for gradients. If `a` has shape `[3]` and was
-broadcast to `[2, 3]` during addition, the gradient that flows back is `[2, 3]`.
-But `a`'s gradient should be `[3]`. So we **sum along the broadcast dimensions**
-to collapse it back. This is what `accumulate_grad()` in `autograd_ops.c` does.
-
-
-## Lesson 5: Automatic Differentiation (The Core Idea)
-
-This is the most important lesson. Understanding autograd means
-understanding how neural networks learn.
-
-### What we're trying to do
-
-We have a loss function `L(w)` where `w` are the network's weights.
-We want to compute `dL/dw` for every weight so we can update them
-to make the loss smaller (gradient descent).
-
-### The chain rule
-
-If `L = f(g(h(w)))`, then:
+Key derivatives you need to know:
 
 ```
-dL/dw = (dL/df) * (df/dg) * (dg/dh) * (dh/dw)
+f(x) = x^n     ->  f'(x) = n * x^(n-1)
+f(x) = e^x     ->  f'(x) = e^x           (exponential is its own derivative!)
+f(x) = ln(x)   ->  f'(x) = 1/x
+f(x) = 1/x     ->  f'(x) = -1/x^2
 ```
 
-Each factor is a local derivative. Reverse-mode autodiff computes
-these efficiently from output to input.
+The derivative tells us the **direction of increase**. If f'(x) > 0, f is
+increasing at x. If f'(x) < 0, f is decreasing. This is how we'll minimize
+the loss function: follow the negative derivative.
 
-### How it works in Axiom
+### Partial derivatives: multiple inputs
 
-Every operation records itself when gradient tracking is enabled.
-When you write:
-
-```c
-ax_tensor_t *z = ax_matmul(x, w);    // records: z came from matmul(x, w)
-ax_tensor_t *a = ax_relu(z);          // records: a came from relu(z)
-ax_tensor_t *loss = ax_sum(a, -1);    // records: loss came from sum(a)
-```
-
-Each result tensor gets a `grad_fn` that knows:
-1. What operation created it (backward function pointer)
-2. What the inputs were (so it can route gradients back)
-3. Any saved values needed for gradient computation
-
-When you call `ax_backward(loss)`:
+When f depends on multiple variables, the partial derivative with respect to
+one variable treats all others as constants.
 
 ```
-1. Set loss.grad = 1.0  (dL/dL = 1, this seeds the process)
+f(x, y) = x^2 + 3xy + y^2
 
-2. Topological sort: [loss, a, z]  (reverse order)
-
-3. Walk backwards:
-   - loss.grad_fn->backward(grad=1.0)
-     -> This is sum_backward: broadcast 1.0 to a's shape
-     -> a.grad = [1, 1, 1, ...]
-
-   - a.grad_fn->backward(grad=a.grad)
-     -> This is relu_backward: multiply by (z > 0 ? 1 : 0)
-     -> z.grad = a.grad * relu'(z)
-
-   - z.grad_fn->backward(grad=z.grad)
-     -> This is matmul_backward:
-     -> x.grad += z.grad @ w^T
-     -> w.grad += x^T @ z.grad
+∂f/∂x = 2x + 3y      (differentiate w.r.t. x, treat y as constant)
+∂f/∂y = 3x + 2y      (differentiate w.r.t. y, treat x as constant)
 ```
 
-That's it. Every weight now has its gradient. One forward pass,
-one backward pass, and you have all the information needed to
-update every parameter in the network.
-
-### The topological sort
-
-The computation forms a directed acyclic graph (DAG). We need to
-process nodes in reverse order (outputs before inputs) so that
-when we compute a node's backward, all the gradients flowing
-into it have already been accumulated.
-
-We use DFS with post-order traversal. The last node visited
-(deepest in the graph) gets processed first during backward.
-
-See `src/core/autograd.c`, the `topo_sort_dfs` function.
-
-
-## Lesson 6: Derivative Cheat Sheet
-
-Here are the derivatives used in `autograd_ops.c`.
-`g` is the gradient flowing in from above (grad_output).
-
-### Element-wise ops
-
-| Forward          | Backward (gradient w.r.t. input)          |
-|-----------------|-------------------------------------------|
-| `y = a + b`     | `da = g`, `db = g`                        |
-| `y = a - b`     | `da = g`, `db = -g`                       |
-| `y = a * b`     | `da = g * b`, `db = g * a`                |
-| `y = a / b`     | `da = g / b`, `db = -g * a / b^2`         |
-| `y = -a`        | `da = -g`                                 |
-| `y = exp(a)`    | `da = g * exp(a)` (= `g * y`)             |
-| `y = log(a)`    | `da = g / a`                              |
-| `y = sqrt(a)`   | `da = g / (2 * sqrt(a))` (= `g / (2*y)`) |
-| `y = a^2`       | `da = g * 2a`                             |
-| `y = a * c`     | `da = g * c`  (c is scalar constant)      |
-
-### Activations
-
-| Forward          | Backward                                  |
-|-----------------|-------------------------------------------|
-| `y = relu(a)`    | `da = g * (a > 0 ? 1 : 0)`               |
-| `y = sigmoid(a)` | `da = g * y * (1 - y)`                    |
-| `y = tanh(a)`    | `da = g * (1 - y^2)`                      |
-
-Notice sigmoid and tanh backward use the **output** `y`, not the input `a`.
-This is why we save the output tensor in the grad_fn.
-
-### Matrix multiply
+The **gradient** is the vector of all partial derivatives:
 
 ```
-y = a @ b    (where a is [m,k] and b is [k,n])
-
-da = g @ b^T     (g is [m,n], b^T is [n,k], result is [m,k])
-db = a^T @ g     (a^T is [k,m], g is [m,n], result is [k,n])
+∇f = [∂f/∂x, ∂f/∂y] = [2x + 3y, 3x + 2y]
 ```
 
-Why? Think about it dimensionally. If `y[i,j] = sum_k(a[i,k] * b[k,j])`,
-then `dy/da[i,k] = b[k,j]` and we need to sum over `j` (the output dimension),
-which is exactly what `g @ b^T` does.
+The gradient points in the direction of steepest increase. To minimize f,
+go in the opposite direction: -∇f.
 
-### Reductions
+### The chain rule: derivatives of compositions
 
-| Forward          | Backward                                  |
-|-----------------|-------------------------------------------|
-| `y = sum(a)`     | `da = g * ones_like(a)` (broadcast g)     |
-| `y = mean(a)`    | `da = g * (1/N) * ones_like(a)`           |
-
-Sum backward just broadcasts the gradient back to the input shape.
-Mean backward does the same but scales by 1/N.
-
-
-## Lesson 7: The Forward-Backward Pattern
-
-Putting it all together. Here's what happens when you train:
-
-```c
-// 1. Forward pass: compute predictions and loss
-ax_tensor_t *h = ax_matmul(input, w1);     // hidden = input @ w1
-ax_tensor_t *a = ax_relu(h);                // activated = relu(hidden)
-ax_tensor_t *pred = ax_matmul(a, w2);       // predictions = activated @ w2
-ax_tensor_t *diff = ax_sub(pred, target);   // error = predictions - target
-ax_tensor_t *sq = ax_square(diff);           // squared error
-ax_tensor_t *loss = ax_mean(sq, -1);         // mean squared error
-
-// 2. Backward pass: compute all gradients
-ax_backward(loss);
-
-// 3. Update weights: w -= learning_rate * w.grad
-// (this is what optimizers will do in Phase 3)
-```
-
-During step 1, each operation records itself in the computation graph.
-During step 2, `ax_backward` walks the graph in reverse and fills in
-`.grad` for every tensor that has `requires_grad = true`.
-Step 3 uses those gradients to update the weights.
-
-This is the heartbeat of neural network training. Every framework
-(PyTorch, TensorFlow, JAX) does exactly this, just with different
-syntax and optimizations.
-
-
-## Lesson 8: Code Map
-
-Where everything lives:
+If y = f(g(x)), then:
 
 ```
-include/axiom/
-  types.h          data types, error codes, device enum
-  error.h          error handling API (AX_CHECK macros)
-  memory.h         arena allocator, aligned alloc
-  tensor.h         the tensor struct and all creation/manipulation functions
-  broadcast.h      numpy-style broadcast shape computation
-  backend_ops.h    the vtable every backend must fill in
-  compute.h        dispatch layer (routes ops to active backend)
-  ops.h            user-facing operations (ax_add, ax_matmul, etc.)
-  autograd.h       backward pass engine, grad_fn, gradient checking
-  axiom.h          master include (pulls in everything)
-
-src/core/
-  error.c          thread-local error state
-  memory.c         arena and aligned allocation implementations
-  tensor.c         tensor creation, storage refcounting, shape ops
-  broadcast.c      broadcast shape computation
-  ops.c            user-facing ops (allocates output, records autograd)
-  autograd.c       backward engine (topo sort, backward traversal)
-  autograd_ops.c   backward functions for every differentiable op
-  activations.c    leaky relu, elu, selu, gelu, swish, softplus, mish, softmax
-  losses.c         mse, mae, cross-entropy, bce, huber loss
-  optim.c          sgd, adam, adamw, rmsprop, adagrad
-  init.c           xavier, kaiming, lecun, uniform, normal initialization
-
-src/compute/
-  dispatch.c       routes calls to active backend
-  backends/
-    cpu_naive.c    pure C reference implementation of all ops
-
-tests/
-  test.h              minimal test harness (assert macros)
-  test_error.c        error handling tests
-  test_memory.c       arena allocator tests
-  test_tensor.c       tensor creation and shape manipulation tests
-  test_compute.c      compute backend tests (every op individually)
-  test_ops.c          high-level ops tests (broadcasting, chaining)
-  test_autograd.c     gradient correctness tests for every differentiable op
-  test_activations.c  activation function forward + gradient tests
-  test_losses.c       loss function value and gradient tests
-  test_optim.c        optimizer convergence tests + init tests
+dy/dx = (dy/dg) * (dg/dx)
 ```
 
+"The derivative of the outside times the derivative of the inside."
 
-## Lesson 9: Loss Functions (Measuring How Wrong You Are)
-
-A loss function measures the gap between your model's predictions and
-the true answer. Training is about minimizing this number.
-
-### MSE (Mean Squared Error)
+Example:
 
 ```
-L = (1/n) * sum((pred_i - target_i)^2)
+y = (3x + 2)^2
+
+Let g = 3x + 2, so y = g^2.
+
+dy/dg = 2g
+dg/dx = 3
+
+dy/dx = 2g * 3 = 2(3x + 2) * 3 = 6(3x + 2)
 ```
 
-Squares the errors, so large errors are penalized much more than small ones.
-The gradient is `2*(pred - target) / n`. This pulls predictions toward
-their targets proportionally to the error.
-
-Good for regression. Bad for classification (doesn't understand probabilities).
-
-### Cross-Entropy (The Classification Loss)
-
-This is the most important loss for classification and understanding it
-requires understanding softmax first.
-
-**Softmax** converts raw logits (any real numbers) into probabilities:
+With more steps, you just keep multiplying:
 
 ```
-softmax(x_i) = exp(x_i) / sum(exp(x_j))
+y = f(g(h(x)))
+
+dy/dx = (dy/df) * (df/dg) * (dg/dh) * (dh/dx)
 ```
 
-The outputs are all positive and sum to 1. The largest logit gets the
-highest probability. Numerically, we subtract max(x) before exp to
-avoid overflow:
+**This is the entire basis of backpropagation.** A neural network is a
+chain of functions. The chain rule lets us compute how the loss changes
+with respect to any weight, no matter how deep the network.
+
+
+## Unit 3: The Neuron
+
+### What a single neuron computes
+
+A neuron takes a vector of inputs, computes a weighted sum, adds a bias,
+and passes the result through an activation function:
 
 ```
-softmax(x_i) = exp(x_i - max(x)) / sum(exp(x_j - max(x)))
+z = w₁x₁ + w₂x₂ + ... + wₙxₙ + b    (weighted sum + bias)
+a = σ(z)                                (activation function)
 ```
 
-**Cross-entropy** then measures how different the predicted distribution is
-from the target distribution:
+In vector notation: `z = w · x + b`, then `a = σ(z)`.
+
+The **weights** (w) determine how much each input matters.
+The **bias** (b) shifts the decision boundary.
+The **activation** (σ) introduces nonlinearity.
+
+### Why activation functions?
+
+Without activation functions, a neural network is just a sequence of linear
+transformations. And the composition of linear functions is still linear:
 
 ```
-L = -(1/batch) * sum(target_i * log(softmax(pred_i)))
+f(x) = W₂(W₁x + b₁) + b₂ = W₂W₁x + W₂b₁ + b₂ = W'x + b'
+```
+
+No matter how many layers, it collapses to a single linear transformation.
+You can't learn XOR, you can't learn curves, you can't learn anything
+that a straight line can't represent.
+
+Activation functions break this linearity. They let the network learn
+arbitrary nonlinear functions.
+
+### Sigmoid
+
+```
+σ(z) = 1 / (1 + e^(-z))
+```
+
+Squashes any real number into (0, 1). Historically popular because:
+- Output looks like a probability
+- Smooth and differentiable everywhere
+- Derivative has a nice form: σ'(z) = σ(z) * (1 - σ(z))
+
+Problems: for very large or very small z, the derivative is nearly zero.
+This causes the **vanishing gradient problem** in deep networks.
+
+In Axiom: `cpu_sigmoid()` in `cpu_naive.c`, `sigmoid_backward()` in `autograd_ops.c`.
+
+### ReLU (Rectified Linear Unit)
+
+```
+ReLU(z) = max(0, z)
+```
+
+Dead simple. If positive, pass through. If negative, output zero.
+
+Derivative: 1 if z > 0, 0 if z < 0, undefined at z = 0 (we use 0).
+
+Why it works so well:
+- No vanishing gradient for positive values (derivative is always 1)
+- Computationally cheap (just a comparison)
+- Induces sparsity (many neurons output 0, which is efficient)
+
+Problem: "dying ReLU" — if a neuron's output is always negative (due to a
+large negative bias), its gradient is always 0 and it never updates.
+
+Variants that fix this:
+- **Leaky ReLU**: `max(αx, x)` where α is small (0.01). Negative side has
+  a small slope instead of zero.
+- **ELU**: `x if x > 0, α(e^x - 1) otherwise`. Smooth near zero.
+- **GELU**: `x * Φ(x)` where Φ is the standard normal CDF. The activation
+  used in GPT and BERT. Smooth approximation of ReLU that allows small
+  negative values.
+
+In Axiom: `ax_relu()` in `ops.c`, `ax_leaky_relu()`, `ax_gelu()` etc. in `activations.c`.
+
+
+## Unit 4: Loss Functions — Measuring Error
+
+The loss function quantifies how wrong the model is. Training minimizes it.
+The choice of loss function shapes how the model learns.
+
+### MSE (Mean Squared Error) for Regression
+
+```
+L = (1/n) Σ (pred_i - target_i)²
+```
+
+You square the errors and average them. Properties:
+- Always non-negative (squared values are positive)
+- Zero only when predictions are perfect
+- Large errors are penalized much more than small errors (quadratic growth)
+- Differentiable everywhere (smooth)
+
+Gradient: `∂L/∂pred_i = 2(pred_i - target_i) / n`
+
+This is proportional to the error itself. Large errors produce large gradients,
+which produce large updates. The model fixes its biggest mistakes first.
+
+In Axiom: `ax_mse_loss()` in `losses.c`. It's composed from `ax_sub → ax_square → ax_mean`,
+so autograd handles the gradient automatically through the chain rule.
+
+### Cross-Entropy for Classification
+
+Classification is fundamentally different from regression. The model outputs
+a probability distribution over classes. We need a loss that measures how
+different two probability distributions are.
+
+**Softmax** first converts raw logits (unnormalized scores) into probabilities:
+
+```
+softmax(x_i) = exp(x_i) / Σⱼ exp(x_j)
+```
+
+All outputs are positive and sum to 1. The largest logit gets the highest
+probability, but all classes get some probability (never exactly 0 or 1).
+
+Numerical stability trick: subtract max(x) from all logits before exp.
+This doesn't change the result (the constant cancels in the fraction)
+but prevents exp from overflowing.
+
+```
+softmax(x_i) = exp(x_i - max(x)) / Σⱼ exp(x_j - max(x))
+```
+
+**Cross-entropy** then measures the difference:
+
+```
+L = -(1/batch) Σ_samples Σ_classes target_c * log(softmax(pred_c))
 ```
 
 If target is one-hot (e.g., [0, 0, 1, 0] for class 2), only the true
-class contributes to the loss. High confidence in the correct class = low loss.
+class contributes. The loss is `-log(predicted probability of true class)`.
 
-The beautiful thing: the gradient of cross-entropy + softmax simplifies to:
+Think about what this means:
+- If model predicts 0.9 for the correct class: loss = -log(0.9) = 0.105 (small)
+- If model predicts 0.5: loss = -log(0.5) = 0.693 (medium)
+- If model predicts 0.01: loss = -log(0.01) = 4.605 (huge!)
+
+Cross-entropy punishes confident wrong answers very harshly. This is exactly
+the behavior we want.
+
+The gradient has one of the most elegant results in all of deep learning:
 
 ```
-dL/d(pred) = (softmax(pred) - target) / batch_size
+∂L/∂pred = (softmax(pred) - target) / batch_size
 ```
 
-This is one of the cleanest results in deep learning. No complicated
-chain rule needed. The gradient is just "what you predicted minus what
-you should have predicted." See `ce_backward` in `losses.c`.
+"What you predicted minus what you should have predicted." Simple, clean,
+numerically stable. This is why cross-entropy + softmax is the standard
+for classification — the gradient is trivial.
+
+In Axiom: `ax_cross_entropy_loss()` in `losses.c`. We compute softmax and
+cross-entropy in a single fused pass for numerical stability, and store the
+softmax output for the backward pass.
+
+### Why MSE is bad for classification
+
+With MSE on classification, gradients can be tiny even when predictions are
+very wrong. Consider sigmoid output + MSE:
+
+```
+pred = sigmoid(z) = 0.99    (very confident, but target is 0!)
+MSE gradient ∝ (0.99 - 0) * sigmoid'(z)
+
+sigmoid'(z) at z≈4.6 is about 0.01
+
+So gradient ∝ 0.99 * 0.01 = 0.0099   (tiny!)
+```
+
+The model is confidently wrong, but the gradient is almost zero because
+sigmoid saturates. Cross-entropy doesn't have this problem because
+log(0.01) = -4.6 produces a huge loss and gradient.
 
 ### Binary Cross-Entropy
 
-For binary (yes/no) classification:
+For binary (yes/no) problems with a single output:
 
 ```
-L = -mean(target * log(sigmoid(pred)) + (1-target) * log(1-sigmoid(pred)))
+L = -mean(target * log(σ(pred)) + (1 - target) * log(1 - σ(pred)))
 ```
 
 Numerically stable version avoids computing log(sigmoid) directly:
 
 ```
-L = mean(max(pred, 0) - pred*target + log(1 + exp(-|pred|)))
+L = mean(max(pred, 0) - pred * target + log(1 + exp(-|pred|)))
 ```
 
-Gradient: `sigmoid(pred) - target` (same elegant simplification).
+Gradient: `σ(pred) - target`, same elegant form as multiclass cross-entropy.
 
-### Huber Loss
-
-A blend of MSE and MAE. Quadratic for small errors (smooth, easy to optimize),
-linear for large errors (robust to outliers):
-
-```
-L = 0.5 * x^2           if |x| <= delta
-    delta * (|x| - 0.5*delta)  otherwise
-```
+In Axiom: `ax_bce_with_logits_loss()` in `losses.c`.
 
 
-## Lesson 10: Optimizers (How to Use Gradients)
+## Unit 5: Gradient Descent and Backpropagation
 
-Once you have gradients from backward, you need to update the weights.
-The simplest approach is `w = w - lr * grad`, but modern optimizers
-do much better.
+This is where everything connects. We have a model (sequence of tensor
+operations), a loss function (measures error), and calculus (chain rule).
+Now we put them together to make the model learn.
 
-### SGD (Stochastic Gradient Descent)
+### The optimization problem
+
+We want to find weights W that minimize the loss:
 
 ```
-w = w - lr * grad
+W* = argmin_W L(model(X; W), Y)
 ```
 
-Simple, but can oscillate in narrow valleys and gets stuck at saddle points.
+Where X is input data, Y is target labels, and model(X; W) is the prediction.
 
-### SGD with Momentum
+The loss landscape is a surface in high-dimensional space (one dimension per weight).
+We're trying to find the lowest point on this surface. For a network with
+millions of parameters, this surface has millions of dimensions.
 
-Imagine a ball rolling down a hill. It accumulates speed in consistent directions
-and dampens oscillations.
+### Gradient descent
 
-```
-v = momentum * v + grad        (velocity accumulates past gradients)
-w = w - lr * v                 (update using velocity, not raw gradient)
-```
+We can't find the minimum analytically (the function is too complex).
+Instead, we use an iterative approach:
 
-Typical momentum = 0.9 means 90% of the previous velocity is retained.
-This smooths out the zigzag and accelerates in consistent directions.
-
-### Adam (Adaptive Moment Estimation)
-
-The most popular optimizer. Combines momentum with per-parameter learning rates.
+1. Start at a random point (random weight initialization)
+2. Compute the gradient of the loss with respect to each weight
+3. Take a small step in the direction that reduces the loss
+4. Repeat
 
 ```
-m = beta1 * m + (1 - beta1) * grad          (1st moment: mean of gradients)
-v = beta2 * v + (1 - beta2) * grad^2        (2nd moment: mean of squared gradients)
-m_hat = m / (1 - beta1^t)                    (bias correction for early steps)
-v_hat = v / (1 - beta2^t)                    (bias correction for early steps)
-w = w - lr * m_hat / (sqrt(v_hat) + eps)     (update)
+w = w - lr * ∂L/∂w
 ```
 
-Why this works:
-- `m` is like momentum (smooths gradient direction)
-- `v` estimates the variance of gradients (how noisy each parameter is)
-- Dividing by `sqrt(v)` gives each parameter its own effective learning rate:
-  noisy parameters get smaller updates, stable ones get larger updates
-- Bias correction handles the fact that m and v start at zero
+The **learning rate** (lr) controls step size:
+- Too large: we overshoot the minimum and oscillate or diverge
+- Too small: we converge painfully slowly
+- Just right: we smoothly descend to a good minimum
 
-Default: beta1=0.9, beta2=0.999, eps=1e-8.
+Typical values: 0.001 for Adam, 0.01 - 0.1 for SGD.
 
-### AdamW (Decoupled Weight Decay)
+### Backpropagation: computing gradients efficiently
 
-Standard Adam applies weight decay through the gradient: `grad += wd * w`.
-AdamW applies it directly to the weights: `w *= (1 - lr * wd)`.
-
-This seems trivial but makes a real difference. With standard Adam, the
-adaptive learning rate interferes with weight decay. Decoupling them
-gives better generalization.
-
-### RMSProp
-
-A precursor to Adam. Keeps a running average of squared gradients:
+For a network with layers `f₁, f₂, ..., fₙ` and loss L:
 
 ```
-v = rho * v + (1 - rho) * grad^2
-w = w - lr * grad / (sqrt(v) + eps)
+input -> f₁ -> f₂ -> ... -> fₙ -> loss
+  x      z₁    z₂          zₙ      L
 ```
 
-Like Adam without the momentum (first moment). Parameters with large
-recent gradients get smaller effective learning rates.
+We need ∂L/∂w for every weight in every layer. The chain rule gives us:
+
+```
+∂L/∂w_in_layer_i = ∂L/∂zₙ * ∂zₙ/∂zₙ₋₁ * ... * ∂z_{i+1}/∂z_i * ∂z_i/∂w
+```
+
+Computing this naively for each weight would repeat a lot of work.
+**Backpropagation** avoids this by working backwards:
+
+```
+1. Forward pass: compute z₁, z₂, ..., zₙ, L  (save all intermediate values)
+
+2. Backward pass:
+   ∂L/∂zₙ = (direct from loss function)
+   ∂L/∂zₙ₋₁ = ∂L/∂zₙ * ∂zₙ/∂zₙ₋₁
+   ∂L/∂zₙ₋₂ = ∂L/∂zₙ₋₁ * ∂zₙ₋₁/∂zₙ₋₂
+   ...
+```
+
+Each step reuses the result from the previous step. The total cost is
+proportional to one forward pass — very efficient.
+
+### Worked example: 2-layer network
+
+Let's trace through a concrete example. Network:
+
+```
+z₁ = x @ W₁ + b₁     (linear layer 1)
+a₁ = relu(z₁)         (activation)
+z₂ = a₁ @ W₂ + b₂    (linear layer 2)
+L = MSE(z₂, target)   (loss)
+```
+
+Forward pass (all values are computed and stored):
+```
+x = [1, 2] (input)
+W₁ = [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]] (shape [2, 3])
+b₁ = [0, 0, 0]
+
+z₁ = [1, 2] @ W₁ + b₁ = [0.9, 1.2, 1.5]
+a₁ = relu(z₁) = [0.9, 1.2, 1.5]  (all positive, so relu is identity)
+
+W₂ = [[0.1], [0.2], [0.3]] (shape [3, 1])
+b₂ = [0]
+
+z₂ = [0.9, 1.2, 1.5] @ W₂ + b₂ = [0.9*0.1 + 1.2*0.2 + 1.5*0.3] = [0.78]
+
+target = [1.0]
+L = (0.78 - 1.0)² = 0.0484
+```
+
+Backward pass:
+```
+∂L/∂z₂ = 2 * (0.78 - 1.0) = -0.44
+
+∂L/∂W₂ = a₁ᵀ @ ∂L/∂z₂ = [[0.9], [1.2], [1.5]] * (-0.44)
+        = [[-0.396], [-0.528], [-0.66]]
+
+∂L/∂a₁ = ∂L/∂z₂ @ W₂ᵀ = (-0.44) * [0.1, 0.2, 0.3] = [-0.044, -0.088, -0.132]
+
+∂L/∂z₁ = ∂L/∂a₁ * relu'(z₁) = [-0.044, -0.088, -0.132] * [1, 1, 1]
+        = [-0.044, -0.088, -0.132]   (all z₁ were positive, so relu' = 1)
+
+∂L/∂W₁ = xᵀ @ ∂L/∂z₁ = [[1], [2]] @ [[-0.044, -0.088, -0.132]]
+        = [[-0.044, -0.088, -0.132],
+           [-0.088, -0.176, -0.264]]
+```
+
+Now we update:
+```
+W₁ = W₁ - lr * ∂L/∂W₁
+W₂ = W₂ - lr * ∂L/∂W₂
+```
+
+Every weight gets pushed in the direction that reduces the loss.
+
+### How Axiom implements this
+
+In Axiom, you don't compute any of this by hand. The autograd engine does it:
+
+```c
+ax_tensor_t *z1 = ax_matmul(x, w1);      // records: z1 = matmul(x, w1)
+ax_tensor_t *a1 = ax_relu(z1);            // records: a1 = relu(z1)
+ax_tensor_t *z2 = ax_matmul(a1, w2);      // records: z2 = matmul(a1, w2)
+ax_tensor_t *loss = ax_mse_loss(z2, target);
+
+ax_backward(loss);  // computes ALL gradients automatically
+// w1->grad and w2->grad are now filled in
+```
+
+Each `ax_*` operation creates a tensor with a `grad_fn` attached — a struct
+containing the backward function and saved values. When `ax_backward` runs,
+it topologically sorts these nodes and calls each backward function in
+reverse order, accumulating gradients.
+
+See `autograd.c` for the backward engine and `autograd_ops.c` for the
+backward function of every operation.
 
 
-## Lesson 11: Weight Initialization (Why It Matters)
+## Unit 6: Optimizers — Better Than Plain Gradient Descent
 
-### The problem
+Plain SGD works but has problems. Modern optimizers fix them.
 
-If weights are too large, activations explode exponentially through layers.
-If too small, they shrink to zero and gradients vanish (the network can't learn).
+### The problem with plain SGD
 
-We need the variance of activations to stay roughly constant as data flows
-through the network.
+Consider a loss surface shaped like a narrow valley:
+
+```
+        /  steep walls  \
+       /                 \
+      /    shallow floor  \
+     /____________________\
+```
+
+SGD oscillates across the steep walls (large gradients there) while making
+slow progress along the shallow floor (small gradients). You can't just
+increase the learning rate because the steep dimensions would diverge.
+
+### Momentum: remember past gradients
+
+Instead of using the raw gradient, maintain a **velocity** that accumulates:
+
+```
+v = β * v + gradient           (β is typically 0.9)
+w = w - lr * v
+```
+
+The velocity averages out oscillations across the steep dimensions (they
+alternate sign and cancel out) while accumulating in the consistent direction
+(same sign adds up). Like a heavy ball rolling: it smooths the zigzag.
+
+### Adam: adaptive learning rates
+
+Different parameters need different learning rates. A weight connecting to
+a frequently active input needs smaller updates than one connecting to a
+rarely active input.
+
+Adam tracks two things per parameter:
+
+```
+m = β₁ * m + (1 - β₁) * g            (1st moment: running mean of gradients)
+v = β₂ * v + (1 - β₂) * g²           (2nd moment: running mean of squared gradients)
+```
+
+The update:
+
+```
+w = w - lr * m / (√v + ε)
+```
+
+Think about what this does:
+- m smooths the gradient direction (like momentum)
+- √v estimates the typical gradient magnitude for this parameter
+- Dividing by √v normalizes the step: parameters with large gradients get
+  smaller effective learning rates, parameters with small gradients get larger ones
+
+There's a subtlety: m and v are initialized to zero, so they're biased toward
+zero in early steps. **Bias correction** fixes this:
+
+```
+m_hat = m / (1 - β₁ᵗ)
+v_hat = v / (1 - β₂ᵗ)
+```
+
+At step t=1 with β₁=0.9: `1 - 0.9¹ = 0.1`, so `m_hat = m / 0.1 = 10 * m`.
+This corrects for the fact that m has only accumulated one gradient so far.
+As t grows, `β₁ᵗ → 0` and the correction vanishes.
+
+Default values (β₁=0.9, β₂=0.999, ε=1e-8) work well for almost everything.
+This is why Adam is the default choice in most deep learning.
+
+In Axiom: `adam_step()` in `optim.c`. The implementation follows the formulas
+exactly. Per-parameter state (m, v) is stored in `ax_param_state_t`.
+
+### AdamW: fixing weight decay
+
+Weight decay (L2 regularization) adds a penalty for large weights:
+
+```
+L_total = L + λ * Σ w²
+```
+
+This is equivalent to adding `λ * w` to the gradient. But with Adam,
+the adaptive learning rate interferes with this — large-gradient parameters
+have their weight decay attenuated.
+
+AdamW decouples them by applying weight decay directly to the weights:
+
+```
+w = w * (1 - lr * λ) - lr * m_hat / (√v_hat + ε)
+```
+
+The first term shrinks weights, the second term is the normal Adam update.
+They don't interfere with each other. This gives better generalization
+in practice and is the standard for training transformers.
+
+In Axiom: `adam_step(opt, true)` for AdamW vs `adam_step(opt, false)` for Adam.
+The boolean controls whether weight decay is decoupled.
+
+
+## Unit 7: Weight Initialization — Why It Matters
+
+### The variance problem
+
+Consider a layer: `z = Σᵢ wᵢ * xᵢ` (sum of n terms).
+
+If weights and inputs are independent with zero mean, then:
+
+```
+Var(z) = n * Var(w) * Var(x)
+```
+
+(This follows from the variance of a product of independent variables.)
+
+If Var(w) = 1 and n = 1000 (a wide layer), then Var(z) = 1000 * Var(x).
+After k layers: Var(output) = 1000^k * Var(input). Exponential explosion!
+
+If Var(w) = 0.001, then Var(z) = 1 * Var(x). Looks fine for one layer.
+But after k layers: 0.001^k * ... → 0. Everything vanishes.
+
+We need `n * Var(w) = 1`, so `Var(w) = 1/n`. This keeps variance stable.
 
 ### Xavier/Glorot initialization
 
-Analyzed for linear layers with sigmoid/tanh activation.
+For a layer with `fan_in` inputs and `fan_out` outputs, Xavier balances
+both forward and backward variance:
 
-For a layer with `fan_in` inputs and `fan_out` outputs, we want:
 ```
-Var(output) = Var(input)
-```
-
-This gives us:
-```
-Var(weight) = 2 / (fan_in + fan_out)
+Var(w) = 2 / (fan_in + fan_out)
 ```
 
-Uniform version: sample from `U[-limit, limit]` where `limit = sqrt(6 / (fan_in + fan_out))`
-Normal version: sample from `N(0, std)` where `std = sqrt(2 / (fan_in + fan_out))`
+For uniform distribution: `w ~ U[-limit, limit]` where `limit = √(6 / (fan_in + fan_out))`
+
+(Because Var(U[-a, a]) = a²/3, and we want a²/3 = 2/(fan_in + fan_out),
+so a = √(6/(fan_in + fan_out)).)
+
+This works well for sigmoid and tanh activations.
 
 ### He/Kaiming initialization
 
-ReLU kills half the values (sets negatives to 0), so Xavier underestimates the needed variance by a factor of 2.
+ReLU sets half the values to zero (those where z < 0). This halves the
+variance at each layer. To compensate:
 
 ```
-Var(weight) = 2 / fan_in
+Var(w) = 2 / fan_in
 ```
 
-This is the standard for networks using ReLU.
+The factor of 2 accounts for ReLU killing half the signal.
 
-### Why only fan_in?
+For uniform: `limit = √(6 / fan_in)`
+For normal: `std = √(2 / fan_in)`
 
-When doing forward propagation, output variance depends on fan_in.
-When doing backward propagation, gradient variance depends on fan_out.
-He init focuses on forward stability. Xavier balances both.
+This is the default in Axiom when you call `ax_dense_create()`. The dense
+layer constructor calls `ax_init_kaiming_uniform()`.
+
+### Why zero initialization doesn't work
+
+If all weights start at zero, all neurons in a layer produce the same output.
+During backprop, they all get the same gradient. They all update the same way.
+They stay identical forever. This is called the **symmetry problem** — the
+network has many neurons but they all learn the same thing.
+
+Random initialization breaks this symmetry. Each neuron starts at a different
+point and learns different features.
 
 
-## Lesson 12: Layers and the Module System
+## Unit 8: The Layer System and Model API
 
 ### Why layers?
 
-Without layers, building a model looks like this:
+Without layers, building a model means manually managing dozens of tensors:
 
 ```c
-ax_tensor_t *w1 = ax_tensor_rand(...);
-ax_tensor_t *b1 = ax_tensor_zeros(...);
-ax_tensor_t *w2 = ax_tensor_rand(...);
-// ... manually init each, manually track each, manually wire forward pass
+ax_tensor_t *w1 = ax_tensor_rand(shape1, 2, -1, 1);
+ax_tensor_t *b1 = ax_tensor_zeros(shape_b1, 1, AX_FLOAT32);
+w1->requires_grad = true;
+b1->requires_grad = true;
+// ... repeat for every layer, manually wire forward pass, manually collect params
 ```
 
 With layers:
@@ -670,105 +829,151 @@ ax_sequential_add(model, ax_dense_create(784, 128, true));
 ax_sequential_add(model, ax_relu_layer_create());
 ax_sequential_add(model, ax_dense_create(128, 10, true));
 
-ax_tensor_t *output = ax_layer_forward(model, input);
+ax_tensor_t *out = ax_layer_forward(model, input);
 ```
 
-Layers encapsulate weights, initialization, and the forward computation.
-Sequential chains them. The model API adds optimizer and loss on top.
+Layers encapsulate: weight allocation, initialization, the forward computation,
+and parameter tracking. The model API adds training on top.
 
-### How it works in C (polymorphism without classes)
+### C polymorphism: vtables without classes
 
-C doesn't have classes, but we fake it with the same trick the Linux kernel uses:
-embed a "base struct" as the first field of every concrete struct, then cast between them.
+C has no classes, but we achieve polymorphism with the same technique used
+by the Linux kernel, GLib, and SQLite.
+
+Every layer type is a struct with `ax_layer_t` as its first field:
 
 ```c
-/* base */
 struct ax_layer {
-    ax_layer_ops_t ops;    /* vtable: forward(), destroy() */
+    ax_layer_ops_t ops;    // function pointers: forward(), destroy()
     ax_layer_type_t type;
     ax_tensor_t *params[AX_LAYER_MAX_PARAMS];
     int n_params;
-    ...
 };
 
-/* concrete */
 typedef struct {
-    ax_layer_t base;       /* MUST be first field */
+    ax_layer_t base;       // MUST be first field
     ax_tensor_t *weight;
     ax_tensor_t *bias;
 } ax_dense_t;
 ```
 
-Because `base` is at offset 0, a pointer to `ax_dense_t` is also a valid
-pointer to `ax_layer_t`. We can pass it to any function expecting a layer:
+Because `base` is at memory offset 0, a pointer to `ax_dense_t` is also
+a valid pointer to `ax_layer_t`:
 
 ```c
-ax_dense_t *d = ...;
-ax_layer_forward((ax_layer_t *)d, input);  /* calls d->base.ops.forward */
+ax_dense_t *dense = malloc(sizeof(ax_dense_t));
+dense->base.ops.forward = dense_forward;  // set the vtable
+
+ax_layer_t *layer = (ax_layer_t *)dense;  // safe cast
+layer->ops.forward(layer, input);          // calls dense_forward
 ```
 
-The `ops.forward` function pointer was set to `dense_forward` during creation,
-so the right implementation runs. This is exactly how C++ vtables work under
-the hood, minus the compiler magic.
+This is literally how C++ vtables work under the hood, minus the compiler
+doing it for you.
 
-### The Dense layer
+### The complete training loop
 
-The fundamental building block. Computes:
-
-```
-output = input @ weight + bias
-```
-
-Where `input` is `[batch, in_features]`, `weight` is `[in_features, out_features]`,
-and `bias` is `[out_features]`. The bias gets broadcast across the batch dimension.
-
-Weight is initialized with Kaiming uniform (good for ReLU networks).
-Bias is initialized to zeros.
-
-### Sequential container
-
-Just an array of layer pointers. Forward pass chains them:
+Putting everything together:
 
 ```c
-x = input;
-for each layer:
-    x = layer.forward(x);
-return x;
+// 1. build the model
+ax_layer_t *net = ax_sequential_create();
+ax_sequential_add(net, ax_dense_create(2, 8, true));
+ax_sequential_add(net, ax_relu_layer_create());
+ax_sequential_add(net, ax_dense_create(8, 1, true));
+
+// 2. create model and compile
+ax_model_t *model = ax_model_create(net);
+ax_optimizer_t *opt = ax_adam_create(model->params, model->n_params,
+                                     0.001, 0.9, 0.999, 1e-8, 0);
+ax_model_compile(model, opt, ax_mse_loss);
+
+// 3. train
+ax_model_fit(model, train_x, train_y, 1000, 100);
+
+// 4. predict
+ax_tensor_t *pred = ax_model_predict(model, test_x);
 ```
 
-Parameter collection recurses into sublayers, so `ax_layer_get_params`
-on a sequential gives you every trainable tensor in the whole model.
+Inside `ax_model_train_step()`, this happens:
 
-### The Model API
-
-Wraps a network + optimizer + loss into a single object:
-
-```c
-ax_model_t *m = ax_model_create(net);
-ax_model_compile(m, optimizer, ax_mse_loss);
-ax_model_fit(m, train_x, train_y, epochs, print_every);
+```
+1. ax_optimizer_zero_grad(opt)       — clear all .grad tensors to zero
+2. ax_layer_forward(net, input)      — forward pass (records computation graph)
+3. loss_fn(pred, target)             — compute scalar loss
+4. ax_backward(loss)                 — backward pass (fills all .grad tensors)
+5. ax_optimizer_step(opt)            — update weights using gradients
 ```
 
-`train_step` does the full loop: zero grad -> forward -> loss -> backward -> step.
-`predict` switches to eval mode and disables gradient tracking.
+This is the heartbeat of deep learning. Every framework does exactly this
+loop, with different syntax.
 
-### Embedded considerations
 
-All arrays are fixed-size (no malloc during forward pass for layer bookkeeping).
-`AX_SEQ_MAX_LAYERS` (64) and `AX_MODEL_MAX_PARAMS` (256) are compile-time
-constants that can be tuned down for memory-constrained targets.
-No strings, no dynamic dispatch beyond the function pointer call.
+## Unit 9: Code Map
+
+Where everything lives in the project:
+
+```
+include/axiom/
+  axiom.h          master include
+  types.h          dtypes (float32, int32, ...), error codes, device enum
+  error.h          thread-safe error handling, AX_CHECK macros
+  memory.h         arena allocator for temporaries, aligned alloc for SIMD
+  tensor.h         N-dim tensor: creation, reshape, transpose, views
+  broadcast.h      numpy-style broadcast shape computation
+  backend_ops.h    vtable that every compute backend fills in
+  compute.h        dispatch layer: routes math ops to active backend
+  ops.h            user-facing operations: ax_add, ax_matmul, ax_relu, etc.
+  autograd.h       backward pass engine, grad_fn struct, gradient checking
+  activations.h    leaky relu, elu, selu, gelu, swish, softplus, mish, softmax
+  losses.h         mse, mae, cross-entropy, bce, huber
+  optim.h          sgd, adam, adamw, rmsprop, adagrad
+  init.h           xavier, kaiming, lecun, uniform, normal initialization
+  layer.h          layer interface, dense, activation wrappers, sequential
+  model.h          model container, compile, train_step, predict, fit
+
+src/core/
+  error.c          thread-local error state with formatted messages
+  memory.c         arena (bump allocator + linked block list), aligned malloc
+  tensor.c         tensor lifecycle, storage refcounting, zero-copy shape ops
+  broadcast.c      broadcast shape computation (right-align, match dimensions)
+  ops.c            allocates outputs, checks shapes, records autograd, dispatches
+  autograd.c       backward(): topo sort via DFS, then calls grad_fns in reverse
+  autograd_ops.c   backward fn for every differentiable op (the derivative cheat sheet)
+  activations.c    activation forward + backward (leaky relu through softmax)
+  losses.c         loss forward + custom backward where composition doesn't work
+  optim.c          optimizer state management + update rules (sgd through adagrad)
+  init.c           random number generation + scaled initialization schemes
+  layer.c          dense forward, activation wrappers, sequential container
+  model.c          model compile, train loop, predict with no_grad
+
+src/compute/
+  dispatch.c       single global pointer to active backend, dispatch functions
+  backends/
+    cpu_naive.c    reference implementation: pure C loops for every operation
+
+tests/
+  test.h              assert macros, test runner
+  test_error.c        error state tests
+  test_memory.c       arena allocator tests
+  test_tensor.c       tensor creation, reshape, transpose, refcount tests
+  test_compute.c      every compute op tested individually
+  test_ops.c          broadcasting, chaining, shape inference tests
+  test_autograd.c     gradient correctness for every differentiable op
+  test_activations.c  activation forward values + gradients
+  test_losses.c       loss values + gradients
+  test_optim.c        optimizer convergence on f(x)=x², init sanity checks
+  test_layer.c        dense, sequential, param collection, XOR training end-to-end
+```
 
 
 ## Coming Next
 
-As the project grows, new lessons will be added:
-
-- **Lesson 13**: Serialization (saving/loading models for deployment)
-- **Lesson 14**: Convolutions (im2col trick, how CNNs see)
-- **Lesson 15**: Batch normalization (why deep networks need it)
-- **Lesson 16**: Recurrent networks (LSTM gates, backprop through time)
-- **Lesson 17**: Attention and transformers (the mechanism behind modern AI)
-- **Lesson 18**: SIMD optimization (how AVX makes math 8x faster)
-- **Lesson 19**: Quantization (INT8 inference for embedded deployment)
-- **Lesson 20**: GPU compute (CUDA kernels, memory coalescing)
+- **Unit 10**: Serialization — saving and loading models for deployment
+- **Unit 11**: Convolutions — what they are, why they work for images, the im2col trick
+- **Unit 12**: Batch normalization — stabilizing deep network training
+- **Unit 13**: Dropout — regularization by random disabling
+- **Unit 14**: Recurrent networks — processing sequences, LSTM gates
+- **Unit 15**: Attention and transformers — the mechanism behind modern AI
+- **Unit 16**: SIMD optimization — processing 8 numbers at once
+- **Unit 17**: Quantization — INT8 inference for embedded deployment

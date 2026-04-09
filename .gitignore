@@ -28,6 +28,9 @@ examples/with_vis/xor
 examples/with_vis/comp
 xor
 
+# lessons (local learning material, not pushed)
+lessons/
+
 # editor/os junk
 *.swp
 *.swo
