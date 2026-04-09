@@ -1,1 +1,0 @@
-/usr/bin/cc -Wl,--dependency-file=CMakeFiles/test_memory.dir/link.d CMakeFiles/test_memory.dir/tests/test_memory.c.o -o test_memory  libaxiom.a -lm

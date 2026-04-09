@@ -1,2 +1,0 @@
-/usr/bin/ar qc libaxiom.a CMakeFiles/axiom_static.dir/src/core/error.c.o CMakeFiles/axiom_static.dir/src/core/memory.c.o CMakeFiles/axiom_static.dir/src/core/tensor.c.o CMakeFiles/axiom_static.dir/src/core/broadcast.c.o CMakeFiles/axiom_static.dir/src/core/ops.c.o CMakeFiles/axiom_static.dir/src/core/autograd.c.o CMakeFiles/axiom_static.dir/src/core/autograd_ops.c.o CMakeFiles/axiom_static.dir/src/compute/dispatch.c.o CMakeFiles/axiom_static.dir/src/compute/backends/cpu_naive.c.o
-/usr/bin/ranlib libaxiom.a

@@ -1,0 +1,42 @@
+# build artifacts
+build/
+axiom/build/
+*.o
+*.a
+*.so
+*.dylib
+*.out
+
+# cmake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# test binaries
+test_error
+test_memory
+test_tensor
+test_compute
+test_ops
+test_autograd
+
+# compiled examples
+examples/without_vis/xor
+examples/without_vis/or
+examples/without_vis/comp
+examples/with_vis/xor
+examples/with_vis/comp
+xor
+
+# editor/os junk
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# raylib build artifacts
+raylib/src/*.o
+raylib/src/libraylib.a
