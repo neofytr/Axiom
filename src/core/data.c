@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 #include <time.h>
 
 
@@ -535,7 +536,7 @@ ax_tensor_t *ax_transform_minmax_scale(ax_tensor_t *t)
 
     for (int64_t f = 0; f < features; f++)
     {
-        float mn = 1e30f, mx = -1e30f;
+        float mn = FLT_MAX, mx = -FLT_MAX;
         for (int64_t i = 0; i < n; i++)
         {
             int64_t idx = (t->ndim == 1) ? i : i * t->strides[0] + f * t->strides[1];

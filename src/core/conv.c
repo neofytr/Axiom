@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 /* compute output spatial dimension */
 static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int pad)
@@ -144,7 +145,7 @@ ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
 
 static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
-    ax_conv2d_t *conv = (ax_conv2d_t *)self->saved[2]; /* hacky: store layer ptr as tensor ptr */
+    ax_conv2d_t *conv = (ax_conv2d_t *)self->ctx;
     ax_tensor_t *input = self->saved[0];
     ax_tensor_t *weight = conv->weight;
 
@@ -340,8 +341,8 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         gf->inputs[0] = input;
         gf->n_inputs = 1;
         gf->saved[0] = input;
-        gf->saved[2] = (ax_tensor_t *)conv; /* stash layer pointer */
-        gf->n_saved = 3;
+        gf->n_saved = 1;
+        gf->ctx = conv;
         output->grad_fn = gf;
     }
 
@@ -440,7 +441,7 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
             {
                 for (int64_t x = 0; x < ow; x++)
                 {
-                    float mx = -1e30f;
+                    float mx = -FLT_MAX;
                     for (int ky = 0; ky < k; ky++)
                     {
                         for (int kx = 0; kx < k; kx++)

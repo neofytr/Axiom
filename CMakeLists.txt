@@ -68,6 +68,10 @@ foreach(test_src ${TEST_SOURCES})
     add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
+# examples
+add_executable(example_xor examples/xor.c)
+target_link_libraries(example_xor PRIVATE axiom_static)
+
 # convenience target: run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure

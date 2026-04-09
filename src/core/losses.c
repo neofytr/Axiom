@@ -8,6 +8,7 @@
 #include "axiom/activations.h"
 #include "axiom/error.h"
 #include <math.h>
+#include <float.h>
 #include <stdlib.h>
 
 
@@ -161,7 +162,7 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
     for (int64_t b = 0; b < batch; b++)
     {
         /* find max for stability */
-        float mx = -1e30f;
+        float mx = -FLT_MAX;
         for (int64_t c = 0; c < classes; c++)
         {
             float v = pd[pred->offset + b * pred->strides[0] + c * pred->strides[1]];

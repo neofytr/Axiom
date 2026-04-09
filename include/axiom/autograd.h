@@ -41,6 +41,9 @@ struct ax_grad_fn
     /* extra scalar context some ops need (e.g., mul_scalar stores the scalar) */
     double scalar_ctx;
     int int_ctx; /* e.g., axis for sum */
+
+    /* opaque pointer for ops that need more context (e.g., conv2d stores its layer) */
+    void *ctx;
 };
 
 /* run backward pass starting from this tensor.

@@ -495,7 +495,11 @@ ax_grad_fn_t *ax_make_sum_backward(ax_tensor_t *a, int axis, ax_tensor_t *out)
 
 /* mean: like sum but divided by count.
    d/da(mean(a)) = 1/N
-   d/da(mean(a, axis=k)) = 1/shape[k] */
+   d/da(mean(a, axis=k)) = 1/shape[k]
+
+   instead of reusing sum_backward and rescaling (which corrupts
+   previously accumulated gradients), we scale grad_out first
+   and then do the broadcast/accumulate. */
 static void mean_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
@@ -507,20 +511,50 @@ static void mean_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     else
         count = a->shape[axis];
 
-    /* reuse sum backward logic, then scale by 1/count */
-    sum_backward(self, grad_out);
+    float inv_count = 1.0f / (float)count;
 
-    /* the grad was already accumulated, so we need to scale it.
-       but sum_backward accumulated the unscaled version...
-       easier to just undo and redo. let's be pragmatic: */
+    if (!self->inputs[0]->requires_grad) return;
 
-    /* actually, let's just scale the accumulated grad directly */
-    float scale = 1.0f / (float)count;
-    int64_t n = ax_tensor_numel(self->inputs[0]->grad);
-    float *gd = (float *)self->inputs[0]->grad->storage->data;
-    for (int64_t i = 0; i < n; i++)
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+
+    if (axis == -1)
     {
-        gd[self->inputs[0]->grad->offset + i] *= scale;
+        /* full reduction: grad_out is scalar, broadcast scaled version to input shape */
+        float g = ((float *)grad_out->storage->data)[grad_out->offset] * inv_count;
+        float *gd = (float *)self->inputs[0]->grad->storage->data;
+        int64_t n = ax_tensor_numel(a);
+        for (int64_t i = 0; i < n; i++)
+            gd[self->inputs[0]->grad->offset + i] += g;
+    }
+    else
+    {
+        /* axis reduction: expand scaled grad_out along the reduced axis */
+        float *gad = (float *)self->inputs[0]->grad->storage->data;
+        float *god = (float *)grad_out->storage->data;
+        int64_t n = ax_tensor_numel(a);
+
+        for (int64_t i = 0; i < n; i++)
+        {
+            int64_t remaining = i;
+            int64_t out_flat = 0;
+
+            for (int d = a->ndim - 1; d >= 0; d--)
+            {
+                int64_t idx = remaining % a->shape[d];
+                remaining /= a->shape[d];
+                if (d != axis)
+                {
+                    int od = (d > axis) ? d - 1 : d;
+                    int64_t os = 1;
+                    for (int k = grad_out->ndim - 1; k > od; k--) os *= grad_out->shape[k];
+                    out_flat += idx * os;
+                }
+            }
+
+            gad[self->inputs[0]->grad->offset + i] +=
+                god[grad_out->offset + out_flat] * inv_count;
+        }
     }
 }
 

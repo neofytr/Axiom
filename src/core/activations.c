@@ -7,6 +7,7 @@
 #include "axiom/compute.h"
 #include "axiom/error.h"
 #include <math.h>
+#include <float.h>
 #include <stdlib.h>
 
 /* selu constants — from the original self-normalizing networks paper */
@@ -432,7 +433,7 @@ ax_tensor_t *ax_softmax(ax_tensor_t *a, int axis)
         int64_t n = a->shape[0];
 
         /* find max for stability */
-        float mx = -1e30f;
+        float mx = -FLT_MAX;
         for (int64_t i = 0; i < n; i++)
         {
             float v = ad[a->offset + i];
@@ -461,7 +462,7 @@ ax_tensor_t *ax_softmax(ax_tensor_t *a, int axis)
 
         for (int64_t r = 0; r < rows; r++)
         {
-            float mx = -1e30f;
+            float mx = -FLT_MAX;
             for (int64_t c = 0; c < cols; c++)
             {
                 float v = ad[a->offset + r * a->strides[0] + c * a->strides[1]];
