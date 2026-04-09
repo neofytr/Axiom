@@ -19,6 +19,7 @@
 #include "model.h"
 #include "serialize.h"
 #include "data.h"
+#include "conv.h"
 
 /* initialize axiom — must be called before any other axiom functions.
    sets up compute backends, memory systems, etc. */
