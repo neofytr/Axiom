@@ -157,6 +157,7 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
 
     /* also compute softmax for the backward pass */
     ax_tensor_t *sm = ax_tensor_zeros(pred->shape, pred->ndim, pred->dtype);
+    if (!sm) return NULL;
     float *sd = (float *)sm->storage->data;
 
     for (int64_t b = 0; b < batch; b++)

@@ -36,8 +36,9 @@ void ax_storage_retain(ax_storage_t *s) {
 
 void ax_storage_release(ax_storage_t *s) {
     if (!s) return;
+    if (s->refcount <= 0) return; /* already freed or corrupted — do not double-free */
     s->refcount--;
-    if (s->refcount <= 0) {
+    if (s->refcount == 0) {
         ax_aligned_free(s->data);
         free(s);
     }
@@ -239,8 +240,14 @@ ax_tensor_t *ax_tensor_scalar(float value) {
 
 void ax_tensor_destroy(ax_tensor_t *t) {
     if (!t) return;
-    if (t->grad) ax_tensor_destroy(t->grad);
-    if (t->grad_fn) free(t->grad_fn);
+    if (t->grad) {
+        ax_tensor_destroy(t->grad);
+        t->grad = NULL;
+    }
+    if (t->grad_fn) {
+        free(t->grad_fn);
+        t->grad_fn = NULL;
+    }
     ax_storage_release(t->storage);
     free(t);
 }
@@ -410,7 +417,6 @@ ax_tensor_t *ax_tensor_unsqueeze(ax_tensor_t *t, int dim) {
 /* element access */
 
 float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
-#if !defined(NDEBUG) || defined(AX_DEBUG)
     for (int i = 0; i < t->ndim; i++) {
         if (indices[i] < 0 || indices[i] >= t->shape[i]) {
             ax_err_set(AX_ERR_OUT_OF_BOUNDS,
@@ -419,7 +425,6 @@ float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
             return 0.0f;
         }
     }
-#endif
     size_t offset = t->offset;
     for (int i = 0; i < t->ndim; i++) {
         offset += indices[i] * t->strides[i];
@@ -428,7 +433,6 @@ float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
 }
 
 void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
-#if !defined(NDEBUG) || defined(AX_DEBUG)
     for (int i = 0; i < t->ndim; i++) {
         if (indices[i] < 0 || indices[i] >= t->shape[i]) {
             ax_err_set(AX_ERR_OUT_OF_BOUNDS,
@@ -437,7 +441,6 @@ void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
             return;
         }
     }
-#endif
     size_t offset = t->offset;
     for (int i = 0; i < t->ndim; i++) {
         offset += indices[i] * t->strides[i];

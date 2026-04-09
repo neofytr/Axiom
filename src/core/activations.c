@@ -51,6 +51,7 @@ static void leaky_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gd = (float *)grad_a->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
@@ -114,6 +115,7 @@ static void elu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gd = (float *)grad_a->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
@@ -194,6 +196,7 @@ static void gelu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gd = (float *)grad_a->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
@@ -263,6 +266,7 @@ static void swish_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gd = (float *)grad_a->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
@@ -330,6 +334,7 @@ static void softplus_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gd = (float *)grad_a->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;

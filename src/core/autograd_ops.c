@@ -18,14 +18,17 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* helper: make sure a tensor has a grad tensor allocated and ready to accumulate into */
-static void ensure_grad(ax_tensor_t *t)
+/* helper: make sure a tensor has a grad tensor allocated and ready to accumulate into.
+   returns false if allocation fails. */
+static bool ensure_grad(ax_tensor_t *t)
 {
-    if (!t->requires_grad) return;
+    if (!t->requires_grad) return true;
     if (!t->grad)
     {
         t->grad = ax_tensor_zeros(t->shape, t->ndim, t->dtype);
+        if (!t->grad) return false;
     }
+    return true;
 }
 
 /* helper: accumulate grad_to_add into t->grad (element-wise addition).
@@ -34,7 +37,7 @@ static void ensure_grad(ax_tensor_t *t)
 static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
 {
     if (!t->requires_grad) return;
-    ensure_grad(t);
+    if (!ensure_grad(t)) return;
 
     /* if shapes match exactly, just add */
     if (t->grad->ndim == grad_to_add->ndim)
@@ -124,6 +127,7 @@ static void sub_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     /* negate grad for b */
     ax_tensor_t *neg_grad = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!neg_grad) return;
     ax_compute_neg(grad_out, neg_grad);
     accumulate_grad(self->inputs[1], neg_grad);
     ax_tensor_destroy(neg_grad);
@@ -148,12 +152,14 @@ static void mul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     /* grad_a = grad_out * b */
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     ax_compute_mul(grad_out, b, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
     ax_tensor_destroy(grad_a);
 
     /* grad_b = grad_out * a */
     ax_tensor_t *grad_b = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_b) return;
     ax_compute_mul(grad_out, a, grad_b);
     accumulate_grad(self->inputs[1], grad_b);
     ax_tensor_destroy(grad_b);
@@ -181,15 +187,18 @@ static void div_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     /* grad_a = grad_out / b */
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     ax_compute_div(grad_out, b, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
     ax_tensor_destroy(grad_a);
 
     /* grad_b = -grad_out * a / b^2 */
     ax_tensor_t *b_sq = ax_tensor_zeros(b->shape, b->ndim, b->dtype);
+    if (!b_sq) return;
     ax_compute_square(b, b_sq);
 
     ax_tensor_t *tmp = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!tmp) { ax_tensor_destroy(b_sq); return; }
     ax_compute_mul(grad_out, a, tmp);
     ax_compute_div(tmp, b_sq, tmp);
     ax_compute_neg(tmp, tmp);
@@ -216,6 +225,7 @@ ax_grad_fn_t *ax_make_div_backward(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *
 static void neg_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *neg_grad = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!neg_grad) return;
     ax_compute_neg(grad_out, neg_grad);
     accumulate_grad(self->inputs[0], neg_grad);
     ax_tensor_destroy(neg_grad);
@@ -236,6 +246,7 @@ static void exp_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *exp_out = self->saved[0]; /* = exp(a) */
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     ax_compute_mul(grad_out, exp_out, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
     ax_tensor_destroy(grad_a);
@@ -258,6 +269,7 @@ static void log_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     ax_compute_div(grad_out, a, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
     ax_tensor_destroy(grad_a);
@@ -282,9 +294,11 @@ static void sqrt_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     /* grad = grad_out / (2 * sqrt(a)) */
     ax_tensor_t *denom = ax_tensor_zeros(sqrt_out->shape, sqrt_out->ndim, sqrt_out->dtype);
+    if (!denom) return;
     ax_compute_mul_scalar(sqrt_out, 2.0, denom);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) { ax_tensor_destroy(denom); return; }
     ax_compute_div(grad_out, denom, grad_a);
 
     accumulate_grad(self->inputs[0], grad_a);
@@ -311,9 +325,11 @@ static void square_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     /* grad = grad_out * 2 * a */
     ax_tensor_t *two_a = ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+    if (!two_a) return;
     ax_compute_mul_scalar(a, 2.0, two_a);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) { ax_tensor_destroy(two_a); return; }
     ax_compute_mul(grad_out, two_a, grad_a);
 
     accumulate_grad(self->inputs[0], grad_a);
@@ -352,6 +368,7 @@ static void mul_scalar_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     double c = self->scalar_ctx;
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     ax_compute_mul_scalar(grad_out, c, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
     ax_tensor_destroy(grad_a);
@@ -380,10 +397,13 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (self->inputs[0]->requires_grad)
     {
         ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
+        if (!bt) return;
         ax_tensor_t *bt_contig = ax_tensor_contiguous(bt);
+        if (!bt_contig) { ax_tensor_destroy(bt); return; }
 
         int64_t ga_shape[] = {grad_out->shape[0], bt_contig->shape[1]};
         ax_tensor_t *grad_a = ax_tensor_zeros(ga_shape, 2, grad_out->dtype);
+        if (!grad_a) { ax_tensor_destroy(bt); ax_tensor_destroy(bt_contig); return; }
         ax_compute_gemm(grad_out, bt_contig, grad_a);
 
         accumulate_grad(self->inputs[0], grad_a);
@@ -396,10 +416,13 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (self->inputs[1]->requires_grad)
     {
         ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
+        if (!at) return;
         ax_tensor_t *at_contig = ax_tensor_contiguous(at);
+        if (!at_contig) { ax_tensor_destroy(at); return; }
 
         int64_t gb_shape[] = {at_contig->shape[0], grad_out->shape[1]};
         ax_tensor_t *grad_b = ax_tensor_zeros(gb_shape, 2, grad_out->dtype);
+        if (!grad_b) { ax_tensor_destroy(at); ax_tensor_destroy(at_contig); return; }
         ax_compute_gemm(at_contig, grad_out, grad_b);
 
         accumulate_grad(self->inputs[1], grad_b);
@@ -439,6 +462,7 @@ static void sum_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         /* full reduction: grad_out is scalar, broadcast to input shape */
         float g = ((float *)grad_out->storage->data)[grad_out->offset];
         ax_tensor_t *grad_a = ax_tensor_full(a->shape, a->ndim, a->dtype, (double)g);
+        if (!grad_a) return;
         accumulate_grad(self->inputs[0], grad_a);
         ax_tensor_destroy(grad_a);
     }
@@ -448,6 +472,7 @@ static void sum_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
            e.g., if a is [2,3] and we summed axis 0, grad_out is [3].
            we need to expand it to [2,3] by repeating along axis 0. */
         ax_tensor_t *grad_a = ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+        if (!grad_a) return;
         int64_t n = ax_tensor_numel(grad_a);
 
         float *gad = (float *)grad_a->storage->data;
@@ -578,6 +603,7 @@ static void relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gad = (float *)grad_a->storage->data;
     float *god = (float *)grad_out->storage->data;
     float *ad = (float *)a->storage->data;
@@ -611,6 +637,7 @@ static void sigmoid_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gad = (float *)grad_a->storage->data;
     float *god = (float *)grad_out->storage->data;
     float *sd = (float *)sig_out->storage->data;
@@ -644,6 +671,7 @@ static void tanh_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
 
     ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
     float *gad = (float *)grad_a->storage->data;
     float *god = (float *)grad_out->storage->data;
     float *td = (float *)tanh_out->storage->data;

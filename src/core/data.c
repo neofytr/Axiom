@@ -77,10 +77,12 @@ static void tensor_ds_get_item(ax_dataset_t *self, int64_t idx,
     /* lazy init views */
     if (!ds->input_views)
     {
-        ds->input_views = calloc(ds->n_samples, sizeof(ax_tensor_t *));
-        ds->target_views = calloc(ds->n_samples, sizeof(ax_tensor_t *));
+        ds->input_views = calloc((size_t)ds->n_samples, sizeof(ax_tensor_t *));
+        ds->target_views = calloc((size_t)ds->n_samples, sizeof(ax_tensor_t *));
         if (!ds->input_views || !ds->target_views)
         {
+            free(ds->input_views); ds->input_views = NULL;
+            free(ds->target_views); ds->target_views = NULL;
             *input = NULL;
             *target = NULL;
             return;
@@ -184,10 +186,12 @@ static void csv_ds_get_item(ax_dataset_t *self, int64_t idx,
 
     if (!ds->input_views)
     {
-        ds->input_views = calloc(ds->n_rows, sizeof(ax_tensor_t *));
-        ds->target_views = calloc(ds->n_rows, sizeof(ax_tensor_t *));
+        ds->input_views = calloc((size_t)ds->n_rows, sizeof(ax_tensor_t *));
+        ds->target_views = calloc((size_t)ds->n_rows, sizeof(ax_tensor_t *));
         if (!ds->input_views || !ds->target_views)
         {
+            free(ds->input_views); ds->input_views = NULL;
+            free(ds->target_views); ds->target_views = NULL;
             *input = NULL;
             *target = NULL;
             return;
@@ -364,8 +368,13 @@ ax_dataloader_t *ax_dataloader_create(ax_dataset_t *dataset,
     dl->n_samples = ax_dataset_length(dataset);
     dl->current_pos = 0;
 
-    /* allocate and fill index array */
-    dl->indices = malloc(dl->n_samples * sizeof(int64_t));
+    /* allocate and fill index array — check for overflow */
+    if (dl->n_samples <= 0 || (size_t)dl->n_samples > SIZE_MAX / sizeof(int64_t))
+    {
+        free(dl);
+        return NULL;
+    }
+    dl->indices = malloc((size_t)dl->n_samples * sizeof(int64_t));
     if (!dl->indices) { free(dl); return NULL; }
 
     for (int64_t i = 0; i < dl->n_samples; i++)
@@ -400,8 +409,12 @@ bool ax_dataloader_next(ax_dataloader_t *dl, ax_batch_t *batch)
     ax_tensor_t *first_in, *first_tgt;
     ax_dataset_get_item(dl->dataset, dl->indices[dl->current_pos],
                         &first_in, &first_tgt);
+    if (!first_in || !first_tgt) return false;
 
     /* allocate batch tensors: [bs, ...item_shape] */
+    if (first_in->ndim + 1 > AX_MAX_DIMS || first_tgt->ndim + 1 > AX_MAX_DIMS)
+        return false;
+
     int64_t in_shape[AX_MAX_DIMS], tgt_shape[AX_MAX_DIMS];
     in_shape[0] = bs;
     tgt_shape[0] = bs;

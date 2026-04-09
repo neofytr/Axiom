@@ -135,6 +135,11 @@ ax_status_t ax_backward(ax_tensor_t *loss)
     if (!loss->grad)
     {
         loss->grad = ax_tensor_ones(loss->shape, loss->ndim, loss->dtype);
+        if (!loss->grad)
+        {
+            ax_err_set(AX_ERR_ALLOC, "failed to allocate loss gradient");
+            return AX_ERR_ALLOC;
+        }
     }
     else
     {

@@ -13,6 +13,8 @@ static inline size_t align_up(size_t val, size_t alignment) {
 
 /* allocate a new arena block with at least min_size usable bytes */
 static ax_arena_block_t *arena_block_create(size_t min_size) {
+    /* check for overflow in alloc_size computation */
+    if (min_size > SIZE_MAX - sizeof(ax_arena_block_t)) return NULL;
     size_t alloc_size = sizeof(ax_arena_block_t) + min_size;
     ax_arena_block_t *block = (ax_arena_block_t *)malloc(alloc_size);
     if (!block) return NULL;
@@ -62,6 +64,7 @@ void *ax_arena_alloc(ax_arena_t *arena, size_t size, size_t alignment) {
 
     /* need a new block — at least big enough for this allocation + alignment padding */
     size_t new_size = arena->block_size;
+    if (size > SIZE_MAX - alignment) return NULL; /* overflow check */
     size_t needed = size + alignment;
     if (needed > new_size) new_size = needed;
 
@@ -108,8 +111,11 @@ void ax_arena_destroy(ax_arena_t *arena) {
 
 void *ax_aligned_alloc(size_t size, size_t alignment) {
     if (size == 0) return NULL;
+    if (alignment == 0) alignment = 1;
 
-    /* allocate with extra space for alignment and storing the original pointer */
+    /* allocate with extra space for alignment and storing the original pointer.
+       check for overflow before computing total. */
+    if (size > SIZE_MAX - alignment - sizeof(void *)) return NULL;
     size_t total = size + alignment + sizeof(void *);
     void *raw = malloc(total);
     if (!raw) return NULL;

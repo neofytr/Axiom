@@ -23,10 +23,14 @@
 #include <math.h>
 #include <float.h>
 
-/* compute output spatial dimension */
+/* compute output spatial dimension.
+   returns -1 if the result would be non-positive (invalid configuration). */
 static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int pad)
 {
-    return (in_dim + 2 * pad - kernel) / stride + 1;
+    if (stride <= 0) return -1;
+    int64_t out = (in_dim + 2 * pad - kernel) / stride + 1;
+    if (out <= 0) return -1;
+    return out;
 }
 
 
@@ -49,6 +53,11 @@ ax_tensor_t *ax_im2col(ax_tensor_t *input, int kh, int kw,
     int64_t W = input->shape[2];
     int64_t out_h = conv_out_dim(H, kh, stride_h, pad_h);
     int64_t out_w = conv_out_dim(W, kw, stride_w, pad_w);
+    if (out_h <= 0 || out_w <= 0)
+    {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "im2col: invalid output dimensions %ld x %ld", out_h, out_w);
+        return NULL;
+    }
 
     int64_t col_shape[] = {C * kh * kw, out_h * out_w};
     ax_tensor_t *cols = ax_tensor_zeros(col_shape, 2, AX_FLOAT32);
@@ -104,6 +113,11 @@ ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
 {
     int64_t out_h = conv_out_dim(height, kh, stride_h, pad_h);
     int64_t out_w = conv_out_dim(width, kw, stride_w, pad_w);
+    if (out_h <= 0 || out_w <= 0)
+    {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "col2im: invalid output dimensions %ld x %ld", out_h, out_w);
+        return NULL;
+    }
 
     int64_t img_shape[] = {channels, height, width};
     ax_tensor_t *img = ax_tensor_zeros(img_shape, 3, AX_FLOAT32);
@@ -197,15 +211,18 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         /* extract single image from input: [C_in, H, W] */
         int64_t img_shape[] = {C_in, H, W};
         ax_tensor_t *img_view = ax_tensor_create(img_shape, 3, AX_FLOAT32);
+        if (!img_view) continue;
         float *ivd = (float *)img_view->storage->data;
         float *ind = (float *)input->storage->data;
         memcpy(ivd, ind + n * C_in * H * W, C_in * H * W * sizeof(float));
 
         ax_tensor_t *col = ax_im2col(img_view, kh, kw, sh, sw, ph, pw);
+        if (!col) { ax_tensor_destroy(img_view); continue; }
 
         /* extract grad_out for this sample: [C_out, out_h*out_w] */
         int64_t go_shape[] = {C_out, out_h * out_w};
         ax_tensor_t *go_mat = ax_tensor_create(go_shape, 2, AX_FLOAT32);
+        if (!go_mat) { ax_tensor_destroy(col); ax_tensor_destroy(img_view); continue; }
         float *god = (float *)go_mat->storage->data;
         float *grd = (float *)grad_out->storage->data;
         memcpy(god, grd + n * C_out * out_h * out_w,
@@ -283,6 +300,11 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
 
     int64_t out_h = conv_out_dim(H, kh, sh, ph);
     int64_t out_w = conv_out_dim(W, kw, sw, pw);
+    if (out_h <= 0 || out_w <= 0)
+    {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "conv2d: invalid output dimensions %ld x %ld", out_h, out_w);
+        return NULL;
+    }
 
     /* reshape weight to [C_out, C_in*kh*kw] for gemm */
     int64_t K = C_in * kh * kw;
@@ -299,6 +321,7 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         /* extract single image: [C_in, H, W] */
         int64_t img_shape[] = {C_in, H, W};
         ax_tensor_t *img = ax_tensor_create(img_shape, 3, AX_FLOAT32);
+        if (!img) { ax_tensor_destroy(output); return NULL; }
         float *imgd = (float *)img->storage->data;
         float *ind = (float *)input->storage->data;
         memcpy(imgd, ind + n * C_in * H * W, C_in * H * W * sizeof(float));
@@ -387,6 +410,7 @@ ax_layer_t *ax_conv2d_create_ex(int in_ch, int out_ch,
     /* weight: [out_ch, in_ch, kh, kw] */
     int64_t w_shape[] = {out_ch, in_ch, kh, kw};
     c->weight = ax_tensor_create(w_shape, 4, AX_FLOAT32);
+    if (!c->weight) { free(c); return NULL; }
     ax_init_kaiming_uniform(c->weight, in_ch * kh * kw);
     c->weight->requires_grad = true;
 
@@ -425,6 +449,11 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     int k = pool->kernel_size, s = pool->stride, p = pool->padding;
     int64_t oh = conv_out_dim(H, k, s, p);
     int64_t ow = conv_out_dim(W, k, s, p);
+    if (oh <= 0 || ow <= 0)
+    {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "maxpool2d: invalid output dimensions");
+        return NULL;
+    }
 
     int64_t out_shape[] = {N, C, oh, ow};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
@@ -493,6 +522,11 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     int k = pool->kernel_size, s = pool->stride, p = pool->padding;
     int64_t oh = conv_out_dim(H, k, s, p);
     int64_t ow = conv_out_dim(W, k, s, p);
+    if (oh <= 0 || ow <= 0)
+    {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "avgpool2d: invalid output dimensions");
+        return NULL;
+    }
 
     int64_t out_shape[] = {N, C, oh, ow};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
