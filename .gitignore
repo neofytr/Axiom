@@ -1,6 +1,5 @@
 # build artifacts
 build/
-axiom/build/
 *.o
 *.a
 *.so
