@@ -1,0 +1,7 @@
+test_error 4 0.000235402
+test_memory 3 0.000314361
+test_tensor 4 0.000296673
+test_compute 4 0.000329297
+test_autograd 2 0.000780182
+test_ops 2 0.000753485
+---

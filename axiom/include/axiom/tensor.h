@@ -29,7 +29,7 @@ typedef struct ax_tensor {
     void *grad_fn;                     /* opaque pointer to grad function */
 } ax_tensor_t;
 
-/* --- storage management --- */
+/* storage management */
 
 /* create a new storage with the given byte count */
 ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device);
@@ -40,7 +40,7 @@ void ax_storage_retain(ax_storage_t *s);
 /* decrement reference count; frees if it hits 0 */
 void ax_storage_release(ax_storage_t *s);
 
-/* --- tensor creation --- */
+/* tensor creation */
 
 /* create a tensor with the given shape and dtype; memory is uninitialized */
 ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype);
@@ -66,12 +66,12 @@ ax_tensor_t *ax_tensor_rand(const int64_t *shape, int ndim, float low, float hig
 /* create a scalar tensor (0-dim) */
 ax_tensor_t *ax_tensor_scalar(float value);
 
-/* --- tensor destruction --- */
+/* tensor destruction */
 
 /* release the tensor and its storage (if refcount drops to 0) */
 void ax_tensor_destroy(ax_tensor_t *t);
 
-/* --- shape queries --- */
+/* shape queries */
 
 /* total number of elements */
 int64_t ax_tensor_numel(const ax_tensor_t *t);
@@ -79,7 +79,7 @@ int64_t ax_tensor_numel(const ax_tensor_t *t);
 /* check if tensor data is contiguous in memory */
 bool ax_tensor_is_contiguous(const ax_tensor_t *t);
 
-/* --- shape manipulation (zero-copy where possible) --- */
+/* shape manipulation (zero-copy where possible) */
 
 /* reshape to new shape; returns new tensor sharing storage if contiguous */
 ax_tensor_t *ax_tensor_reshape(ax_tensor_t *t, const int64_t *new_shape, int new_ndim);
@@ -93,13 +93,13 @@ ax_tensor_t *ax_tensor_squeeze(ax_tensor_t *t, int dim);
 /* insert a dimension of size 1 at the given position */
 ax_tensor_t *ax_tensor_unsqueeze(ax_tensor_t *t, int dim);
 
-/* --- element access --- */
+/* element access */
 
 /* get/set a single f32 element using ndim indices */
 float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices);
 void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value);
 
-/* --- view creation --- */
+/* view creation */
 
 /* create a view (shares storage, different shape/strides/offset) */
 ax_tensor_t *ax_tensor_view(ax_tensor_t *t);
@@ -107,7 +107,7 @@ ax_tensor_t *ax_tensor_view(ax_tensor_t *t);
 /* make a contiguous copy of the tensor */
 ax_tensor_t *ax_tensor_contiguous(ax_tensor_t *t);
 
-/* --- printing --- */
+/* printing */
 
 /* print tensor shape and a few elements for debugging */
 void ax_tensor_print(const ax_tensor_t *t);

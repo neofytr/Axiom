@@ -11,7 +11,7 @@
 /* default alignment for simd readiness */
 #define AX_DEFAULT_ALIGNMENT 64
 
-/* --- arena allocator --- */
+/* arena allocator */
 /* bulk allocator for temporary buffers during forward/backward passes.
    allocations are fast (bump pointer), and freed all at once. */
 
@@ -49,7 +49,7 @@ void ax_arena_reset(ax_arena_t *arena);
 /* destroy the arena — frees all blocks */
 void ax_arena_destroy(ax_arena_t *arena);
 
-/* --- aligned malloc/free wrappers --- */
+/* aligned malloc/free wrappers */
 /* general-purpose aligned allocation for persistent data */
 
 void *ax_aligned_alloc(size_t size, size_t alignment);

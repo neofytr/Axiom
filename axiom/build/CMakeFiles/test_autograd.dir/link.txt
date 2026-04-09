@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/test_autograd.dir/link.d CMakeFiles/test_autograd.dir/tests/test_autograd.c.o -o test_autograd  libaxiom.a -lm

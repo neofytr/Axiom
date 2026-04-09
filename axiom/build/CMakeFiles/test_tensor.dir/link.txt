@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/test_tensor.dir/link.d CMakeFiles/test_tensor.dir/tests/test_tensor.c.o -o test_tensor  libaxiom.a -lm

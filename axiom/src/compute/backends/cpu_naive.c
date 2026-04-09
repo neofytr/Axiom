@@ -8,7 +8,7 @@
 #include <string.h>
 #include <float.h>
 
-/* --- helpers --- */
+/* helpers */
 
 /* get a float32 element from a tensor at a flat index, respecting strides */
 static inline float tensor_get_f32(const ax_tensor_t *t, int64_t flat_idx) {
@@ -65,7 +65,7 @@ static inline float bcast_get_f32(const ax_tensor_t *t, const ax_tensor_t *out, 
     return ((float *)t->storage->data)[offset];
 }
 
-/* --- element-wise binary ops --- */
+/* element-wise binary ops */
 
 /* generic binary op with broadcasting */
 #define DEFINE_BINOP(name, op_expr) \
@@ -89,7 +89,7 @@ DEFINE_BINOP(sub, va - vb)
 DEFINE_BINOP(mul, va * vb)
 DEFINE_BINOP(div_op, vb != 0.0f ? va / vb : 0.0f)
 
-/* --- element-wise unary ops --- */
+/* element-wise unary ops */
 
 #define DEFINE_UNOP(name, op_expr) \
 static ax_status_t cpu_##name(const ax_tensor_t *in, ax_tensor_t *out) { \
@@ -112,7 +112,7 @@ DEFINE_UNOP(log_op, v > 0.0f ? logf(v) : -FLT_MAX)
 DEFINE_UNOP(sqrt_op, v >= 0.0f ? sqrtf(v) : 0.0f)
 DEFINE_UNOP(square, v * v)
 
-/* --- scalar ops --- */
+/* scalar ops */
 
 static ax_status_t cpu_add_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out) {
     if (in->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32) {
@@ -140,7 +140,7 @@ static ax_status_t cpu_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     return AX_OK;
 }
 
-/* --- gemm: general matrix multiply --- */
+/* gemm: general matrix multiply */
 /* out[m,n] = a[m,k] @ b[k,n] — 2d only for now */
 
 static ax_status_t cpu_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
@@ -182,7 +182,7 @@ static ax_status_t cpu_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     return AX_OK;
 }
 
-/* --- reduction ops --- */
+/* reduction ops */
 
 static ax_status_t cpu_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     if (in->dtype != AX_FLOAT32) {
@@ -222,7 +222,6 @@ static ax_status_t cpu_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         /* compute output flat index by skipping the reduced axis */
         int64_t remaining = i;
         int64_t out_flat = 0;
-        int64_t out_stride = 1;
 
         /* walk dimensions right to left */
         for (int d = in->ndim - 1; d >= 0; d--) {
@@ -354,7 +353,7 @@ static ax_status_t cpu_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     return AX_OK;
 }
 
-/* --- comparison ops --- */
+/* comparison ops */
 
 static ax_status_t cpu_equal(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
     if (a->dtype != AX_FLOAT32) {
@@ -384,7 +383,7 @@ static ax_status_t cpu_greater(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     return AX_OK;
 }
 
-/* --- data movement --- */
+/* data movement */
 
 static ax_status_t cpu_fill(ax_tensor_t *t, double value) {
     if (t->dtype != AX_FLOAT32) {
@@ -411,7 +410,7 @@ static ax_status_t cpu_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
     return AX_OK;
 }
 
-/* --- activations --- */
+/* activations */
 
 static ax_status_t cpu_relu(const ax_tensor_t *in, ax_tensor_t *out) {
     if (in->dtype != AX_FLOAT32) {
@@ -452,7 +451,7 @@ static ax_status_t cpu_tanh_op(const ax_tensor_t *in, ax_tensor_t *out) {
     return AX_OK;
 }
 
-/* --- backend registration --- */
+/* backend registration */
 
 const ax_backend_ops_t ax_cpu_naive_ops = {
     .name       = "cpu_naive",

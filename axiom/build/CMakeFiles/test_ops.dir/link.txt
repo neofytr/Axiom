@@ -1,0 +1,1 @@
+/usr/bin/cc -Wl,--dependency-file=CMakeFiles/test_ops.dir/link.d CMakeFiles/test_ops.dir/tests/test_ops.c.o -o test_ops  libaxiom.a -lm

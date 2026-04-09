@@ -35,7 +35,7 @@ const ax_backend_ops_t *ax_compute_get_ops(void);
 /* register a custom backend at runtime (for plugins/extensions) */
 ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops_t *ops);
 
-/* --- dispatch functions --- */
+/* dispatch functions */
 /* these call through to the active backend's function pointers.
    tensor.c calls these; user code normally calls the tensor-level api instead. */
 

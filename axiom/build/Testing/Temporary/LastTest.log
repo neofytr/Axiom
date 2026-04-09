@@ -1,0 +1,237 @@
+Start testing: Apr 09 21:37 +0530
+----------------------------------------------------------
+1/6 Testing: test_error
+1/6 Test: test_error
+Command: "/home/raj/Desktop/Projects/neoNN/axiom/build/test_error"
+Directory: /home/raj/Desktop/Projects/neoNN/axiom/build
+"test_error" start time: Apr 09 21:37 +0530
+Output:
+----------------------------------------------------------
+=== error tests ===
+[test] test_error_set_get
+  ok
+[test] test_error_clear
+  ok
+[test] test_error_callback
+  ok
+[test] test_status_names
+  ok
+
+results: 10 passed, 0 failed, 10 total
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_error" end time: Apr 09 21:37 +0530
+"test_error" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/6 Testing: test_memory
+2/6 Test: test_memory
+Command: "/home/raj/Desktop/Projects/neoNN/axiom/build/test_memory"
+Directory: /home/raj/Desktop/Projects/neoNN/axiom/build
+"test_memory" start time: Apr 09 21:37 +0530
+Output:
+----------------------------------------------------------
+=== memory tests ===
+[test] test_arena_create
+  ok
+[test] test_arena_alloc
+  ok
+[test] test_arena_grow
+  ok
+[test] test_arena_reset
+  ok
+[test] test_arena_large_alloc
+  ok
+[test] test_aligned_alloc
+  ok
+[test] test_aligned_alloc_various
+  ok
+[test] test_edge_cases
+  ok
+
+results: 57 passed, 0 failed, 57 total
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_memory" end time: Apr 09 21:37 +0530
+"test_memory" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/6 Testing: test_tensor
+3/6 Test: test_tensor
+Command: "/home/raj/Desktop/Projects/neoNN/axiom/build/test_tensor"
+Directory: /home/raj/Desktop/Projects/neoNN/axiom/build
+"test_tensor" start time: Apr 09 21:37 +0530
+Output:
+----------------------------------------------------------
+=== tensor tests ===
+[test] test_tensor_create
+  ok
+[test] test_tensor_fill_constructors
+  ok
+[test] test_tensor_from_array
+  ok
+[test] test_tensor_arange
+  ok
+[test] test_tensor_rand
+  ok
+[test] test_tensor_scalar
+  ok
+[test] test_storage_refcount
+  ok
+[test] test_tensor_reshape
+  ok
+[test] test_tensor_transpose
+  ok
+[test] test_tensor_squeeze_unsqueeze
+  ok
+[test] test_tensor_contiguous
+  ok
+[test] test_dtype_utils
+  ok
+
+results: 72 passed, 0 failed, 72 total
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_tensor" end time: Apr 09 21:37 +0530
+"test_tensor" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/6 Testing: test_compute
+4/6 Test: test_compute
+Command: "/home/raj/Desktop/Projects/neoNN/axiom/build/test_compute"
+Directory: /home/raj/Desktop/Projects/neoNN/axiom/build
+"test_compute" start time: Apr 09 21:37 +0530
+Output:
+----------------------------------------------------------
+=== compute tests ===
+[test] test_add
+  ok
+[test] test_sub
+  ok
+[test] test_mul
+  ok
+[test] test_div
+  ok
+[test] test_neg
+  ok
+[test] test_exp_log
+  ok
+[test] test_sqrt_square
+  ok
+[test] test_scalar_ops
+  ok
+[test] test_gemm
+  ok
+[test] test_gemm_identity
+  ok
+[test] test_sum_all
+  ok
+[test] test_sum_axis
+  ok
+[test] test_mean
+  ok
+[test] test_max_min
+  ok
+[test] test_comparisons
+  ok
+[test] test_fill_copy
+  ok
+[test] test_relu
+  ok
+[test] test_sigmoid
+  ok
+[test] test_tanh
+  ok
+[test] test_backend_selection
+  ok
+
+results: 71 passed, 0 failed, 71 total
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_compute" end time: Apr 09 21:37 +0530
+"test_compute" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/6 Testing: test_autograd
+5/6 Test: test_autograd
+Command: "/home/raj/Desktop/Projects/neoNN/axiom/build/test_autograd"
+Directory: /home/raj/Desktop/Projects/neoNN/axiom/build
+"test_autograd" start time: Apr 09 21:37 +0530
+Output:
+----------------------------------------------------------
+=== autograd tests ===
+[test] test_grad_add
+  ok
+[test] test_grad_mul
+  ok
+[test] test_grad_square
+  ok
+[test] test_grad_sigmoid
+  ok
+[test] test_grad_relu
+  ok
+[test] test_grad_matmul
+  ok
+[test] test_grad_chain
+  ok
+[test] test_grad_mul_scalar
+  ok
+[test] test_grad_neg
+  ok
+[test] test_grad_mean
+  ok
+[test] test_no_grad
+  ok
+[test] test_grad_exp
+  ok
+[test] test_grad_tanh
+  ok
+
+results: 38 passed, 0 failed, 38 total
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_autograd" end time: Apr 09 21:37 +0530
+"test_autograd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/6 Testing: test_ops
+6/6 Test: test_ops
+Command: "/home/raj/Desktop/Projects/neoNN/axiom/build/test_ops"
+Directory: /home/raj/Desktop/Projects/neoNN/axiom/build
+"test_ops" start time: Apr 09 21:37 +0530
+Output:
+----------------------------------------------------------
+=== ops tests ===
+[test] test_ops_add
+  ok
+[test] test_ops_broadcast_add
+  ok
+[test] test_ops_matmul
+  ok
+[test] test_ops_chain
+  ok
+[test] test_ops_sum_mean
+  ok
+[test] test_ops_scalar
+  ok
+
+results: 27 passed, 0 failed, 27 total
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_ops" end time: Apr 09 21:37 +0530
+"test_ops" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Apr 09 21:37 +0530

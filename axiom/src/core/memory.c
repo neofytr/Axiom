@@ -4,7 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* --- helpers --- */
+/* helpers */
 
 /* align a value up to the nearest multiple of alignment */
 static inline size_t align_up(size_t val, size_t alignment) {
@@ -23,7 +23,7 @@ static ax_arena_block_t *arena_block_create(size_t min_size) {
     return block;
 }
 
-/* --- arena allocator --- */
+/* arena allocator */
 
 ax_arena_t *ax_arena_create(size_t block_size) {
     ax_arena_t *arena = (ax_arena_t *)malloc(sizeof(ax_arena_t));
@@ -47,19 +47,22 @@ ax_arena_t *ax_arena_create(size_t block_size) {
 void *ax_arena_alloc(ax_arena_t *arena, size_t size, size_t alignment) {
     if (!arena || size == 0) return NULL;
 
-    /* align the current offset within the active block */
-    size_t aligned_offset = align_up(arena->head->used, alignment);
+    /* compute the aligned address relative to the block's data pointer.
+       we need to align the actual address, not just the offset. */
+    uintptr_t base = (uintptr_t)arena->head->data;
+    uintptr_t current = base + arena->head->used;
+    uintptr_t aligned = (current + alignment - 1) & ~(alignment - 1);
+    size_t aligned_offset = (size_t)(aligned - base);
 
     /* check if there's room in the current block */
     if (aligned_offset + size <= arena->head->size) {
-        void *ptr = arena->head->data + aligned_offset;
         arena->head->used = aligned_offset + size;
-        return ptr;
+        return (void *)aligned;
     }
 
-    /* need a new block — at least big enough for this allocation */
+    /* need a new block — at least big enough for this allocation + alignment padding */
     size_t new_size = arena->block_size;
-    size_t needed = align_up(0, alignment) + size;
+    size_t needed = size + alignment;
     if (needed > new_size) new_size = needed;
 
     ax_arena_block_t *block = arena_block_create(new_size);
@@ -70,11 +73,11 @@ void *ax_arena_alloc(ax_arena_t *arena, size_t size, size_t alignment) {
     arena->head = block;
     arena->total_allocated += new_size;
 
-    /* allocate from the fresh block */
-    size_t offset = align_up(0, alignment);
-    void *ptr = block->data + offset;
-    block->used = offset + size;
-    return ptr;
+    /* allocate from the fresh block with proper alignment */
+    base = (uintptr_t)block->data;
+    aligned = (base + alignment - 1) & ~(alignment - 1);
+    block->used = (size_t)(aligned - base) + size;
+    return (void *)aligned;
 }
 
 void ax_arena_reset(ax_arena_t *arena) {
@@ -101,7 +104,7 @@ void ax_arena_destroy(ax_arena_t *arena) {
     free(arena);
 }
 
-/* --- aligned alloc wrappers --- */
+/* aligned alloc wrappers */
 
 void *ax_aligned_alloc(size_t size, size_t alignment) {
     if (size == 0) return NULL;

@@ -1,0 +1,12 @@
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/axiom_static.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/axiom_shared.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/test_error.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/test_memory.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/test_tensor.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/test_compute.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/test_autograd.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/test_ops.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/run_tests.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/test.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/edit_cache.dir
+/home/raj/Desktop/Projects/neoNN/axiom/build/CMakeFiles/rebuild_cache.dir

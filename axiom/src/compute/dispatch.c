@@ -59,7 +59,7 @@ ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops
     return AX_OK;
 }
 
-/* --- dispatch helpers --- */
+/* dispatch helpers */
 /* macro to reduce boilerplate: check that backend is initialized,
    check that the op is implemented, then call it */
 #define DISPATCH_BINOP(op, a, b, out) \
@@ -88,13 +88,13 @@ ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops
         return active_ops->op(in, out); \
     } while (0)
 
-/* --- binary ops --- */
+/* binary ops */
 ax_status_t ax_compute_add(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(add, a, b, out); }
 ax_status_t ax_compute_sub(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(sub, a, b, out); }
 ax_status_t ax_compute_mul(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(mul, a, b, out); }
 ax_status_t ax_compute_div(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(div_op, a, b, out); }
 
-/* --- unary ops --- */
+/* unary ops */
 ax_status_t ax_compute_neg(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(neg, in, out); }
 ax_status_t ax_compute_abs(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(abs_op, in, out); }
 ax_status_t ax_compute_exp(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(exp_op, in, out); }
@@ -102,7 +102,7 @@ ax_status_t ax_compute_log(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_U
 ax_status_t ax_compute_sqrt(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(sqrt_op, in, out); }
 ax_status_t ax_compute_square(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(square, in, out); }
 
-/* --- scalar ops --- */
+/* scalar ops */
 ax_status_t ax_compute_add_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out) {
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->add_scalar) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "add_scalar not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
@@ -115,10 +115,10 @@ ax_status_t ax_compute_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     return active_ops->mul_scalar(in, scalar, out);
 }
 
-/* --- matrix ops --- */
+/* matrix ops */
 ax_status_t ax_compute_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(gemm, a, b, out); }
 
-/* --- reduction ops --- */
+/* reduction ops */
 ax_status_t ax_compute_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->sum) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "sum not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
@@ -143,20 +143,24 @@ ax_status_t ax_compute_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     return active_ops->min_op(in, axis, out);
 }
 
-/* --- comparison ops --- */
+/* comparison ops */
 ax_status_t ax_compute_equal(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(equal, a, b, out); }
 ax_status_t ax_compute_greater(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(greater, a, b, out); }
 
-/* --- data movement --- */
+/* data movement */
 ax_status_t ax_compute_fill(ax_tensor_t *t, double value) {
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->fill) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "fill not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->fill(t, value);
 }
 
-ax_status_t ax_compute_copy(const ax_tensor_t *src, ax_tensor_t *dst) { DISPATCH_BINOP(copy, src, dst); }
+ax_status_t ax_compute_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->copy) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "copy not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
+    return active_ops->copy(src, dst);
+}
 
-/* --- activations --- */
+/* activations */
 ax_status_t ax_compute_relu(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(relu, in, out); }
 ax_status_t ax_compute_sigmoid(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(sigmoid, in, out); }
 ax_status_t ax_compute_tanh(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(tanh_op, in, out); }
