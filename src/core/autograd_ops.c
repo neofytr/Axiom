@@ -584,9 +584,18 @@ static void mean_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         /* full reduction: grad_out is scalar, broadcast scaled version to input shape */
         float g = ((float *)grad_out->storage->data)[grad_out->offset] * inv_count;
         float *gd = (float *)self->inputs[0]->grad->storage->data;
+        int64_t goff = (int64_t)self->inputs[0]->grad->offset;
         int64_t n = ax_tensor_numel(a);
-        for (int64_t i = 0; i < n; i++)
-            gd[self->inputs[0]->grad->offset + i] += g;
+
+        if (goff == 0 && ax_tensor_is_contiguous(self->inputs[0]->grad)) {
+            ax_vf32 vg = ax_vf32_set1(g);
+            int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+            for (; i < ve; i += AX_VF32_WIDTH)
+                ax_vf32_store(gd + i, ax_vf32_add(ax_vf32_load(gd + i), vg));
+            for (; i < n; i++) gd[i] += g;
+        } else {
+            for (int64_t i = 0; i < n; i++) gd[goff + i] += g;
+        }
     }
     else
     {
@@ -634,26 +643,47 @@ ax_grad_fn_t *ax_make_mean_backward(ax_tensor_t *a, int axis, ax_tensor_t *out)
 
 
 /* relu: d/da(relu(a)) = (a > 0) ? 1 : 0
-   saved[0] = a (input) */
+   saved[0] = a (input, contiguous from ax_ensure_contiguous) */
 static void relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
+    ax_tensor_t *input = self->inputs[0];
+    if (!input->requires_grad) return;
+
     int64_t n = ax_tensor_numel(grad_out);
+    if (!ensure_grad(input)) return;
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gad = (float *)grad_a->storage->data;
     float *god = (float *)grad_out->storage->data;
-    float *ad = (float *)a->storage->data;
+    float *ad  = (float *)a->storage->data;
+    float *ig  = (float *)input->grad->storage->data;
 
-    for (int64_t i = 0; i < n; i++)
+    /* fast path: all contiguous — directly accumulate masked gradient, no temp alloc */
+    if (a->offset == 0 && grad_out->offset == 0 && input->grad->offset == 0
+        && ax_tensor_is_contiguous(grad_out) && ax_tensor_is_contiguous(input->grad))
     {
-        float aval = ad[a->offset + i];
-        gad[grad_a->offset + i] = (aval > 0.0f) ? god[grad_out->offset + i] : 0.0f;
+        int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+        ax_vf32 vzero = ax_vf32_zero();
+        for (; i < ve; i += AX_VF32_WIDTH) {
+            ax_vf32 mask = ax_vf32_cmpgt(ax_vf32_load(ad + i), vzero);
+            ax_vf32 dg = ax_vf32_mul(ax_vf32_load(god + i), mask);
+            ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), dg));
+        }
+        for (; i < n; i++)
+            ig[i] += (ad[i] > 0.0f) ? god[i] : 0.0f;
     }
-
-    accumulate_grad(self->inputs[0], grad_a);
-    ax_tensor_destroy(grad_a);
+    else
+    {
+        /* slow path: non-contiguous */
+        ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+        if (!grad_a) return;
+        float *gad = (float *)grad_a->storage->data;
+        for (int64_t i = 0; i < n; i++) {
+            float aval = ad[a->offset + i];
+            gad[grad_a->offset + i] = (aval > 0.0f) ? god[grad_out->offset + i] : 0.0f;
+        }
+        accumulate_grad(input, grad_a);
+        ax_tensor_destroy(grad_a);
+    }
 }
 
 ax_grad_fn_t *ax_make_relu_backward(ax_tensor_t *a, ax_tensor_t *out)
@@ -674,22 +704,43 @@ ax_grad_fn_t *ax_make_relu_backward(ax_tensor_t *a, ax_tensor_t *out)
 static void sigmoid_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *sig_out = self->saved[0];
+    ax_tensor_t *input = self->inputs[0];
+    if (!input->requires_grad) return;
     int64_t n = ax_tensor_numel(grad_out);
+    if (!ensure_grad(input)) return;
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gad = (float *)grad_a->storage->data;
     float *god = (float *)grad_out->storage->data;
-    float *sd = (float *)sig_out->storage->data;
+    float *sd  = (float *)sig_out->storage->data;
+    float *ig  = (float *)input->grad->storage->data;
 
-    for (int64_t i = 0; i < n; i++)
+    if (sig_out->offset == 0 && grad_out->offset == 0 && input->grad->offset == 0
+        && ax_tensor_is_contiguous(grad_out) && ax_tensor_is_contiguous(input->grad))
     {
-        float s = sd[sig_out->offset + i];
-        gad[grad_a->offset + i] = god[grad_out->offset + i] * s * (1.0f - s);
+        ax_vf32 vone = ax_vf32_set1(1.0f);
+        int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+        for (; i < ve; i += AX_VF32_WIDTH) {
+            ax_vf32 s = ax_vf32_load(sd + i);
+            ax_vf32 g = ax_vf32_load(god + i);
+            ax_vf32 dg = ax_vf32_mul(g, ax_vf32_mul(s, ax_vf32_sub(vone, s)));
+            ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), dg));
+        }
+        for (; i < n; i++) {
+            float s = sd[i];
+            ig[i] += god[i] * s * (1.0f - s);
+        }
     }
-
-    accumulate_grad(self->inputs[0], grad_a);
-    ax_tensor_destroy(grad_a);
+    else
+    {
+        ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+        if (!grad_a) return;
+        float *gad = (float *)grad_a->storage->data;
+        for (int64_t i = 0; i < n; i++) {
+            float s = sd[sig_out->offset + i];
+            gad[grad_a->offset + i] = god[grad_out->offset + i] * s * (1.0f - s);
+        }
+        accumulate_grad(input, grad_a);
+        ax_tensor_destroy(grad_a);
+    }
 }
 
 ax_grad_fn_t *ax_make_sigmoid_backward(ax_tensor_t *a, ax_tensor_t *out)
@@ -708,22 +759,43 @@ ax_grad_fn_t *ax_make_sigmoid_backward(ax_tensor_t *a, ax_tensor_t *out)
 static void tanh_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *tanh_out = self->saved[0];
+    ax_tensor_t *input = self->inputs[0];
+    if (!input->requires_grad) return;
     int64_t n = ax_tensor_numel(grad_out);
+    if (!ensure_grad(input)) return;
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gad = (float *)grad_a->storage->data;
     float *god = (float *)grad_out->storage->data;
-    float *td = (float *)tanh_out->storage->data;
+    float *td  = (float *)tanh_out->storage->data;
+    float *ig  = (float *)input->grad->storage->data;
 
-    for (int64_t i = 0; i < n; i++)
+    if (tanh_out->offset == 0 && grad_out->offset == 0 && input->grad->offset == 0
+        && ax_tensor_is_contiguous(grad_out) && ax_tensor_is_contiguous(input->grad))
     {
-        float t = td[tanh_out->offset + i];
-        gad[grad_a->offset + i] = god[grad_out->offset + i] * (1.0f - t * t);
+        ax_vf32 vone = ax_vf32_set1(1.0f);
+        int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+        for (; i < ve; i += AX_VF32_WIDTH) {
+            ax_vf32 t = ax_vf32_load(td + i);
+            ax_vf32 g = ax_vf32_load(god + i);
+            ax_vf32 dg = ax_vf32_mul(g, ax_vf32_sub(vone, ax_vf32_mul(t, t)));
+            ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), dg));
+        }
+        for (; i < n; i++) {
+            float t = td[i];
+            ig[i] += god[i] * (1.0f - t * t);
+        }
     }
-
-    accumulate_grad(self->inputs[0], grad_a);
-    ax_tensor_destroy(grad_a);
+    else
+    {
+        ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+        if (!grad_a) return;
+        float *gad = (float *)grad_a->storage->data;
+        for (int64_t i = 0; i < n; i++) {
+            float t = td[tanh_out->offset + i];
+            gad[grad_a->offset + i] = god[grad_out->offset + i] * (1.0f - t * t);
+        }
+        accumulate_grad(input, grad_a);
+        ax_tensor_destroy(grad_a);
+    }
 }
 
 ax_grad_fn_t *ax_make_tanh_backward(ax_tensor_t *a, ax_tensor_t *out)

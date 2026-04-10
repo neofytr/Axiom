@@ -41,57 +41,83 @@ static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *istd = (float *)inv_std_t->storage->data;
     float *gd = (float *)bn->gamma->storage->data;
 
-    /* dgamma = sum(grad_out * x_hat, axis=0) */
-    /* dbeta  = sum(grad_out, axis=0) */
+    /* fused dgamma + dbeta + dx with SIMD.
+       pass 1: compute sum_go, sum_go_xh, dgamma, dbeta per channel
+       pass 2: apply dx formula per element */
+
+    float *dg = NULL, *db = NULL, *ig = NULL;
     if (bn->gamma->requires_grad) {
         if (!bn->gamma->grad)
             bn->gamma->grad = ax_tensor_zeros(bn->gamma->shape, bn->gamma->ndim, bn->gamma->dtype);
         if (!bn->gamma->grad) goto cleanup;
-        float *dg = (float *)bn->gamma->grad->storage->data;
-        for (int64_t c = 0; c < feat; c++)
-            for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++) {
-                    int64_t idx = n * feat * spatial + c * spatial + s;
-                    dg[c] += go[idx] * xh[idx];
-                }
+        dg = (float *)bn->gamma->grad->storage->data;
     }
     if (bn->beta->requires_grad) {
         if (!bn->beta->grad)
             bn->beta->grad = ax_tensor_zeros(bn->beta->shape, bn->beta->ndim, bn->beta->dtype);
         if (!bn->beta->grad) goto cleanup;
-        float *db = (float *)bn->beta->grad->storage->data;
-        for (int64_t c = 0; c < feat; c++)
-            for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++)
-                    db[c] += go[n * feat * spatial + c * spatial + s];
+        db = (float *)bn->beta->grad->storage->data;
     }
-
-    /* dx */
     if (input->requires_grad) {
         if (!input->grad)
             input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
         if (!input->grad) goto cleanup;
-        float *ig = (float *)input->grad->storage->data;
+        ig = (float *)input->grad->storage->data;
+    }
 
-        for (int64_t c = 0; c < feat; c++) {
-            float gamma_f = gd[c];
-            float is = istd[c];
+    for (int64_t c = 0; c < feat; c++) {
+        /* pass 1: SIMD reduction for sum_go, sum_go_xh (also accumulates dgamma, dbeta) */
+        ax_vf32 v_sgo = ax_vf32_zero();
+        ax_vf32 v_sgx = ax_vf32_zero();
+        float s_sgo = 0, s_sgx = 0;
 
-            float sum_go = 0, sum_go_xh = 0;
-            for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++) {
-                    int64_t idx = n * feat * spatial + c * spatial + s;
-                    float g = go[idx];
-                    sum_go += g;
-                    sum_go_xh += g * xh[idx];
+        for (int64_t n = 0; n < batch; n++) {
+            int64_t base = n * feat * spatial + c * spatial;
+            int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
+            for (; s < se; s += AX_VF32_WIDTH) {
+                ax_vf32 g = ax_vf32_load(go + base + s);
+                ax_vf32 x = ax_vf32_load(xh + base + s);
+                v_sgo = ax_vf32_add(v_sgo, g);
+                v_sgx = ax_vf32_fmadd(g, x, v_sgx);
+            }
+            for (; s < spatial; s++) {
+                float g = go[base + s];
+                s_sgo += g;
+                s_sgx += g * xh[base + s];
+            }
+        }
+        float sum_go    = ax_vf32_hsum(v_sgo) + s_sgo;
+        float sum_go_xh = ax_vf32_hsum(v_sgx) + s_sgx;
+
+        if (dg) dg[c] += sum_go_xh;
+        if (db) db[c] += sum_go;
+
+        /* pass 2: dx = (1/N) * gamma * inv_std * (N*go - sum_go - xh*sum_go_xh) */
+        if (ig) {
+            float coeff = gd[c] * istd[c] / N;
+            ax_vf32 v_coeff  = ax_vf32_set1(coeff);
+            ax_vf32 v_N      = ax_vf32_set1(N);
+            ax_vf32 v_sum_go = ax_vf32_set1(sum_go);
+            ax_vf32 v_sum_gx = ax_vf32_set1(sum_go_xh);
+
+            for (int64_t n = 0; n < batch; n++) {
+                int64_t base = n * feat * spatial + c * spatial;
+                int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
+                for (; s < se; s += AX_VF32_WIDTH) {
+                    ax_vf32 g = ax_vf32_load(go + base + s);
+                    ax_vf32 x = ax_vf32_load(xh + base + s);
+                    /* dx = coeff * (N*g - sum_go - x*sum_go_xh) */
+                    ax_vf32 dx = ax_vf32_mul(v_coeff,
+                        ax_vf32_sub(ax_vf32_sub(ax_vf32_mul(v_N, g), v_sum_go),
+                                    ax_vf32_mul(x, v_sum_gx)));
+                    ax_vf32_store(ig + base + s,
+                        ax_vf32_add(ax_vf32_load(ig + base + s), dx));
                 }
-            for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++) {
-                    int64_t idx = n * feat * spatial + c * spatial + s;
-                    float dx = (1.0f / N) * gamma_f * is *
-                        (N * go[idx] - sum_go - xh[idx] * sum_go_xh);
-                    ig[idx] += dx;
+                for (; s < spatial; s++) {
+                    float dx = coeff * (N * go[base + s] - sum_go - xh[base + s] * sum_go_xh);
+                    ig[base + s] += dx;
                 }
+            }
         }
     }
 
