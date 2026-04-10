@@ -15,6 +15,7 @@
 #include "axiom/compute.h"
 #include "axiom/broadcast.h"
 #include "axiom/error.h"
+#include "../compute/backends/simd_defs.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -53,13 +54,27 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
         }
         if (same)
         {
-            /* straightforward accumulation */
+            /* straightforward accumulation — SIMD when both are contiguous */
             int64_t n = ax_tensor_numel(t->grad);
             float *gd = (float *)t->grad->storage->data;
             float *ad = (float *)grad_to_add->storage->data;
-            for (int64_t i = 0; i < n; i++)
+            int64_t goff = (int64_t)t->grad->offset;
+            int64_t aoff = (int64_t)grad_to_add->offset;
+
+            if (goff == 0 && aoff == 0
+                && ax_tensor_is_contiguous(t->grad)
+                && ax_tensor_is_contiguous(grad_to_add))
             {
-                gd[t->grad->offset + i] += ad[grad_to_add->offset + i];
+                int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+                for (; i < ve; i += AX_VF32_WIDTH)
+                    ax_vf32_store(gd + i, ax_vf32_add(ax_vf32_load(gd + i), ax_vf32_load(ad + i)));
+                for (; i < n; i++)
+                    gd[i] += ad[i];
+            }
+            else
+            {
+                for (int64_t i = 0; i < n; i++)
+                    gd[goff + i] += ad[aoff + i];
             }
             return;
         }
@@ -559,7 +574,10 @@ static void mean_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (!self->inputs[0]->requires_grad) return;
 
     if (!self->inputs[0]->grad)
+    {
         self->inputs[0]->grad = ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+        if (!self->inputs[0]->grad) return;
+    }
 
     if (axis == -1)
     {

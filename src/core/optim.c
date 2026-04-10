@@ -74,20 +74,32 @@ ax_optimizer_t *ax_sgd_create(ax_tensor_t **params, int n_params,
 
 static void sgd_step(ax_optimizer_t *opt)
 {
+    ax_vf32 v_lr   = ax_vf32_set1(opt->lr);
+    ax_vf32 v_wd   = ax_vf32_set1(opt->weight_decay);
+    ax_vf32 v_mom  = ax_vf32_set1(opt->momentum);
+
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
         if (!p->grad) continue;
 
         int64_t n = ax_tensor_numel(p);
+        int64_t wo = p->offset;
+        int64_t go = p->grad->offset;
         float *wd = (float *)p->storage->data;
         float *gd = (float *)p->grad->storage->data;
 
-        /* l2 weight decay: grad += weight_decay * w */
+        /* fuse weight decay into grad if needed */
         if (opt->weight_decay > 0.0f)
         {
-            for (int64_t j = 0; j < n; j++)
-                gd[p->grad->offset + j] += opt->weight_decay * wd[p->offset + j];
+            int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+            for (; j < ve; j += AX_VF32_WIDTH) {
+                ax_vf32 g = ax_vf32_load(gd + go + j);
+                ax_vf32 w = ax_vf32_load(wd + wo + j);
+                ax_vf32_store(gd + go + j, ax_vf32_fmadd(v_wd, w, g));
+            }
+            for (; j < n; j++)
+                gd[go + j] += opt->weight_decay * wd[wo + j];
         }
 
         if (opt->momentum > 0.0f)
@@ -95,20 +107,49 @@ static void sgd_step(ax_optimizer_t *opt)
             ensure_state_m(&opt->state[i], p);
             float *vd = (float *)opt->state[i].m->storage->data;
 
-            for (int64_t j = 0; j < n; j++)
+            if (opt->nesterov)
             {
-                vd[j] = opt->momentum * vd[j] + gd[p->grad->offset + j];
-
-                if (opt->nesterov)
-                    wd[p->offset + j] -= opt->lr * (gd[p->grad->offset + j] + opt->momentum * vd[j]);
-                else
-                    wd[p->offset + j] -= opt->lr * vd[j];
+                int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+                for (; j < ve; j += AX_VF32_WIDTH) {
+                    ax_vf32 g = ax_vf32_load(gd + go + j);
+                    ax_vf32 v = ax_vf32_load(vd + j);
+                    v = ax_vf32_fmadd(v_mom, v, g); /* v = mom*v + g */
+                    ax_vf32_store(vd + j, v);
+                    ax_vf32 upd = ax_vf32_fmadd(v_mom, v, g); /* g + mom*v */
+                    ax_vf32 w = ax_vf32_load(wd + wo + j);
+                    ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, upd)));
+                }
+                for (; j < n; j++) {
+                    vd[j] = opt->momentum * vd[j] + gd[go + j];
+                    wd[wo + j] -= opt->lr * (gd[go + j] + opt->momentum * vd[j]);
+                }
+            }
+            else
+            {
+                int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+                for (; j < ve; j += AX_VF32_WIDTH) {
+                    ax_vf32 g = ax_vf32_load(gd + go + j);
+                    ax_vf32 v = ax_vf32_fmadd(v_mom, ax_vf32_load(vd + j), g);
+                    ax_vf32_store(vd + j, v);
+                    ax_vf32 w = ax_vf32_load(wd + wo + j);
+                    ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, v)));
+                }
+                for (; j < n; j++) {
+                    vd[j] = opt->momentum * vd[j] + gd[go + j];
+                    wd[wo + j] -= opt->lr * vd[j];
+                }
             }
         }
         else
         {
-            for (int64_t j = 0; j < n; j++)
-                wd[p->offset + j] -= opt->lr * gd[p->grad->offset + j];
+            int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+            for (; j < ve; j += AX_VF32_WIDTH) {
+                ax_vf32 w = ax_vf32_load(wd + wo + j);
+                ax_vf32 g = ax_vf32_load(gd + go + j);
+                ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, g)));
+            }
+            for (; j < n; j++)
+                wd[wo + j] -= opt->lr * gd[go + j];
         }
 
         opt->state[i].step_count++;
@@ -258,6 +299,12 @@ ax_optimizer_t *ax_rmsprop_create(ax_tensor_t **params, int n_params,
 
 static void rmsprop_step(ax_optimizer_t *opt)
 {
+    ax_vf32 v_rho   = ax_vf32_set1(opt->rho);
+    ax_vf32 v_1mr   = ax_vf32_set1(1.0f - opt->rho);
+    ax_vf32 v_lr    = ax_vf32_set1(opt->lr);
+    ax_vf32 v_eps   = ax_vf32_set1(opt->eps);
+    ax_vf32 v_wd    = ax_vf32_set1(opt->weight_decay);
+
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
@@ -266,21 +313,30 @@ static void rmsprop_step(ax_optimizer_t *opt)
         ensure_state_v(&opt->state[i], p);
 
         int64_t n = ax_tensor_numel(p);
+        int64_t wo = p->offset, go = p->grad->offset;
         float *wd = (float *)p->storage->data;
         float *gd = (float *)p->grad->storage->data;
         float *vd = (float *)opt->state[i].v->storage->data;
 
-        for (int64_t j = 0; j < n; j++)
+        int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+        for (; j < ve; j += AX_VF32_WIDTH)
         {
-            float g = gd[p->grad->offset + j];
-
+            ax_vf32 g = ax_vf32_load(gd + go + j);
+            ax_vf32 w = ax_vf32_load(wd + wo + j);
             if (opt->weight_decay > 0.0f)
-                g += opt->weight_decay * wd[p->offset + j];
-
-            vd[j] = opt->rho * vd[j] + (1.0f - opt->rho) * g * g;
-            wd[p->offset + j] -= opt->lr * g / (sqrtf(vd[j]) + opt->eps);
+                g = ax_vf32_fmadd(v_wd, w, g);
+            ax_vf32 v = ax_vf32_fmadd(v_1mr, ax_vf32_mul(g, g), ax_vf32_mul(v_rho, ax_vf32_load(vd + j)));
+            ax_vf32_store(vd + j, v);
+            ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v), v_eps);
+            ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(g, denom))));
         }
-
+        for (; j < n; j++)
+        {
+            float g = gd[go + j];
+            if (opt->weight_decay > 0.0f) g += opt->weight_decay * wd[wo + j];
+            vd[j] = opt->rho * vd[j] + (1.0f - opt->rho) * g * g;
+            wd[wo + j] -= opt->lr * g / (sqrtf(vd[j]) + opt->eps);
+        }
         opt->state[i].step_count++;
     }
 }
@@ -305,6 +361,10 @@ ax_optimizer_t *ax_adagrad_create(ax_tensor_t **params, int n_params,
 
 static void adagrad_step(ax_optimizer_t *opt)
 {
+    ax_vf32 v_lr  = ax_vf32_set1(opt->lr);
+    ax_vf32 v_eps = ax_vf32_set1(opt->eps);
+    ax_vf32 v_wd  = ax_vf32_set1(opt->weight_decay);
+
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
@@ -313,21 +373,30 @@ static void adagrad_step(ax_optimizer_t *opt)
         ensure_state_v(&opt->state[i], p);
 
         int64_t n = ax_tensor_numel(p);
+        int64_t wo = p->offset, go = p->grad->offset;
         float *wd = (float *)p->storage->data;
         float *gd = (float *)p->grad->storage->data;
         float *vd = (float *)opt->state[i].v->storage->data;
 
-        for (int64_t j = 0; j < n; j++)
+        int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+        for (; j < ve; j += AX_VF32_WIDTH)
         {
-            float g = gd[p->grad->offset + j];
-
+            ax_vf32 g = ax_vf32_load(gd + go + j);
+            ax_vf32 w = ax_vf32_load(wd + wo + j);
             if (opt->weight_decay > 0.0f)
-                g += opt->weight_decay * wd[p->offset + j];
-
-            vd[j] += g * g;
-            wd[p->offset + j] -= opt->lr * g / (sqrtf(vd[j]) + opt->eps);
+                g = ax_vf32_fmadd(v_wd, w, g);
+            ax_vf32 v = ax_vf32_add(ax_vf32_load(vd + j), ax_vf32_mul(g, g));
+            ax_vf32_store(vd + j, v);
+            ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v), v_eps);
+            ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(g, denom))));
         }
-
+        for (; j < n; j++)
+        {
+            float g = gd[go + j];
+            if (opt->weight_decay > 0.0f) g += opt->weight_decay * wd[wo + j];
+            vd[j] += g * g;
+            wd[wo + j] -= opt->lr * g / (sqrtf(vd[j]) + opt->eps);
+        }
         opt->state[i].step_count++;
     }
 }
