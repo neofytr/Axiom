@@ -47,6 +47,7 @@ set(AXIOM_SOURCES
     src/core/data.c
     src/core/conv.c
     src/core/norm.c
+    src/core/lr_scheduler.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
 )
@@ -84,6 +85,7 @@ set(TEST_SOURCES
     tests/test_integration.c
     tests/test_grad_verify.c
     tests/test_serialize_all.c
+    tests/test_lr_sched.c
 )
 
 foreach(test_src ${TEST_SOURCES})

@@ -205,9 +205,10 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
         ax_grad_fn_t *gf = ax_grad_fn_create(ce_backward);
         gf->inputs[0] = pred;
         gf->n_inputs = 1;
-        gf->saved[0] = pred;
-        gf->saved[1] = target;
-        gf->saved[2] = sm;
+        gf->saved[0] = pred;    /* borrowed — graph node */
+        gf->saved[1] = target;  /* borrowed — user tensor */
+        gf->saved[2] = sm;      /* owned — helper we created */
+        gf->saved_owned[2] = true;
         gf->n_saved = 3;
         loss->grad_fn = gf;
     }

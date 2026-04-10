@@ -1,6 +1,7 @@
 /* tensor.c — tensor creation, storage management, shape ops */
 
 #include "axiom/tensor.h"
+#include "axiom/autograd.h"
 #include "axiom/memory.h"
 #include "axiom/compute.h"
 #include <stdlib.h>
@@ -245,7 +246,28 @@ void ax_tensor_destroy(ax_tensor_t *t) {
         t->grad = NULL;
     }
     if (t->grad_fn) {
-        free(t->grad_fn);
+        ax_grad_fn_t *gf = (ax_grad_fn_t *)t->grad_fn;
+        /* free owned saved tensors (helpers created during forward
+           that aren't part of the graph and nobody else references) */
+        for (int i = 0; i < gf->n_saved; i++)
+        {
+            if (gf->saved_owned[i] && gf->saved[i])
+            {
+                ax_tensor_destroy(gf->saved[i]);
+                gf->saved[i] = NULL;
+            }
+        }
+        /* free ctx if backward didn't already clean it up.
+           only call ctx_cleanup if one was set — if none was set,
+           ctx might point to a layer struct or other non-owned memory.
+           backward functions that malloc their own ctx MUST set ctx_cleanup
+           or null out self->ctx after freeing. */
+        if (gf->ctx && gf->ctx_cleanup)
+        {
+            gf->ctx_cleanup(gf->ctx);
+            gf->ctx = NULL;
+        }
+        free(gf);
         t->grad_fn = NULL;
     }
     ax_storage_release(t->storage);

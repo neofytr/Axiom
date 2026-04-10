@@ -90,6 +90,15 @@ cleanup:
     ax_tensor_destroy(ctx->x_hat);
     ax_tensor_destroy(ctx->inv_std);
     free(ctx);
+    self->ctx = NULL;
+}
+
+static void bn_ctx_cleanup(void *p)
+{
+    bn_backward_ctx_t *ctx = (bn_backward_ctx_t *)p;
+    if (ctx->x_hat) ax_tensor_destroy(ctx->x_hat);
+    if (ctx->inv_std) ax_tensor_destroy(ctx->inv_std);
+    free(ctx);
 }
 
 static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
@@ -193,6 +202,7 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         gf->inputs[0] = input;
         gf->n_inputs = 1;
         gf->ctx = ctx;
+        gf->ctx_cleanup = bn_ctx_cleanup;
         out->requires_grad = true;
         out->grad_fn = gf;
     }
@@ -319,6 +329,15 @@ cleanup:
     ax_tensor_destroy(ctx->x_hat);
     ax_tensor_destroy(ctx->inv_std);
     free(ctx);
+    self->ctx = NULL;
+}
+
+static void ln_ctx_cleanup(void *p)
+{
+    ln_backward_ctx_t *ctx = (ln_backward_ctx_t *)p;
+    if (ctx->x_hat) ax_tensor_destroy(ctx->x_hat);
+    if (ctx->inv_std) ax_tensor_destroy(ctx->inv_std);
+    free(ctx);
 }
 
 static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
@@ -396,6 +415,7 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
         gf->inputs[0] = input;
         gf->n_inputs = 1;
         gf->ctx = ctx;
+        gf->ctx_cleanup = ln_ctx_cleanup;
         out->requires_grad = true;
         out->grad_fn = gf;
     }
@@ -511,6 +531,7 @@ static ax_tensor_t *dropout_forward(ax_layer_t *self, ax_tensor_t *input)
         gf->inputs[0] = input;
         gf->n_inputs = 1;
         gf->saved[0] = mask;
+        gf->saved_owned[0] = true; /* we created the mask, we own it */
         gf->n_saved = 1;
         out->requires_grad = true;
         out->grad_fn = gf;

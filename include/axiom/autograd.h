@@ -33,17 +33,24 @@ struct ax_grad_fn
     ax_tensor_t *inputs[AX_GRAD_MAX_INPUTS];
     int n_inputs;
 
-    /* tensors saved during forward that backward needs
-       (e.g., matmul saves both inputs, sigmoid saves output) */
+    /* tensors saved during forward that backward needs.
+       saved_owned[i] indicates whether the grad_fn owns saved[i] and
+       should destroy it on cleanup (true for helper tensors like the
+       softmax output in cross-entropy, false for tensors that are
+       also graph nodes or user-owned). */
     ax_tensor_t *saved[AX_GRAD_MAX_SAVED];
+    bool saved_owned[AX_GRAD_MAX_SAVED];
     int n_saved;
 
     /* extra scalar context some ops need (e.g., mul_scalar stores the scalar) */
     double scalar_ctx;
     int int_ctx; /* e.g., axis for sum */
 
-    /* opaque pointer for ops that need more context (e.g., conv2d stores its layer) */
+    /* opaque pointer for ops that need more context (e.g., conv2d stores its layer).
+       ctx_cleanup is called to free ctx if backward was never called. if backward
+       handles its own cleanup, it should set ctx = NULL afterward. */
     void *ctx;
+    void (*ctx_cleanup)(void *ctx);
 };
 
 /* run backward pass starting from this tensor.

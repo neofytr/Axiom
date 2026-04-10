@@ -173,9 +173,10 @@ static void test_relu_grad(void)
     int64_t xs[] = {2, 2};
     ax_tensor_t *x = ax_tensor_from_array(x_data, xs, 2, AX_FLOAT32);
 
-    /* initialize weights to values that produce activations far from 0 */
+    /* initialize weights to large positive values so pre-activations
+       are firmly positive (far from the relu kink at 0) */
     int64_t ws[] = {2, 3};
-    g_weight = ax_tensor_rand(ws, 2, 0.5f, 2.0f);
+    g_weight = ax_tensor_rand(ws, 2, 1.0f, 3.0f);
 
     float err = verify_grad(g_weight, relu_forward_for_check, x);
     AX_TEST_ASSERT(err >= 0, "grad computed");
