@@ -7,6 +7,7 @@
 #include "axiom/init.h"
 #include "axiom/error.h"
 #include "axiom/rng.h"
+#include "../compute/backends/simd_defs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -158,38 +159,80 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
 
         for (int64_t c = 0; c < feat; c++)
         {
-            /* pass 1: welford's online mean + variance in a single scan.
-               numerically stable — no catastrophic cancellation from large values. */
-            double w_mean = 0.0;
-            double m2 = 0.0;
-            int64_t count = 0;
-            for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++)
-                {
-                    count++;
-                    double x = (double)id[n * feat * spatial + c * spatial + s];
-                    double delta = x - w_mean;
-                    w_mean += delta / (double)count;
-                    double delta2 = x - w_mean;
-                    m2 += delta * delta2;
+            /* pass 1: compute mean with SIMD reduction */
+            float mean;
+            {
+                double dsum = 0.0;
+                for (int64_t n = 0; n < batch; n++) {
+                    int64_t base = n * feat * spatial + c * spatial;
+                    int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
+                    ax_vf32 vs = ax_vf32_zero();
+                    for (; s < se; s += AX_VF32_WIDTH)
+                        vs = ax_vf32_add(vs, ax_vf32_load(id + base + s));
+                    dsum += (double)ax_vf32_hsum(vs);
+                    for (; s < spatial; s++) dsum += (double)id[base + s];
                 }
+                mean = (float)(dsum / (double)(batch * spatial));
+            }
 
-            float mean = (float)w_mean;
-            float var = (count > 0) ? (float)(m2 / (double)count) : 0.0f;
-            float var_sum = (float)m2; /* for bessel correction */
+            /* pass 2: compute variance with SIMD */
+            ax_vf32 v_mean = ax_vf32_set1(mean);
+            double var_sum_d = 0.0;
+            for (int64_t n = 0; n < batch; n++)
+            {
+                int64_t base = n * feat * spatial + c * spatial;
+                int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
+                ax_vf32 vv = ax_vf32_zero();
+                for (; s < se; s += AX_VF32_WIDTH) {
+                    ax_vf32 d = ax_vf32_sub(ax_vf32_load(id + base + s), v_mean);
+                    vv = ax_vf32_fmadd(d, d, vv);
+                }
+                var_sum_d += (double)ax_vf32_hsum(vv);
+                for (; s < spatial; s++) {
+                    float d = id[base + s] - mean;
+                    var_sum_d += (double)d * (double)d;
+                }
+            }
+            float var = (float)(var_sum_d / (double)(batch * spatial));
+            float var_sum = (float)var_sum_d;
             float inv_std = 1.0f / sqrtf(var + bn->eps);
 
             if (record) is_d[c] = inv_std;
 
-            /* pass 2: normalize and apply affine */
+            /* pass 2: normalize and apply affine.
+               fuse to single FMA: out = scale * input + bias_out */
+            float scale = gd[c] * inv_std;
+            float bias_out = bd[c] - gd[c] * mean * inv_std;
+            ax_vf32 v_sc = ax_vf32_set1(scale);
+            ax_vf32 v_bi = ax_vf32_set1(bias_out);
+            ax_vf32 v_is = ax_vf32_set1(inv_std);
+            ax_vf32 v_mn = ax_vf32_set1(mean);
+
             for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++)
-                {
-                    int64_t idx = n * feat * spatial + c * spatial + s;
-                    float x_hat = (id[idx] - mean) * inv_std;
-                    od[idx] = gd[c] * x_hat + bd[c];
-                    if (record) xh_d[idx] = x_hat;
+            {
+                int64_t base = n * feat * spatial + c * spatial;
+                if (record) {
+                    int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
+                    for (; s < se; s += AX_VF32_WIDTH) {
+                        ax_vf32 inp = ax_vf32_load(id + base + s);
+                        ax_vf32 xh = ax_vf32_mul(ax_vf32_sub(inp, v_mn), v_is);
+                        ax_vf32_store(od + base + s, ax_vf32_fmadd(v_sc, ax_vf32_load(id + base + s), v_bi));
+                        ax_vf32_store(xh_d + base + s, xh);
+                    }
+                    for (; s < spatial; s++) {
+                        float xh = (id[base + s] - mean) * inv_std;
+                        od[base + s] = scale * id[base + s] + bias_out;
+                        xh_d[base + s] = xh;
+                    }
+                } else {
+                    int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
+                    for (; s < se; s += AX_VF32_WIDTH)
+                        ax_vf32_store(od + base + s,
+                            ax_vf32_fmadd(v_sc, ax_vf32_load(id + base + s), v_bi));
+                    for (; s < spatial; s++)
+                        od[base + s] = scale * id[base + s] + bias_out;
                 }
+            }
 
             rm[c] = (1.0f - bn->momentum) * rm[c] + bn->momentum * mean;
             int64_t eff_count = batch * spatial;
@@ -199,16 +242,27 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
     }
     else
     {
+        /* eval path: fused scale+shift per channel.
+           precompute scale = gamma * inv_std, bias_out = beta - gamma * mean * inv_std
+           then out[idx] = scale * input[idx] + bias_out (single FMA per element) */
         for (int64_t c = 0; c < feat; c++)
         {
             float inv_std = 1.0f / sqrtf(rv[c] + bn->eps);
+            float scale = gd[c] * inv_std;
+            float bias_out = bd[c] - gd[c] * rm[c] * inv_std;
+            ax_vf32 v_scale = ax_vf32_set1(scale);
+            ax_vf32 v_bias = ax_vf32_set1(bias_out);
+
             for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++)
-                {
-                    int64_t idx = n * feat * spatial + c * spatial + s;
-                    float x_hat = (id[idx] - rm[c]) * inv_std;
-                    od[idx] = gd[c] * x_hat + bd[c];
-                }
+            {
+                int64_t base = n * feat * spatial + c * spatial;
+                int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
+                for (; s < se; s += AX_VF32_WIDTH)
+                    ax_vf32_store(od + base + s,
+                        ax_vf32_fmadd(v_scale, ax_vf32_load(id + base + s), v_bias));
+                for (; s < spatial; s++)
+                    od[base + s] = scale * id[base + s] + bias_out;
+            }
         }
     }
 

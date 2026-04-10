@@ -554,33 +554,80 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     float *id = (float *)inp->storage->data;
     float *od = (float *)output->storage->data;
 
-    for (int64_t n = 0; n < N; n++)
+    /* fast path: k=2, s=2, p=0 (most common maxpool config).
+       no boundary checks needed, unrolled 2x2 window comparison. */
+    if (k == 2 && s == 2 && p == 0)
     {
-        for (int64_t c = 0; c < C; c++)
+        for (int64_t n = 0; n < N; n++)
         {
-            for (int64_t y = 0; y < oh; y++)
+            for (int64_t c = 0; c < C; c++)
             {
-                for (int64_t x = 0; x < ow; x++)
+                const float *ic = id + (n * C + c) * H * W;
+                float *oc = od + (n * C + c) * oh * ow;
+                float *ix = record ? idxd + (n * C + c) * oh * ow : NULL;
+
+                for (int64_t y = 0; y < oh; y++)
                 {
-                    float mx = -FLT_MAX;
-                    int64_t max_iy = -1, max_ix = -1;
-                    for (int ky = 0; ky < k; ky++)
+                    int64_t iy = y * 2;
+                    const float *row0 = ic + iy * W;
+                    const float *row1 = ic + (iy + 1) * W;
+
+                    for (int64_t x = 0; x < ow; x++)
                     {
-                        for (int kx = 0; kx < k; kx++)
-                        {
-                            int64_t iy = y * s - p + ky;
-                            int64_t ix = x * s - p + kx;
-                            if (iy >= 0 && iy < H && ix >= 0 && ix < W)
-                            {
-                                float v = id[((n * C + c) * H + iy) * W + ix];
-                                if (v > mx) { mx = v; max_iy = iy; max_ix = ix; }
-                            }
+                        int64_t ix2 = x * 2;
+                        float a = row0[ix2], b = row0[ix2 + 1];
+                        float c2 = row1[ix2], d = row1[ix2 + 1];
+
+                        /* branchless 4-way max */
+                        float m01 = a > b ? a : b;
+                        float m23 = c2 > d ? c2 : d;
+                        float mx = m01 > m23 ? m01 : m23;
+                        oc[y * ow + x] = mx;
+
+                        if (record) {
+                            int64_t mi;
+                            if (mx == a)      mi = iy * W + ix2;
+                            else if (mx == b) mi = iy * W + ix2 + 1;
+                            else if (mx == c2) mi = (iy+1) * W + ix2;
+                            else               mi = (iy+1) * W + ix2 + 1;
+                            ix[y * ow + x] = (float)mi;
                         }
                     }
-                    int64_t oi = ((n * C + c) * oh + y) * ow + x;
-                    od[oi] = mx;
-                    if (record)
-                        idxd[oi] = (max_iy >= 0) ? (float)(max_iy * W + max_ix) : -1.0f;
+                }
+            }
+        }
+    }
+    else
+    {
+        /* general path with boundary checks */
+        for (int64_t n = 0; n < N; n++)
+        {
+            for (int64_t c = 0; c < C; c++)
+            {
+                for (int64_t y = 0; y < oh; y++)
+                {
+                    for (int64_t x = 0; x < ow; x++)
+                    {
+                        float mx = -FLT_MAX;
+                        int64_t max_iy = -1, max_ix = -1;
+                        for (int ky = 0; ky < k; ky++)
+                        {
+                            for (int kx = 0; kx < k; kx++)
+                            {
+                                int64_t iy = y * s - p + ky;
+                                int64_t ix2 = x * s - p + kx;
+                                if (iy >= 0 && iy < H && ix2 >= 0 && ix2 < W)
+                                {
+                                    float v = id[((n * C + c) * H + iy) * W + ix2];
+                                    if (v > mx) { mx = v; max_iy = iy; max_ix = ix2; }
+                                }
+                            }
+                        }
+                        int64_t oi = ((n * C + c) * oh + y) * ow + x;
+                        od[oi] = mx;
+                        if (record)
+                            idxd[oi] = (max_iy >= 0) ? (float)(max_iy * W + max_ix) : -1.0f;
+                    }
                 }
             }
         }
