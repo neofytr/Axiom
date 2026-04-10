@@ -18,6 +18,7 @@
 #include "axiom/init.h"
 #include "axiom/compute.h"
 #include "axiom/error.h"
+#include "../compute/backends/simd_defs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -104,36 +105,14 @@ ax_tensor_t *ax_im2col(ax_tensor_t *input, int kh, int kw,
     return cols;
 }
 
-/* col2im: inverse of im2col. scatters column data back into image format.
-   accumulates (adds) into overlapping positions (needed for gradient). */
-
-ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
-                        int64_t height, int64_t width,
-                        int kh, int kw,
-                        int stride_h, int stride_w,
-                        int pad_h, int pad_w)
+/* internal: scatter col2im into a pre-zeroed float buffer.
+   id must be zeroed before calling (accumulates into it). */
+static void col2im_into(const float *cd, int64_t channels,
+                         int64_t height, int64_t width,
+                         int kh, int kw, int stride_h, int stride_w,
+                         int pad_h, int pad_w, int64_t out_h, int64_t out_w,
+                         float *id)
 {
-    if (cols->dtype != AX_FLOAT32)
-    {
-        ax_err_set(AX_ERR_INVALID_DTYPE, "col2im expects float32 input");
-        return NULL;
-    }
-
-    int64_t out_h = conv_out_dim(height, kh, stride_h, pad_h);
-    int64_t out_w = conv_out_dim(width, kw, stride_w, pad_w);
-    if (out_h <= 0 || out_w <= 0)
-    {
-        ax_err_set(AX_ERR_INVALID_SHAPE, "col2im: invalid output dimensions %" PRId64 " x %" PRId64, out_h, out_w);
-        return NULL;
-    }
-
-    int64_t img_shape[] = {channels, height, width};
-    ax_tensor_t *img = ax_tensor_zeros(img_shape, 3, AX_FLOAT32);
-    if (!img) return NULL;
-
-    float *cd = (float *)cols->storage->data;
-    float *id = (float *)img->storage->data;
-
     int64_t col_idx = 0;
     for (int64_t c = 0; c < channels; c++)
     {
@@ -147,18 +126,39 @@ ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
                     {
                         int64_t ih = oh * stride_h - pad_h + ky;
                         int64_t iw = ow * stride_w - pad_w + kx;
-
                         if (ih >= 0 && ih < height && iw >= 0 && iw < width)
-                        {
                             id[c * height * width + ih * width + iw] +=
                                 cd[col_idx * out_h * out_w + oh * out_w + ow];
-                        }
                     }
                 }
                 col_idx++;
             }
         }
     }
+}
+
+/* col2im: inverse of im2col. allocating version for public API. */
+ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
+                        int64_t height, int64_t width,
+                        int kh, int kw,
+                        int stride_h, int stride_w,
+                        int pad_h, int pad_w)
+{
+    int64_t out_h = conv_out_dim(height, kh, stride_h, pad_h);
+    int64_t out_w = conv_out_dim(width, kw, stride_w, pad_w);
+    if (out_h <= 0 || out_w <= 0)
+    {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "col2im: invalid output dimensions %" PRId64 " x %" PRId64, out_h, out_w);
+        return NULL;
+    }
+
+    int64_t img_shape[] = {channels, height, width};
+    ax_tensor_t *img = ax_tensor_zeros(img_shape, 3, AX_FLOAT32);
+    if (!img) return NULL;
+
+    col2im_into((float *)cols->storage->data, channels, height, width,
+                kh, kw, stride_h, stride_w, pad_h, pad_w, out_h, out_w,
+                (float *)img->storage->data);
     return img;
 }
 
@@ -239,11 +239,13 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t dcol_shape[] = {K, M};
     int64_t colt_shape[] = {M, K};  /* transposed col for weight grad */
 
+    int64_t img_shape[] = {C_in, H, W};
     ax_tensor_t *col_buf  = ax_tensor_create(col_shape, 2, AX_FLOAT32);
     ax_tensor_t *go_mat   = ax_tensor_create(go_shape, 2, AX_FLOAT32);
     ax_tensor_t *dw_buf   = weight->requires_grad ? ax_tensor_create(dw_shape, 2, AX_FLOAT32) : NULL;
     ax_tensor_t *dcol_buf = input_orig->requires_grad ? ax_tensor_create(dcol_shape, 2, AX_FLOAT32) : NULL;
     ax_tensor_t *colt_buf = weight->requires_grad ? ax_tensor_create(colt_shape, 2, AX_FLOAT32) : NULL;
+    ax_tensor_t *dimg_buf = input_orig->requires_grad ? ax_tensor_create(img_shape, 3, AX_FLOAT32) : NULL;
 
     float *ind = (float *)input_data->storage->data;
     float *grd = (float *)grad_out->storage->data;
@@ -273,22 +275,35 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
             float *wg = (float *)weight->grad->storage->data;
             float *dwd = (float *)dw_buf->storage->data;
-            for (int64_t i = 0; i < C_out * K; i++) wg[i] += dwd[i];
+            int64_t wn = C_out * K;
+            {
+                int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
+                for (; wi < wve; wi += AX_VF32_WIDTH)
+                    ax_vf32_store(wg + wi, ax_vf32_add(ax_vf32_load(wg + wi), ax_vf32_load(dwd + wi)));
+                for (; wi < wn; wi++) wg[wi] += dwd[wi];
+            }
         }
 
-        /* input gradient: dcol = W^T @ go_mat, then col2im */
-        if (input_orig->requires_grad && wt_contig && dcol_buf)
+        /* input gradient: dcol = W^T @ go_mat, then col2im into pre-allocated buffer */
+        if (input_orig->requires_grad && wt_contig && dcol_buf && dimg_buf)
         {
             memset(dcol_buf->storage->data, 0, (size_t)(K * M) * sizeof(float));
             ax_compute_gemm(wt_contig, go_mat, dcol_buf);
 
-            ax_tensor_t *dimg = ax_col2im(dcol_buf, C_in, H, W, kh, kw, sh, sw, ph, pw);
-            float *ig = (float *)input_orig->grad->storage->data;
-            float *dg = (float *)dimg->storage->data;
-            for (int64_t i = 0; i < C_in * H * W; i++)
-                ig[n * C_in * H * W + i] += dg[i];
+            /* col2im into pre-allocated buffer (no per-sample malloc) */
+            float *dimg_d = (float *)dimg_buf->storage->data;
+            memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));
+            col2im_into((float *)dcol_buf->storage->data, C_in, H, W,
+                         kh, kw, sh, sw, ph, pw, out_h, out_w, dimg_d);
 
-            ax_tensor_destroy(dimg);
+            /* SIMD accumulate into input gradient */
+            float *ig = (float *)input_orig->grad->storage->data + n * C_in * H * W;
+            int64_t total = C_in * H * W;
+            int64_t i = 0, ve = total - (total % AX_VF32_WIDTH);
+            for (; i < ve; i += AX_VF32_WIDTH)
+                ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), ax_vf32_load(dimg_d + i)));
+            for (; i < total; i++)
+                ig[i] += dimg_d[i];
         }
     }
 
@@ -297,6 +312,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (dw_buf) ax_tensor_destroy(dw_buf);
     if (dcol_buf) ax_tensor_destroy(dcol_buf);
     if (colt_buf) ax_tensor_destroy(colt_buf);
+    if (dimg_buf) ax_tensor_destroy(dimg_buf);
     if (wt_contig) ax_tensor_destroy(wt_contig);
 }
 
