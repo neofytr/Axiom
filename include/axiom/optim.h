@@ -37,6 +37,10 @@ typedef struct
     /* per-parameter state (allocated lazily on first step) */
     ax_param_state_t *state;
 
+    /* global step counter — incremented once per ax_optimizer_step() call.
+       used for adam/adamw bias correction so all parameters share the same t. */
+    int64_t global_step;
+
     /* hyperparameters */
     float lr;           /* learning rate */
     float beta1;        /* adam/adamw first moment decay (default 0.9) */

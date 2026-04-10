@@ -3,10 +3,17 @@
 #include "axiom/memory.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 /* helpers */
 
-/* align a value up to the nearest multiple of alignment */
+/* check if value is a power of two (required for alignment) */
+static inline bool is_power_of_two(size_t v) {
+    return v > 0 && (v & (v - 1)) == 0;
+}
+
+/* align a value up to the nearest multiple of alignment.
+   alignment must be a power of two. */
 static inline size_t align_up(size_t val, size_t alignment) {
     return (val + alignment - 1) & ~(alignment - 1);
 }
@@ -48,6 +55,8 @@ ax_arena_t *ax_arena_create(size_t block_size) {
 
 void *ax_arena_alloc(ax_arena_t *arena, size_t size, size_t alignment) {
     if (!arena || size == 0) return NULL;
+    if (alignment == 0) alignment = 1;
+    if (!is_power_of_two(alignment)) return NULL;
 
     /* compute the aligned address relative to the block's data pointer.
        we need to align the actual address, not just the offset. */
@@ -112,6 +121,12 @@ void ax_arena_destroy(ax_arena_t *arena) {
 void *ax_aligned_alloc(size_t size, size_t alignment) {
     if (size == 0) return NULL;
     if (alignment == 0) alignment = 1;
+    /* round up to next power of two if not already */
+    if (!is_power_of_two(alignment)) {
+        size_t p = 1;
+        while (p < alignment) p <<= 1;
+        alignment = p;
+    }
 
     /* allocate with extra space for alignment and storing the original pointer.
        check for overflow before computing total. */

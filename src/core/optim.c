@@ -139,6 +139,15 @@ ax_optimizer_t *ax_adam_create(ax_tensor_t **params, int n_params,
 
 static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
 {
+    /* increment global step once per call — all parameters share the same t.
+       per-parameter step counts would give different bias corrections to different
+       params (e.g. if some have no grad for a batch), which is incorrect. */
+    opt->global_step++;
+    int64_t t = opt->global_step;
+
+    float bc1 = 1.0f - powf(opt->beta1, (float)t);
+    float bc2 = 1.0f - powf(opt->beta2, (float)t);
+
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
@@ -146,9 +155,6 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
 
         ensure_state_m(&opt->state[i], p);
         ensure_state_v(&opt->state[i], p);
-        opt->state[i].step_count++;
-
-        int64_t t = opt->state[i].step_count;
         int64_t n = ax_tensor_numel(p);
         float *wd = (float *)p->storage->data;
         float *gd = (float *)p->grad->storage->data;
@@ -168,10 +174,6 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
             for (int64_t j = 0; j < n; j++)
                 gd[p->grad->offset + j] += opt->weight_decay * wd[p->offset + j];
         }
-
-        /* bias correction factors */
-        float bc1 = 1.0f - powf(opt->beta1, (float)t);
-        float bc2 = 1.0f - powf(opt->beta2, (float)t);
 
         for (int64_t j = 0; j < n; j++)
         {

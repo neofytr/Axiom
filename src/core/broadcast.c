@@ -2,6 +2,7 @@
 
 #include "axiom/broadcast.h"
 #include "axiom/error.h"
+#include <inttypes.h>
 
 ax_status_t ax_broadcast_shape(
     const int64_t *a_shape, int a_ndim,
@@ -40,7 +41,7 @@ ax_status_t ax_broadcast_shape(
         else
         {
             ax_err_set(AX_ERR_SHAPE_MISMATCH,
-                       "cannot broadcast dim %ld with %ld", da, db);
+                       "cannot broadcast dim %" PRId64 " with %" PRId64, da, db);
             return AX_ERR_SHAPE_MISMATCH;
         }
     }

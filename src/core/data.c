@@ -1,3 +1,6 @@
+/* posix source for strtok_r */
+#define _POSIX_C_SOURCE 200809L
+
 /* data.c — dataset, dataloader, and transform implementations.
 
    the general pattern: dataset provides random access to samples,
@@ -16,6 +19,7 @@
 #include <math.h>
 #include <float.h>
 #include <time.h>
+#include <inttypes.h>
 
 
 /* tensor dataset: wraps two tensors where dim 0 is the sample axis */
@@ -93,7 +97,7 @@ static void tensor_ds_get_item(ax_dataset_t *self, int64_t idx,
     if (idx < 0 || idx >= ds->n_samples)
     {
         ax_err_set(AX_ERR_OUT_OF_BOUNDS,
-                   "dataset index %ld out of range [0, %ld)", idx, ds->n_samples);
+                   "dataset index %" PRId64 " out of range [0, %" PRId64 ")", idx, ds->n_samples);
         *input = NULL;
         *target = NULL;
         return;
@@ -173,10 +177,15 @@ static int64_t count_csv_lines(const char *path, bool has_header)
     return has_header ? count - 1 : count;
 }
 
-/* parse a single float from a csv field */
+/* parse a single float from a csv field.
+   uses strtof instead of atof for error detection. */
 static float parse_float(const char *s)
 {
-    return (float)atof(s);
+    if (!s || *s == '\0') return 0.0f;
+    char *end;
+    float val = strtof(s, &end);
+    if (end == s) return 0.0f; /* no conversion performed */
+    return val;
 }
 
 static void csv_ds_get_item(ax_dataset_t *self, int64_t idx,
@@ -202,7 +211,7 @@ static void csv_ds_get_item(ax_dataset_t *self, int64_t idx,
     if (idx < 0 || idx >= ds->n_rows)
     {
         ax_err_set(AX_ERR_OUT_OF_BOUNDS,
-                   "csv dataset index %ld out of range [0, %ld)", idx, ds->n_rows);
+                   "csv dataset index %" PRId64 " out of range [0, %" PRId64 ")", idx, ds->n_rows);
         *input = NULL;
         *target = NULL;
         return;
@@ -286,22 +295,23 @@ ax_dataset_t *ax_csv_dataset_load(const char *path,
         if (line_len == CSV_LINE_MAX - 1 && line[line_len - 1] != '\n')
         {
             ax_err_set(AX_ERR_INTERNAL,
-                       "csv line %ld exceeds maximum length (%d bytes)",
-                       (long)(row + (has_header ? 2 : 1)), CSV_LINE_MAX);
+                       "csv line %" PRId64 " exceeds maximum length (%d bytes)",
+                       row + (has_header ? 2 : 1), CSV_LINE_MAX);
             /* skip rest of truncated line */
             int ch;
             while ((ch = fgetc(f)) != '\n' && ch != EOF) {}
             continue;
         }
 
-        /* tokenize by comma */
+        /* tokenize by comma (strtok_r for thread safety) */
         char *fields[CSV_FIELDS_MAX];
         int n_fields = 0;
-        char *tok = strtok(line, ",\n\r");
+        char *saveptr = NULL;
+        char *tok = strtok_r(line, ",\n\r", &saveptr);
         while (tok && n_fields < CSV_FIELDS_MAX)
         {
             fields[n_fields++] = tok;
-            tok = strtok(NULL, ",\n\r");
+            tok = strtok_r(NULL, ",\n\r", &saveptr);
         }
 
         /* validate column indices don't exceed parsed fields */

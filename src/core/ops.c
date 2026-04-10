@@ -8,12 +8,15 @@
 #include "axiom/error.h"
 #include "axiom/autograd.h"
 #include <stdlib.h>
+#include <inttypes.h>
 
 /* internal helpers */
 
 /* figure out the output shape for a binary op (broadcasting) and allocate the result */
 static ax_tensor_t *alloc_binop_result(ax_tensor_t *a, ax_tensor_t *b)
 {
+    if (!a || !b) return NULL;
+
     int64_t out_shape[AX_MAX_DIMS];
     int out_ndim;
 
@@ -28,6 +31,7 @@ static ax_tensor_t *alloc_binop_result(ax_tensor_t *a, ax_tensor_t *b)
 /* allocate an output tensor with same shape as input */
 static ax_tensor_t *alloc_like(ax_tensor_t *t)
 {
+    if (!t) return NULL;
     return ax_tensor_zeros(t->shape, t->ndim, t->dtype);
 }
 
@@ -285,7 +289,7 @@ ax_tensor_t *ax_matmul(ax_tensor_t *a, ax_tensor_t *b)
     if (a->shape[1] != b->shape[0])
     {
         ax_err_set(AX_ERR_SHAPE_MISMATCH,
-                   "matmul: [%ld,%ld] @ [%ld,%ld] inner dims don't match",
+                   "matmul: [%" PRId64 ",%" PRId64 "] @ [%" PRId64 ",%" PRId64 "] inner dims don't match",
                    a->shape[0], a->shape[1], b->shape[0], b->shape[1]);
         return NULL;
     }

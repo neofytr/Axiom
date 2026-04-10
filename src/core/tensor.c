@@ -9,9 +9,21 @@
 #include <stdio.h>
 #include <time.h>
 #include <limits.h>
+#include <inttypes.h>
 
 /* track whether rng has been seeded */
 static bool rng_seeded = false;
+
+void ax_set_seed(unsigned int seed)
+{
+    srand(seed);
+    rng_seeded = true;
+}
+
+bool ax_rng_is_seeded(void)
+{
+    return rng_seeded;
+}
 
 /* storage */
 
@@ -26,20 +38,20 @@ ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device) {
     }
 
     s->size_bytes = size_bytes;
-    s->refcount = 1;
+    atomic_init(&s->refcount, 1);
     s->device = device;
     return s;
 }
 
 void ax_storage_retain(ax_storage_t *s) {
-    if (s) s->refcount++;
+    if (s) atomic_fetch_add(&s->refcount, 1);
 }
 
 void ax_storage_release(ax_storage_t *s) {
     if (!s) return;
-    if (s->refcount <= 0) return; /* already freed or corrupted — do not double-free */
-    s->refcount--;
-    if (s->refcount == 0) {
+    int prev = atomic_fetch_sub(&s->refcount, 1);
+    if (prev <= 1) {
+        /* was 1 (or already corrupted), now 0 — free */
         ax_aligned_free(s->data);
         free(s);
     }
@@ -64,7 +76,7 @@ static int64_t compute_numel(const int64_t *shape, int ndim) {
     for (int i = 0; i < ndim; i++) {
         if (shape[i] <= 0) {
             ax_err_set(AX_ERR_INVALID_SHAPE,
-                       "shape dimension %d is non-positive: %ld", i, shape[i]);
+                       "shape dimension %d is non-positive: %" PRId64, i, shape[i]);
             return -1;
         }
         if (!safe_mul_i64(n, shape[i], &n)) {
@@ -103,7 +115,7 @@ static ax_tensor_t *tensor_alloc_meta(const int64_t *shape, int ndim, ax_dtype_t
     for (int i = 0; i < ndim; i++) {
         if (shape[i] <= 0) {
             ax_err_set(AX_ERR_INVALID_SHAPE,
-                       "shape dimension %d must be positive, got %ld", i, shape[i]);
+                       "shape dimension %d must be positive, got %" PRId64, i, shape[i]);
             return NULL;
         }
     }
@@ -142,7 +154,7 @@ ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype) 
     /* check for size_t overflow: n * elem_size */
     if (elem_size > 0 && (size_t)n > SIZE_MAX / elem_size) {
         ax_err_set(AX_ERR_INVALID_SHAPE,
-                   "allocation size overflow: %ld elements * %zu bytes", n, elem_size);
+                   "allocation size overflow: %" PRId64 " elements * %zu bytes", n, elem_size);
         free(t);
         return NULL;
     }
@@ -303,7 +315,7 @@ ax_tensor_t *ax_tensor_reshape(ax_tensor_t *t, const int64_t *new_shape, int new
     int64_t old_n = compute_numel(t->shape, t->ndim);
     int64_t new_n = compute_numel(new_shape, new_ndim);
     if (old_n != new_n) {
-        ax_err_set(AX_ERR_SHAPE_MISMATCH, "reshape: %ld elements vs %ld elements", old_n, new_n);
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "reshape: %" PRId64 " elements vs %" PRId64 " elements", old_n, new_n);
         return NULL;
     }
 
@@ -442,7 +454,7 @@ float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
     for (int i = 0; i < t->ndim; i++) {
         if (indices[i] < 0 || indices[i] >= t->shape[i]) {
             ax_err_set(AX_ERR_OUT_OF_BOUNDS,
-                       "get_f32: index %ld out of bounds for dim %d (size %ld)",
+                       "get_f32: index %" PRId64 " out of bounds for dim %d (size %" PRId64 ")",
                        indices[i], i, t->shape[i]);
             return 0.0f;
         }
@@ -458,7 +470,7 @@ void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
     for (int i = 0; i < t->ndim; i++) {
         if (indices[i] < 0 || indices[i] >= t->shape[i]) {
             ax_err_set(AX_ERR_OUT_OF_BOUNDS,
-                       "set_f32: index %ld out of bounds for dim %d (size %ld)",
+                       "set_f32: index %" PRId64 " out of bounds for dim %d (size %" PRId64 ")",
                        indices[i], i, t->shape[i]);
             return;
         }
@@ -507,7 +519,7 @@ void ax_tensor_print_shape(const ax_tensor_t *t) {
     if (!t) { printf("(null)\n"); return; }
     printf("tensor(shape=[");
     for (int i = 0; i < t->ndim; i++) {
-        printf("%ld%s", t->shape[i], i < t->ndim - 1 ? ", " : "");
+        printf("%" PRId64 "%s", t->shape[i], i < t->ndim - 1 ? ", " : "");
     }
     printf("], dtype=%s)\n", ax_dtype_name(t->dtype));
 }
@@ -537,6 +549,6 @@ void ax_tensor_print(const ax_tensor_t *t) {
         float v = ax_tensor_get_f32(t, indices);
         printf("%.4f%s", v, i < limit - 1 ? ", " : "");
     }
-    if (n > limit) printf(", ... (%ld more)", n - limit);
+    if (n > limit) printf(", ... (%" PRId64 " more)", n - limit);
     printf("]\n");
 }

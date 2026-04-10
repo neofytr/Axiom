@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <float.h>
+#include <inttypes.h>
 
 /* helpers */
 
@@ -161,7 +162,7 @@ static ax_status_t cpu_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     int64_t n = b->shape[1];
 
     if (b->shape[0] != k || out->shape[0] != m || out->shape[1] != n) {
-        ax_err_set(AX_ERR_SHAPE_MISMATCH, "gemm shape mismatch: [%ld,%ld] @ [%ld,%ld] -> [%ld,%ld]",
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "gemm shape mismatch: [%" PRId64 ",%" PRId64 "] @ [%" PRId64 ",%" PRId64 "] -> [%" PRId64 ",%" PRId64 "]",
                    m, k, b->shape[0], b->shape[1], out->shape[0], out->shape[1]);
         return AX_ERR_SHAPE_MISMATCH;
     }

@@ -10,20 +10,18 @@
    the math is in INTERNALS.md. */
 
 #include "axiom/init.h"
+#include "axiom/tensor.h"
 #include "axiom/compute.h"
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
 
-static bool seeded = false;
-
+/* delegate to the shared RNG state managed by tensor.c.
+   if ax_set_seed has already been called we don't auto-reseed. */
 static void seed_once(void)
 {
-    if (!seeded)
-    {
-        srand((unsigned)time(NULL));
-        seeded = true;
-    }
+    if (!ax_rng_is_seeded())
+        ax_set_seed((unsigned)time(NULL));
 }
 
 /* generate uniform random float in [low, high) */

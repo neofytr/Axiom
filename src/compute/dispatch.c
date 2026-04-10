@@ -13,6 +13,13 @@ static const ax_backend_ops_t *backends[AX_BACKEND_COUNT] = { NULL };
 /* currently active backend */
 static ax_backend_id_t active_id = AX_BACKEND_CPU_NAIVE;
 static const ax_backend_ops_t *active_ops = NULL;
+static int compute_initialized = 0;
+
+/* ensure the compute system is ready; called lazily from dispatch macros */
+static void ensure_compute_init(void) {
+    if (compute_initialized) return;
+    ax_compute_init();
+}
 
 ax_status_t ax_compute_init(void) {
     /* register the cpu naive backend — always available */
@@ -21,11 +28,13 @@ ax_status_t ax_compute_init(void) {
     /* select the best available backend (just cpu naive for now) */
     active_id = AX_BACKEND_CPU_NAIVE;
     active_ops = backends[AX_BACKEND_CPU_NAIVE];
+    compute_initialized = 1;
     return AX_OK;
 }
 
 void ax_compute_shutdown(void) {
     active_ops = NULL;
+    compute_initialized = 0;
 }
 
 ax_status_t ax_compute_set_backend(ax_backend_id_t id) {
@@ -64,6 +73,7 @@ ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops
    check that the op is implemented, then call it */
 #define DISPATCH_BINOP(op, a, b, out) \
     do { \
+        ensure_compute_init(); \
         if (!active_ops) { \
             ax_err_set(AX_ERR_BACKEND, "compute not initialized"); \
             return AX_ERR_BACKEND; \
@@ -77,6 +87,7 @@ ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops
 
 #define DISPATCH_UNOP(op, in, out) \
     do { \
+        ensure_compute_init(); \
         if (!active_ops) { \
             ax_err_set(AX_ERR_BACKEND, "compute not initialized"); \
             return AX_ERR_BACKEND; \
@@ -104,12 +115,14 @@ ax_status_t ax_compute_square(const ax_tensor_t *in, ax_tensor_t *out) { DISPATC
 
 /* scalar ops */
 ax_status_t ax_compute_add_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->add_scalar) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "add_scalar not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->add_scalar(in, scalar, out);
 }
 
 ax_status_t ax_compute_mul_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->mul_scalar) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "mul_scalar not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->mul_scalar(in, scalar, out);
@@ -120,24 +133,28 @@ ax_status_t ax_compute_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 
 /* reduction ops */
 ax_status_t ax_compute_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->sum) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "sum not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->sum(in, axis, out);
 }
 
 ax_status_t ax_compute_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->mean) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "mean not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->mean(in, axis, out);
 }
 
 ax_status_t ax_compute_max(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->max_op) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "max not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->max_op(in, axis, out);
 }
 
 ax_status_t ax_compute_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->min_op) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "min not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->min_op(in, axis, out);
@@ -149,12 +166,14 @@ ax_status_t ax_compute_greater(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 
 /* data movement */
 ax_status_t ax_compute_fill(ax_tensor_t *t, double value) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->fill) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "fill not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->fill(t, value);
 }
 
 ax_status_t ax_compute_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
+    ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->copy) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "copy not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
     return active_ops->copy(src, dst);

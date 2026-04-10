@@ -5,12 +5,13 @@
 
 #include "types.h"
 #include "error.h"
+#include <stdatomic.h>
 
 /* ref-counted data buffer shared across tensor views */
 typedef struct {
     void *data;            /* raw data pointer (aligned) */
     size_t size_bytes;     /* total allocated bytes */
-    int refcount;          /* reference count; freed when it hits 0 */
+    atomic_int refcount;   /* atomic reference count; freed when it hits 0 */
     ax_device_t device;    /* where this memory lives */
 } ax_storage_t;
 
@@ -63,7 +64,14 @@ ax_tensor_t *ax_tensor_arange(int64_t start, int64_t end, ax_dtype_t dtype);
 /* create a tensor filled with uniform random values in [low, high) */
 ax_tensor_t *ax_tensor_rand(const int64_t *shape, int ndim, float low, float high);
 
-/* create a scalar tensor (0-dim) */
+/* seed the global RNG used by ax_tensor_rand and weight initializers */
+void ax_set_seed(unsigned int seed);
+
+/* returns true if ax_set_seed has been called (used by init.c to avoid double-seeding) */
+bool ax_rng_is_seeded(void);
+
+/* create a scalar tensor (shape [1], 1-dim).
+   not truly 0-dim since many ops assume ndim >= 1. */
 ax_tensor_t *ax_tensor_scalar(float value);
 
 /* tensor destruction */

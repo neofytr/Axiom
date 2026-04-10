@@ -38,8 +38,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <inttypes.h>
 
 #define TENSOR_MAGIC 0x41585430  /* "AXT0" */
+
+/* max bytes we'll allocate for a single tensor from a file.
+   prevents a crafted file from causing unbounded malloc (DoS).
+   2 GB should cover any reasonable model. */
+#define AX_MAX_TENSOR_BYTES ((size_t)2u * 1024u * 1024u * 1024u)
 
 /* write helpers (little-endian on most platforms we care about;
    for big-endian targets you'd add byte swapping here) */
@@ -122,7 +128,7 @@ static ax_tensor_t *read_tensor(FILE *f)
         /* validate each shape dimension is positive */
         if (shape[i] <= 0) {
             ax_err_set(AX_ERR_INVALID_SHAPE,
-                       "shape[%u] = %ld is non-positive in file", i, shape[i]);
+                       "shape[%u] = %" PRId64 " is non-positive in file", i, shape[i]);
             return NULL;
         }
         /* check for overflow in numel computation */
@@ -137,7 +143,16 @@ static ax_tensor_t *read_tensor(FILE *f)
     size_t elem_size = ax_dtype_size((ax_dtype_t)dtype);
     if (elem_size > 0 && (size_t)numel > SIZE_MAX / elem_size) {
         ax_err_set(AX_ERR_INVALID_SHAPE,
-                   "allocation size overflow: %ld elements * %zu bytes", numel, elem_size);
+                   "allocation size overflow: %" PRId64 " elements * %zu bytes", numel, elem_size);
+        return NULL;
+    }
+
+    /* cap allocation size to prevent DoS from crafted files */
+    size_t total_bytes = (size_t)numel * elem_size;
+    if (total_bytes > AX_MAX_TENSOR_BYTES) {
+        ax_err_set(AX_ERR_INVALID_SHAPE,
+                   "tensor too large for deserialization: %zu bytes (max %zu)",
+                   total_bytes, AX_MAX_TENSOR_BYTES);
         return NULL;
     }
 
@@ -547,7 +562,7 @@ ax_model_t *ax_model_load(const char *path)
                 if (n_existing < 0 || n_loaded < 0 || n_existing != n_loaded)
                 {
                     ax_err_set(AX_ERR_SHAPE_MISMATCH,
-                               "layer %u param %d: expected %ld elements, file has %ld",
+                               "layer %u param %d: expected %" PRId64 " elements, file has %" PRId64,
                                i, p, n_existing, n_loaded);
                     ax_tensor_destroy(loaded);
                     ax_layer_destroy(seq);

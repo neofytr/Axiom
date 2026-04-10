@@ -114,16 +114,20 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_batchnorm_t *bn = (ax_batchnorm_t *)self;
     if (!input || (input->ndim != 2 && input->ndim != 4)) return NULL;
 
-    int64_t batch = input->shape[0];
-    int64_t feat = input->shape[1];
-    int64_t H = (input->ndim == 4) ? input->shape[2] : 1;
-    int64_t W = (input->ndim == 4) ? input->shape[3] : 1;
+    /* ensure contiguous so flat indexing below is correct */
+    ax_tensor_t *inp = ax_ensure_contiguous(input);
+    if (!inp) return NULL;
+
+    int64_t batch = inp->shape[0];
+    int64_t feat = inp->shape[1];
+    int64_t H = (inp->ndim == 4) ? inp->shape[2] : 1;
+    int64_t W = (inp->ndim == 4) ? inp->shape[3] : 1;
     int64_t spatial = H * W;
     float eff_batch = (float)(batch * spatial); /* elements per channel */
-    float *id = (float *)input->storage->data;
+    float *id = (float *)inp->storage->data;
 
-    ax_tensor_t *out = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-    if (!out) return NULL;
+    ax_tensor_t *out = ax_tensor_zeros(inp->shape, inp->ndim, inp->dtype);
+    if (!out) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
     float *od = (float *)out->storage->data;
     float *gd = (float *)bn->gamma->storage->data;
     float *bd = (float *)bn->beta->storage->data;
@@ -214,6 +218,7 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         if (!ctx) {
             ax_tensor_destroy(x_hat_save);
             ax_tensor_destroy(inv_std_save);
+            if (inp != input) ax_tensor_destroy(inp);
             return out;
         }
         ctx->x_hat = x_hat_save;
@@ -221,7 +226,7 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         ctx->bn = bn;
 
         ax_grad_fn_t *gf = ax_grad_fn_create(batchnorm_backward);
-        gf->inputs[0] = input;
+        gf->inputs[0] = input; /* route grad to original (possibly non-contiguous) input */
         gf->n_inputs = 1;
         gf->ctx = ctx;
         gf->ctx_cleanup = bn_ctx_cleanup;
@@ -229,6 +234,7 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         out->grad_fn = gf;
     }
 
+    if (inp != input) ax_tensor_destroy(inp);
     return out;
 }
 
@@ -370,12 +376,16 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_layernorm_t *ln = (ax_layernorm_t *)self;
     if (!input || input->ndim != 2) return NULL;
 
-    int64_t batch = input->shape[0];
-    int64_t feat = input->shape[1];
-    float *id = (float *)input->storage->data;
+    /* ensure contiguous so flat indexing below is correct */
+    ax_tensor_t *inp = ax_ensure_contiguous(input);
+    if (!inp) return NULL;
 
-    ax_tensor_t *out = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-    if (!out) return NULL;
+    int64_t batch = inp->shape[0];
+    int64_t feat = inp->shape[1];
+    float *id = (float *)inp->storage->data;
+
+    ax_tensor_t *out = ax_tensor_zeros(inp->shape, inp->ndim, inp->dtype);
+    if (!out) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
     float *od = (float *)out->storage->data;
     float *gd = (float *)ln->gamma->storage->data;
     float *bd = (float *)ln->beta->storage->data;
@@ -430,6 +440,7 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
         if (!ctx) {
             ax_tensor_destroy(x_hat_save);
             ax_tensor_destroy(inv_std_save);
+            if (inp != input) ax_tensor_destroy(inp);
             return out;
         }
         ctx->x_hat = x_hat_save;
@@ -437,7 +448,7 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
         ctx->ln = ln;
 
         ax_grad_fn_t *gf = ax_grad_fn_create(layernorm_backward);
-        gf->inputs[0] = input;
+        gf->inputs[0] = input; /* route grad to original (possibly non-contiguous) input */
         gf->n_inputs = 1;
         gf->ctx = ctx;
         gf->ctx_cleanup = ln_ctx_cleanup;
@@ -445,6 +456,7 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
         out->grad_fn = gf;
     }
 
+    if (inp != input) ax_tensor_destroy(inp);
     return out;
 }
 

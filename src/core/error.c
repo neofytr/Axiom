@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdatomic.h>
 
 /* per-thread error state */
 typedef struct {
@@ -14,9 +15,10 @@ typedef struct {
 /* thread-local storage for error state */
 static _Thread_local ax_err_state_t tl_err = { AX_OK, "" };
 
-/* global callback — set once, read from any thread */
-static ax_err_callback_t g_callback = NULL;
-static void *g_callback_userdata = NULL;
+/* global callback — atomics ensure visibility across threads.
+   set once during init, read from any thread. */
+static atomic_uintptr_t g_callback = ATOMIC_VAR_INIT(0);
+static atomic_uintptr_t g_callback_userdata = ATOMIC_VAR_INIT(0);
 
 void ax_err_set(ax_status_t status, const char *fmt, ...) {
     tl_err.status = status;
@@ -28,8 +30,10 @@ void ax_err_set(ax_status_t status, const char *fmt, ...) {
     va_end(args);
 
     /* notify callback if registered */
-    if (g_callback) {
-        g_callback(status, tl_err.message, g_callback_userdata);
+    ax_err_callback_t cb = (ax_err_callback_t)atomic_load(&g_callback);
+    if (cb) {
+        void *ud = (void *)atomic_load(&g_callback_userdata);
+        cb(status, tl_err.message, ud);
     }
 }
 
@@ -47,6 +51,6 @@ const char *ax_err_last_message(void) {
 }
 
 void ax_err_set_callback(ax_err_callback_t cb, void *userdata) {
-    g_callback = cb;
-    g_callback_userdata = userdata;
+    atomic_store(&g_callback_userdata, (uintptr_t)userdata);
+    atomic_store(&g_callback, (uintptr_t)cb);
 }

@@ -7,9 +7,10 @@
 #include "axiom/error.h"
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 
-/* global gradient tracking state */
-static bool grad_tracking = true;
+/* thread-local gradient tracking — safe for concurrent inference */
+static _Thread_local bool grad_tracking = true;
 
 void ax_no_grad(void)    { grad_tracking = false; }
 void ax_enable_grad(void){ grad_tracking = true; }
@@ -35,84 +36,119 @@ void ax_zero_grad(ax_tensor_t *t)
 /* we need to collect all nodes in reverse topological order.
    classic approach: dfs with visited set, append on exit.
 
-   keeping it simple with a flat array. for the kinds of graphs
-   we'll be building (hundreds, not millions of nodes), this is fine. */
+   both lists are heap-allocated and grow dynamically to avoid
+   blowing the stack on embedded targets (typical limit: 8-64KB). */
 
-#define MAX_GRAPH_NODES 4096
+#define TOPO_INIT_CAP 4096
 
 typedef struct
 {
-    ax_tensor_t *nodes[MAX_GRAPH_NODES];
+    ax_tensor_t **nodes;
     int count;
+    int capacity;
 } topo_list_t;
 
-/* visited set — just linear scan, it's small */
-static bool in_list(topo_list_t *list, ax_tensor_t *t)
+static bool tl_init(topo_list_t *l)
 {
-    for (int i = 0; i < list->count; i++)
-    {
-        if (list->nodes[i] == t) return true;
-    }
+    l->nodes = (ax_tensor_t **)malloc(TOPO_INIT_CAP * sizeof(ax_tensor_t *));
+    if (!l->nodes) return false;
+    l->count = 0;
+    l->capacity = TOPO_INIT_CAP;
+    return true;
+}
+
+static void tl_free(topo_list_t *l)
+{
+    free(l->nodes);
+    l->nodes = NULL;
+    l->count = l->capacity = 0;
+}
+
+static bool tl_contains(const topo_list_t *l, ax_tensor_t *t)
+{
+    for (int i = 0; i < l->count; i++)
+        if (l->nodes[i] == t) return true;
     return false;
+}
+
+static bool tl_push(topo_list_t *l, ax_tensor_t *t)
+{
+    if (l->count >= l->capacity)
+    {
+        int new_cap = l->capacity * 2;
+        ax_tensor_t **nn = (ax_tensor_t **)realloc(l->nodes,
+                                                    (size_t)new_cap * sizeof(ax_tensor_t *));
+        if (!nn) return false;
+        l->nodes = nn;
+        l->capacity = new_cap;
+    }
+    l->nodes[l->count++] = t;
+    return true;
 }
 
 /* iterative dfs to build reverse topological order.
    avoids stack overflow on deep computation graphs. */
 typedef struct {
     ax_tensor_t *node;
-    int child_idx;  /* next child to visit; -1 means node just pushed */
+    int child_idx;
 } dfs_frame_t;
 
 static void topo_sort_dfs(ax_tensor_t *t, topo_list_t *visited, topo_list_t *order)
 {
     if (!t) return;
 
-    /* explicit stack for iterative DFS */
-    dfs_frame_t stack[MAX_GRAPH_NODES];
+    int stack_cap = TOPO_INIT_CAP;
+    dfs_frame_t *stack = (dfs_frame_t *)malloc((size_t)stack_cap * sizeof(dfs_frame_t));
+    if (!stack) return;
     int stack_top = 0;
 
     stack[stack_top++] = (dfs_frame_t){ .node = t, .child_idx = 0 };
 
     while (stack_top > 0)
     {
-        dfs_frame_t *frame = &stack[stack_top - 1];
-        ax_tensor_t *node = frame->node;
+        ax_tensor_t *node = stack[stack_top - 1].node;
+        int cidx = stack[stack_top - 1].child_idx;
 
-        /* first visit: mark as visited */
-        if (frame->child_idx == 0)
+        if (cidx == 0)
         {
-            if (in_list(visited, node) || visited->count >= MAX_GRAPH_NODES)
-            {
-                stack_top--;
-                continue;
-            }
-            visited->nodes[visited->count++] = node;
+            if (tl_contains(visited, node)) { stack_top--; continue; }
+            if (!tl_push(visited, node))    { stack_top--; continue; }
         }
 
-        /* find next child to visit */
         ax_grad_fn_t *gf = (ax_grad_fn_t *)node->grad_fn;
         int n_children = gf ? gf->n_inputs : 0;
 
-        if (frame->child_idx < n_children)
+        if (cidx < n_children)
         {
-            ax_tensor_t *child = gf->inputs[frame->child_idx];
-            frame->child_idx++;
+            stack[stack_top - 1].child_idx++;
+            ax_tensor_t *child = gf->inputs[cidx];
 
-            if (child && !in_list(visited, child) && stack_top < MAX_GRAPH_NODES)
+            if (child && !tl_contains(visited, child))
             {
+                if (stack_top >= stack_cap)
+                {
+                    int new_cap = stack_cap * 2;
+                    dfs_frame_t *ns = (dfs_frame_t *)realloc(stack,
+                                          (size_t)new_cap * sizeof(dfs_frame_t));
+                    if (!ns)
+                    {
+                        ax_err_set(AX_ERR_ALLOC, "topo_sort_dfs: stack growth failed");
+                        break;
+                    }
+                    stack = ns;
+                    stack_cap = new_cap;
+                }
                 stack[stack_top++] = (dfs_frame_t){ .node = child, .child_idx = 0 };
             }
         }
         else
         {
-            /* all children visited: post-order append */
-            if (order->count < MAX_GRAPH_NODES)
-            {
-                order->nodes[order->count++] = node;
-            }
+            tl_push(order, node);
             stack_top--;
         }
     }
+
+    free(stack);
 }
 
 ax_status_t ax_backward(ax_tensor_t *loss)
@@ -126,7 +162,7 @@ ax_status_t ax_backward(ax_tensor_t *loss)
     if (ax_tensor_numel(loss) != 1)
     {
         ax_err_set(AX_ERR_SHAPE_MISMATCH,
-                   "backward expects scalar loss, got %ld elements",
+                   "backward expects scalar loss, got %" PRId64 " elements",
                    ax_tensor_numel(loss));
         return AX_ERR_SHAPE_MISMATCH;
     }
@@ -147,8 +183,19 @@ ax_status_t ax_backward(ax_tensor_t *loss)
     }
 
     /* build topological order */
-    topo_list_t visited = { .count = 0 };
-    topo_list_t order = { .count = 0 };
+    topo_list_t visited, order;
+    if (!tl_init(&visited))
+    {
+        ax_err_set(AX_ERR_ALLOC, "ax_backward: visited alloc failed");
+        return AX_ERR_ALLOC;
+    }
+    if (!tl_init(&order))
+    {
+        tl_free(&visited);
+        ax_err_set(AX_ERR_ALLOC, "ax_backward: order alloc failed");
+        return AX_ERR_ALLOC;
+    }
+
     topo_sort_dfs(loss, &visited, &order);
 
     /* walk in reverse (from loss toward leaves) and call backward fns */
@@ -163,6 +210,9 @@ ax_status_t ax_backward(ax_tensor_t *loss)
         gf->backward(gf, node->grad);
     }
 
+    tl_free(&visited);
+    tl_free(&order);
+
     return AX_OK;
 }
 
@@ -170,30 +220,64 @@ void ax_graph_cleanup(ax_tensor_t *root)
 {
     if (!root) return;
 
-    /* collect all nodes in the graph */
-    topo_list_t visited = { .count = 0 };
-    topo_list_t order = { .count = 0 };
+    topo_list_t visited, order;
+    if (!tl_init(&visited)) return;
+    if (!tl_init(&order)) { tl_free(&visited); return; }
+
     topo_sort_dfs(root, &visited, &order);
 
-    /* destroy non-leaf intermediate nodes. skip the root tensor
-       since the caller still holds a reference and will destroy it.
-       a leaf has no grad_fn (parameters, user-created tensors). */
+    /* for every non-leaf node: run ctx_cleanup (if backward never ran),
+       free saved_owned tensors (most backward fns leave these alive),
+       free the grad_fn struct, then destroy the intermediate tensor.
+       leaf nodes (no grad_fn) are parameters — leave them alone.
+       the root is skipped here and handled below (caller destroys it). */
     for (int i = 0; i < order.count; i++)
     {
         ax_tensor_t *node = order.nodes[i];
-        if (node != root && node->grad_fn)
+        if (node == root || !node->grad_fn) continue;
+
+        ax_grad_fn_t *gf = (ax_grad_fn_t *)node->grad_fn;
+        if (gf->ctx && gf->ctx_cleanup)
         {
-            ax_tensor_destroy(node);
+            gf->ctx_cleanup(gf->ctx);
+            gf->ctx = NULL;
         }
+        for (int j = 0; j < gf->n_saved; j++)
+        {
+            if (gf->saved_owned[j] && gf->saved[j])
+            {
+                ax_tensor_destroy(gf->saved[j]);
+                gf->saved[j] = NULL;
+            }
+        }
+        free(gf);
+        node->grad_fn = NULL;
+        ax_tensor_destroy(node);
     }
 
-    /* detach root from the graph so it can be destroyed safely
-       without walking into freed memory */
+    /* detach root from the graph without destroying it — caller owns it */
     if (root->grad_fn)
     {
-        free(root->grad_fn);
+        ax_grad_fn_t *gf = (ax_grad_fn_t *)root->grad_fn;
+        if (gf->ctx && gf->ctx_cleanup)
+        {
+            gf->ctx_cleanup(gf->ctx);
+            gf->ctx = NULL;
+        }
+        for (int i = 0; i < gf->n_saved; i++)
+        {
+            if (gf->saved_owned[i] && gf->saved[i])
+            {
+                ax_tensor_destroy(gf->saved[i]);
+                gf->saved[i] = NULL;
+            }
+        }
+        free(gf);
         root->grad_fn = NULL;
     }
+
+    tl_free(&visited);
+    tl_free(&order);
 }
 
 /* gradient checking utility: compare analytical vs numerical gradient.
@@ -242,7 +326,6 @@ double ax_grad_check(
         double numerical = (double)(f_plus - f_minus) / (2.0 * eps);
 
         /* analytical gradient from backward */
-        /* flat index into grad tensor */
         int64_t remaining = i;
         int64_t indices[AX_MAX_DIMS];
         for (int d = input->ndim - 1; d >= 0; d--)
@@ -260,6 +343,7 @@ double ax_grad_check(
         ax_tensor_destroy(loss_minus);
     }
 
+    ax_graph_cleanup(loss);
     ax_tensor_destroy(loss);
     return max_diff;
 }

@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <inttypes.h>
 #include <float.h>
 
 /* compute output spatial dimension.
@@ -55,7 +56,7 @@ ax_tensor_t *ax_im2col(ax_tensor_t *input, int kh, int kw,
     int64_t out_w = conv_out_dim(W, kw, stride_w, pad_w);
     if (out_h <= 0 || out_w <= 0)
     {
-        ax_err_set(AX_ERR_INVALID_SHAPE, "im2col: invalid output dimensions %ld x %ld", out_h, out_w);
+        ax_err_set(AX_ERR_INVALID_SHAPE, "im2col: invalid output dimensions %" PRId64 " x %" PRId64, out_h, out_w);
         return NULL;
     }
 
@@ -115,7 +116,7 @@ ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
     int64_t out_w = conv_out_dim(width, kw, stride_w, pad_w);
     if (out_h <= 0 || out_w <= 0)
     {
-        ax_err_set(AX_ERR_INVALID_SHAPE, "col2im: invalid output dimensions %ld x %ld", out_h, out_w);
+        ax_err_set(AX_ERR_INVALID_SHAPE, "col2im: invalid output dimensions %" PRId64 " x %" PRId64, out_h, out_w);
         return NULL;
     }
 
@@ -160,13 +161,14 @@ ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
 static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_conv2d_t *conv = (ax_conv2d_t *)self->ctx;
-    ax_tensor_t *input = self->saved[0];
+    ax_tensor_t *input_orig = self->inputs[0]; /* original — for grad accumulation */
+    ax_tensor_t *input_data = self->saved[0];  /* contiguous — for data access */
     ax_tensor_t *weight = conv->weight;
 
-    int64_t N = input->shape[0];
-    int64_t C_in = input->shape[1];
-    int64_t H = input->shape[2];
-    int64_t W = input->shape[3];
+    int64_t N = input_data->shape[0];
+    int64_t C_in = input_data->shape[1];
+    int64_t H = input_data->shape[2];
+    int64_t W = input_data->shape[3];
     int64_t C_out = weight->shape[0];
     int kh = conv->kernel_h, kw = conv->kernel_w;
     int sh = conv->stride_h, sw = conv->stride_w;
@@ -182,10 +184,10 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         if (!weight->grad)
             weight->grad = ax_tensor_zeros(weight->shape, weight->ndim, weight->dtype);
     }
-    if (input->requires_grad)
+    if (input_orig->requires_grad)
     {
-        if (!input->grad)
-            input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+        if (!input_orig->grad)
+            input_orig->grad = ax_tensor_zeros(input_orig->shape, input_orig->ndim, input_orig->dtype);
     }
 
     /* bias gradient: sum grad_out over N, H, W */
@@ -208,12 +210,12 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     for (int64_t n = 0; n < N; n++)
     {
-        /* extract single image from input: [C_in, H, W] */
+        /* extract single image from contiguous input_data: [C_in, H, W] */
         int64_t img_shape[] = {C_in, H, W};
         ax_tensor_t *img_view = ax_tensor_create(img_shape, 3, AX_FLOAT32);
         if (!img_view) continue;
         float *ivd = (float *)img_view->storage->data;
-        float *ind = (float *)input->storage->data;
+        float *ind = (float *)input_data->storage->data;
         memcpy(ivd, ind + n * C_in * H * W, C_in * H * W * sizeof(float));
 
         ax_tensor_t *col = ax_im2col(img_view, kh, kw, sh, sw, ph, pw);
@@ -246,11 +248,10 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         }
 
         /* input gradient: dcol = W^T @ grad_out_mat, then col2im
-           W reshaped: [C_out, C_in*kh*kw]
-           W^T: [C_in*kh*kw, C_out]
-           grad_out_mat: [C_out, out_h*out_w]
-           dcol: [C_in*kh*kw, out_h*out_w] */
-        if (input->requires_grad)
+           W reshaped: [C_out, C_in*kh*kw], W^T: [C_in*kh*kw, C_out]
+           grad_out_mat: [C_out, out_h*out_w], dcol: [C_in*kh*kw, out_h*out_w]
+           accumulated into input_orig->grad (flat-indexed; grad is freshly-allocated contiguous) */
+        if (input_orig->requires_grad)
         {
             int64_t K = C_in * kh * kw;
             int64_t M = out_h * out_w;
@@ -264,7 +265,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                         dd[k * M + m] += wdata[co * K + k] * god[co * M + m];
 
             ax_tensor_t *dimg = ax_col2im(dcol, C_in, H, W, kh, kw, sh, sw, ph, pw);
-            float *ig = (float *)input->grad->storage->data;
+            float *ig = (float *)input_orig->grad->storage->data;
             float *dg = (float *)dimg->storage->data;
             for (int64_t i = 0; i < C_in * H * W; i++)
                 ig[n * C_in * H * W + i] += dg[i];
@@ -289,10 +290,14 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         return NULL;
     }
 
-    int64_t N = input->shape[0];
-    int64_t C_in = input->shape[1];
-    int64_t H = input->shape[2];
-    int64_t W = input->shape[3];
+    /* ensure contiguous so memcpy-based im2col below works correctly */
+    ax_tensor_t *inp = ax_ensure_contiguous(input);
+    if (!inp) return NULL;
+
+    int64_t N = inp->shape[0];
+    int64_t C_in = inp->shape[1];
+    int64_t H = inp->shape[2];
+    int64_t W = inp->shape[3];
     int64_t C_out = conv->out_channels;
     int kh = conv->kernel_h, kw = conv->kernel_w;
     int sh = conv->stride_h, sw = conv->stride_w;
@@ -302,7 +307,7 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     int64_t out_w = conv_out_dim(W, kw, sw, pw);
     if (out_h <= 0 || out_w <= 0)
     {
-        ax_err_set(AX_ERR_INVALID_SHAPE, "conv2d: invalid output dimensions %ld x %ld", out_h, out_w);
+        ax_err_set(AX_ERR_INVALID_SHAPE, "conv2d: invalid output dimensions %" PRId64 " x %" PRId64, out_h, out_w);
         return NULL;
     }
 
@@ -311,19 +316,19 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
 
     int64_t out_shape[] = {N, C_out, out_h, out_w};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
-    if (!output) return NULL;
+    if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
 
     float *od = (float *)output->storage->data;
     float *wd = (float *)conv->weight->storage->data;
 
     for (int64_t n = 0; n < N; n++)
     {
-        /* extract single image: [C_in, H, W] */
+        /* extract single image from contiguous inp: [C_in, H, W] */
         int64_t img_shape[] = {C_in, H, W};
         ax_tensor_t *img = ax_tensor_create(img_shape, 3, AX_FLOAT32);
-        if (!img) { ax_tensor_destroy(output); return NULL; }
+        if (!img) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
         float *imgd = (float *)img->storage->data;
-        float *ind = (float *)input->storage->data;
+        float *ind = (float *)inp->storage->data;
         memcpy(imgd, ind + n * C_in * H * W, C_in * H * W * sizeof(float));
 
         /* im2col: [C_in*kh*kw, out_h*out_w] */
@@ -361,12 +366,17 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     {
         output->requires_grad = true;
         ax_grad_fn_t *gf = ax_grad_fn_create(conv2d_backward);
-        gf->inputs[0] = input;
+        gf->inputs[0] = input;           /* original — for grad routing */
         gf->n_inputs = 1;
-        gf->saved[0] = input;
+        gf->saved[0] = inp;              /* contiguous — for data access in backward */
+        gf->saved_owned[0] = (inp != input);
         gf->n_saved = 1;
         gf->ctx = conv;
         output->grad_fn = gf;
+    }
+    else
+    {
+        if (inp != input) ax_tensor_destroy(inp);
     }
 
     return output;
@@ -482,22 +492,26 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         return NULL;
     }
 
-    int64_t N = input->shape[0];
-    int64_t C = input->shape[1];
-    int64_t H = input->shape[2];
-    int64_t W = input->shape[3];
+    ax_tensor_t *inp = ax_ensure_contiguous(input);
+    if (!inp) return NULL;
+
+    int64_t N = inp->shape[0];
+    int64_t C = inp->shape[1];
+    int64_t H = inp->shape[2];
+    int64_t W = inp->shape[3];
     int k = pool->kernel_size, s = pool->stride, p = pool->padding;
     int64_t oh = conv_out_dim(H, k, s, p);
     int64_t ow = conv_out_dim(W, k, s, p);
     if (oh <= 0 || ow <= 0)
     {
         ax_err_set(AX_ERR_INVALID_SHAPE, "maxpool2d: invalid output dimensions");
+        if (inp != input) ax_tensor_destroy(inp);
         return NULL;
     }
 
     int64_t out_shape[] = {N, C, oh, ow};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
-    if (!output) return NULL;
+    if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
 
     bool record = ax_grad_enabled() && input->requires_grad;
     ax_tensor_t *indices = NULL;
@@ -508,7 +522,7 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         else idxd = (float *)indices->storage->data;
     }
 
-    float *id = (float *)input->storage->data;
+    float *id = (float *)inp->storage->data;
     float *od = (float *)output->storage->data;
 
     for (int64_t n = 0; n < N; n++)
@@ -542,6 +556,8 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
             }
         }
     }
+
+    if (inp != input) ax_tensor_destroy(inp);
 
     if (record) {
         pool_ctx_t *ctx = malloc(sizeof(pool_ctx_t));
@@ -632,22 +648,26 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
 
     if (input->ndim != 4) return NULL;
 
-    int64_t N = input->shape[0], C = input->shape[1];
-    int64_t H = input->shape[2], W = input->shape[3];
+    ax_tensor_t *inp = ax_ensure_contiguous(input);
+    if (!inp) return NULL;
+
+    int64_t N = inp->shape[0], C = inp->shape[1];
+    int64_t H = inp->shape[2], W = inp->shape[3];
     int k = pool->kernel_size, s = pool->stride, p = pool->padding;
     int64_t oh = conv_out_dim(H, k, s, p);
     int64_t ow = conv_out_dim(W, k, s, p);
     if (oh <= 0 || ow <= 0)
     {
         ax_err_set(AX_ERR_INVALID_SHAPE, "avgpool2d: invalid output dimensions");
+        if (inp != input) ax_tensor_destroy(inp);
         return NULL;
     }
 
     int64_t out_shape[] = {N, C, oh, ow};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
-    if (!output) return NULL;
+    if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
 
-    float *id = (float *)input->storage->data;
+    float *id = (float *)inp->storage->data;
     float *od = (float *)output->storage->data;
 
     for (int64_t n = 0; n < N; n++)
@@ -679,6 +699,8 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         }
     }
 
+    if (inp != input) ax_tensor_destroy(inp);
+
     if (ax_grad_enabled() && input->requires_grad) {
         pool_ctx_t *ctx = malloc(sizeof(pool_ctx_t));
         if (ctx) {
@@ -689,7 +711,7 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
             gf->inputs[0] = input;
             gf->n_inputs = 1;
             gf->ctx = ctx;
-        gf->ctx_cleanup = (void(*)(void*))free;
+            gf->ctx_cleanup = (void(*)(void*))free;
             output->requires_grad = true;
             output->grad_fn = gf;
         }
@@ -749,15 +771,18 @@ static ax_tensor_t *global_avgpool_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     if (input->ndim != 4) return NULL;
 
-    int64_t N = input->shape[0], C = input->shape[1];
-    int64_t H = input->shape[2], W = input->shape[3];
+    ax_tensor_t *inp = ax_ensure_contiguous(input);
+    if (!inp) return NULL;
+
+    int64_t N = inp->shape[0], C = inp->shape[1];
+    int64_t H = inp->shape[2], W = inp->shape[3];
     int64_t spatial = H * W;
 
     int64_t out_shape[] = {N, C};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 2, AX_FLOAT32);
-    if (!output) return NULL;
+    if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
 
-    float *id = (float *)input->storage->data;
+    float *id = (float *)inp->storage->data;
     float *od = (float *)output->storage->data;
 
     for (int64_t n = 0; n < N; n++)
@@ -771,6 +796,8 @@ static ax_tensor_t *global_avgpool_forward(ax_layer_t *self, ax_tensor_t *input)
         }
     }
 
+    if (inp != input) ax_tensor_destroy(inp);
+
     if (ax_grad_enabled() && input->requires_grad) {
         gap_ctx_t *ctx = malloc(sizeof(gap_ctx_t));
         if (ctx) {
@@ -780,7 +807,7 @@ static ax_tensor_t *global_avgpool_forward(ax_layer_t *self, ax_tensor_t *input)
             gf->inputs[0] = input;
             gf->n_inputs = 1;
             gf->ctx = ctx;
-        gf->ctx_cleanup = (void(*)(void*))free;
+            gf->ctx_cleanup = (void(*)(void*))free;
             output->requires_grad = true;
             output->grad_fn = gf;
         }

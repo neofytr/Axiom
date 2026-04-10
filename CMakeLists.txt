@@ -108,6 +108,9 @@ endforeach()
 add_executable(example_xor examples/xor.c)
 target_link_libraries(example_xor PRIVATE axiom_static)
 
+add_executable(example_mnist examples/mnist.c)
+target_link_libraries(example_mnist PRIVATE axiom_static)
+
 # convenience target: run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure

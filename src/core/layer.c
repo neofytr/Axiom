@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <inttypes.h>
 
 /* layer type names for printing */
 static const char *layer_type_name(ax_layer_type_t type)
@@ -357,7 +358,7 @@ void ax_layer_summary(ax_layer_t *layer)
     if (layer->type == AX_LAYER_SEQUENTIAL)
     {
         ax_sequential_t *seq = (ax_sequential_t *)layer;
-        printf("Sequential model (%d layers, %ld params)\n",
+        printf("Sequential model (%d layers, %" PRId64 " params)\n",
                seq->n_layers, ax_layer_param_count(layer));
         printf("%-4s %-14s %-20s %s\n", "#", "type", "shape", "params");
 
@@ -368,25 +369,25 @@ void ax_layer_summary(ax_layer_t *layer)
 
             if (l->type == AX_LAYER_DENSE)
             {
-                printf("%-4d %-14s (%ld, %ld) -> (%ld, %ld)     %ld\n",
+                printf("%-4d %-14s (?, %" PRId64 ") -> (?, %" PRId64 ")     %" PRId64 "\n",
                        i, layer_type_name(l->type),
-                       (long)-1, l->input_features,
-                       (long)-1, l->output_features,
+                       l->input_features,
+                       l->output_features,
                        pc);
             }
             else
             {
-                printf("%-4d %-14s                         %ld\n",
+                printf("%-4d %-14s                         %" PRId64 "\n",
                        i, layer_type_name(l->type), pc);
             }
         }
 
-        printf("total params: %ld\n", ax_layer_param_count(layer));
+        printf("total params: %" PRId64 "\n", ax_layer_param_count(layer));
         return;
     }
 
     /* single layer */
-    printf("%s: %ld params\n", layer_type_name(layer->type),
+    printf("%s: %" PRId64 " params\n", layer_type_name(layer->type),
            ax_layer_param_count(layer));
 }
 
