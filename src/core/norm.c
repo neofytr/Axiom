@@ -158,27 +158,30 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
 
         for (int64_t c = 0; c < feat; c++)
         {
-            /* compute mean over N*H*W elements for channel c */
-            float sum = 0;
-            for (int64_t n = 0; n < batch; n++)
-                for (int64_t s = 0; s < spatial; s++)
-                    sum += id[n * feat * spatial + c * spatial + s];
-            float mean = sum / eff_batch;
-
-            /* compute variance */
-            float var_sum = 0;
+            /* pass 1: welford's online mean + variance in a single scan.
+               numerically stable — no catastrophic cancellation from large values. */
+            double w_mean = 0.0;
+            double m2 = 0.0;
+            int64_t count = 0;
             for (int64_t n = 0; n < batch; n++)
                 for (int64_t s = 0; s < spatial; s++)
                 {
-                    float d = id[n * feat * spatial + c * spatial + s] - mean;
-                    var_sum += d * d;
+                    count++;
+                    double x = (double)id[n * feat * spatial + c * spatial + s];
+                    double delta = x - w_mean;
+                    w_mean += delta / (double)count;
+                    double delta2 = x - w_mean;
+                    m2 += delta * delta2;
                 }
-            float var = var_sum / eff_batch;
+
+            float mean = (float)w_mean;
+            float var = (count > 0) ? (float)(m2 / (double)count) : 0.0f;
+            float var_sum = (float)m2; /* for bessel correction */
             float inv_std = 1.0f / sqrtf(var + bn->eps);
 
             if (record) is_d[c] = inv_std;
 
-            /* normalize and apply affine */
+            /* pass 2: normalize and apply affine */
             for (int64_t n = 0; n < batch; n++)
                 for (int64_t s = 0; s < spatial; s++)
                 {
@@ -189,9 +192,6 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
                 }
 
             rm[c] = (1.0f - bn->momentum) * rm[c] + bn->momentum * mean;
-            /* use unbiased variance (Bessel's correction) for the running estimate,
-               matching PyTorch/standard BatchNorm behavior. the biased var is used
-               for the actual normalization above, but the running stat should be unbiased. */
             int64_t eff_count = batch * spatial;
             float unbiased_var = (eff_count > 1) ? var_sum / (float)(eff_count - 1) : var;
             rv[c] = (1.0f - bn->momentum) * rv[c] + bn->momentum * unbiased_var;
@@ -411,22 +411,23 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
 
     for (int64_t b = 0; b < batch; b++)
     {
-        float sum = 0;
-        for (int64_t f = 0; f < feat; f++)
-            sum += id[b * feat + f];
-        float mean = sum / (float)feat;
-
-        float var_sum = 0;
+        /* pass 1: welford's online mean + variance */
+        double w_mean = 0.0, m2 = 0.0;
         for (int64_t f = 0; f < feat; f++)
         {
-            float d = id[b * feat + f] - mean;
-            var_sum += d * d;
+            double x = (double)id[b * feat + f];
+            double delta = x - w_mean;
+            w_mean += delta / (double)(f + 1);
+            double delta2 = x - w_mean;
+            m2 += delta * delta2;
         }
-        float var = var_sum / (float)feat;
+        float mean = (float)w_mean;
+        float var = (feat > 0) ? (float)(m2 / (double)feat) : 0.0f;
         float inv_std = 1.0f / sqrtf(var + ln->eps);
 
         if (record) is_d[b] = inv_std;
 
+        /* pass 2: normalize and apply affine */
         for (int64_t f = 0; f < feat; f++)
         {
             float x_hat = (id[b * feat + f] - mean) * inv_std;
