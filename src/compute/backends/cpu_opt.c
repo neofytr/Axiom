@@ -156,13 +156,14 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
 
 /* tiled gemm: cache-blocked with packing for L2 reuse.
    tile sizes tuned for typical desktop L2 (256 KB).
-   MR x NR micro-kernel accumulates in registers. */
+   MR x NR micro-kernel accumulates in registers.
+   NR matches SIMD width for vectorized inner loop. */
 
 #define GEMM_MC 64     /* rows of A panel */
 #define GEMM_NC 256    /* cols of B panel */
 #define GEMM_KC 256    /* depth of both panels */
-#define GEMM_MR 4      /* micro-kernel row block */
-#define GEMM_NR 4      /* micro-kernel col block */
+#define GEMM_MR 8      /* micro-kernel row block */
+#define GEMM_NR AX_VF32_WIDTH  /* micro-kernel col block = SIMD width */
 
 /* pack a MC x KC panel of A (row-major) into contiguous MR-row strips.
    edge rows beyond actual m are zero-padded. */
@@ -203,29 +204,39 @@ static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
 }
 
 /* MR x NR micro-kernel: C[MR,NR] += A_packed[MR,kc] * B_packed[kc,NR].
-   A_packed is MR-strided, B_packed is NR-strided. */
+   A_packed is MR-strided, B_packed is NR-strided.
+   uses SIMD: each accumulator row is one ax_vf32 (NR = SIMD width). */
 static void micro_kernel(int64_t kc, const float *ap, const float *bp,
                           float *c, int64_t ldc, int64_t mr, int64_t nr)
 {
-    /* register accumulators */
-    float acc[GEMM_MR * GEMM_NR];
-    memset(acc, 0, sizeof(acc));
+    /* MR accumulator vectors, each NR-wide */
+    ax_vf32 acc[GEMM_MR];
+    for (int ii = 0; ii < GEMM_MR; ii++) acc[ii] = ax_vf32_zero();
 
     for (int64_t p = 0; p < kc; p++) {
+        ax_vf32 bv = ax_vf32_load(bp);
         for (int ii = 0; ii < GEMM_MR; ii++) {
-            float a_val = ap[ii];
-            for (int jj = 0; jj < GEMM_NR; jj++) {
-                acc[ii * GEMM_NR + jj] += a_val * bp[jj];
-            }
+            ax_vf32 av = ax_vf32_set1(ap[ii]);
+            acc[ii] = ax_vf32_fmadd(av, bv, acc[ii]);
         }
         ap += GEMM_MR;
         bp += GEMM_NR;
     }
 
     /* write back only valid elements (edge safety) */
-    for (int64_t ii = 0; ii < mr; ii++) {
-        for (int64_t jj = 0; jj < nr; jj++) {
-            c[ii * ldc + jj] += acc[ii * GEMM_NR + jj];
+    if (nr == GEMM_NR) {
+        /* full NR tile — SIMD store */
+        for (int64_t ii = 0; ii < mr; ii++) {
+            ax_vf32 existing = ax_vf32_load(c + ii * ldc);
+            ax_vf32_store(c + ii * ldc, ax_vf32_add(existing, acc[ii]));
+        }
+    } else {
+        /* edge tile — scalar writeback via unaligned store to stack, no OOB writes */
+        for (int64_t ii = 0; ii < mr; ii++) {
+            float tmp[AX_VF32_WIDTH] __attribute__((aligned(64)));
+            ax_vf32_store(tmp, acc[ii]);
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += tmp[jj];
         }
     }
 }
