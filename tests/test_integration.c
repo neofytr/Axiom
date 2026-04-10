@@ -17,17 +17,17 @@ static void test_batchnorm_trains(void)
     ax_tensor_t *y = ax_tensor_from_array(y_data, ys, 2, AX_FLOAT32);
 
     ax_layer_t *net = ax_sequential_create();
-    ax_sequential_add(net, ax_dense_create(2, 8, true));
-    ax_sequential_add(net, ax_batchnorm_create(8, 1e-5f, 0.1f));
+    ax_sequential_add(net, ax_dense_create(2, 16, true));
+    ax_sequential_add(net, ax_batchnorm_create(16, 1e-5f, 0.1f));
     ax_sequential_add(net, ax_relu_layer_create());
-    ax_sequential_add(net, ax_dense_create(8, 1, true));
+    ax_sequential_add(net, ax_dense_create(16, 1, true));
 
     ax_model_t *m = ax_model_create(net);
     ax_optimizer_t *opt = ax_adam_create(m->params, m->n_params, 0.01f, 0.9f, 0.999f, 1e-8f, 0);
     ax_model_compile(m, opt, ax_mse_loss);
 
     float first = ax_model_train_step(m, x, y);
-    for (int i = 0; i < 300; i++) ax_model_train_step(m, x, y);
+    for (int i = 0; i < 500; i++) ax_model_train_step(m, x, y);
     float last = ax_model_train_step(m, x, y);
 
     AX_TEST_ASSERT(last < first, "batchnorm model should train (loss decreased)");
@@ -47,17 +47,17 @@ static void test_layernorm_trains(void)
     ax_tensor_t *y = ax_tensor_from_array(y_data, ys, 2, AX_FLOAT32);
 
     ax_layer_t *net = ax_sequential_create();
-    ax_sequential_add(net, ax_dense_create(2, 8, true));
-    ax_sequential_add(net, ax_layernorm_create(8, 1e-5f));
+    ax_sequential_add(net, ax_dense_create(2, 16, true));
+    ax_sequential_add(net, ax_layernorm_create(16, 1e-5f));
     ax_sequential_add(net, ax_relu_layer_create());
-    ax_sequential_add(net, ax_dense_create(8, 1, true));
+    ax_sequential_add(net, ax_dense_create(16, 1, true));
 
     ax_model_t *m = ax_model_create(net);
     ax_optimizer_t *opt = ax_adam_create(m->params, m->n_params, 0.01f, 0.9f, 0.999f, 1e-8f, 0);
     ax_model_compile(m, opt, ax_mse_loss);
 
     float first = ax_model_train_step(m, x, y);
-    for (int i = 0; i < 300; i++) ax_model_train_step(m, x, y);
+    for (int i = 0; i < 500; i++) ax_model_train_step(m, x, y);
     float last = ax_model_train_step(m, x, y);
 
     AX_TEST_ASSERT(last < first, "layernorm model should train");

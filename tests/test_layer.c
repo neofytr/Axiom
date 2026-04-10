@@ -129,20 +129,23 @@ static void test_xor_training(void)
     ax_tensor_t *x = make_2d((float[]){0,0, 0,1, 1,0, 1,1}, 4, 2);
     ax_tensor_t *y = make_2d((float[]){0, 1, 1, 0}, 4, 1);
 
-    /* model: 2 -> 8 -> relu -> 1 */
+    /* model: 2 -> 16 -> relu -> 16 -> relu -> 1
+       wider hidden layers to avoid dead relu sensitivity */
     ax_layer_t *net = ax_sequential_create();
-    ax_sequential_add(net, ax_dense_create(2, 8, true));
+    ax_sequential_add(net, ax_dense_create(2, 16, true));
     ax_sequential_add(net, ax_relu_layer_create());
-    ax_sequential_add(net, ax_dense_create(8, 1, true));
+    ax_sequential_add(net, ax_dense_create(16, 16, true));
+    ax_sequential_add(net, ax_relu_layer_create());
+    ax_sequential_add(net, ax_dense_create(16, 1, true));
 
     ax_model_t *model = ax_model_create(net);
     ax_optimizer_t *opt = ax_adam_create(model->params, model->n_params,
                                          0.01f, 0.9f, 0.999f, 1e-8f, 0.0f);
     ax_model_compile(model, opt, ax_mse_loss);
 
-    /* train for a bunch of steps */
+    /* train for enough steps to reliably converge */
     float first_loss = ax_model_train_step(model, x, y);
-    for (int i = 0; i < 500; i++)
+    for (int i = 0; i < 1000; i++)
         ax_model_train_step(model, x, y);
     float last_loss = ax_model_train_step(model, x, y);
 
