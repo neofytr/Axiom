@@ -125,6 +125,12 @@ target_link_libraries(example_spiral PRIVATE axiom_static)
 add_executable(example_regression examples/regression.c)
 target_link_libraries(example_regression PRIVATE axiom_static)
 
+add_executable(bench_backend examples/bench_backend.c)
+target_link_libraries(bench_backend PRIVATE axiom_static)
+
+add_executable(mnist_cnn examples/mnist_cnn.c)
+target_link_libraries(mnist_cnn PRIVATE axiom_static)
+
 # convenience target: run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure

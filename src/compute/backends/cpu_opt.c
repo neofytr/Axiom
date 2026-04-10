@@ -248,11 +248,11 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
         bp += GEMM_NR;
     }
 
-    /* writeback: full tile uses aligned store, edge uses scalar */
+    /* writeback: C matrix may not be aligned at tile boundaries, use unaligned ops */
     if (mr == GEMM_MR && nr == GEMM_NR) {
         #define STORE_ROW(row, lo, hi) \
-            _mm256_store_ps(c + (row)*ldc,     _mm256_add_ps(lo, _mm256_load_ps(c + (row)*ldc))); \
-            _mm256_store_ps(c + (row)*ldc + 8, _mm256_add_ps(hi, _mm256_load_ps(c + (row)*ldc + 8)));
+            _mm256_storeu_ps(c + (row)*ldc,     _mm256_add_ps(lo, _mm256_loadu_ps(c + (row)*ldc))); \
+            _mm256_storeu_ps(c + (row)*ldc + 8, _mm256_add_ps(hi, _mm256_loadu_ps(c + (row)*ldc + 8)));
         STORE_ROW(0, c00, c01); STORE_ROW(1, c10, c11);
         STORE_ROW(2, c20, c21); STORE_ROW(3, c30, c31);
         STORE_ROW(4, c40, c41); STORE_ROW(5, c50, c51);
@@ -299,12 +299,12 @@ static void micro_kernel(int64_t kc, const float *ap, const float *bp,
         bp += GEMM_NR;
     }
 
-    /* writeback */
+    /* writeback: C may not be aligned at tile boundaries */
     if (mr == GEMM_MR && nr == GEMM_NR) {
         for (int ii = 0; ii < GEMM_MR; ii++)
             for (int v = 0; v < NVEC; v++) {
                 float *cp = c + ii * ldc + v * AX_VF32_WIDTH;
-                ax_vf32_store(cp, ax_vf32_add(ax_vf32_load(cp), acc[ii][v]));
+                ax_vf32_storeu(cp, ax_vf32_add(ax_vf32_loadu(cp), acc[ii][v]));
             }
     } else {
         float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
