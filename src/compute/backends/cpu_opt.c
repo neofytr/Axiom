@@ -153,8 +153,81 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
 }
 
 
-/* gemm: contiguous fast path with stride-free inner loop.
-   falls back to naive for strided inputs. tiling added in phase 1. */
+/* tiled gemm: cache-blocked with packing for L2 reuse.
+   tile sizes tuned for typical desktop L2 (256 KB).
+   MR x NR micro-kernel accumulates in registers. */
+
+#define GEMM_MC 64     /* rows of A panel */
+#define GEMM_NC 256    /* cols of B panel */
+#define GEMM_KC 256    /* depth of both panels */
+#define GEMM_MR 4      /* micro-kernel row block */
+#define GEMM_NR 4      /* micro-kernel col block */
+
+/* pack a MC x KC panel of A (row-major) into contiguous MR-row strips.
+   edge rows beyond actual m are zero-padded. */
+static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
+                    int64_t m_remain, float *packed)
+{
+    for (int64_t i = 0; i < mc; i += GEMM_MR) {
+        int64_t mr = (i + GEMM_MR <= m_remain) ? GEMM_MR : (m_remain > i ? m_remain - i : 0);
+        for (int64_t p = 0; p < kc; p++) {
+            for (int64_t ii = 0; ii < GEMM_MR; ii++) {
+                if (ii < mr)
+                    packed[ii] = a[(i + ii) * lda + p];
+                else
+                    packed[ii] = 0.0f;  /* zero-pad edge */
+            }
+            packed += GEMM_MR;
+        }
+    }
+}
+
+/* pack a KC x NC panel of B (row-major) into contiguous NR-col strips.
+   edge cols beyond actual n are zero-padded. */
+static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
+                    int64_t n_remain, float *packed)
+{
+    for (int64_t j = 0; j < nc; j += GEMM_NR) {
+        int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
+        for (int64_t p = 0; p < kc; p++) {
+            for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                if (jj < nr)
+                    packed[jj] = b[p * ldb + (j + jj)];
+                else
+                    packed[jj] = 0.0f;
+            }
+            packed += GEMM_NR;
+        }
+    }
+}
+
+/* MR x NR micro-kernel: C[MR,NR] += A_packed[MR,kc] * B_packed[kc,NR].
+   A_packed is MR-strided, B_packed is NR-strided. */
+static void micro_kernel(int64_t kc, const float *ap, const float *bp,
+                          float *c, int64_t ldc, int64_t mr, int64_t nr)
+{
+    /* register accumulators */
+    float acc[GEMM_MR * GEMM_NR];
+    memset(acc, 0, sizeof(acc));
+
+    for (int64_t p = 0; p < kc; p++) {
+        for (int ii = 0; ii < GEMM_MR; ii++) {
+            float a_val = ap[ii];
+            for (int jj = 0; jj < GEMM_NR; jj++) {
+                acc[ii * GEMM_NR + jj] += a_val * bp[jj];
+            }
+        }
+        ap += GEMM_MR;
+        bp += GEMM_NR;
+    }
+
+    /* write back only valid elements (edge safety) */
+    for (int64_t ii = 0; ii < mr; ii++) {
+        for (int64_t jj = 0; jj < nr; jj++) {
+            c[ii * ldc + jj] += acc[ii * GEMM_NR + jj];
+        }
+    }
+}
 
 static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
     if (a->dtype != AX_FLOAT32) {
@@ -171,32 +244,90 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         return ax_cpu_naive_ops.gemm(a, b, out);
     }
 
-    /* check all three are contiguous */
     int64_t na = validate_contig_f32(a);
     int64_t nb = validate_contig_f32(b);
-    int64_t no = validate_contig_f32(out);
-    if (na < 0 || nb < 0 || no < 0) {
+    int64_t no_v = validate_contig_f32(out);
+    if (na < 0 || nb < 0 || no_v < 0) {
+        return ax_cpu_naive_ops.gemm(a, b, out);
+    }
+
+    /* for very small matrices, use simple loop (tiling overhead not worth it) */
+    if (m * n * k < 4096) {
+        const float *ad = raw_f32(a);
+        const float *bd = raw_f32(b);
+        float *od = raw_f32(out);
+        memset(od, 0, (size_t)(m * n) * sizeof(float));
+        for (int64_t i = 0; i < m; i++)
+            for (int64_t p = 0; p < k; p++) {
+                float a_ip = ad[i * k + p];
+                for (int64_t j = 0; j < n; j++)
+                    od[i * n + j] += a_ip * bd[p * n + j];
+            }
+        return AX_OK;
+    }
+
+    /* round up tile counts for packing */
+    int64_t mc_padded = ((m + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+    int64_t nc_padded = ((n + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+    /* checked scratch allocation — bounded by AX_MAX_SCRATCH_BYTES */
+    size_t pack_a_size = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
+    size_t pack_b_size = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
+    if (pack_a_size + pack_b_size > AX_MAX_SCRATCH_BYTES) {
+        return ax_cpu_naive_ops.gemm(a, b, out);
+    }
+
+    float *pack_a_buf = (float *)ax_aligned_alloc(pack_a_size, 64);
+    float *pack_b_buf = (float *)ax_aligned_alloc(pack_b_size, 64);
+    if (!pack_a_buf || !pack_b_buf) {
+        ax_aligned_free(pack_a_buf);
+        ax_aligned_free(pack_b_buf);
         return ax_cpu_naive_ops.gemm(a, b, out);
     }
 
     const float *ad = raw_f32(a);
     const float *bd = raw_f32(b);
     float *od = raw_f32(out);
-
-    /* zero output first */
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    /* ijk loop with contiguous pointer arithmetic.
-       no stride computation — just row-major addressing.
-       tiling optimization comes in phase 1. */
-    for (int64_t i = 0; i < m; i++) {
-        for (int64_t p = 0; p < k; p++) {
-            float a_ip = ad[i * k + p];
-            for (int64_t j = 0; j < n; j++) {
-                od[i * n + j] += a_ip * bd[p * n + j];
+    /* main tiling loop: iterate over KC tiles, then MC, then NC */
+    for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+        int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+
+        for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+            int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+
+            /* pack A panel [ic:ic+mc, pc:pc+kc] */
+            pack_a(ad + ic * k + pc, k, mc_padded < mc ? mc_padded : mc, kc, mc, pack_a_buf);
+
+            for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+                int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+
+                /* pack B panel [pc:pc+kc, jc:jc+nc] */
+                pack_b(bd + pc * n + jc, n, kc, nc_padded < nc ? nc_padded : nc, nc, pack_b_buf);
+
+                /* micro-kernel over MR x NR blocks */
+                int64_t mc_round = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                int64_t nc_round = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+                for (int64_t ir = 0; ir < mc_round; ir += GEMM_MR) {
+                    int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                    for (int64_t jr = 0; jr < nc_round; jr += GEMM_NR) {
+                        int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+
+                        const float *ap = pack_a_buf + ir * kc;
+                        const float *bp = pack_b_buf + jr * kc;
+                        float *cp = od + (ic + ir) * n + (jc + jr);
+
+                        micro_kernel(kc, ap, bp, cp, n, mr, nr);
+                    }
+                }
             }
         }
     }
+
+    ax_aligned_free(pack_a_buf);
+    ax_aligned_free(pack_b_buf);
     return AX_OK;
 }
 
