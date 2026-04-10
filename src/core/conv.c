@@ -218,90 +218,92 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
 
     float *wdata = (float *)weight->storage->data;
+    int64_t K = C_in * kh * kw;
+    int64_t M = out_h * out_w;
+
+    /* pre-compute W^T once outside the loop (weights don't change during backward) */
+    ax_tensor_t *wt_contig = NULL;
+    if (input_orig->requires_grad)
+    {
+        int64_t w2d_shape[] = {C_out, K};
+        ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
+        if (w2d) {
+            memcpy(w2d->storage->data, wdata, (size_t)(C_out * K) * sizeof(float));
+            ax_tensor_t *w2d_t = ax_tensor_transpose(w2d, 0, 1);
+            wt_contig = ax_tensor_contiguous(w2d_t);
+            ax_tensor_destroy(w2d_t);
+            ax_tensor_destroy(w2d);
+        }
+    }
+
+    /* pre-allocate reusable scratch tensors outside the loop */
+    int64_t img_shape[] = {C_in, H, W};
+    int64_t go_shape[] = {C_out, M};
+    int64_t dw_shape[] = {C_out, K};
+    int64_t dcol_shape[] = {K, M};
+
+    ax_tensor_t *img_view = ax_tensor_create(img_shape, 3, AX_FLOAT32);
+    ax_tensor_t *go_mat   = ax_tensor_create(go_shape, 2, AX_FLOAT32);
+    ax_tensor_t *dw_buf   = weight->requires_grad ? ax_tensor_zeros(dw_shape, 2, AX_FLOAT32) : NULL;
+    ax_tensor_t *dcol_buf = input_orig->requires_grad ? ax_tensor_zeros(dcol_shape, 2, AX_FLOAT32) : NULL;
+
+    float *ind = (float *)input_data->storage->data;
+    float *grd = (float *)grad_out->storage->data;
 
     for (int64_t n = 0; n < N; n++)
     {
-        /* extract single image from contiguous input_data: [C_in, H, W] */
-        int64_t img_shape[] = {C_in, H, W};
-        ax_tensor_t *img_view = ax_tensor_create(img_shape, 3, AX_FLOAT32);
-        if (!img_view) continue;
-        float *ivd = (float *)img_view->storage->data;
-        float *ind = (float *)input_data->storage->data;
-        memcpy(ivd, ind + n * C_in * H * W, C_in * H * W * sizeof(float));
+        /* fill pre-allocated image view (no malloc per sample) */
+        memcpy(img_view->storage->data, ind + n * C_in * H * W,
+               (size_t)(C_in * H * W) * sizeof(float));
 
         ax_tensor_t *col = ax_im2col(img_view, kh, kw, sh, sw, ph, pw);
-        if (!col) { ax_tensor_destroy(img_view); continue; }
+        if (!col) continue;
 
-        /* extract grad_out for this sample: [C_out, out_h*out_w] */
-        int64_t go_shape[] = {C_out, out_h * out_w};
-        ax_tensor_t *go_mat = ax_tensor_create(go_shape, 2, AX_FLOAT32);
-        if (!go_mat) { ax_tensor_destroy(col); ax_tensor_destroy(img_view); continue; }
-        float *god = (float *)go_mat->storage->data;
-        float *grd = (float *)grad_out->storage->data;
-        memcpy(god, grd + n * C_out * out_h * out_w,
-               C_out * out_h * out_w * sizeof(float));
+        /* fill pre-allocated grad_out matrix (no malloc per sample) */
+        memcpy(go_mat->storage->data, grd + n * C_out * M,
+               (size_t)(C_out * M) * sizeof(float));
 
-        /* weight gradient: dW += grad_out_mat @ col^T
-           use dispatch GEMM for the transposed matmul */
-        if (weight->requires_grad)
+        /* weight gradient: dW += go_mat @ col^T */
+        if (weight->requires_grad && dw_buf)
         {
-            int64_t K = C_in * kh * kw;
-            int64_t M = out_h * out_w;
-
-            /* col^T: [M, K] */
+            /* transpose col in-place: build contiguous [M, K] from [K, M] */
             ax_tensor_t *col_t = ax_tensor_transpose(col, 0, 1);
             ax_tensor_t *col_tc = ax_tensor_contiguous(col_t);
 
-            /* dW_sample = go_mat @ col_tc: [C_out, K] */
-            int64_t dw_shape[] = {C_out, K};
-            ax_tensor_t *dw = ax_tensor_zeros(dw_shape, 2, AX_FLOAT32);
-            ax_compute_gemm(go_mat, col_tc, dw);
+            memset(dw_buf->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
+            ax_compute_gemm(go_mat, col_tc, dw_buf);
 
-            /* accumulate into weight grad */
             float *wg = (float *)weight->grad->storage->data;
-            float *dwd = (float *)dw->storage->data;
+            float *dwd = (float *)dw_buf->storage->data;
             for (int64_t i = 0; i < C_out * K; i++) wg[i] += dwd[i];
 
             ax_tensor_destroy(col_t);
             ax_tensor_destroy(col_tc);
-            ax_tensor_destroy(dw);
         }
 
-        /* input gradient: dcol = W^T @ grad_out_mat, then col2im */
-        if (input_orig->requires_grad)
+        /* input gradient: dcol = W^T @ go_mat, then col2im */
+        if (input_orig->requires_grad && wt_contig && dcol_buf)
         {
-            int64_t K = C_in * kh * kw;
-            int64_t M = out_h * out_w;
+            memset(dcol_buf->storage->data, 0, (size_t)(K * M) * sizeof(float));
+            ax_compute_gemm(wt_contig, go_mat, dcol_buf);
 
-            /* W^T: [K, C_out] */
-            int64_t w2d_shape[] = {C_out, K};
-            ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
-            memcpy(w2d->storage->data, wdata, (size_t)(C_out * K) * sizeof(float));
-            ax_tensor_t *w2d_t = ax_tensor_transpose(w2d, 0, 1);
-            ax_tensor_t *w2d_tc = ax_tensor_contiguous(w2d_t);
-
-            /* dcol = W^T @ go_mat: [K, M] */
-            int64_t dcol_shape[] = {K, M};
-            ax_tensor_t *dcol = ax_tensor_zeros(dcol_shape, 2, AX_FLOAT32);
-            ax_compute_gemm(w2d_tc, go_mat, dcol);
-
-            ax_tensor_t *dimg = ax_col2im(dcol, C_in, H, W, kh, kw, sh, sw, ph, pw);
+            ax_tensor_t *dimg = ax_col2im(dcol_buf, C_in, H, W, kh, kw, sh, sw, ph, pw);
             float *ig = (float *)input_orig->grad->storage->data;
             float *dg = (float *)dimg->storage->data;
             for (int64_t i = 0; i < C_in * H * W; i++)
                 ig[n * C_in * H * W + i] += dg[i];
 
-            ax_tensor_destroy(w2d);
-            ax_tensor_destroy(w2d_t);
-            ax_tensor_destroy(w2d_tc);
-            ax_tensor_destroy(dcol);
             ax_tensor_destroy(dimg);
         }
 
         ax_tensor_destroy(col);
-        ax_tensor_destroy(go_mat);
-        ax_tensor_destroy(img_view);
     }
+
+    ax_tensor_destroy(img_view);
+    ax_tensor_destroy(go_mat);
+    if (dw_buf) ax_tensor_destroy(dw_buf);
+    if (dcol_buf) ax_tensor_destroy(dcol_buf);
+    if (wt_contig) ax_tensor_destroy(wt_contig);
 }
 
 static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
@@ -338,6 +340,7 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     /* reshape weight to [C_out, C_in*kh*kw] for gemm */
     int64_t K = C_in * kh * kw;
 
+    int64_t M = out_h * out_w;
     int64_t out_shape[] = {N, C_out, out_h, out_w};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
     if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
@@ -345,37 +348,40 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     float *od = (float *)output->storage->data;
     float *wd = (float *)conv->weight->storage->data;
 
+    /* pre-allocate weight as 2D tensor once (weights don't change during forward) */
+    int64_t w2d_shape[] = {C_out, K};
+    ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
+    if (!w2d) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
+    memcpy(w2d->storage->data, wd, (size_t)(C_out * K) * sizeof(float));
+
+    /* pre-allocate reusable scratch */
+    int64_t img_shape[] = {C_in, H, W};
+    int64_t res_shape[] = {C_out, M};
+    ax_tensor_t *img = ax_tensor_create(img_shape, 3, AX_FLOAT32);
+    ax_tensor_t *res = ax_tensor_zeros(res_shape, 2, AX_FLOAT32);
+    if (!img || !res) {
+        ax_tensor_destroy(w2d);
+        if (img) ax_tensor_destroy(img);
+        if (res) ax_tensor_destroy(res);
+        if (inp != input) ax_tensor_destroy(inp);
+        ax_tensor_destroy(output); return NULL;
+    }
+    float *ind = (float *)inp->storage->data;
+
     for (int64_t n = 0; n < N; n++)
     {
-        /* extract single image from contiguous inp: [C_in, H, W] */
-        int64_t img_shape[] = {C_in, H, W};
-        ax_tensor_t *img = ax_tensor_create(img_shape, 3, AX_FLOAT32);
-        if (!img) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
-        float *imgd = (float *)img->storage->data;
-        float *ind = (float *)inp->storage->data;
-        memcpy(imgd, ind + n * C_in * H * W, C_in * H * W * sizeof(float));
+        /* fill reusable image buffer (no per-sample malloc) */
+        memcpy(img->storage->data, ind + n * C_in * H * W,
+               (size_t)(C_in * H * W) * sizeof(float));
 
-        /* im2col: [C_in*kh*kw, out_h*out_w] */
         ax_tensor_t *col = ax_im2col(img, kh, kw, sh, sw, ph, pw);
-        if (!col) { ax_tensor_destroy(img); ax_tensor_destroy(output); return NULL; }
+        if (!col) continue;
 
-        /* output = weight_2d @ col via dispatch (uses optimized tiled GEMM).
-           weight_2d: [C_out, K], col: [K, out_h*out_w], result: [C_out, M] */
-        int64_t M = out_h * out_w;
-        int64_t w2d_shape[] = {C_out, K};
-        int64_t res_shape[] = {C_out, M};
-        ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
-        ax_tensor_t *res = ax_tensor_zeros(res_shape, 2, AX_FLOAT32);
-        if (!w2d || !res) {
-            if (w2d) ax_tensor_destroy(w2d);
-            if (res) ax_tensor_destroy(res);
-            ax_tensor_destroy(col); ax_tensor_destroy(img);
-            ax_tensor_destroy(output); return NULL;
-        }
-        memcpy(w2d->storage->data, wd, (size_t)(C_out * K) * sizeof(float));
+        /* result = w2d @ col via dispatch GEMM */
+        memset(res->storage->data, 0, (size_t)(C_out * M) * sizeof(float));
         ax_compute_gemm(w2d, col, res);
 
-        /* copy result to output and add bias */
+        /* copy to output with bias */
         float *rd = (float *)res->storage->data;
         for (int64_t co = 0; co < C_out; co++)
         {
@@ -388,11 +394,11 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             }
         }
 
-        ax_tensor_destroy(w2d);
-        ax_tensor_destroy(res);
         ax_tensor_destroy(col);
-        ax_tensor_destroy(img);
     }
+    ax_tensor_destroy(w2d);
+    ax_tensor_destroy(img);
+    ax_tensor_destroy(res);
 
     /* hook up backward */
     if (ax_grad_enabled() && (input->requires_grad || conv->weight->requires_grad))
