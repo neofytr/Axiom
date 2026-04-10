@@ -64,11 +64,9 @@ ax_tensor_t *ax_tensor_arange(int64_t start, int64_t end, ax_dtype_t dtype);
 /* create a tensor filled with uniform random values in [low, high) */
 ax_tensor_t *ax_tensor_rand(const int64_t *shape, int ndim, float low, float high);
 
-/* seed the global RNG used by ax_tensor_rand and weight initializers */
+/* seed the global RNG used by ax_tensor_rand and weight initializers.
+   wraps ax_rng_seed() from rng.h for backward compatibility. */
 void ax_set_seed(unsigned int seed);
-
-/* returns true if ax_set_seed has been called (used by init.c to avoid double-seeding) */
-bool ax_rng_is_seeded(void);
 
 /* create a scalar tensor (shape [1], 1-dim).
    not truly 0-dim since many ops assume ndim >= 1. */

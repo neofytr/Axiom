@@ -48,6 +48,7 @@ set(AXIOM_SOURCES
     src/core/conv.c
     src/core/norm.c
     src/core/lr_scheduler.c
+    src/core/rng.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
 )
@@ -110,6 +111,9 @@ target_link_libraries(example_xor PRIVATE axiom_static)
 
 add_executable(example_mnist examples/mnist.c)
 target_link_libraries(example_mnist PRIVATE axiom_static)
+
+add_executable(example_spiral examples/spiral.c)
+target_link_libraries(example_spiral PRIVATE axiom_static)
 
 # convenience target: run all tests
 add_custom_target(run_tests

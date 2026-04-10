@@ -13,12 +13,12 @@
 #include "axiom/data.h"
 #include "axiom/compute.h"
 #include "axiom/error.h"
+#include "axiom/rng.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <float.h>
-#include <time.h>
 #include <inttypes.h>
 
 
@@ -353,10 +353,10 @@ ax_dataset_t *ax_csv_dataset_load(const char *path,
 
 static void shuffle_indices(int64_t *arr, int64_t n)
 {
-    /* fisher-yates shuffle */
+    /* fisher-yates shuffle with debiased rng */
     for (int64_t i = n - 1; i > 0; i--)
     {
-        int64_t j = rand() % (i + 1);
+        int64_t j = (int64_t)ax_rng_bounded((uint64_t)(i + 1));
         int64_t tmp = arr[i];
         arr[i] = arr[j];
         arr[j] = tmp;
@@ -392,7 +392,6 @@ ax_dataloader_t *ax_dataloader_create(ax_dataset_t *dataset,
 
     if (shuffle)
     {
-        srand((unsigned)time(NULL));
         shuffle_indices(dl->indices, dl->n_samples);
     }
 

@@ -6,10 +6,10 @@
 #include "axiom/compute.h"
 #include "axiom/init.h"
 #include "axiom/error.h"
+#include "axiom/rng.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <time.h>
 
 
 /* context saved during batchnorm forward for the backward pass */
@@ -503,8 +503,6 @@ ax_layer_t *ax_layernorm_create(int64_t num_features, float eps)
 
 /* dropout */
 
-static bool dropout_seeded = false;
-
 static void dropout_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *input = self->inputs[0];
@@ -532,8 +530,6 @@ static ax_tensor_t *dropout_forward(ax_layer_t *self, ax_tensor_t *input)
     if (!self->training || dp->p <= 0.0f)
         return ax_tensor_view(input);
 
-    if (!dropout_seeded) { srand((unsigned)time(NULL)); dropout_seeded = true; }
-
     ax_tensor_t *out = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
     if (!out) return NULL;
 
@@ -555,7 +551,7 @@ static ax_tensor_t *dropout_forward(ax_layer_t *self, ax_tensor_t *input)
 
     for (int64_t i = 0; i < n; i++)
     {
-        float r = (float)rand() / (float)RAND_MAX;
+        float r = ax_rng_float();
         if (r < keep) {
             od[out->offset + i] = id[input->offset + i] * scale;
             if (record) md[i] = scale;

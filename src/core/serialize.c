@@ -47,27 +47,90 @@
    2 GB should cover any reasonable model. */
 #define AX_MAX_TENSOR_BYTES ((size_t)2u * 1024u * 1024u * 1024u)
 
-/* write helpers (little-endian on most platforms we care about;
-   for big-endian targets you'd add byte swapping here) */
+/* crc32 (iso 3309 polynomial, same as zlib/png).
+   computed incrementally so we don't need to buffer the whole file. */
+static uint32_t crc32_table[256];
+static int crc32_table_built = 0;
 
-static bool write_u32(FILE *f, uint32_t v) { return fwrite(&v, 4, 1, f) == 1; }
-static bool write_i64(FILE *f, int64_t v)  { return fwrite(&v, 8, 1, f) == 1; }
-static bool write_f32(FILE *f, float v)    { return fwrite(&v, 4, 1, f) == 1; }
-static bool write_u8(FILE *f, uint8_t v)   { return fwrite(&v, 1, 1, f) == 1; }
+static void crc32_build_table(void)
+{
+    for (uint32_t i = 0; i < 256; i++)
+    {
+        uint32_t c = i;
+        for (int j = 0; j < 8; j++)
+            c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        crc32_table[i] = c;
+    }
+    crc32_table_built = 1;
+}
+
+static uint32_t crc32_update(uint32_t crc, const void *data, size_t len)
+{
+    if (!crc32_table_built) crc32_build_table();
+    const uint8_t *p = (const uint8_t *)data;
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++)
+        crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return ~crc;
+}
+
+/* compute crc32 of a file region [start_pos, end_pos).
+   if end_pos < 0, reads to EOF. */
+static uint32_t crc32_of_file(FILE *f, long start_pos, long end_pos)
+{
+    if (!crc32_table_built) crc32_build_table();
+    fseek(f, start_pos, SEEK_SET);
+    uint32_t crc = 0;
+    uint8_t buf[4096];
+    long remaining = (end_pos >= 0) ? (end_pos - start_pos) : -1;
+    for (;;)
+    {
+        size_t to_read = sizeof(buf);
+        if (remaining >= 0 && (long)to_read > remaining)
+            to_read = (size_t)remaining;
+        if (to_read == 0) break;
+        size_t n = fread(buf, 1, to_read, f);
+        if (n == 0) break;
+        crc = crc32_update(crc, buf, n);
+        if (remaining >= 0) remaining -= (long)n;
+    }
+    return crc;
+}
+
+/* write helpers with incremental crc tracking.
+   pass crc=NULL to skip crc accumulation. */
+
+static bool write_bytes(FILE *f, const void *data, size_t len, uint32_t *crc)
+{
+    if (fwrite(data, 1, len, f) != len) return false;
+    if (crc) *crc = crc32_update(*crc, data, len);
+    return true;
+}
+
+static bool write_u32(FILE *f, uint32_t v)  { return write_bytes(f, &v, 4, NULL); }
+static bool write_i64(FILE *f, int64_t v)   { return write_bytes(f, &v, 8, NULL); }
+static bool write_f32(FILE *f, float v)     { return write_bytes(f, &v, 4, NULL); }
+static bool write_u8(FILE *f, uint8_t v)    { return write_bytes(f, &v, 1, NULL); }
+
+/* crc-tracked variants */
+static bool write_u32_c(FILE *f, uint32_t v, uint32_t *c)  { return write_bytes(f, &v, 4, c); }
+static bool write_i64_c(FILE *f, int64_t v, uint32_t *c)   { return write_bytes(f, &v, 8, c); }
+static bool write_f32_c(FILE *f, float v, uint32_t *c)     { return write_bytes(f, &v, 4, c); }
+static bool write_u8_c(FILE *f, uint8_t v, uint32_t *c)    { return write_bytes(f, &v, 1, c); }
 
 static bool read_u32(FILE *f, uint32_t *v) { return fread(v, 4, 1, f) == 1; }
 static bool read_i64(FILE *f, int64_t *v)  { return fread(v, 8, 1, f) == 1; }
 static bool read_f32(FILE *f, float *v)    { return fread(v, 4, 1, f) == 1; }
 static bool read_u8(FILE *f, uint8_t *v)   { return fread(v, 1, 1, f) == 1; }
 
-/* write a tensor's metadata + data to file */
-static bool write_tensor(FILE *f, ax_tensor_t *t)
+/* write a tensor's metadata + data to file, optionally tracking crc */
+static bool write_tensor_crc(FILE *f, ax_tensor_t *t, uint32_t *crc)
 {
-    if (!write_u32(f, (uint32_t)t->dtype)) return false;
-    if (!write_u32(f, (uint32_t)t->ndim)) return false;
+    if (!write_u32_c(f, (uint32_t)t->dtype, crc)) return false;
+    if (!write_u32_c(f, (uint32_t)t->ndim, crc)) return false;
     for (int i = 0; i < t->ndim; i++)
     {
-        if (!write_i64(f, t->shape[i])) return false;
+        if (!write_i64_c(f, t->shape[i], crc)) return false;
     }
 
     /* make contiguous before writing (in case of transposed/strided tensor) */
@@ -77,18 +140,22 @@ static bool write_tensor(FILE *f, ax_tensor_t *t)
 
     if (ax_tensor_is_contiguous(t) && t->offset == 0)
     {
-        if (fwrite(t->storage->data, 1, bytes, f) != bytes) return false;
+        if (!write_bytes(f, t->storage->data, bytes, crc)) return false;
     }
     else
     {
-        /* slow path: copy element by element for non-contiguous tensors */
         ax_tensor_t *c = ax_tensor_contiguous(t);
         if (!c) return false;
-        bool ok = fwrite(c->storage->data, 1, bytes, f) == bytes;
+        bool ok = write_bytes(f, c->storage->data, bytes, crc);
         ax_tensor_destroy(c);
         if (!ok) return false;
     }
     return true;
+}
+
+static bool write_tensor(FILE *f, ax_tensor_t *t)
+{
+    return write_tensor_crc(f, t, NULL);
 }
 
 /* safe multiply for serialization validation */
@@ -248,98 +315,98 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
         return AX_ERR_INTERNAL;
     }
 
-    /* header */
-    write_u32(f, AX_MAGIC);
-    write_u32(f, AX_FORMAT_VERSION);
-    write_u32(f, (uint32_t)seq->n_layers);
+    /* all writes go through crc-tracked variants */
+    uint32_t crc = 0;
 
-    /* layer descriptors: each layer writes its type, n_params, then
-       type-specific configuration bytes. the loader reads the same fields
-       in the same order to reconstruct the layer. */
+    /* header */
+    write_u32_c(f, AX_MAGIC, &crc);
+    write_u32_c(f, AX_FORMAT_VERSION, &crc);
+    write_u32_c(f, (uint32_t)seq->n_layers, &crc);
+
+    /* layer descriptors */
     for (int i = 0; i < seq->n_layers; i++)
     {
         ax_layer_t *l = seq->layers[i];
-        write_u32(f, (uint32_t)l->type);
-        write_u32(f, (uint32_t)l->n_params);
-        write_u32(f, (uint32_t)l->n_buffers);
+        write_u32_c(f, (uint32_t)l->type, &crc);
+        write_u32_c(f, (uint32_t)l->n_params, &crc);
+        write_u32_c(f, (uint32_t)l->n_buffers, &crc);
 
         switch (l->type)
         {
             case AX_LAYER_DENSE: {
                 ax_dense_t *d = (ax_dense_t *)l;
-                write_i64(f, l->input_features);
-                write_i64(f, l->output_features);
-                write_u8(f, d->use_bias ? 1 : 0);
+                write_i64_c(f, l->input_features, &crc);
+                write_i64_c(f, l->output_features, &crc);
+                write_u8_c(f, d->use_bias ? 1 : 0, &crc);
                 break;
             }
             case AX_LAYER_CONV2D: {
                 ax_conv2d_t *c = (ax_conv2d_t *)l;
-                write_u32(f, (uint32_t)c->in_channels);
-                write_u32(f, (uint32_t)c->out_channels);
-                write_u32(f, (uint32_t)c->kernel_h);
-                write_u32(f, (uint32_t)c->kernel_w);
-                write_u32(f, (uint32_t)c->stride_h);
-                write_u32(f, (uint32_t)c->stride_w);
-                write_u32(f, (uint32_t)c->pad_h);
-                write_u32(f, (uint32_t)c->pad_w);
-                write_u8(f, c->use_bias ? 1 : 0);
+                write_u32_c(f, (uint32_t)c->in_channels, &crc);
+                write_u32_c(f, (uint32_t)c->out_channels, &crc);
+                write_u32_c(f, (uint32_t)c->kernel_h, &crc);
+                write_u32_c(f, (uint32_t)c->kernel_w, &crc);
+                write_u32_c(f, (uint32_t)c->stride_h, &crc);
+                write_u32_c(f, (uint32_t)c->stride_w, &crc);
+                write_u32_c(f, (uint32_t)c->pad_h, &crc);
+                write_u32_c(f, (uint32_t)c->pad_w, &crc);
+                write_u8_c(f, c->use_bias ? 1 : 0, &crc);
                 break;
             }
             case AX_LAYER_MAXPOOL2D: {
                 ax_maxpool2d_t *p = (ax_maxpool2d_t *)l;
-                write_u32(f, (uint32_t)p->kernel_size);
-                write_u32(f, (uint32_t)p->stride);
-                write_u32(f, (uint32_t)p->padding);
+                write_u32_c(f, (uint32_t)p->kernel_size, &crc);
+                write_u32_c(f, (uint32_t)p->stride, &crc);
+                write_u32_c(f, (uint32_t)p->padding, &crc);
                 break;
             }
             case AX_LAYER_AVGPOOL2D: {
                 ax_avgpool2d_t *p = (ax_avgpool2d_t *)l;
-                write_u32(f, (uint32_t)p->kernel_size);
-                write_u32(f, (uint32_t)p->stride);
-                write_u32(f, (uint32_t)p->padding);
+                write_u32_c(f, (uint32_t)p->kernel_size, &crc);
+                write_u32_c(f, (uint32_t)p->stride, &crc);
+                write_u32_c(f, (uint32_t)p->padding, &crc);
                 break;
             }
             case AX_LAYER_BATCHNORM: {
                 ax_batchnorm_t *bn = (ax_batchnorm_t *)l;
-                write_i64(f, bn->num_features);
-                write_f32(f, bn->eps);
-                write_f32(f, bn->momentum);
+                write_i64_c(f, bn->num_features, &crc);
+                write_f32_c(f, bn->eps, &crc);
+                write_f32_c(f, bn->momentum, &crc);
                 break;
             }
             case AX_LAYER_LAYERNORM: {
                 ax_layernorm_t *ln = (ax_layernorm_t *)l;
-                write_i64(f, ln->num_features);
-                write_f32(f, ln->eps);
+                write_i64_c(f, ln->num_features, &crc);
+                write_f32_c(f, ln->eps, &crc);
                 break;
             }
             case AX_LAYER_DROPOUT: {
                 ax_dropout_t *dp = (ax_dropout_t *)l;
-                write_f32(f, dp->p);
+                write_f32_c(f, dp->p, &crc);
                 break;
             }
             case AX_LAYER_LEAKY_RELU:
             case AX_LAYER_ELU: {
                 ax_activation_layer_t *al = (ax_activation_layer_t *)l;
-                write_f32(f, al->alpha);
+                write_f32_c(f, al->alpha, &crc);
                 break;
             }
             case AX_LAYER_SOFTMAX: {
-                write_u32(f, 1); /* axis, always 1 for now */
+                write_u32_c(f, 1, &crc);
                 break;
             }
-            /* stateless layers: relu, sigmoid, tanh, gelu, swish, flatten, global_avgpool */
             default:
                 break;
         }
     }
 
-    /* parameter data */
+    /* parameter and buffer data */
     for (int i = 0; i < seq->n_layers; i++)
     {
         ax_layer_t *l = seq->layers[i];
         for (int p = 0; p < l->n_params; p++)
         {
-            if (!write_tensor(f, l->params[p]))
+            if (!write_tensor_crc(f, l->params[p], &crc))
             {
                 fclose(f);
                 ax_err_set(AX_ERR_INTERNAL, "failed writing params for layer %d", i);
@@ -348,7 +415,7 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
         }
         for (int p = 0; p < l->n_buffers; p++)
         {
-            if (!write_tensor(f, l->buffers[p]))
+            if (!write_tensor_crc(f, l->buffers[p], &crc))
             {
                 fclose(f);
                 ax_err_set(AX_ERR_INTERNAL, "failed writing buffers for layer %d", i);
@@ -356,6 +423,9 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
             }
         }
     }
+
+    /* append crc32 (not included in the checksum itself) */
+    write_u32(f, crc);
 
     fclose(f);
     return AX_OK;
@@ -603,6 +673,30 @@ ax_model_t *ax_model_load(const char *path)
                 }
             }
             ax_tensor_destroy(loaded);
+        }
+    }
+
+    /* verify crc32 (version >= 4) */
+    if (version >= 4)
+    {
+        long data_end = ftell(f);
+        uint32_t stored_crc;
+        if (!read_u32(f, &stored_crc))
+        {
+            ax_err_set(AX_ERR_INTERNAL, "missing checksum in model file");
+            ax_layer_destroy(seq);
+            fclose(f);
+            return NULL;
+        }
+        uint32_t computed_crc = crc32_of_file(f, 0, data_end);
+        if (computed_crc != stored_crc)
+        {
+            ax_err_set(AX_ERR_INTERNAL,
+                       "model file corrupted: checksum mismatch (stored 0x%08x, computed 0x%08x)",
+                       stored_crc, computed_crc);
+            ax_layer_destroy(seq);
+            fclose(f);
+            return NULL;
         }
     }
 

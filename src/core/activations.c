@@ -176,18 +176,69 @@ ax_tensor_t *ax_elu(ax_tensor_t *a, float alpha)
 }
 
 
-/* selu — just scaled elu with fixed constants */
+/* selu: lambda * (x if x > 0, alpha * (exp(x) - 1) otherwise)
+   single-node implementation with custom backward. */
+
+static void selu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *input = self->saved[0];
+    int64_t n = ax_tensor_numel(grad_out);
+
+    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
+    float *gd = (float *)grad_a->storage->data;
+    float *go = (float *)grad_out->storage->data;
+    float *ad = (float *)input->storage->data;
+
+    for (int64_t i = 0; i < n; i++)
+    {
+        float x = ad[input->offset + i];
+        /* selu'(x) = lambda if x > 0, lambda * alpha * exp(x) otherwise */
+        float deriv = (x > 0.0f) ? SELU_LAMBDA : SELU_LAMBDA * SELU_ALPHA * expf(x);
+        gd[grad_a->offset + i] = go[grad_out->offset + i] * deriv;
+    }
+
+    if (self->inputs[0]->requires_grad)
+    {
+        if (!self->inputs[0]->grad)
+            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+        float *ig = (float *)self->inputs[0]->grad->storage->data;
+        for (int64_t i = 0; i < n; i++)
+            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
+    }
+    ax_tensor_destroy(grad_a);
+}
 
 ax_tensor_t *ax_selu(ax_tensor_t *a)
 {
     if (!check_f32(a)) return NULL;
+    ax_tensor_t *out = alloc_out(a);
+    if (!out) return NULL;
 
-    /* selu(x) = lambda * elu(x, alpha) */
-    ax_tensor_t *e = ax_elu(a, SELU_ALPHA);
-    if (!e) return NULL;
+    int64_t n = ax_tensor_numel(a);
+    float *od = (float *)out->storage->data;
+    float *ad = (float *)a->storage->data;
 
-    ax_tensor_t *out = ax_mul_scalar(e, (double)SELU_LAMBDA);
-    ax_tensor_destroy(e);
+    for (int64_t i = 0; i < n; i++)
+    {
+        float x = ad[a->offset + i];
+        od[out->offset + i] = (x > 0.0f)
+            ? SELU_LAMBDA * x
+            : SELU_LAMBDA * SELU_ALPHA * (expf(x) - 1.0f);
+    }
+
+    if (needs_grad(a))
+    {
+        out->requires_grad = true;
+        ax_grad_fn_t *gf = ax_grad_fn_create(selu_backward);
+        gf->inputs[0] = a;
+        gf->n_inputs = 1;
+        ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = (a_safe != a);
+        gf->n_saved = 1;
+        out->grad_fn = gf;
+    }
     return out;
 }
 
@@ -405,20 +456,70 @@ ax_tensor_t *ax_softplus(ax_tensor_t *a)
 
 
 /* mish: x * tanh(softplus(x))
-   we compose it from existing ops so autograd works for free */
+   single-node implementation. mish'(x) = tanh(sp) + x * sig(x) * (1 - tanh(sp)^2)
+   where sp = softplus(x), sig = sigmoid */
+
+static void mish_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *input = self->saved[0];
+    int64_t n = ax_tensor_numel(grad_out);
+
+    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!grad_a) return;
+    float *gd = (float *)grad_a->storage->data;
+    float *go = (float *)grad_out->storage->data;
+    float *ad = (float *)input->storage->data;
+
+    for (int64_t i = 0; i < n; i++)
+    {
+        float x = ad[input->offset + i];
+        float sp = (x > 20.0f) ? x : ((x < -20.0f) ? expf(x) : logf(1.0f + expf(x)));
+        float tsp = tanhf(sp);
+        float sig = 1.0f / (1.0f + expf(-x));
+        float deriv = tsp + x * sig * (1.0f - tsp * tsp);
+        gd[grad_a->offset + i] = go[grad_out->offset + i] * deriv;
+    }
+
+    if (self->inputs[0]->requires_grad)
+    {
+        if (!self->inputs[0]->grad)
+            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+        float *ig = (float *)self->inputs[0]->grad->storage->data;
+        for (int64_t i = 0; i < n; i++)
+            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
+    }
+    ax_tensor_destroy(grad_a);
+}
 
 ax_tensor_t *ax_mish(ax_tensor_t *a)
 {
     if (!check_f32(a)) return NULL;
+    ax_tensor_t *out = alloc_out(a);
+    if (!out) return NULL;
 
-    ax_tensor_t *sp = ax_softplus(a);
-    if (!sp) return NULL;
-    ax_tensor_t *t = ax_tanh_op(sp);
-    if (!t) { ax_tensor_destroy(sp); return NULL; }
-    ax_tensor_t *out = ax_mul(a, t);
+    int64_t n = ax_tensor_numel(a);
+    float *od = (float *)out->storage->data;
+    float *ad = (float *)a->storage->data;
 
-    ax_tensor_destroy(sp);
-    ax_tensor_destroy(t);
+    for (int64_t i = 0; i < n; i++)
+    {
+        float x = ad[a->offset + i];
+        float sp = (x > 20.0f) ? x : ((x < -20.0f) ? expf(x) : logf(1.0f + expf(x)));
+        od[out->offset + i] = x * tanhf(sp);
+    }
+
+    if (needs_grad(a))
+    {
+        out->requires_grad = true;
+        ax_grad_fn_t *gf = ax_grad_fn_create(mish_backward);
+        gf->inputs[0] = a;
+        gf->n_inputs = 1;
+        ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = (a_safe != a);
+        gf->n_saved = 1;
+        out->grad_fn = gf;
+    }
     return out;
 }
 

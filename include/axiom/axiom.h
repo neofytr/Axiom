@@ -14,6 +14,7 @@
 #include "activations.h"
 #include "losses.h"
 #include "optim.h"
+#include "rng.h"
 #include "init.h"
 #include "layer.h"
 #include "model.h"

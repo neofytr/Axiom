@@ -13,23 +13,62 @@
 
 
 /* mse: mean((pred - target)^2)
-   composed from sub -> square -> mean, so autograd just works. */
+   d/dpred = 2*(pred - target) / n */
+
+static void mse_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *pred = self->saved[0];
+    ax_tensor_t *target = self->saved[1];
+    int64_t n = ax_tensor_numel(pred);
+    float g = ((float *)grad_out->storage->data)[grad_out->offset];
+    float scale = 2.0f * g / (float)n;
+
+    if (!pred->requires_grad) return;
+    if (!pred->grad)
+        pred->grad = ax_tensor_zeros(pred->shape, pred->ndim, pred->dtype);
+    if (!pred->grad) return;
+
+    float *pg = (float *)pred->grad->storage->data;
+    float *pd = (float *)pred->storage->data;
+    float *td = (float *)target->storage->data;
+
+    for (int64_t i = 0; i < n; i++)
+    {
+        float diff = pd[pred->offset + i] - td[target->offset + i];
+        pg[pred->grad->offset + i] += diff * scale;
+    }
+}
 
 ax_tensor_t *ax_mse_loss(ax_tensor_t *pred, ax_tensor_t *target)
 {
-    ax_tensor_t *diff = ax_sub(pred, target);
-    if (!diff) return NULL;
+    int64_t n = ax_tensor_numel(pred);
+    float *pd = (float *)pred->storage->data;
+    float *td = (float *)target->storage->data;
 
-    ax_tensor_t *sq = ax_square(diff);
-    if (!sq) return NULL;
+    float total = 0.0f;
+    for (int64_t i = 0; i < n; i++)
+    {
+        float d = pd[pred->offset + i] - td[target->offset + i];
+        total += d * d;
+    }
 
-    ax_tensor_t *loss = ax_mean(sq, -1);
+    ax_tensor_t *loss = ax_tensor_scalar(total / (float)n);
 
-    /* don't destroy intermediates — backward needs them for the chain rule.
-       this is a known tradeoff: compose ops = simple code, but intermediates
-       stay alive until the user destroys the loss tensor.
-       TODO: proper memory management with refcounting through the graph. */
-
+    if (ax_grad_enabled() && pred->requires_grad)
+    {
+        loss->requires_grad = true;
+        ax_grad_fn_t *gf = ax_grad_fn_create(mse_backward);
+        gf->inputs[0] = pred;
+        gf->n_inputs = 1;
+        ax_tensor_t *pred_safe = ax_ensure_contiguous(pred);
+        ax_tensor_t *target_safe = ax_ensure_contiguous(target);
+        gf->saved[0] = pred_safe;
+        gf->saved_owned[0] = (pred_safe != pred);
+        gf->saved[1] = target_safe;
+        gf->saved_owned[1] = (target_safe != target);
+        gf->n_saved = 2;
+        loss->grad_fn = gf;
+    }
     return loss;
 }
 

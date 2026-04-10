@@ -41,6 +41,98 @@ void ax_zero_grad(ax_tensor_t *t)
 
 #define TOPO_INIT_CAP 4096
 
+/* open-addressing hash set on pointer values.
+   O(1) amortized lookup instead of O(n) linear scan. */
+typedef struct {
+    uintptr_t *buckets;
+    int capacity;
+    int count;
+} ptr_set_t;
+
+static bool ps_init(ptr_set_t *s, int cap)
+{
+    s->buckets = (uintptr_t *)calloc((size_t)cap, sizeof(uintptr_t));
+    if (!s->buckets) return false;
+    s->capacity = cap;
+    s->count = 0;
+    return true;
+}
+
+static void ps_free(ptr_set_t *s)
+{
+    free(s->buckets);
+    s->buckets = NULL;
+    s->capacity = s->count = 0;
+}
+
+/* fibonacci hashing for pointer -> slot */
+static inline int ps_slot(uintptr_t key, int cap)
+{
+    return (int)((key * 0x9e3779b97f4a7c15ULL) >> 32) & (cap - 1);
+}
+
+static bool ps_grow(ptr_set_t *s)
+{
+    int new_cap = s->capacity * 2;
+    uintptr_t *old = s->buckets;
+    int old_cap = s->capacity;
+
+    s->buckets = (uintptr_t *)calloc((size_t)new_cap, sizeof(uintptr_t));
+    if (!s->buckets) { s->buckets = old; return false; }
+    s->capacity = new_cap;
+    s->count = 0;
+
+    for (int i = 0; i < old_cap; i++)
+    {
+        if (old[i] != 0)
+        {
+            int slot = ps_slot(old[i], new_cap);
+            while (s->buckets[slot] != 0) slot = (slot + 1) & (new_cap - 1);
+            s->buckets[slot] = old[i];
+            s->count++;
+        }
+    }
+    free(old);
+    return true;
+}
+
+/* returns true if key was already present */
+static bool ps_insert(ptr_set_t *s, void *ptr)
+{
+    uintptr_t key = (uintptr_t)ptr;
+    if (key == 0) return false; /* 0 is sentinel */
+
+    /* grow at 70% load */
+    if (s->count * 10 >= s->capacity * 7)
+    {
+        if (!ps_grow(s)) return false;
+    }
+
+    int slot = ps_slot(key, s->capacity);
+    while (s->buckets[slot] != 0)
+    {
+        if (s->buckets[slot] == key) return true; /* already present */
+        slot = (slot + 1) & (s->capacity - 1);
+    }
+    s->buckets[slot] = key;
+    s->count++;
+    return false;
+}
+
+static bool ps_contains(const ptr_set_t *s, void *ptr)
+{
+    uintptr_t key = (uintptr_t)ptr;
+    if (key == 0) return false;
+    int slot = ps_slot(key, s->capacity);
+    while (s->buckets[slot] != 0)
+    {
+        if (s->buckets[slot] == key) return true;
+        slot = (slot + 1) & (s->capacity - 1);
+    }
+    return false;
+}
+
+/* dynamic array for topo order */
 typedef struct
 {
     ax_tensor_t **nodes;
@@ -62,13 +154,6 @@ static void tl_free(topo_list_t *l)
     free(l->nodes);
     l->nodes = NULL;
     l->count = l->capacity = 0;
-}
-
-static bool tl_contains(const topo_list_t *l, ax_tensor_t *t)
-{
-    for (int i = 0; i < l->count; i++)
-        if (l->nodes[i] == t) return true;
-    return false;
 }
 
 static bool tl_push(topo_list_t *l, ax_tensor_t *t)
@@ -93,7 +178,7 @@ typedef struct {
     int child_idx;
 } dfs_frame_t;
 
-static void topo_sort_dfs(ax_tensor_t *t, topo_list_t *visited, topo_list_t *order)
+static void topo_sort_dfs(ax_tensor_t *t, ptr_set_t *visited, topo_list_t *order)
 {
     if (!t) return;
 
@@ -111,8 +196,7 @@ static void topo_sort_dfs(ax_tensor_t *t, topo_list_t *visited, topo_list_t *ord
 
         if (cidx == 0)
         {
-            if (tl_contains(visited, node)) { stack_top--; continue; }
-            if (!tl_push(visited, node))    { stack_top--; continue; }
+            if (ps_insert(visited, node)) { stack_top--; continue; } /* already visited */
         }
 
         ax_grad_fn_t *gf = (ax_grad_fn_t *)node->grad_fn;
@@ -123,7 +207,7 @@ static void topo_sort_dfs(ax_tensor_t *t, topo_list_t *visited, topo_list_t *ord
             stack[stack_top - 1].child_idx++;
             ax_tensor_t *child = gf->inputs[cidx];
 
-            if (child && !tl_contains(visited, child))
+            if (child && !ps_contains(visited, child))
             {
                 if (stack_top >= stack_cap)
                 {
@@ -183,15 +267,16 @@ ax_status_t ax_backward(ax_tensor_t *loss)
     }
 
     /* build topological order */
-    topo_list_t visited, order;
-    if (!tl_init(&visited))
+    ptr_set_t visited;
+    topo_list_t order;
+    if (!ps_init(&visited, TOPO_INIT_CAP))
     {
         ax_err_set(AX_ERR_ALLOC, "ax_backward: visited alloc failed");
         return AX_ERR_ALLOC;
     }
     if (!tl_init(&order))
     {
-        tl_free(&visited);
+        ps_free(&visited);
         ax_err_set(AX_ERR_ALLOC, "ax_backward: order alloc failed");
         return AX_ERR_ALLOC;
     }
@@ -210,7 +295,7 @@ ax_status_t ax_backward(ax_tensor_t *loss)
         gf->backward(gf, node->grad);
     }
 
-    tl_free(&visited);
+    ps_free(&visited);
     tl_free(&order);
 
     return AX_OK;
@@ -220,9 +305,10 @@ void ax_graph_cleanup(ax_tensor_t *root)
 {
     if (!root) return;
 
-    topo_list_t visited, order;
-    if (!tl_init(&visited)) return;
-    if (!tl_init(&order)) { tl_free(&visited); return; }
+    ptr_set_t visited;
+    topo_list_t order;
+    if (!ps_init(&visited, TOPO_INIT_CAP)) return;
+    if (!tl_init(&order)) { ps_free(&visited); return; }
 
     topo_sort_dfs(root, &visited, &order);
 
@@ -276,7 +362,7 @@ void ax_graph_cleanup(ax_tensor_t *root)
         root->grad_fn = NULL;
     }
 
-    tl_free(&visited);
+    ps_free(&visited);
     tl_free(&order);
 }
 

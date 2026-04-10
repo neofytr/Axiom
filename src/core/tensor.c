@@ -4,6 +4,7 @@
 #include "axiom/autograd.h"
 #include "axiom/memory.h"
 #include "axiom/compute.h"
+#include "axiom/rng.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -11,18 +12,9 @@
 #include <limits.h>
 #include <inttypes.h>
 
-/* track whether rng has been seeded */
-static bool rng_seeded = false;
-
 void ax_set_seed(unsigned int seed)
 {
-    srand(seed);
-    rng_seeded = true;
-}
-
-bool ax_rng_is_seeded(void)
-{
-    return rng_seeded;
+    ax_rng_seed((uint64_t)seed);
 }
 
 /* storage */
@@ -224,19 +216,13 @@ ax_tensor_t *ax_tensor_arange(int64_t start, int64_t end, ax_dtype_t dtype) {
 }
 
 ax_tensor_t *ax_tensor_rand(const int64_t *shape, int ndim, float low, float high) {
-    if (!rng_seeded) {
-        srand((unsigned)time(NULL));
-        rng_seeded = true;
-    }
-
     ax_tensor_t *t = ax_tensor_create(shape, ndim, AX_FLOAT32);
     if (!t) return NULL;
 
-    float range = high - low;
     int64_t n = compute_numel(shape, ndim);
     float *d = (float *)t->storage->data;
     for (int64_t i = 0; i < n; i++) {
-        d[i] = low + ((float)rand() / (float)RAND_MAX) * range;
+        d[i] = ax_rng_uniform(low, high);
     }
     return t;
 }
