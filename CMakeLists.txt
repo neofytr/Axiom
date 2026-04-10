@@ -54,6 +54,12 @@ set(AXIOM_SOURCES
     src/compute/backends/cpu_opt.c
 )
 
+# enable SIMD for the optimized backend on x86
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
+    set_source_files_properties(src/compute/backends/cpu_opt.c
+        PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+endif()
+
 # static library
 add_library(axiom_static STATIC ${AXIOM_SOURCES})
 target_include_directories(axiom_static PUBLIC include)

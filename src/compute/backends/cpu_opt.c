@@ -61,9 +61,10 @@ static inline int64_t validate_triple_same(const ax_tensor_t *a, const ax_tensor
 }
 
 
-/* element-wise binary ops (contiguous, no broadcast) */
+/* element-wise binary ops (contiguous, no broadcast).
+   separate SIMD and scalar expressions to avoid type conflicts. */
 
-#define DEFINE_OPT_BINOP(name, expr, naive_fn) \
+#define DEFINE_OPT_BINOP(name, simd_expr, scalar_expr, naive_fn) \
 static ax_status_t opt_##name(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { \
     int64_t n = validate_triple_same(a, b, out); \
     if (n < 0) return ax_cpu_naive_ops.naive_fn(a, b, out); \
@@ -75,24 +76,24 @@ static ax_status_t opt_##name(const ax_tensor_t *a, const ax_tensor_t *b, ax_ten
     for (; i < vec_end; i += AX_VF32_WIDTH) { \
         ax_vf32 va = ax_vf32_load(ad + i); \
         ax_vf32 vb = ax_vf32_load(bd + i); \
-        ax_vf32_store(od + i, expr); \
+        ax_vf32_store(od + i, simd_expr); \
     } \
     for (; i < n; i++) { \
-        float va = ad[i], vb = bd[i]; \
-        od[i] = (float)(expr); \
+        float sa = ad[i], sb = bd[i]; \
+        od[i] = scalar_expr; \
     } \
     return AX_OK; \
 }
 
-DEFINE_OPT_BINOP(add, ax_vf32_add(va, vb), add)
-DEFINE_OPT_BINOP(sub, ax_vf32_sub(va, vb), sub)
-DEFINE_OPT_BINOP(mul, ax_vf32_mul(va, vb), mul)
-DEFINE_OPT_BINOP(div_op, ax_vf32_div(va, vb), div_op)
+DEFINE_OPT_BINOP(add, ax_vf32_add(va, vb), sa + sb, add)
+DEFINE_OPT_BINOP(sub, ax_vf32_sub(va, vb), sa - sb, sub)
+DEFINE_OPT_BINOP(mul, ax_vf32_mul(va, vb), sa * sb, mul)
+DEFINE_OPT_BINOP(div_op, ax_vf32_div(va, vb), sa / sb, div_op)
 
 
 /* element-wise unary ops (contiguous) */
 
-#define DEFINE_OPT_UNOP(name, expr, naive_fn) \
+#define DEFINE_OPT_UNOP(name, simd_expr, scalar_expr, naive_fn) \
 static ax_status_t opt_##name(const ax_tensor_t *in, ax_tensor_t *out) { \
     int64_t ni = validate_contig_f32(in); \
     int64_t no = validate_contig_f32(out); \
@@ -104,26 +105,26 @@ static ax_status_t opt_##name(const ax_tensor_t *in, ax_tensor_t *out) { \
     int64_t vec_end = n - (n % AX_VF32_WIDTH); \
     for (; i < vec_end; i += AX_VF32_WIDTH) { \
         ax_vf32 v = ax_vf32_load(id + i); \
-        ax_vf32_store(od + i, expr); \
+        ax_vf32_store(od + i, simd_expr); \
     } \
     for (; i < n; i++) { \
-        float v = id[i]; \
-        od[i] = (float)(expr); \
+        float sv = id[i]; \
+        od[i] = scalar_expr; \
     } \
     return AX_OK; \
 }
 
-DEFINE_OPT_UNOP(neg, ax_vf32_neg(v), neg)
-DEFINE_OPT_UNOP(abs_op, ax_vf32_abs(v), abs_op)
-DEFINE_OPT_UNOP(exp_op, ax_vf32_exp(v), exp_op)
-DEFINE_OPT_UNOP(log_op, (v > 0.0f ? ax_vf32_log(v) : -FLT_MAX), log_op)
-DEFINE_OPT_UNOP(sqrt_op, (v >= 0.0f ? ax_vf32_sqrt(v) : 0.0f), sqrt_op)
-DEFINE_OPT_UNOP(square, ax_vf32_mul(v, v), square)
+DEFINE_OPT_UNOP(neg, ax_vf32_neg(v), -sv, neg)
+DEFINE_OPT_UNOP(abs_op, ax_vf32_abs(v), fabsf(sv), abs_op)
+DEFINE_OPT_UNOP(exp_op, ax_vf32_exp(v), expf(sv > 88.0f ? 88.0f : (sv < -88.0f ? -88.0f : sv)), exp_op)
+DEFINE_OPT_UNOP(log_op, ax_vf32_log(v), (sv > 0.0f ? logf(sv) : -FLT_MAX), log_op)
+DEFINE_OPT_UNOP(sqrt_op, ax_vf32_sqrt(v), (sv >= 0.0f ? sqrtf(sv) : 0.0f), sqrt_op)
+DEFINE_OPT_UNOP(square, ax_vf32_mul(v, v), sv * sv, square)
 
 /* activations */
-DEFINE_OPT_UNOP(relu, ax_vf32_relu(v), relu)
-DEFINE_OPT_UNOP(sigmoid, ax_vf32_sigmoid(v), sigmoid)
-DEFINE_OPT_UNOP(tanh_op, ax_vf32_tanh(v), tanh_op)
+DEFINE_OPT_UNOP(relu, ax_vf32_relu(v), (sv > 0.0f ? sv : 0.0f), relu)
+DEFINE_OPT_UNOP(sigmoid, ax_vf32_sigmoid(v), (1.0f / (1.0f + expf(-sv))), sigmoid)
+DEFINE_OPT_UNOP(tanh_op, ax_vf32_tanh(v), tanhf(sv), tanh_op)
 
 
 /* scalar ops */
