@@ -82,6 +82,7 @@ set(TEST_SOURCES
     tests/test_conv.c
     tests/test_norm.c
     tests/test_integration.c
+    tests/test_grad_verify.c
 )
 
 foreach(test_src ${TEST_SOURCES})
