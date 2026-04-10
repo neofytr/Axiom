@@ -48,6 +48,11 @@ ax_tensor_t *ax_im2col(ax_tensor_t *input, int kh, int kw,
         ax_err_set(AX_ERR_SHAPE_MISMATCH, "im2col expects [C, H, W] input");
         return NULL;
     }
+    if (input->dtype != AX_FLOAT32)
+    {
+        ax_err_set(AX_ERR_INVALID_DTYPE, "im2col expects float32 input");
+        return NULL;
+    }
 
     int64_t C = input->shape[0];
     int64_t H = input->shape[1];
@@ -112,6 +117,12 @@ ax_tensor_t *ax_col2im(ax_tensor_t *cols, int64_t channels,
                         int stride_h, int stride_w,
                         int pad_h, int pad_w)
 {
+    if (cols->dtype != AX_FLOAT32)
+    {
+        ax_err_set(AX_ERR_INVALID_DTYPE, "col2im expects float32 input");
+        return NULL;
+    }
+
     int64_t out_h = conv_out_dim(height, kh, stride_h, pad_h);
     int64_t out_w = conv_out_dim(width, kw, stride_w, pad_w);
     if (out_h <= 0 || out_w <= 0)
@@ -231,38 +242,48 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                C_out * out_h * out_w * sizeof(float));
 
         /* weight gradient: dW += grad_out_mat @ col^T
-           grad_out_mat: [C_out, out_h*out_w]
-           col^T: [out_h*out_w, C_in*kh*kw]
-           result: [C_out, C_in*kh*kw] = weight shape flattened */
+           use dispatch GEMM for the transposed matmul */
         if (weight->requires_grad)
         {
-            float *coldata = (float *)col->storage->data;
-            float *wg = (float *)weight->grad->storage->data;
             int64_t K = C_in * kh * kw;
             int64_t M = out_h * out_w;
 
-            for (int64_t co = 0; co < C_out; co++)
-                for (int64_t k = 0; k < K; k++)
-                    for (int64_t m = 0; m < M; m++)
-                        wg[co * K + k] += god[co * M + m] * coldata[k * M + m];
+            /* col^T: [M, K] */
+            ax_tensor_t *col_t = ax_tensor_transpose(col, 0, 1);
+            ax_tensor_t *col_tc = ax_tensor_contiguous(col_t);
+
+            /* dW_sample = go_mat @ col_tc: [C_out, K] */
+            int64_t dw_shape[] = {C_out, K};
+            ax_tensor_t *dw = ax_tensor_zeros(dw_shape, 2, AX_FLOAT32);
+            ax_compute_gemm(go_mat, col_tc, dw);
+
+            /* accumulate into weight grad */
+            float *wg = (float *)weight->grad->storage->data;
+            float *dwd = (float *)dw->storage->data;
+            for (int64_t i = 0; i < C_out * K; i++) wg[i] += dwd[i];
+
+            ax_tensor_destroy(col_t);
+            ax_tensor_destroy(col_tc);
+            ax_tensor_destroy(dw);
         }
 
-        /* input gradient: dcol = W^T @ grad_out_mat, then col2im
-           W reshaped: [C_out, C_in*kh*kw], W^T: [C_in*kh*kw, C_out]
-           grad_out_mat: [C_out, out_h*out_w], dcol: [C_in*kh*kw, out_h*out_w]
-           accumulated into input_orig->grad (flat-indexed; grad is freshly-allocated contiguous) */
+        /* input gradient: dcol = W^T @ grad_out_mat, then col2im */
         if (input_orig->requires_grad)
         {
             int64_t K = C_in * kh * kw;
             int64_t M = out_h * out_w;
+
+            /* W^T: [K, C_out] */
+            int64_t w2d_shape[] = {C_out, K};
+            ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
+            memcpy(w2d->storage->data, wdata, (size_t)(C_out * K) * sizeof(float));
+            ax_tensor_t *w2d_t = ax_tensor_transpose(w2d, 0, 1);
+            ax_tensor_t *w2d_tc = ax_tensor_contiguous(w2d_t);
+
+            /* dcol = W^T @ go_mat: [K, M] */
             int64_t dcol_shape[] = {K, M};
             ax_tensor_t *dcol = ax_tensor_zeros(dcol_shape, 2, AX_FLOAT32);
-            float *dd = (float *)dcol->storage->data;
-
-            for (int64_t k = 0; k < K; k++)
-                for (int64_t m = 0; m < M; m++)
-                    for (int64_t co = 0; co < C_out; co++)
-                        dd[k * M + m] += wdata[co * K + k] * god[co * M + m];
+            ax_compute_gemm(w2d_tc, go_mat, dcol);
 
             ax_tensor_t *dimg = ax_col2im(dcol, C_in, H, W, kh, kw, sh, sw, ph, pw);
             float *ig = (float *)input_orig->grad->storage->data;
@@ -270,6 +291,9 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             for (int64_t i = 0; i < C_in * H * W; i++)
                 ig[n * C_in * H * W + i] += dg[i];
 
+            ax_tensor_destroy(w2d);
+            ax_tensor_destroy(w2d_t);
+            ax_tensor_destroy(w2d_tc);
             ax_tensor_destroy(dcol);
             ax_tensor_destroy(dimg);
         }
