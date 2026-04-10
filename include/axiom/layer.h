@@ -18,7 +18,7 @@
 /* max layers in a sequential model */
 #define AX_SEQ_MAX_LAYERS 64
 
-/* layer types */
+/* layer types — every layer MUST have its own value here */
 typedef enum
 {
     AX_LAYER_DENSE = 0,
@@ -30,7 +30,16 @@ typedef enum
     AX_LAYER_GELU,
     AX_LAYER_SWISH,
     AX_LAYER_SOFTMAX,
+    AX_LAYER_CONV2D,
+    AX_LAYER_MAXPOOL2D,
+    AX_LAYER_AVGPOOL2D,
+    AX_LAYER_GLOBAL_AVGPOOL2D,
+    AX_LAYER_FLATTEN,
+    AX_LAYER_BATCHNORM,
+    AX_LAYER_LAYERNORM,
+    AX_LAYER_DROPOUT,
     AX_LAYER_SEQUENTIAL,
+    AX_LAYER_TYPE_COUNT,
 } ax_layer_type_t;
 
 /* forward declaration */
@@ -74,6 +83,16 @@ typedef struct
 
 /* create a dense layer. initializes weights with kaiming by default. */
 ax_layer_t *ax_dense_create(int64_t in_features, int64_t out_features, bool use_bias);
+
+
+/* activation layers — the struct is public so serialization can access alpha/axis */
+
+typedef struct
+{
+    ax_layer_t base;
+    float alpha;    /* for leaky relu, elu */
+    int axis;       /* for softmax */
+} ax_activation_layer_t;
 
 
 /* activation layers — stateless, no parameters.

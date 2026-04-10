@@ -32,6 +32,8 @@
 #include "axiom/serialize.h"
 #include "axiom/error.h"
 #include "axiom/activations.h"
+#include "axiom/conv.h"
+#include "axiom/norm.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,27 +238,83 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
     write_u32(f, AX_FORMAT_VERSION);
     write_u32(f, (uint32_t)seq->n_layers);
 
-    /* layer descriptors */
+    /* layer descriptors: each layer writes its type, n_params, then
+       type-specific configuration bytes. the loader reads the same fields
+       in the same order to reconstruct the layer. */
     for (int i = 0; i < seq->n_layers; i++)
     {
         ax_layer_t *l = seq->layers[i];
         write_u32(f, (uint32_t)l->type);
         write_u32(f, (uint32_t)l->n_params);
-        write_i64(f, l->input_features);
-        write_i64(f, l->output_features);
 
-        /* extra context for parameterized activations */
-        float extra = 0.0f;
-        uint8_t flags = 0;
-
-        if (l->type == AX_LAYER_DENSE)
+        switch (l->type)
         {
-            ax_dense_t *d = (ax_dense_t *)l;
-            flags = d->use_bias ? 1 : 0;
+            case AX_LAYER_DENSE: {
+                ax_dense_t *d = (ax_dense_t *)l;
+                write_i64(f, l->input_features);
+                write_i64(f, l->output_features);
+                write_u8(f, d->use_bias ? 1 : 0);
+                break;
+            }
+            case AX_LAYER_CONV2D: {
+                ax_conv2d_t *c = (ax_conv2d_t *)l;
+                write_u32(f, (uint32_t)c->in_channels);
+                write_u32(f, (uint32_t)c->out_channels);
+                write_u32(f, (uint32_t)c->kernel_h);
+                write_u32(f, (uint32_t)c->kernel_w);
+                write_u32(f, (uint32_t)c->stride_h);
+                write_u32(f, (uint32_t)c->stride_w);
+                write_u32(f, (uint32_t)c->pad_h);
+                write_u32(f, (uint32_t)c->pad_w);
+                write_u8(f, c->use_bias ? 1 : 0);
+                break;
+            }
+            case AX_LAYER_MAXPOOL2D: {
+                ax_maxpool2d_t *p = (ax_maxpool2d_t *)l;
+                write_u32(f, (uint32_t)p->kernel_size);
+                write_u32(f, (uint32_t)p->stride);
+                write_u32(f, (uint32_t)p->padding);
+                break;
+            }
+            case AX_LAYER_AVGPOOL2D: {
+                ax_avgpool2d_t *p = (ax_avgpool2d_t *)l;
+                write_u32(f, (uint32_t)p->kernel_size);
+                write_u32(f, (uint32_t)p->stride);
+                write_u32(f, (uint32_t)p->padding);
+                break;
+            }
+            case AX_LAYER_BATCHNORM: {
+                ax_batchnorm_t *bn = (ax_batchnorm_t *)l;
+                write_i64(f, bn->num_features);
+                write_f32(f, bn->eps);
+                write_f32(f, bn->momentum);
+                break;
+            }
+            case AX_LAYER_LAYERNORM: {
+                ax_layernorm_t *ln = (ax_layernorm_t *)l;
+                write_i64(f, ln->num_features);
+                write_f32(f, ln->eps);
+                break;
+            }
+            case AX_LAYER_DROPOUT: {
+                ax_dropout_t *dp = (ax_dropout_t *)l;
+                write_f32(f, dp->p);
+                break;
+            }
+            case AX_LAYER_LEAKY_RELU:
+            case AX_LAYER_ELU: {
+                ax_activation_layer_t *al = (ax_activation_layer_t *)l;
+                write_f32(f, al->alpha);
+                break;
+            }
+            case AX_LAYER_SOFTMAX: {
+                write_u32(f, 1); /* axis, always 1 for now */
+                break;
+            }
+            /* stateless layers: relu, sigmoid, tanh, gelu, swish, flatten, global_avgpool */
+            default:
+                break;
         }
-
-        write_f32(f, extra);
-        write_u8(f, flags);
     }
 
     /* parameter data */
@@ -325,90 +383,118 @@ ax_model_t *ax_model_load(const char *path)
         return NULL;
     }
 
-    /* read layer descriptors */
-    typedef struct { uint32_t type, n_params; int64_t in_f, out_f; float extra; uint8_t flags; } layer_desc_t;
-    layer_desc_t *descs = calloc(n_layers, sizeof(layer_desc_t));
-    if (!descs)
-    {
-        ax_err_set(AX_ERR_ALLOC, "failed to allocate layer descriptors");
-        fclose(f);
-        return NULL;
-    }
-
-    for (uint32_t i = 0; i < n_layers; i++)
-    {
-        if (!read_u32(f, &descs[i].type) ||
-            !read_u32(f, &descs[i].n_params) ||
-            !read_i64(f, &descs[i].in_f) ||
-            !read_i64(f, &descs[i].out_f) ||
-            !read_f32(f, &descs[i].extra) ||
-            !read_u8(f, &descs[i].flags))
-        {
-            ax_err_set(AX_ERR_INTERNAL,
-                       "truncated layer descriptor at layer %u", i);
-            free(descs);
-            fclose(f);
-            return NULL;
-        }
-
-        /* validate n_params per layer */
-        if (descs[i].n_params > AX_LAYER_MAX_PARAMS) {
-            ax_err_set(AX_ERR_INVALID_SHAPE,
-                       "layer %u has %u params (max %d)",
-                       i, descs[i].n_params, AX_LAYER_MAX_PARAMS);
-            free(descs);
-            fclose(f);
-            return NULL;
-        }
-
-        /* validate feature dimensions are positive for parameterized layers */
-        if (descs[i].type == AX_LAYER_DENSE && (descs[i].in_f <= 0 || descs[i].out_f <= 0)) {
-            ax_err_set(AX_ERR_INVALID_SHAPE,
-                       "layer %u has invalid features: in=%ld out=%ld",
-                       i, descs[i].in_f, descs[i].out_f);
-            free(descs);
-            fclose(f);
-            return NULL;
-        }
-    }
-
-    /* reconstruct layers */
+    /* reconstruct layers from type-specific descriptors */
     ax_layer_t *seq = ax_sequential_create();
+    if (!seq) { fclose(f); return NULL; }
 
     for (uint32_t i = 0; i < n_layers; i++)
     {
-        ax_layer_t *layer = NULL;
-
-        switch (descs[i].type)
+        uint32_t type, n_params;
+        if (!read_u32(f, &type) || !read_u32(f, &n_params))
         {
-            case AX_LAYER_DENSE:
-                layer = ax_dense_create(descs[i].in_f, descs[i].out_f,
-                                        descs[i].flags & 1);
-                break;
-            case AX_LAYER_RELU:       layer = ax_relu_layer_create(); break;
-            case AX_LAYER_SIGMOID:    layer = ax_sigmoid_layer_create(); break;
-            case AX_LAYER_TANH:       layer = ax_tanh_layer_create(); break;
-            case AX_LAYER_LEAKY_RELU: layer = ax_leaky_relu_layer_create(descs[i].extra); break;
-            case AX_LAYER_ELU:        layer = ax_elu_layer_create(descs[i].extra); break;
-            case AX_LAYER_GELU:       layer = ax_gelu_layer_create(); break;
-            case AX_LAYER_SWISH:      layer = ax_swish_layer_create(); break;
-            case AX_LAYER_SOFTMAX:    layer = ax_softmax_layer_create((int)descs[i].extra); break;
-            default:
-                ax_err_set(AX_ERR_INTERNAL, "unknown layer type %u", descs[i].type);
-                free(descs);
-                ax_layer_destroy(seq);
-                fclose(f);
-                return NULL;
-        }
-
-        if (!layer)
-        {
-            free(descs);
+            ax_err_set(AX_ERR_INTERNAL, "truncated layer header at layer %u", i);
             ax_layer_destroy(seq);
             fclose(f);
             return NULL;
         }
 
+        if (n_params > AX_LAYER_MAX_PARAMS)
+        {
+            ax_err_set(AX_ERR_INVALID_SHAPE, "layer %u: %u params exceeds max", i, n_params);
+            ax_layer_destroy(seq); fclose(f); return NULL;
+        }
+
+        ax_layer_t *layer = NULL;
+
+        switch (type)
+        {
+            case AX_LAYER_DENSE: {
+                int64_t in_f, out_f; uint8_t bias;
+                if (!read_i64(f, &in_f) || !read_i64(f, &out_f) || !read_u8(f, &bias))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                if (in_f <= 0 || out_f <= 0)
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_dense_create(in_f, out_f, bias & 1);
+                break;
+            }
+            case AX_LAYER_CONV2D: {
+                uint32_t in_ch, out_ch, kh, kw, sh, sw, ph, pw; uint8_t bias;
+                if (!read_u32(f, &in_ch) || !read_u32(f, &out_ch) ||
+                    !read_u32(f, &kh) || !read_u32(f, &kw) ||
+                    !read_u32(f, &sh) || !read_u32(f, &sw) ||
+                    !read_u32(f, &ph) || !read_u32(f, &pw) ||
+                    !read_u8(f, &bias))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_conv2d_create_ex(in_ch, out_ch, kh, kw, sh, sw, ph, pw, bias & 1);
+                break;
+            }
+            case AX_LAYER_MAXPOOL2D: {
+                uint32_t ks, st, pd;
+                if (!read_u32(f, &ks) || !read_u32(f, &st) || !read_u32(f, &pd))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_maxpool2d_create(ks, st, pd);
+                break;
+            }
+            case AX_LAYER_AVGPOOL2D: {
+                uint32_t ks, st, pd;
+                if (!read_u32(f, &ks) || !read_u32(f, &st) || !read_u32(f, &pd))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_avgpool2d_create(ks, st, pd);
+                break;
+            }
+            case AX_LAYER_BATCHNORM: {
+                int64_t nf; float eps, mom;
+                if (!read_i64(f, &nf) || !read_f32(f, &eps) || !read_f32(f, &mom))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                if (nf <= 0) { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_batchnorm_create(nf, eps, mom);
+                break;
+            }
+            case AX_LAYER_LAYERNORM: {
+                int64_t nf; float eps;
+                if (!read_i64(f, &nf) || !read_f32(f, &eps))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                if (nf <= 0) { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_layernorm_create(nf, eps);
+                break;
+            }
+            case AX_LAYER_DROPOUT: {
+                float p;
+                if (!read_f32(f, &p))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_dropout_create(p);
+                break;
+            }
+            case AX_LAYER_LEAKY_RELU:
+            case AX_LAYER_ELU: {
+                float alpha;
+                if (!read_f32(f, &alpha))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = (type == AX_LAYER_LEAKY_RELU)
+                    ? ax_leaky_relu_layer_create(alpha)
+                    : ax_elu_layer_create(alpha);
+                break;
+            }
+            case AX_LAYER_SOFTMAX: {
+                uint32_t axis;
+                if (!read_u32(f, &axis))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_softmax_layer_create((int)axis);
+                break;
+            }
+            case AX_LAYER_RELU:           layer = ax_relu_layer_create(); break;
+            case AX_LAYER_SIGMOID:        layer = ax_sigmoid_layer_create(); break;
+            case AX_LAYER_TANH:           layer = ax_tanh_layer_create(); break;
+            case AX_LAYER_GELU:           layer = ax_gelu_layer_create(); break;
+            case AX_LAYER_SWISH:          layer = ax_swish_layer_create(); break;
+            case AX_LAYER_FLATTEN:        layer = ax_flatten_create(); break;
+            case AX_LAYER_GLOBAL_AVGPOOL2D: layer = ax_global_avgpool2d_create(); break;
+            default:
+                ax_err_set(AX_ERR_INTERNAL, "unknown layer type %u at layer %u", type, i);
+                ax_layer_destroy(seq); fclose(f); return NULL;
+        }
+
+        if (!layer) { ax_layer_destroy(seq); fclose(f); return NULL; }
         ax_sequential_add(seq, layer);
     }
 
@@ -424,7 +510,6 @@ ax_model_t *ax_model_load(const char *path)
             if (!loaded)
             {
                 ax_err_set(AX_ERR_INTERNAL, "failed reading params for layer %u param %d", i, p);
-                free(descs);
                 ax_layer_destroy(seq);
                 fclose(f);
                 return NULL;
@@ -442,7 +527,6 @@ ax_model_t *ax_model_load(const char *path)
                                "layer %u param %d: expected %ld elements, file has %ld",
                                i, p, n_existing, n_loaded);
                     ax_tensor_destroy(loaded);
-                    free(descs);
                     ax_layer_destroy(seq);
                     fclose(f);
                     return NULL;
@@ -454,7 +538,6 @@ ax_model_t *ax_model_load(const char *path)
         }
     }
 
-    free(descs);
     fclose(f);
 
     ax_model_t *model = ax_model_create(seq);

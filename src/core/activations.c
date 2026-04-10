@@ -413,12 +413,59 @@ ax_tensor_t *ax_mish(ax_tensor_t *a)
 }
 
 
-/* softmax along an axis. numerically stable version:
-   softmax(x)_i = exp(x_i - max(x)) / sum(exp(x_i - max(x)))
+/* softmax backward:
+   grad_input = s * (grad_out - sum(grad_out * s, keepdim))
+   where s is the softmax output */
 
-   no autograd for now — softmax backward is only really needed
-   in combination with cross-entropy, and that combo has a much
-   simpler fused gradient. we'll handle it in the loss function. */
+static void softmax_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *input = self->inputs[0];
+    ax_tensor_t *softmax_out = self->saved[0]; /* saved softmax output */
+
+    if (!input->requires_grad) return;
+
+    if (!input->grad)
+        input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!input->grad) return;
+
+    float *ig = (float *)input->grad->storage->data;
+    float *go = (float *)grad_out->storage->data;
+    float *sd = (float *)softmax_out->storage->data;
+
+    if (input->ndim == 1)
+    {
+        int64_t n = input->shape[0];
+        /* dot = sum(grad_out * s) */
+        float dot = 0;
+        for (int64_t i = 0; i < n; i++)
+            dot += go[grad_out->offset + i] * sd[softmax_out->offset + i];
+        for (int64_t i = 0; i < n; i++)
+            ig[input->grad->offset + i] +=
+                sd[softmax_out->offset + i] * (go[grad_out->offset + i] - dot);
+    }
+    else if (input->ndim == 2)
+    {
+        int64_t rows = input->shape[0];
+        int64_t cols = input->shape[1];
+        for (int64_t r = 0; r < rows; r++)
+        {
+            float dot = 0;
+            for (int64_t c = 0; c < cols; c++)
+                dot += go[grad_out->offset + r * cols + c] *
+                       sd[softmax_out->offset + r * cols + c];
+            for (int64_t c = 0; c < cols; c++) {
+                int64_t idx = r * cols + c;
+                ig[input->grad->offset + idx] +=
+                    sd[softmax_out->offset + idx] *
+                    (go[grad_out->offset + idx] - dot);
+            }
+        }
+    }
+}
+
+
+/* softmax along an axis. numerically stable version:
+   softmax(x)_i = exp(x_i - max(x)) / sum(exp(x_i - max(x))) */
 
 ax_tensor_t *ax_softmax(ax_tensor_t *a, int axis)
 {
@@ -493,6 +540,19 @@ ax_tensor_t *ax_softmax(ax_tensor_t *a, int axis)
                    "softmax only supports 1d or 2d (axis=1) for now");
         ax_tensor_destroy(out);
         return NULL;
+    }
+
+    /* hook up backward */
+    if (needs_grad(a))
+    {
+        out->requires_grad = true;
+        ax_grad_fn_t *gf = ax_grad_fn_create(softmax_backward);
+        gf->inputs[0] = a;
+        gf->n_inputs = 1;
+        gf->saved[0] = out;
+        gf->n_saved = 1;
+        gf->int_ctx = axis;
+        out->grad_fn = gf;
     }
 
     return out;

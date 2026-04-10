@@ -19,7 +19,7 @@
 
 /* magic bytes to identify axiom model files */
 #define AX_MAGIC 0x41584F4E  /* "AXON" in ascii */
-#define AX_FORMAT_VERSION 1
+#define AX_FORMAT_VERSION 2
 
 /* save a sequential model to a binary file.
    writes architecture + all parameter data.

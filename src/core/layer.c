@@ -23,8 +23,16 @@ static const char *layer_type_name(ax_layer_type_t type)
         case AX_LAYER_ELU:        return "ELU";
         case AX_LAYER_GELU:       return "GELU";
         case AX_LAYER_SWISH:      return "Swish";
-        case AX_LAYER_SOFTMAX:    return "Softmax";
-        case AX_LAYER_SEQUENTIAL: return "Sequential";
+        case AX_LAYER_SOFTMAX:         return "Softmax";
+        case AX_LAYER_CONV2D:          return "Conv2D";
+        case AX_LAYER_MAXPOOL2D:       return "MaxPool2D";
+        case AX_LAYER_AVGPOOL2D:       return "AvgPool2D";
+        case AX_LAYER_GLOBAL_AVGPOOL2D:return "GlobalAvgPool";
+        case AX_LAYER_FLATTEN:         return "Flatten";
+        case AX_LAYER_BATCHNORM:       return "BatchNorm";
+        case AX_LAYER_LAYERNORM:       return "LayerNorm";
+        case AX_LAYER_DROPOUT:         return "Dropout";
+        case AX_LAYER_SEQUENTIAL:      return "Sequential";
         default: return "Unknown";
     }
 }
@@ -102,14 +110,8 @@ ax_layer_t *ax_dense_create(int64_t in_features, int64_t out_features, bool use_
 
 
 /* activation layers — thin wrappers so they fit in a sequential model.
-   they have no parameters and no state. */
-
-typedef struct
-{
-    ax_layer_t base;
-    float alpha;    /* for leaky relu, elu */
-    int axis;       /* for softmax */
-} ax_activation_layer_t;
+   they have no parameters and no state.
+   ax_activation_layer_t is defined in layer.h so serialize.c can access it. */
 
 static ax_tensor_t *relu_forward(ax_layer_t *self, ax_tensor_t *input) { return ax_relu(input); }
 static ax_tensor_t *sigmoid_forward(ax_layer_t *self, ax_tensor_t *input) { return ax_sigmoid(input); }
