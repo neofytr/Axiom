@@ -17,10 +17,35 @@ add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter
 
 # sanitizer build: cmake -DCMAKE_BUILD_TYPE=Debug -DAX_SANITIZE=ON ..
 option(AX_SANITIZE "enable address + undefined behavior sanitizers" OFF)
+option(AX_TSAN "enable thread sanitizer (mutually exclusive with AX_SANITIZE)" OFF)
+
+if(AX_SANITIZE AND AX_TSAN)
+    message(FATAL_ERROR "AX_SANITIZE and AX_TSAN are mutually exclusive")
+endif()
+
 if(AX_SANITIZE)
     message(STATUS "sanitizers enabled (asan + ubsan)")
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(AX_TSAN)
+    message(STATUS "thread sanitizer enabled")
+    add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=thread)
+endif()
+
+# openmp parallelism: cmake -DAX_OPENMP=ON .. (default ON for desktop)
+option(AX_OPENMP "enable openmp multi-core parallelism" ON)
+if(AX_OPENMP)
+    find_package(OpenMP)
+    if(OpenMP_C_FOUND)
+        message(STATUS "openmp enabled (${OpenMP_C_VERSION})")
+        add_compile_definitions(AX_HAVE_OPENMP)
+    else()
+        message(STATUS "openmp requested but not found — building single-threaded")
+        set(AX_OPENMP OFF)
+    endif()
 endif()
 
 # hardening flags for release
@@ -64,12 +89,18 @@ endif()
 add_library(axiom_static STATIC ${AXIOM_SOURCES})
 target_include_directories(axiom_static PUBLIC include)
 target_link_libraries(axiom_static PUBLIC m)
+if(AX_OPENMP AND OpenMP_C_FOUND)
+    target_link_libraries(axiom_static PUBLIC OpenMP::OpenMP_C)
+endif()
 set_target_properties(axiom_static PROPERTIES OUTPUT_NAME axiom)
 
 # shared library
 add_library(axiom_shared SHARED ${AXIOM_SOURCES})
 target_include_directories(axiom_shared PUBLIC include)
 target_link_libraries(axiom_shared PUBLIC m)
+if(AX_OPENMP AND OpenMP_C_FOUND)
+    target_link_libraries(axiom_shared PUBLIC OpenMP::OpenMP_C)
+endif()
 set_target_properties(axiom_shared PROPERTIES OUTPUT_NAME axiom)
 
 # tests
@@ -94,6 +125,7 @@ set(TEST_SOURCES
     tests/test_grad_verify.c
     tests/test_serialize_all.c
     tests/test_lr_sched.c
+    tests/test_backend_opt.c
 )
 
 foreach(test_src ${TEST_SOURCES})

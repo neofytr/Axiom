@@ -35,6 +35,16 @@ const ax_backend_ops_t *ax_compute_get_ops(void);
 /* register a custom backend at runtime (for plugins/extensions) */
 ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops_t *ops);
 
+/* set the maximum number of threads used by parallel ops.
+   wraps omp_set_num_threads() when openmp is enabled.
+   no-op when openmp is disabled (always 1 thread).
+   pass 0 to reset to default (omp_get_max_threads). */
+void ax_set_num_threads(int n);
+
+/* get the current maximum number of threads.
+   returns 1 if openmp is disabled. */
+int ax_get_num_threads(void);
+
 /* dispatch functions */
 /* these call through to the active backend's function pointers.
    tensor.c calls these; user code normally calls the tensor-level api instead. */

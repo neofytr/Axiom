@@ -4,6 +4,10 @@
 #include "axiom/error.h"
 #include <stddef.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* declared in cpu_naive.c and cpu_opt.c */
 extern const ax_backend_ops_t ax_cpu_naive_ops;
 extern const ax_backend_ops_t ax_cpu_opt_ops;
@@ -185,3 +189,27 @@ ax_status_t ax_compute_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
 ax_status_t ax_compute_relu(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(relu, in, out); }
 ax_status_t ax_compute_sigmoid(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(sigmoid, in, out); }
 ax_status_t ax_compute_tanh(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(tanh_op, in, out); }
+
+/* thread control */
+void ax_set_num_threads(int n)
+{
+#ifdef _OPENMP
+    if (n <= 0) {
+        /* reset to default: hardware concurrency */
+        omp_set_num_threads(omp_get_num_procs());
+    } else {
+        omp_set_num_threads(n);
+    }
+#else
+    (void)n;
+#endif
+}
+
+int ax_get_num_threads(void)
+{
+#ifdef _OPENMP
+    return omp_get_max_threads();
+#else
+    return 1;
+#endif
+}
