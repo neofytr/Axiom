@@ -850,8 +850,19 @@ static ax_tensor_t *flatten_forward(ax_layer_t *self, ax_tensor_t *input)
     int64_t n = ax_tensor_numel(input);
     float *od = (float *)output->storage->data;
     float *id = (float *)input->storage->data;
+    /* must respect strides for non-contiguous inputs (e.g., after transpose) */
     for (int64_t i = 0; i < n; i++)
-        od[i] = id[input->offset + i];
+    {
+        int64_t remaining = i;
+        int64_t src_offset = input->offset;
+        for (int d = input->ndim - 1; d >= 0; d--)
+        {
+            int64_t idx = remaining % input->shape[d];
+            remaining /= input->shape[d];
+            src_offset += idx * input->strides[d];
+        }
+        od[i] = id[src_offset];
+    }
 
     if (record) {
         flatten_ctx_t *ctx = malloc(sizeof(flatten_ctx_t));

@@ -157,7 +157,11 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
             }
 
             rm[f] = (1.0f - bn->momentum) * rm[f] + bn->momentum * mean;
-            rv[f] = (1.0f - bn->momentum) * rv[f] + bn->momentum * var;
+            /* use unbiased variance (Bessel's correction) for the running estimate,
+               matching PyTorch/standard BatchNorm behavior. the biased var is used
+               for the actual normalization above, but the running stat should be unbiased. */
+            float unbiased_var = (batch > 1) ? var_sum / (float)(batch - 1) : var;
+            rv[f] = (1.0f - bn->momentum) * rv[f] + bn->momentum * unbiased_var;
         }
     }
     else

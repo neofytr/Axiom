@@ -127,14 +127,18 @@ static void ce_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *td = (float *)target->storage->data;
 
     /* gradient of cross-entropy with softmax is simply: softmax(pred) - target
-       this is one of the cleanest results in all of deep learning */
+       this is one of the cleanest results in all of deep learning.
+       note: pred->grad and softmax_out have their own (contiguous) strides;
+       target may also have non-default strides. use each tensor's own strides. */
     for (int64_t b = 0; b < batch; b++)
     {
         for (int64_t c = 0; c < classes; c++)
         {
-            int64_t idx = b * pred->strides[0] + c * pred->strides[1];
-            pg[pred->grad->offset + idx] +=
-                (sd[softmax_out->offset + idx] - td[target->offset + idx]) * scale;
+            int64_t grad_idx = b * pred->grad->strides[0] + c * pred->grad->strides[1];
+            int64_t sm_idx = b * softmax_out->strides[0] + c * softmax_out->strides[1];
+            int64_t tgt_idx = b * target->strides[0] + c * target->strides[1];
+            pg[pred->grad->offset + grad_idx] +=
+                (sd[softmax_out->offset + sm_idx] - td[target->offset + tgt_idx]) * scale;
         }
     }
 }
@@ -183,11 +187,13 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
         float log_sum = logf(sum_exp);
         for (int64_t c = 0; c < classes; c++)
         {
-            int64_t idx = b * pred->strides[0] + c * pred->strides[1];
-            sd[sm->offset + idx] /= sum_exp;  /* softmax */
+            int64_t pred_idx = b * pred->strides[0] + c * pred->strides[1];
+            int64_t sm_idx = b * sm->strides[0] + c * sm->strides[1];
+            int64_t tgt_idx = b * target->strides[0] + c * target->strides[1];
+            sd[sm->offset + sm_idx] /= sum_exp;  /* softmax */
 
-            float log_sm = (pd[pred->offset + idx] - mx) - log_sum;
-            total_loss -= td[target->offset + idx] * log_sm;
+            float log_sm = (pd[pred->offset + pred_idx] - mx) - log_sum;
+            total_loss -= td[target->offset + tgt_idx] * log_sm;
         }
     }
 
