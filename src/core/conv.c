@@ -335,28 +335,37 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         ax_tensor_t *col = ax_im2col(img, kh, kw, sh, sw, ph, pw);
         if (!col) { ax_tensor_destroy(img); ax_tensor_destroy(output); return NULL; }
 
-        /* output = weight @ col: [C_out, out_h*out_w] */
+        /* output = weight_2d @ col via dispatch (uses optimized tiled GEMM).
+           weight_2d: [C_out, K], col: [K, out_h*out_w], result: [C_out, M] */
         int64_t M = out_h * out_w;
-        float *cd = (float *)col->storage->data;
+        int64_t w2d_shape[] = {C_out, K};
+        int64_t res_shape[] = {C_out, M};
+        ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
+        ax_tensor_t *res = ax_tensor_zeros(res_shape, 2, AX_FLOAT32);
+        if (!w2d || !res) {
+            if (w2d) ax_tensor_destroy(w2d);
+            if (res) ax_tensor_destroy(res);
+            ax_tensor_destroy(col); ax_tensor_destroy(img);
+            ax_tensor_destroy(output); return NULL;
+        }
+        memcpy(w2d->storage->data, wd, (size_t)(C_out * K) * sizeof(float));
+        ax_compute_gemm(w2d, col, res);
 
+        /* copy result to output and add bias */
+        float *rd = (float *)res->storage->data;
         for (int64_t co = 0; co < C_out; co++)
         {
+            float bias_val = (conv->use_bias && conv->bias)
+                ? ((float *)conv->bias->storage->data)[co] : 0.0f;
             for (int64_t m = 0; m < M; m++)
             {
-                float sum = 0;
-                for (int64_t k = 0; k < K; k++)
-                    sum += wd[co * K + k] * cd[k * M + m];
-
-                if (conv->use_bias && conv->bias)
-                {
-                    float *bd = (float *)conv->bias->storage->data;
-                    sum += bd[co];
-                }
-
-                od[((n * C_out + co) * out_h + m / out_w) * out_w + m % out_w] = sum;
+                od[((n * C_out + co) * out_h + m / out_w) * out_w + m % out_w]
+                    = rd[co * M + m] + bias_val;
             }
         }
 
+        ax_tensor_destroy(w2d);
+        ax_tensor_destroy(res);
         ax_tensor_destroy(col);
         ax_tensor_destroy(img);
     }
