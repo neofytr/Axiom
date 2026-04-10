@@ -87,9 +87,10 @@ static ax_status_t cpu_##name(const ax_tensor_t *a, const ax_tensor_t *b, ax_ten
 DEFINE_BINOP(add, va + vb)
 DEFINE_BINOP(sub, va - vb)
 DEFINE_BINOP(mul, va * vb)
-/* division by zero returns 0.0f by design — no crash, but callers should be
-   aware this silently masks errors rather than producing inf/nan */
-DEFINE_BINOP(div_op, vb != 0.0f ? va / vb : 0.0f)
+/* division by zero produces ieee 754 infinity, matching standard math behavior.
+   this lets log_backward and similar produce correct (large) gradients near zero
+   instead of silently zeroing them. users should use gradient clipping if needed. */
+DEFINE_BINOP(div_op, va / vb)
 
 /* element-wise unary ops */
 

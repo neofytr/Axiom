@@ -246,6 +246,7 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
         ax_layer_t *l = seq->layers[i];
         write_u32(f, (uint32_t)l->type);
         write_u32(f, (uint32_t)l->n_params);
+        write_u32(f, (uint32_t)l->n_buffers);
 
         switch (l->type)
         {
@@ -330,6 +331,15 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
                 return AX_ERR_INTERNAL;
             }
         }
+        for (int p = 0; p < l->n_buffers; p++)
+        {
+            if (!write_tensor(f, l->buffers[p]))
+            {
+                fclose(f);
+                ax_err_set(AX_ERR_INTERNAL, "failed writing buffers for layer %d", i);
+                return AX_ERR_INTERNAL;
+            }
+        }
     }
 
     fclose(f);
@@ -384,12 +394,14 @@ ax_model_t *ax_model_load(const char *path)
     }
 
     /* reconstruct layers from type-specific descriptors */
+    uint32_t layer_n_buffers[AX_SEQ_MAX_LAYERS];
+    memset(layer_n_buffers, 0, sizeof(layer_n_buffers));
     ax_layer_t *seq = ax_sequential_create();
     if (!seq) { fclose(f); return NULL; }
 
     for (uint32_t i = 0; i < n_layers; i++)
     {
-        uint32_t type, n_params;
+        uint32_t type, n_params, n_buffers_file = 0;
         if (!read_u32(f, &type) || !read_u32(f, &n_params))
         {
             ax_err_set(AX_ERR_INTERNAL, "truncated layer header at layer %u", i);
@@ -398,12 +410,23 @@ ax_model_t *ax_model_load(const char *path)
             return NULL;
         }
 
+        if (version >= 3) {
+            if (!read_u32(f, &n_buffers_file))
+            {
+                ax_err_set(AX_ERR_INTERNAL, "truncated layer header (n_buffers) at layer %u", i);
+                ax_layer_destroy(seq);
+                fclose(f);
+                return NULL;
+            }
+        }
+
         if (n_params > AX_LAYER_MAX_PARAMS)
         {
             ax_err_set(AX_ERR_INVALID_SHAPE, "layer %u: %u params exceeds max", i, n_params);
             ax_layer_destroy(seq); fclose(f); return NULL;
         }
 
+        layer_n_buffers[i] = n_buffers_file;
         ax_layer_t *layer = NULL;
 
         switch (type)
@@ -533,6 +556,36 @@ ax_model_t *ax_model_load(const char *path)
                 }
                 size_t bytes = (size_t)n_existing * ax_dtype_size(existing->dtype);
                 memcpy(existing->storage->data, loaded->storage->data, bytes);
+            }
+            ax_tensor_destroy(loaded);
+        }
+
+        /* load buffer data (version >= 3) */
+        uint32_t nb = layer_n_buffers[i];
+        for (uint32_t b = 0; b < nb; b++)
+        {
+            ax_tensor_t *loaded = read_tensor(f);
+            if (!loaded)
+            {
+                ax_err_set(AX_ERR_INTERNAL, "failed reading buffer for layer %u buffer %u", i, b);
+                ax_layer_destroy(seq);
+                fclose(f);
+                return NULL;
+            }
+
+            if (b < (uint32_t)layer->n_buffers)
+            {
+                ax_tensor_t *existing = layer->buffers[b];
+                if (existing && existing->storage)
+                {
+                    int64_t n_existing = ax_tensor_numel(existing);
+                    int64_t n_loaded = ax_tensor_numel(loaded);
+                    if (n_existing == n_loaded)
+                    {
+                        size_t bytes = (size_t)n_existing * ax_dtype_size(existing->dtype);
+                        memcpy(existing->storage->data, loaded->storage->data, bytes);
+                    }
+                }
             }
             ax_tensor_destroy(loaded);
         }

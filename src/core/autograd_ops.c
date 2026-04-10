@@ -171,8 +171,12 @@ ax_grad_fn_t *ax_make_mul_backward(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *
     gf->inputs[0] = a;
     gf->inputs[1] = b;
     gf->n_inputs = 2;
-    gf->saved[0] = a;
-    gf->saved[1] = b;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    ax_tensor_t *b_safe = ax_ensure_contiguous(b);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
+    gf->saved[1] = b_safe;
+    gf->saved_owned[1] = (b_safe != b);
     gf->n_saved = 2;
     return gf;
 }
@@ -214,8 +218,12 @@ ax_grad_fn_t *ax_make_div_backward(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *
     gf->inputs[0] = a;
     gf->inputs[1] = b;
     gf->n_inputs = 2;
-    gf->saved[0] = a;
-    gf->saved[1] = b;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    ax_tensor_t *b_safe = ax_ensure_contiguous(b);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
+    gf->saved[1] = b_safe;
+    gf->saved_owned[1] = (b_safe != b);
     gf->n_saved = 2;
     return gf;
 }
@@ -280,7 +288,9 @@ ax_grad_fn_t *ax_make_log_backward(ax_tensor_t *a, ax_tensor_t *out)
     ax_grad_fn_t *gf = ax_grad_fn_create(log_backward);
     gf->inputs[0] = a;
     gf->n_inputs = 1;
-    gf->saved[0] = a;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
     gf->n_saved = 1;
     return gf;
 }
@@ -342,7 +352,9 @@ ax_grad_fn_t *ax_make_square_backward(ax_tensor_t *a, ax_tensor_t *out)
     ax_grad_fn_t *gf = ax_grad_fn_create(square_backward);
     gf->inputs[0] = a;
     gf->n_inputs = 1;
-    gf->saved[0] = a;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
     gf->n_saved = 1;
     return gf;
 }
@@ -438,8 +450,12 @@ ax_grad_fn_t *ax_make_matmul_backward(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_
     gf->inputs[0] = a;
     gf->inputs[1] = b;
     gf->n_inputs = 2;
-    gf->saved[0] = a;
-    gf->saved[1] = b;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    ax_tensor_t *b_safe = ax_ensure_contiguous(b);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
+    gf->saved[1] = b_safe;
+    gf->saved_owned[1] = (b_safe != b);
     gf->n_saved = 2;
     return gf;
 }
@@ -511,7 +527,9 @@ ax_grad_fn_t *ax_make_sum_backward(ax_tensor_t *a, int axis, ax_tensor_t *out)
     ax_grad_fn_t *gf = ax_grad_fn_create(sum_backward);
     gf->inputs[0] = a;
     gf->n_inputs = 1;
-    gf->saved[0] = a;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
     gf->n_saved = 1;
     gf->int_ctx = axis;
     return gf;
@@ -588,7 +606,9 @@ ax_grad_fn_t *ax_make_mean_backward(ax_tensor_t *a, int axis, ax_tensor_t *out)
     ax_grad_fn_t *gf = ax_grad_fn_create(mean_backward);
     gf->inputs[0] = a;
     gf->n_inputs = 1;
-    gf->saved[0] = a;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
     gf->n_saved = 1;
     gf->int_ctx = axis;
     return gf;
@@ -623,7 +643,9 @@ ax_grad_fn_t *ax_make_relu_backward(ax_tensor_t *a, ax_tensor_t *out)
     ax_grad_fn_t *gf = ax_grad_fn_create(relu_backward);
     gf->inputs[0] = a;
     gf->n_inputs = 1;
-    gf->saved[0] = a;
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
     gf->n_saved = 1;
     return gf;
 }

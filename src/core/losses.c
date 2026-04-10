@@ -90,8 +90,12 @@ ax_tensor_t *ax_mae_loss(ax_tensor_t *pred, ax_tensor_t *target)
         ax_grad_fn_t *gf = ax_grad_fn_create(mae_backward);
         gf->inputs[0] = pred;
         gf->n_inputs = 1;
-        gf->saved[0] = pred;
-        gf->saved[1] = target;
+        ax_tensor_t *pred_safe = ax_ensure_contiguous(pred);
+        ax_tensor_t *target_safe = ax_ensure_contiguous(target);
+        gf->saved[0] = pred_safe;
+        gf->saved_owned[0] = (pred_safe != pred);
+        gf->saved[1] = target_safe;
+        gf->saved_owned[1] = (target_safe != target);
         gf->n_saved = 2;
         loss->grad_fn = gf;
     }
@@ -205,8 +209,12 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
         ax_grad_fn_t *gf = ax_grad_fn_create(ce_backward);
         gf->inputs[0] = pred;
         gf->n_inputs = 1;
-        gf->saved[0] = pred;    /* borrowed — graph node */
-        gf->saved[1] = target;  /* borrowed — user tensor */
+        ax_tensor_t *pred_safe = ax_ensure_contiguous(pred);
+        ax_tensor_t *target_safe = ax_ensure_contiguous(target);
+        gf->saved[0] = pred_safe;
+        gf->saved_owned[0] = (pred_safe != pred);
+        gf->saved[1] = target_safe;
+        gf->saved_owned[1] = (target_safe != target);
         gf->saved[2] = sm;      /* owned — helper we created */
         gf->saved_owned[2] = true;
         gf->n_saved = 3;
@@ -276,8 +284,12 @@ ax_tensor_t *ax_bce_with_logits_loss(ax_tensor_t *pred, ax_tensor_t *target)
         ax_grad_fn_t *gf = ax_grad_fn_create(bce_backward);
         gf->inputs[0] = pred;
         gf->n_inputs = 1;
-        gf->saved[0] = pred;
-        gf->saved[1] = target;
+        ax_tensor_t *pred_safe = ax_ensure_contiguous(pred);
+        ax_tensor_t *target_safe = ax_ensure_contiguous(target);
+        gf->saved[0] = pred_safe;
+        gf->saved_owned[0] = (pred_safe != pred);
+        gf->saved[1] = target_safe;
+        gf->saved_owned[1] = (target_safe != target);
         gf->n_saved = 2;
         loss->grad_fn = gf;
     }
@@ -342,8 +354,12 @@ ax_tensor_t *ax_huber_loss(ax_tensor_t *pred, ax_tensor_t *target, float delta)
         ax_grad_fn_t *gf = ax_grad_fn_create(huber_backward);
         gf->inputs[0] = pred;
         gf->n_inputs = 1;
-        gf->saved[0] = pred;
-        gf->saved[1] = target;
+        ax_tensor_t *pred_safe = ax_ensure_contiguous(pred);
+        ax_tensor_t *target_safe = ax_ensure_contiguous(target);
+        gf->saved[0] = pred_safe;
+        gf->saved_owned[0] = (pred_safe != pred);
+        gf->saved[1] = target_safe;
+        gf->saved_owned[1] = (target_safe != target);
         gf->n_saved = 2;
         gf->scalar_ctx = (double)delta;
         loss->grad_fn = gf;

@@ -12,7 +12,30 @@ Axiom codebase. Every contributor must follow these. No exceptions.
 - On error paths (early returns, gotos): free everything allocated before the error.
 - Use `ax_graph_cleanup` after backward to free computation graph intermediates.
 - In inference mode, sequential forward frees intermediates between layers.
-- `ax_tensor_destroy` frees the tensor, its grad, its grad_fn, and releases storage.
+- `ax_tensor_destroy` frees the tensor, its grad, its grad_fn (including owned saved
+  tensors and ctx), and releases storage.
+- `grad_fn->saved_owned[i]` marks tensors that the grad_fn is responsible for freeing.
+  Set this when saving a tensor that was created specifically for backward (not a user tensor).
+- `grad_fn->ctx_cleanup` is called to free the ctx struct if backward never ran.
+  Always set this for malloc'd ctx structs.
+
+**Rule: manual training loops MUST call ax_graph_cleanup.**
+
+Composed ops (e.g., `ax_mse_loss` = sub + square + mean) create intermediate tensors
+that live until `ax_graph_cleanup(loss)` is called. The `ax_model_train_step` function
+handles this automatically. If you write a manual training loop:
+
+```c
+ax_optimizer_zero_grad(opt);
+ax_tensor_t *pred = ax_layer_forward(net, input);
+ax_tensor_t *loss = ax_mse_loss(pred, target);
+ax_backward(loss);
+ax_optimizer_step(opt);
+ax_graph_cleanup(loss);   /* frees intermediates */
+ax_tensor_destroy(loss);  /* frees the loss tensor itself */
+```
+
+Omitting `ax_graph_cleanup` causes memory to grow every training step.
 
 **Rule: no use-after-free.**
 

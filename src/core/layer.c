@@ -282,6 +282,31 @@ int ax_layer_get_params(ax_layer_t *layer, ax_tensor_t **params, int max_params)
     return count;
 }
 
+int ax_layer_get_buffers(ax_layer_t *layer, ax_tensor_t **buffers, int max_buffers)
+{
+    if (!layer) return 0;
+
+    /* for sequential: recurse into sublayers */
+    if (layer->type == AX_LAYER_SEQUENTIAL)
+    {
+        ax_sequential_t *seq = (ax_sequential_t *)layer;
+        int total = 0;
+        for (int i = 0; i < seq->n_layers && total < max_buffers; i++)
+        {
+            total += ax_layer_get_buffers(seq->layers[i], buffers + total, max_buffers - total);
+        }
+        return total;
+    }
+
+    /* for regular layers: copy buffers from the flat array */
+    int count = 0;
+    for (int i = 0; i < layer->n_buffers && count < max_buffers; i++)
+    {
+        buffers[count++] = layer->buffers[i];
+    }
+    return count;
+}
+
 void ax_layer_train(ax_layer_t *layer)
 {
     if (!layer) return;

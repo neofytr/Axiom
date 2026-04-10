@@ -27,8 +27,14 @@ static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_tensor_t *inv_std_t = ctx->inv_std;
     ax_batchnorm_t *bn = ctx->bn;
 
+    int ndim = grad_out->ndim;
     int64_t batch = grad_out->shape[0];
     int64_t feat = grad_out->shape[1];
+    int64_t H = (ndim == 4) ? grad_out->shape[2] : 1;
+    int64_t W = (ndim == 4) ? grad_out->shape[3] : 1;
+    int64_t spatial = H * W;
+    float N = (float)(batch * spatial); /* effective sample count per channel */
+
     float *go = (float *)grad_out->storage->data;
     float *xh = (float *)x_hat_t->storage->data;
     float *istd = (float *)inv_std_t->storage->data;
@@ -41,18 +47,22 @@ static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             bn->gamma->grad = ax_tensor_zeros(bn->gamma->shape, bn->gamma->ndim, bn->gamma->dtype);
         if (!bn->gamma->grad) goto cleanup;
         float *dg = (float *)bn->gamma->grad->storage->data;
-        for (int64_t f = 0; f < feat; f++)
-            for (int64_t b = 0; b < batch; b++)
-                dg[f] += go[b * feat + f] * xh[b * feat + f];
+        for (int64_t c = 0; c < feat; c++)
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++) {
+                    int64_t idx = n * feat * spatial + c * spatial + s;
+                    dg[c] += go[idx] * xh[idx];
+                }
     }
     if (bn->beta->requires_grad) {
         if (!bn->beta->grad)
             bn->beta->grad = ax_tensor_zeros(bn->beta->shape, bn->beta->ndim, bn->beta->dtype);
         if (!bn->beta->grad) goto cleanup;
         float *db = (float *)bn->beta->grad->storage->data;
-        for (int64_t f = 0; f < feat; f++)
-            for (int64_t b = 0; b < batch; b++)
-                db[f] += go[b * feat + f];
+        for (int64_t c = 0; c < feat; c++)
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++)
+                    db[c] += go[n * feat * spatial + c * spatial + s];
     }
 
     /* dx */
@@ -61,28 +71,26 @@ static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
         if (!input->grad) goto cleanup;
         float *ig = (float *)input->grad->storage->data;
-        float N = (float)batch;
 
-        for (int64_t f = 0; f < feat; f++) {
-            float gamma_f = gd[f];
-            float is = istd[f];
+        for (int64_t c = 0; c < feat; c++) {
+            float gamma_f = gd[c];
+            float is = istd[c];
 
-            /* dx_hat = grad_out * gamma */
-            /* dvar = sum(dx_hat * x_hat) * -0.5 * is^2  (since is = 1/sqrt(var+eps)) */
-            /* dmean = sum(dx_hat) * -is + dvar * sum(-2*x_hat*is^(-1))/N ... simplified: */
-            /* Using the simplified formula:
-               dx = (1/N) * gamma * inv_std * (N * dout - sum(dout) - x_hat * sum(dout * x_hat)) */
             float sum_go = 0, sum_go_xh = 0;
-            for (int64_t b = 0; b < batch; b++) {
-                float g = go[b * feat + f];
-                sum_go += g;
-                sum_go_xh += g * xh[b * feat + f];
-            }
-            for (int64_t b = 0; b < batch; b++) {
-                float dx = (1.0f / N) * gamma_f * is *
-                    (N * go[b * feat + f] - sum_go - xh[b * feat + f] * sum_go_xh);
-                ig[b * feat + f] += dx;
-            }
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++) {
+                    int64_t idx = n * feat * spatial + c * spatial + s;
+                    float g = go[idx];
+                    sum_go += g;
+                    sum_go_xh += g * xh[idx];
+                }
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++) {
+                    int64_t idx = n * feat * spatial + c * spatial + s;
+                    float dx = (1.0f / N) * gamma_f * is *
+                        (N * go[idx] - sum_go - xh[idx] * sum_go_xh);
+                    ig[idx] += dx;
+                }
         }
     }
 
@@ -104,10 +112,14 @@ static void bn_ctx_cleanup(void *p)
 static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_batchnorm_t *bn = (ax_batchnorm_t *)self;
-    if (!input || input->ndim != 2) return NULL;
+    if (!input || (input->ndim != 2 && input->ndim != 4)) return NULL;
 
     int64_t batch = input->shape[0];
     int64_t feat = input->shape[1];
+    int64_t H = (input->ndim == 4) ? input->shape[2] : 1;
+    int64_t W = (input->ndim == 4) ? input->shape[3] : 1;
+    int64_t spatial = H * W;
+    float eff_batch = (float)(batch * spatial); /* elements per channel */
     float *id = (float *)input->storage->data;
 
     ax_tensor_t *out = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
@@ -140,49 +152,59 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
         float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
-        for (int64_t f = 0; f < feat; f++)
+        for (int64_t c = 0; c < feat; c++)
         {
+            /* compute mean over N*H*W elements for channel c */
             float sum = 0;
-            for (int64_t b = 0; b < batch; b++)
-                sum += id[b * feat + f];
-            float mean = sum / (float)batch;
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++)
+                    sum += id[n * feat * spatial + c * spatial + s];
+            float mean = sum / eff_batch;
 
+            /* compute variance */
             float var_sum = 0;
-            for (int64_t b = 0; b < batch; b++)
-            {
-                float d = id[b * feat + f] - mean;
-                var_sum += d * d;
-            }
-            float var = var_sum / (float)batch;
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++)
+                {
+                    float d = id[n * feat * spatial + c * spatial + s] - mean;
+                    var_sum += d * d;
+                }
+            float var = var_sum / eff_batch;
             float inv_std = 1.0f / sqrtf(var + bn->eps);
 
-            if (record) is_d[f] = inv_std;
+            if (record) is_d[c] = inv_std;
 
-            for (int64_t b = 0; b < batch; b++)
-            {
-                float x_hat = (id[b * feat + f] - mean) * inv_std;
-                od[b * feat + f] = gd[f] * x_hat + bd[f];
-                if (record) xh_d[b * feat + f] = x_hat;
-            }
+            /* normalize and apply affine */
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++)
+                {
+                    int64_t idx = n * feat * spatial + c * spatial + s;
+                    float x_hat = (id[idx] - mean) * inv_std;
+                    od[idx] = gd[c] * x_hat + bd[c];
+                    if (record) xh_d[idx] = x_hat;
+                }
 
-            rm[f] = (1.0f - bn->momentum) * rm[f] + bn->momentum * mean;
+            rm[c] = (1.0f - bn->momentum) * rm[c] + bn->momentum * mean;
             /* use unbiased variance (Bessel's correction) for the running estimate,
                matching PyTorch/standard BatchNorm behavior. the biased var is used
                for the actual normalization above, but the running stat should be unbiased. */
-            float unbiased_var = (batch > 1) ? var_sum / (float)(batch - 1) : var;
-            rv[f] = (1.0f - bn->momentum) * rv[f] + bn->momentum * unbiased_var;
+            int64_t eff_count = batch * spatial;
+            float unbiased_var = (eff_count > 1) ? var_sum / (float)(eff_count - 1) : var;
+            rv[c] = (1.0f - bn->momentum) * rv[c] + bn->momentum * unbiased_var;
         }
     }
     else
     {
-        for (int64_t f = 0; f < feat; f++)
+        for (int64_t c = 0; c < feat; c++)
         {
-            float inv_std = 1.0f / sqrtf(rv[f] + bn->eps);
-            for (int64_t b = 0; b < batch; b++)
-            {
-                float x_hat = (id[b * feat + f] - rm[f]) * inv_std;
-                od[b * feat + f] = gd[f] * x_hat + bd[f];
-            }
+            float inv_std = 1.0f / sqrtf(rv[c] + bn->eps);
+            for (int64_t n = 0; n < batch; n++)
+                for (int64_t s = 0; s < spatial; s++)
+                {
+                    int64_t idx = n * feat * spatial + c * spatial + s;
+                    float x_hat = (id[idx] - rm[c]) * inv_std;
+                    od[idx] = gd[c] * x_hat + bd[c];
+                }
         }
     }
 
@@ -250,6 +272,9 @@ ax_layer_t *ax_batchnorm_create(int64_t num_features, float eps, float momentum)
     bn->base.params[0] = bn->gamma;
     bn->base.params[1] = bn->beta;
     bn->base.n_params = 2;
+    bn->base.buffers[0] = bn->running_mean;
+    bn->base.buffers[1] = bn->running_var;
+    bn->base.n_buffers = 2;
     bn->base.input_features = num_features;
     bn->base.output_features = num_features;
 

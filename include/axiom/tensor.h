@@ -107,6 +107,14 @@ ax_tensor_t *ax_tensor_view(ax_tensor_t *t);
 /* make a contiguous copy of the tensor */
 ax_tensor_t *ax_tensor_contiguous(ax_tensor_t *t);
 
+/* return the tensor if contiguous, or a contiguous copy. caller must
+   check if the return value differs from input to know whether to free it. */
+static inline ax_tensor_t *ax_ensure_contiguous(ax_tensor_t *t) {
+    if (!t) return NULL;
+    if (ax_tensor_is_contiguous(t) && t->offset == 0) return t;
+    return ax_tensor_contiguous(t);
+}
+
 /* printing */
 
 /* print tensor shape and a few elements for debugging */

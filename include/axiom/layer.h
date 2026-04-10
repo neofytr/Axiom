@@ -15,6 +15,9 @@
 /* max parameters a single layer can have (weights + bias = 2 for dense) */
 #define AX_LAYER_MAX_PARAMS 4
 
+/* max non-trainable buffers a layer can have (e.g. batchnorm running stats) */
+#define AX_LAYER_MAX_BUFFERS 4
+
 /* max layers in a sequential model */
 #define AX_SEQ_MAX_LAYERS 64
 
@@ -63,6 +66,10 @@ struct ax_layer
     /* parameter tracking — flat array, no heap allocation */
     ax_tensor_t *params[AX_LAYER_MAX_PARAMS];
     int n_params;
+
+    /* non-trainable buffer tracking (e.g. batchnorm running stats) */
+    ax_tensor_t *buffers[AX_LAYER_MAX_BUFFERS];
+    int n_buffers;
 
     /* shape info for model summary */
     int64_t input_features;
@@ -134,6 +141,10 @@ ax_tensor_t *ax_layer_forward(ax_layer_t *layer, ax_tensor_t *input);
 /* get all trainable parameters from a layer (and sublayers for sequential).
    fills params array, returns count. */
 int ax_layer_get_params(ax_layer_t *layer, ax_tensor_t **params, int max_params);
+
+/* get all non-trainable buffers from a layer (and sublayers for sequential).
+   fills buffers array, returns count. */
+int ax_layer_get_buffers(ax_layer_t *layer, ax_tensor_t **buffers, int max_buffers);
 
 /* set train/eval mode (recursive for sequential) */
 void ax_layer_train(ax_layer_t *layer);

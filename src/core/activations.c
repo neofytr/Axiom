@@ -96,7 +96,9 @@ ax_tensor_t *ax_leaky_relu(ax_tensor_t *a, float alpha)
         ax_grad_fn_t *gf = ax_grad_fn_create(leaky_relu_backward);
         gf->inputs[0] = a;
         gf->n_inputs = 1;
-        gf->saved[0] = a;
+        ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = (a_safe != a);
         gf->n_saved = 1;
         gf->scalar_ctx = (double)alpha;
         out->grad_fn = gf;
@@ -162,7 +164,9 @@ ax_tensor_t *ax_elu(ax_tensor_t *a, float alpha)
         ax_grad_fn_t *gf = ax_grad_fn_create(elu_backward);
         gf->inputs[0] = a;
         gf->n_inputs = 1;
-        gf->saved[0] = a;
+        ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = (a_safe != a);
         gf->saved[1] = out;
         gf->n_saved = 2;
         gf->scalar_ctx = (double)alpha;
@@ -249,7 +253,9 @@ ax_tensor_t *ax_gelu(ax_tensor_t *a)
         ax_grad_fn_t *gf = ax_grad_fn_create(gelu_backward);
         gf->inputs[0] = a;
         gf->n_inputs = 1;
-        gf->saved[0] = a;
+        ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = (a_safe != a);
         gf->n_saved = 1;
         out->grad_fn = gf;
     }
@@ -317,7 +323,9 @@ ax_tensor_t *ax_swish(ax_tensor_t *a)
         ax_grad_fn_t *gf = ax_grad_fn_create(swish_backward);
         gf->inputs[0] = a;
         gf->n_inputs = 1;
-        gf->saved[0] = a;
+        ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = (a_safe != a);
         gf->saved[1] = out;
         gf->n_saved = 2;
         out->grad_fn = gf;
@@ -386,7 +394,9 @@ ax_tensor_t *ax_softplus(ax_tensor_t *a)
         ax_grad_fn_t *gf = ax_grad_fn_create(softplus_backward);
         gf->inputs[0] = a;
         gf->n_inputs = 1;
-        gf->saved[0] = a;
+        ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = (a_safe != a);
         gf->n_saved = 1;
         out->grad_fn = gf;
     }

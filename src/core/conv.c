@@ -556,6 +556,7 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         gf->saved_owned[0] = true; /* we created the indices tensor */
         gf->n_saved = 1;
         gf->ctx = ctx;
+        gf->ctx_cleanup = (void(*)(void*))free;
         output->requires_grad = true;
         output->grad_fn = gf;
     }
@@ -688,6 +689,7 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
             gf->inputs[0] = input;
             gf->n_inputs = 1;
             gf->ctx = ctx;
+        gf->ctx_cleanup = (void(*)(void*))free;
             output->requires_grad = true;
             output->grad_fn = gf;
         }
@@ -778,6 +780,7 @@ static ax_tensor_t *global_avgpool_forward(ax_layer_t *self, ax_tensor_t *input)
             gf->inputs[0] = input;
             gf->n_inputs = 1;
             gf->ctx = ctx;
+        gf->ctx_cleanup = (void(*)(void*))free;
             output->requires_grad = true;
             output->grad_fn = gf;
         }
@@ -876,6 +879,7 @@ static ax_tensor_t *flatten_forward(ax_layer_t *self, ax_tensor_t *input)
             gf->inputs[0] = input;
             gf->n_inputs = 1;
             gf->ctx = ctx;
+        gf->ctx_cleanup = (void(*)(void*))free;
             output->requires_grad = true;
             output->grad_fn = gf;
         }
