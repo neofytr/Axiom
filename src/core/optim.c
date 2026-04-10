@@ -9,6 +9,7 @@
 #include "axiom/optim.h"
 #include "axiom/compute.h"
 #include "axiom/error.h"
+#include "../compute/backends/simd_defs.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -161,34 +162,63 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
         float *md = (float *)opt->state[i].m->storage->data;
         float *vd = (float *)opt->state[i].v->storage->data;
 
-        /* adamw: decoupled weight decay (applied directly to weights, not grad) */
-        if (decoupled_decay && opt->weight_decay > 0.0f)
+        /* fused adam: weight decay + moment update + weight update in one pass.
+           parameter tensors are always contiguous (created by layer constructors). */
+        float decay_scale = decoupled_decay ? (1.0f - opt->lr * opt->weight_decay) : 1.0f;
+        if (decay_scale < 0.0f) decay_scale = 0.0f; /* clamp for extreme hyperparams */
+        float wd_grad = (!decoupled_decay && opt->weight_decay > 0.0f) ? opt->weight_decay : 0.0f;
+        int64_t wo = p->offset;
+        int64_t go = p->grad->offset;
+
+        ax_vf32 v_beta1   = ax_vf32_set1(opt->beta1);
+        ax_vf32 v_beta2   = ax_vf32_set1(opt->beta2);
+        ax_vf32 v_1mb1    = ax_vf32_set1(1.0f - opt->beta1);
+        ax_vf32 v_1mb2    = ax_vf32_set1(1.0f - opt->beta2);
+        ax_vf32 v_lr      = ax_vf32_set1(opt->lr);
+        ax_vf32 v_eps     = ax_vf32_set1(opt->eps);
+        ax_vf32 v_bc1     = ax_vf32_set1(bc1);
+        ax_vf32 v_bc2     = ax_vf32_set1(bc2);
+        ax_vf32 v_decay   = ax_vf32_set1(decay_scale);
+        ax_vf32 v_wd_grad = ax_vf32_set1(wd_grad);
+
+        int64_t j = 0;
+        int64_t vec_end = n - (n % AX_VF32_WIDTH);
+        for (; j < vec_end; j += AX_VF32_WIDTH)
         {
-            for (int64_t j = 0; j < n; j++)
-                wd[p->offset + j] *= (1.0f - opt->lr * opt->weight_decay);
+            ax_vf32 w = ax_vf32_load(wd + wo + j);
+            ax_vf32 g = ax_vf32_load(gd + go + j);
+            ax_vf32 m = ax_vf32_load(md + j);
+            ax_vf32 v = ax_vf32_load(vd + j);
+
+            /* decoupled weight decay */
+            w = ax_vf32_mul(w, v_decay);
+            /* l2 through gradient */
+            g = ax_vf32_fmadd(v_wd_grad, w, g);
+
+            /* moment updates */
+            m = ax_vf32_fmadd(v_1mb1, g, ax_vf32_mul(v_beta1, m));
+            v = ax_vf32_fmadd(v_1mb2, ax_vf32_mul(g, g), ax_vf32_mul(v_beta2, v));
+
+            /* bias-corrected update */
+            ax_vf32 m_hat = ax_vf32_div(m, v_bc1);
+            ax_vf32 v_hat = ax_vf32_div(v, v_bc2);
+            ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v_hat), v_eps);
+            w = ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(m_hat, denom)));
+
+            ax_vf32_store(wd + wo + j, w);
+            ax_vf32_store(md + j, m);
+            ax_vf32_store(vd + j, v);
         }
-
-        /* regular adam: l2 regularization through gradient */
-        if (!decoupled_decay && opt->weight_decay > 0.0f)
+        /* scalar tail */
+        for (; j < n; j++)
         {
-            for (int64_t j = 0; j < n; j++)
-                gd[p->grad->offset + j] += opt->weight_decay * wd[p->offset + j];
-        }
-
-        for (int64_t j = 0; j < n; j++)
-        {
-            float g = gd[p->grad->offset + j];
-
-            /* update moments */
+            float w = wd[wo + j] * decay_scale;
+            float g = gd[go + j] + wd_grad * w;
             md[j] = opt->beta1 * md[j] + (1.0f - opt->beta1) * g;
             vd[j] = opt->beta2 * vd[j] + (1.0f - opt->beta2) * g * g;
-
-            /* bias-corrected moments */
             float m_hat = md[j] / bc1;
             float v_hat = vd[j] / bc2;
-
-            /* update */
-            wd[p->offset + j] -= opt->lr * m_hat / (sqrtf(v_hat) + opt->eps);
+            wd[wo + j] = w - opt->lr * m_hat / (sqrtf(v_hat) + opt->eps);
         }
     }
 }

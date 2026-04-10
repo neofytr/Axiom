@@ -4,6 +4,7 @@
 
 #include "axiom/autograd.h"
 #include "axiom/compute.h"
+#include "axiom/memory.h"
 #include "axiom/error.h"
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,19 @@
 
 /* thread-local gradient tracking — safe for concurrent inference */
 static _Thread_local bool grad_tracking = true;
+
+/* thread-local arena for backward pass scratch allocations.
+   created lazily, reset after each ax_backward() call.
+   backward functions can use ax_backward_arena() to get fast
+   bump-allocated scratch that's freed in bulk. */
+static _Thread_local ax_arena_t *backward_arena = NULL;
+
+ax_arena_t *ax_backward_arena(void)
+{
+    if (!backward_arena)
+        backward_arena = ax_arena_create(0); /* default 1 MB */
+    return backward_arena;
+}
 
 void ax_no_grad(void)    { grad_tracking = false; }
 void ax_enable_grad(void){ grad_tracking = true; }
@@ -297,6 +311,10 @@ ax_status_t ax_backward(ax_tensor_t *loss)
 
     ps_free(&visited);
     tl_free(&order);
+
+    /* reset backward arena — frees all scratch from this pass in bulk */
+    if (backward_arena)
+        ax_arena_reset(backward_arena);
 
     return AX_OK;
 }

@@ -77,6 +77,12 @@ bool ax_grad_enabled(void);
 /* allocate a grad_fn (just a malloc + zeroing) */
 ax_grad_fn_t *ax_grad_fn_create(ax_backward_fn_t fn);
 
+/* get the thread-local backward scratch arena. backward functions can
+   use this for temporary buffers that are freed in bulk after ax_backward().
+   do NOT store arena pointers in grad_fn->saved[] — they become stale after reset. */
+#include "memory.h"
+ax_arena_t *ax_backward_arena(void);
+
 /* numerical gradient check for testing.
    compares analytical gradient against finite-difference approximation.
    returns the max absolute difference. */
