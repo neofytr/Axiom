@@ -51,6 +51,7 @@ set(AXIOM_SOURCES
     src/core/rng.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
+    src/compute/backends/cpu_opt.c
 )
 
 # static library
@@ -114,6 +115,9 @@ target_link_libraries(example_mnist PRIVATE axiom_static)
 
 add_executable(example_spiral examples/spiral.c)
 target_link_libraries(example_spiral PRIVATE axiom_static)
+
+add_executable(example_regression examples/regression.c)
+target_link_libraries(example_regression PRIVATE axiom_static)
 
 # convenience target: run all tests
 add_custom_target(run_tests

@@ -342,20 +342,30 @@ static void test_tanh(void) {
 /* backend dispatch tests */
 
 static void test_backend_selection(void) {
-    AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CPU_NAIVE,
-                       "default backend should be cpu_naive");
+    /* default is cpu_opt (optimized with naive fallback) */
+    AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CPU_SIMD,
+                       "default backend should be cpu_opt");
 
     const ax_backend_ops_t *ops = ax_compute_get_ops();
     AX_TEST_ASSERT(ops != NULL, "ops should not be null");
-    AX_TEST_ASSERT(strcmp(ops->name, "cpu_naive") == 0, "backend name should be cpu_naive");
+    AX_TEST_ASSERT(strcmp(ops->name, "cpu_opt") == 0, "backend name should be cpu_opt");
+
+    /* can switch to naive */
+    ax_status_t s1 = ax_compute_set_backend(AX_BACKEND_CPU_NAIVE);
+    AX_TEST_ASSERT_EQ(s1, AX_OK, "switching to naive should succeed");
+    AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CPU_NAIVE,
+                       "backend should be cpu_naive after switch");
 
     /* trying to set unavailable backend should fail */
-    ax_status_t s = ax_compute_set_backend(AX_BACKEND_CUDA);
-    AX_TEST_ASSERT(s != AX_OK, "setting cuda backend should fail (not available)");
+    ax_status_t s2 = ax_compute_set_backend(AX_BACKEND_CUDA);
+    AX_TEST_ASSERT(s2 != AX_OK, "setting cuda backend should fail (not available)");
 
-    /* cpu naive should still be active */
+    /* should still be naive after failed switch */
     AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CPU_NAIVE,
                        "backend should still be cpu_naive after failed switch");
+
+    /* switch back to opt */
+    ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
 }
 
 int main(void) {

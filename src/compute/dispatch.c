@@ -4,8 +4,9 @@
 #include "axiom/error.h"
 #include <stddef.h>
 
-/* declared in cpu_naive.c */
+/* declared in cpu_naive.c and cpu_opt.c */
 extern const ax_backend_ops_t ax_cpu_naive_ops;
+extern const ax_backend_ops_t ax_cpu_opt_ops;
 
 /* registered backends table */
 static const ax_backend_ops_t *backends[AX_BACKEND_COUNT] = { NULL };
@@ -22,12 +23,13 @@ static void ensure_compute_init(void) {
 }
 
 ax_status_t ax_compute_init(void) {
-    /* register the cpu naive backend — always available */
+    /* register all built-in backends */
     backends[AX_BACKEND_CPU_NAIVE] = &ax_cpu_naive_ops;
+    backends[AX_BACKEND_CPU_SIMD]  = &ax_cpu_opt_ops;
 
-    /* select the best available backend (just cpu naive for now) */
-    active_id = AX_BACKEND_CPU_NAIVE;
-    active_ops = backends[AX_BACKEND_CPU_NAIVE];
+    /* select the optimized backend by default (falls back to naive internally) */
+    active_id = AX_BACKEND_CPU_SIMD;
+    active_ops = &ax_cpu_opt_ops;
     compute_initialized = 1;
     return AX_OK;
 }
