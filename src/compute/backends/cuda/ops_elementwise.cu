@@ -78,8 +78,14 @@ static ax_status_t run_binop(
     int64_t n = 1;
     for (int d = 0; d < out->ndim; d++) n *= out->shape[d];
 
-    BinopMeta *dm;
-    cudaMalloc(&dm, sizeof(BinopMeta));
+    /* build meta on host, upload once to the persistent scratch arena.
+       replaces the old cudaMalloc/cudaFree-per-call pattern. */
+    ax_cuda_scratch_reset();
+    BinopMeta *dm = (BinopMeta *)ax_cuda_scratch_alloc(sizeof(BinopMeta));
+    if (!dm) {
+        ax_err_set(AX_ERR_BACKEND, "cuda scratch arena too small for binop meta");
+        return AX_ERR_BACKEND;
+    }
     BinopMeta hm;
     memcpy(hm.as,  a->shape,     sizeof(int64_t) * (size_t)a->ndim);
     memcpy(hm.ast, a->strides,   sizeof(int64_t) * (size_t)a->ndim);
@@ -102,8 +108,6 @@ static ax_status_t run_binop(
         (const float *)b->storage->data, dm->bs, dm->bst, hm.bn,
         (float *)      out->storage->data, dm->os, dm->ost, hm.on,
         (int64_t)a->offset, (int64_t)b->offset, (int64_t)out->offset, n);
-
-    cudaFree(dm);
     return AX_OK;
 }
 

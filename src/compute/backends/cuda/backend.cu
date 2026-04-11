@@ -16,6 +16,33 @@ cublasHandle_t ax_cuda_cublas_handle(void) {
     return g_cublas;
 }
 
+/* ── device-side scratch arena ─────────────────────────────────────
+   single persistent buffer used by ops that need to upload small
+   metadata structs without paying cudaMalloc/cudaFree per call. see
+   internal.h for the contract. */
+
+static void *g_cuda_scratch    = NULL;
+static size_t g_cuda_scratch_used = 0;
+
+/* round up to 16-byte alignment so structs with int64 arrays land on
+   natural boundaries. */
+static inline size_t align_up_16(size_t x) {
+    return (x + 15u) & ~((size_t)15u);
+}
+
+void *ax_cuda_scratch_alloc(size_t bytes) {
+    if (!g_cuda_scratch) return NULL;
+    size_t aligned = align_up_16(bytes);
+    if (g_cuda_scratch_used + aligned > AX_CUDA_SCRATCH_BYTES) return NULL;
+    void *p = (char *)g_cuda_scratch + g_cuda_scratch_used;
+    g_cuda_scratch_used += aligned;
+    return p;
+}
+
+void ax_cuda_scratch_reset(void) {
+    g_cuda_scratch_used = 0;
+}
+
 /* ── lifecycle hooks ──────────────────────────────────────────────── */
 
 extern "C" {
@@ -26,10 +53,24 @@ static ax_status_t cuda_init_hook(void) {
        this silently leaves g_cublas NULL and later ops will fail with
        a cublas status error. */
     ax_cuda_cublas_handle();
+    /* allocate the persistent device-side scratch arena. on failure
+       we silently leave it NULL; ops that need scratch will then fall
+       back to their per-call cudaMalloc path (or just fail). */
+    if (!g_cuda_scratch) {
+        if (cudaMalloc(&g_cuda_scratch, AX_CUDA_SCRATCH_BYTES) != cudaSuccess) {
+            g_cuda_scratch = NULL;
+        }
+        g_cuda_scratch_used = 0;
+    }
     return AX_OK;
 }
 
 static void cuda_shutdown_hook(void) {
+    if (g_cuda_scratch) {
+        cudaFree(g_cuda_scratch);
+        g_cuda_scratch = NULL;
+        g_cuda_scratch_used = 0;
+    }
     if (g_cublas) {
         cublasDestroy(g_cublas);
         g_cublas = NULL;

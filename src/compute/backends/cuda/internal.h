@@ -54,6 +54,36 @@ static inline int atomic_fetch_sub(atomic_int *obj, int val) {
    that need gemm. */
 cublasHandle_t ax_cuda_cublas_handle(void);
 
+/* device-side scratch arena.
+
+   ops that need to upload a small metadata struct to the device (e.g.
+   BinopMeta for broadcasting) previously did a cudaMalloc + cudaMemcpy
+   + cudaFree on every single call. on real workloads this adds up to
+   thousands of mallocs per training step and dominates the op cost.
+
+   the scratch arena is one persistent ~4 KB device buffer, created by
+   backend.cu's init hook, that kernel-metadata uploads bump into. it
+   is reset at the start of every op that uses it (ops hold no state
+   across calls) and sized statically because real metadata structs
+   are tens of bytes each.
+
+   not thread-safe w.r.t. concurrent host-side calls into the backend:
+   caller is expected to serialise. the cuda driver already serialises
+   kernel launches on the default stream, and every backend op in
+   axiom is a single kernel launch today, so this is fine for now.
+   when we add streams in phase 5 we will revisit. */
+
+#define AX_CUDA_SCRATCH_BYTES 4096
+
+/* return a pointer into the scratch arena with at least `bytes` free
+   and 16-byte aligned. the returned pointer is invalidated on the
+   next reset. returns NULL if `bytes` exceeds the arena capacity. */
+void *ax_cuda_scratch_alloc(size_t bytes);
+
+/* rewind the arena so a subsequent ax_cuda_scratch_alloc returns the
+   first slot again. typically called at the start of an op. */
+void  ax_cuda_scratch_reset(void);
+
 extern "C" {
 
 /* elementwise ops (ops_elementwise.cu) */
