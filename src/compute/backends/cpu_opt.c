@@ -742,7 +742,16 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
      value = input[ci, ih, iw] if in-bounds else 0 */
 
 /* pack a KC x NC panel of im2col(input) into NR-col strips. identical layout
-   to pack_b() so the micro_kernel is untouched. */
+   to pack_b() so the micro_kernel is untouched.
+
+   fast path: when a strip lies entirely on one output row AND stride_w==1,
+   the iw positions within the strip are contiguous. that reduces the gather
+   to a memset(leading pad) + memcpy(valid middle) + memset(trailing pad) —
+   glibc memset/memcpy are simd-tuned, so the common case (stride-1 convs)
+   stops being bottlenecked by per-element branches.
+
+   slow path: general scalar gather with per-element bounds checks.
+   used when the strip spans a row boundary or stride_w != 1. */
 static void pack_b_im2col(const ax_conv_params_t *p,
                            int64_t kc, int64_t nc_pack, int64_t nc,
                            int64_t jc, int64_t pc,
@@ -759,28 +768,63 @@ static void pack_b_im2col(const ax_conv_params_t *p,
 
     for (int64_t j = 0; j < nc_pack; j += GEMM_NR) {
         int64_t nr = (j + GEMM_NR <= nc) ? GEMM_NR : (nc > j ? nc - j : 0);
+
+        /* strip geometry, independent of r */
+        int64_t gm_first = jc + j;
+        int64_t oh_first = (nr > 0) ? (gm_first / out_w) : 0;
+        int64_t ow_first = gm_first - oh_first * out_w;
+        int64_t gm_last = (nr > 0) ? (gm_first + nr - 1) : gm_first;
+        int64_t oh_last = (nr > 0) ? (gm_last / out_w) : oh_first;
+        bool fast_ok = (nr > 0) && (sw == 1) && (oh_first == oh_last);
+
         for (int64_t r = 0; r < kc; r++) {
-            /* translate global k = pc + r → (ci, ky, kx) */
             int64_t gk = pc + r;
             int64_t ci = gk / khkw;
             int64_t rem = gk - ci * khkw;
             int ky = (int)(rem / kw);
             int kx = (int)(rem - (int64_t)ky * kw);
 
-            for (int64_t jj = 0; jj < GEMM_NR; jj++) {
-                float val = 0.0f;
-                if (jj < nr) {
-                    /* translate global m = jc + j + jj → (oh, ow) */
-                    int64_t gm = jc + j + jj;
-                    int64_t oh = gm / out_w;
-                    int64_t ow = gm - oh * out_w;
-                    int64_t ih = oh * sh - ph + ky;
-                    int64_t iw = ow * sw - pw + kx;
-                    if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                        val = input[ci * HW + ih * W + iw];
-                    }
+            if (fast_ok) {
+                int64_t ih = oh_first * sh - ph + ky;
+                if (ih < 0 || ih >= H) {
+                    memset(packed, 0, (size_t)GEMM_NR * sizeof(float));
+                } else {
+                    int64_t iw_start = ow_first - pw + kx;
+                    int64_t lo = 0, hi = nr;
+                    if (iw_start < 0) lo = -iw_start;
+                    int64_t iw_last = iw_start + nr - 1;
+                    if (iw_last >= W) hi = W - iw_start;
+                    if (hi < 0) hi = 0;
+                    if (lo > nr) lo = nr;
+                    if (hi > nr) hi = nr;
+                    if (lo > hi) lo = hi;
+
+                    if (lo > 0)
+                        memset(packed, 0, (size_t)lo * sizeof(float));
+                    if (hi > lo)
+                        memcpy(packed + lo,
+                               input + ci * HW + ih * W + (iw_start + lo),
+                               (size_t)(hi - lo) * sizeof(float));
+                    if (nr > hi)
+                        memset(packed + hi, 0, (size_t)(nr - hi) * sizeof(float));
+                    if (GEMM_NR > nr)
+                        memset(packed + nr, 0, (size_t)(GEMM_NR - nr) * sizeof(float));
                 }
-                packed[jj] = val;
+            } else {
+                for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                    float val = 0.0f;
+                    if (jj < nr) {
+                        int64_t gm = jc + j + jj;
+                        int64_t oh = gm / out_w;
+                        int64_t ow = gm - oh * out_w;
+                        int64_t ih = oh * sh - ph + ky;
+                        int64_t iw = ow * sw - pw + kx;
+                        if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                            val = input[ci * HW + ih * W + iw];
+                        }
+                    }
+                    packed[jj] = val;
+                }
             }
             packed += GEMM_NR;
         }
