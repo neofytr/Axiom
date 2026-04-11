@@ -63,7 +63,7 @@ endif()
 
 # hardening flags for release
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    add_compile_options(-O2 -D_FORTIFY_SOURCE=2)
+    add_compile_options(-O3 -fno-math-errno -funroll-loops -fno-trapping-math -D_FORTIFY_SOURCE=2)
 endif()
 
 # library sources
