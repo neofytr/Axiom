@@ -372,6 +372,8 @@ static double ax_autotune_run_kernel(void)
 }
 #endif
 
+/* picks fast cores on hybrid cpus and pins the omp worker pool to them
+   so the os scheduler can't migrate workers back onto slow e-cores. */
 int ax_autotune_threads(void)
 {
 #ifndef _OPENMP
@@ -468,8 +470,55 @@ int ax_autotune_threads(void)
 
     omp_set_num_threads(fast_count);
 
+    /* collect the fast cpu ids in the same order cpu_ids[] was scanned */
+    int fast_cpus[CPU_SETSIZE];
+    int fc = 0;
+    for (int i = 0; i < n_cpus && fc < fast_count; i++) {
+        if (times[i] <= threshold) {
+            fast_cpus[fc++] = cpu_ids[i];
+        }
+    }
+    /* fc should equal fast_count unless fast_count was clamped to 1 above */
+    if (fc == 0) {
+        fast_cpus[fc++] = cpu_ids[0];
+    }
+
+    /* pin each omp worker to one fast core. without this step
+       omp_set_num_threads alone lets the scheduler drop workers onto
+       slow cores and nullifies the calibration. best-effort: failures
+       are logged but not fatal. */
+    int pin_failures = 0;
+    #pragma omp parallel num_threads(fast_count) reduction(+:pin_failures)
+    {
+        int w = omp_get_thread_num();
+        int cpu = fast_cpus[w % fc];
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(cpu, &one);
+        if (sched_setaffinity(0, sizeof(one), &one) != 0) {
+            pin_failures += 1;
+        }
+    }
+
+    /* build a short "a,b,c" list of pinned cpus for the log line */
+    char cpu_list[128];
+    size_t off = 0;
+    for (int i = 0; i < fc && off + 8 < sizeof(cpu_list); i++) {
+        int w_ = snprintf(cpu_list + off, sizeof(cpu_list) - off,
+                          (i == 0) ? "%d" : ",%d", fast_cpus[i]);
+        if (w_ < 0) break;
+        off += (size_t)w_;
+    }
+
     fprintf(stderr, "axiom: autotune chose %d fast cores (%.1fms calibration)\n",
             fast_count, total_ms);
+    fprintf(stderr, "axiom: pinned %d omp workers to cores [%s]%s\n",
+            fast_count, cpu_list,
+            pin_failures ? " (some pins failed)" : "");
+    if (pin_failures) {
+        fprintf(stderr, "axiom: sched_setaffinity failed for %d/%d workers\n",
+                pin_failures, fast_count);
+    }
 
     return fast_count;
 #endif /* __linux__ */
