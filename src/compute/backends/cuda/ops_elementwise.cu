@@ -108,6 +108,7 @@ static ax_status_t run_binop(
         (const float *)b->storage->data, dm->bs, dm->bst, hm.bn,
         (float *)      out->storage->data, dm->os, dm->ost, hm.on,
         (int64_t)a->offset, (int64_t)b->offset, (int64_t)out->offset, n);
+    AX_CUDA_CHECK_LAUNCH("binop");
     return AX_OK;
 }
 
@@ -146,6 +147,7 @@ static ax_status_t run_unop(
     kernel<<<blocks, AX_CUDA_BLOCK>>>(
         (const float *)in->storage->data, (float *)out->storage->data,
         (int64_t)in->offset, (int64_t)out->offset, n);
+    AX_CUDA_CHECK_LAUNCH("unop");
     return AX_OK;
 }
 
@@ -212,6 +214,7 @@ ax_status_t cuda_add_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *o
         (const float *)in->storage->data, (float)scalar,
         (float *)out->storage->data,
         (int64_t)in->offset, (int64_t)out->offset, n);
+    AX_CUDA_CHECK_LAUNCH("add_scalar");
     return AX_OK;
 }
 
@@ -227,6 +230,7 @@ ax_status_t cuda_mul_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *o
         (const float *)in->storage->data, (float)scalar,
         (float *)out->storage->data,
         (int64_t)in->offset, (int64_t)out->offset, n);
+    AX_CUDA_CHECK_LAUNCH("mul_scalar");
     return AX_OK;
 }
 
@@ -240,6 +244,7 @@ ax_status_t cuda_fill(ax_tensor_t *t, double value) {
     int blocks = (int)((n + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
     k_fill<<<blocks, AX_CUDA_BLOCK>>>(
         (float *)t->storage->data, (float)value, (int64_t)t->offset, n);
+    AX_CUDA_CHECK_LAUNCH("fill");
     return AX_OK;
 }
 
@@ -258,9 +263,13 @@ ax_status_t cuda_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
         ( src_gpu && !dst_gpu) ? cudaMemcpyDeviceToHost   :
         (!src_gpu &&  dst_gpu) ? cudaMemcpyHostToDevice   :
                                   cudaMemcpyHostToHost;
-    cudaMemcpy((float *)dst->storage->data + dst->offset,
-               (const float *)src->storage->data + src->offset,
-               bytes, kind);
+    if (cudaMemcpy((float *)dst->storage->data + dst->offset,
+                   (const float *)src->storage->data + src->offset,
+                   bytes, kind) != cudaSuccess) {
+        ax_err_set(AX_ERR_BACKEND, "cuda copy: cudaMemcpy failed (%s)",
+                   cudaGetErrorString(cudaGetLastError()));
+        return AX_ERR_BACKEND;
+    }
     return AX_OK;
 }
 

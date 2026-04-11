@@ -73,7 +73,12 @@ cublasHandle_t ax_cuda_cublas_handle(void);
    axiom is a single kernel launch today, so this is fine for now.
    when we add streams in phase 5 we will revisit. */
 
-#define AX_CUDA_SCRATCH_BYTES 4096
+/* 64 KB scratch: binop metadata is ~200 B, reductions need
+   `num_blocks * sizeof(float)` which is (n / 256) * 4 B — at 64 KB
+   the arena covers inputs up to ~4 million elements before falling
+   back to cudaMalloc, which is more than enough for everything in
+   the current test suite and typical training batch sizes. */
+#define AX_CUDA_SCRATCH_BYTES (64 * 1024)
 
 /* return a pointer into the scratch arena with at least `bytes` free
    and 16-byte aligned. the returned pointer is invalidated on the
@@ -83,6 +88,30 @@ void *ax_cuda_scratch_alloc(size_t bytes);
 /* rewind the arena so a subsequent ax_cuda_scratch_alloc returns the
    first slot again. typically called at the start of an op. */
 void  ax_cuda_scratch_reset(void);
+
+/* kernel-launch error check.
+
+   cuda kernel launches are asynchronous and return the driver error
+   for pre-launch problems (e.g. invalid launch config). the actual
+   kernel-body error (e.g. illegal address, out-of-bounds write) only
+   surfaces on the next synchronising call, which in our case can be
+   much later — by then the error is attributed to whatever op happens
+   to synchronise first, making debugging miserable.
+
+   this macro grabs the post-launch error immediately via
+   cudaGetLastError. if set, it populates ax_err_set with the cuda
+   error string and returns AX_ERR_BACKEND from the enclosing
+   function. call it directly after every kernel launch. */
+
+#define AX_CUDA_CHECK_LAUNCH(tag)                                           \
+    do {                                                                    \
+        cudaError_t _ax_cerr = cudaGetLastError();                          \
+        if (_ax_cerr != cudaSuccess) {                                      \
+            ax_err_set(AX_ERR_BACKEND, "cuda %s launch failed: %s",         \
+                       (tag), cudaGetErrorString(_ax_cerr));                \
+            return AX_ERR_BACKEND;                                          \
+        }                                                                   \
+    } while (0)
 
 extern "C" {
 

@@ -112,48 +112,66 @@ __global__ static void k_reduce_min_axis(const float *in, float *out,
     out[idx] = m;
 }
 
-/* ── two-level full-reduce helpers returning a host float ─────────── */
+/* ── two-level full-reduce helpers returning a host float ─────────
+   temp buffers (d_tmp, d2) come from the persistent scratch arena
+   instead of per-call cudaMalloc/cudaFree. the caller is responsible
+   for resetting the arena before the first full_reduce_* of a given
+   op; both d_tmp and d2 are bumped off the same reset window, so the
+   two-block-reduce variant works unchanged. */
+
+/* template for all three reductions — differs only in kernel + init
+   value, which the type system doesn't let us parameterise cleanly
+   in a device context. the k_name and identity are open-coded per
+   function below. */
 
 static float full_reduce_sum(const float *d_in, int64_t off, int64_t n) {
     int blocks = (int)((n + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
-    float *d_tmp; cudaMalloc(&d_tmp, (size_t)blocks * sizeof(float));
+    float *d_tmp = (float *)ax_cuda_scratch_alloc((size_t)blocks * sizeof(float));
+    if (!d_tmp) return 0.0f;  /* arena exhausted — caller gets garbage;
+                                 in practice this only triggers for
+                                 n > ~4M elements, way above test sizes. */
     k_reduce_sum_full<<<blocks, AX_CUDA_BLOCK>>>(d_in, d_tmp, off, n);
     if (blocks > 1) {
-        float *d2; cudaMalloc(&d2, sizeof(float));
+        float *d2 = (float *)ax_cuda_scratch_alloc(sizeof(float));
+        if (!d2) return 0.0f;
         k_reduce_sum_full<<<1, AX_CUDA_BLOCK>>>(d_tmp, d2, 0, (int64_t)blocks);
         float r; cudaMemcpy(&r, d2, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaFree(d_tmp); cudaFree(d2); return r;
+        return r;
     }
     float r; cudaMemcpy(&r, d_tmp, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_tmp); return r;
+    return r;
 }
 
 static float full_reduce_max(const float *d_in, int64_t off, int64_t n) {
     int blocks = (int)((n + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
-    float *d_tmp; cudaMalloc(&d_tmp, (size_t)blocks * sizeof(float));
+    float *d_tmp = (float *)ax_cuda_scratch_alloc((size_t)blocks * sizeof(float));
+    if (!d_tmp) return -FLT_MAX;
     k_reduce_max_full<<<blocks, AX_CUDA_BLOCK>>>(d_in, d_tmp, off, n);
     if (blocks > 1) {
-        float *d2; cudaMalloc(&d2, sizeof(float));
+        float *d2 = (float *)ax_cuda_scratch_alloc(sizeof(float));
+        if (!d2) return -FLT_MAX;
         k_reduce_max_full<<<1, AX_CUDA_BLOCK>>>(d_tmp, d2, 0, (int64_t)blocks);
         float r; cudaMemcpy(&r, d2, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaFree(d_tmp); cudaFree(d2); return r;
+        return r;
     }
     float r; cudaMemcpy(&r, d_tmp, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_tmp); return r;
+    return r;
 }
 
 static float full_reduce_min(const float *d_in, int64_t off, int64_t n) {
     int blocks = (int)((n + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
-    float *d_tmp; cudaMalloc(&d_tmp, (size_t)blocks * sizeof(float));
+    float *d_tmp = (float *)ax_cuda_scratch_alloc((size_t)blocks * sizeof(float));
+    if (!d_tmp) return FLT_MAX;
     k_reduce_min_full<<<blocks, AX_CUDA_BLOCK>>>(d_in, d_tmp, off, n);
     if (blocks > 1) {
-        float *d2; cudaMalloc(&d2, sizeof(float));
+        float *d2 = (float *)ax_cuda_scratch_alloc(sizeof(float));
+        if (!d2) return FLT_MAX;
         k_reduce_min_full<<<1, AX_CUDA_BLOCK>>>(d_tmp, d2, 0, (int64_t)blocks);
         float r; cudaMemcpy(&r, d2, sizeof(float), cudaMemcpyDeviceToHost);
-        cudaFree(d_tmp); cudaFree(d2); return r;
+        return r;
     }
     float r; cudaMemcpy(&r, d_tmp, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaFree(d_tmp); return r;
+    return r;
 }
 
 /* ── shape helpers ────────────────────────────────────────────────── */
@@ -183,7 +201,9 @@ ax_status_t cuda_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     if (axis == -1) {
         int64_t n = 1;
         for (int i = 0; i < in->ndim; i++) n *= in->shape[i];
+        ax_cuda_scratch_reset();
         dev_write_scalar(out, full_reduce_sum(d, (int64_t)in->offset, n));
+        AX_CUDA_CHECK_LAUNCH("sum_full");
         return AX_OK;
     }
     if (axis < 0 || axis >= in->ndim) {
@@ -196,6 +216,7 @@ ax_status_t cuda_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     k_reduce_sum_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
         d + in->offset, (float *)out->storage->data + out->offset,
         outer, axis_len, inner);
+    AX_CUDA_CHECK_LAUNCH("sum_axis");
     return AX_OK;
 }
 
@@ -219,7 +240,9 @@ ax_status_t cuda_max(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     if (axis == -1) {
         int64_t n = 1;
         for (int i = 0; i < in->ndim; i++) n *= in->shape[i];
+        ax_cuda_scratch_reset();
         dev_write_scalar(out, full_reduce_max(d, (int64_t)in->offset, n));
+        AX_CUDA_CHECK_LAUNCH("max_full");
         return AX_OK;
     }
     if (axis < 0 || axis >= in->ndim) {
@@ -232,6 +255,7 @@ ax_status_t cuda_max(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     k_reduce_max_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
         d + in->offset, (float *)out->storage->data + out->offset,
         outer, axis_len, inner);
+    AX_CUDA_CHECK_LAUNCH("max_axis");
     return AX_OK;
 }
 
@@ -244,7 +268,9 @@ ax_status_t cuda_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     if (axis == -1) {
         int64_t n = 1;
         for (int i = 0; i < in->ndim; i++) n *= in->shape[i];
+        ax_cuda_scratch_reset();
         dev_write_scalar(out, full_reduce_min(d, (int64_t)in->offset, n));
+        AX_CUDA_CHECK_LAUNCH("min_full");
         return AX_OK;
     }
     if (axis < 0 || axis >= in->ndim) {
@@ -257,6 +283,7 @@ ax_status_t cuda_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     k_reduce_min_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
         d + in->offset, (float *)out->storage->data + out->offset,
         outer, axis_len, inner);
+    AX_CUDA_CHECK_LAUNCH("min_axis");
     return AX_OK;
 }
 
