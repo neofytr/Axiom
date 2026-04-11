@@ -317,7 +317,12 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
     __m256 c40 = _mm256_setzero_ps(), c41 = _mm256_setzero_ps();
     __m256 c50 = _mm256_setzero_ps(), c51 = _mm256_setzero_ps();
 
+    /* prefetch distance of 8 iterations keeps the l1 warm without evicting
+       the currently-used lines. tuned for the 6x16 inner loop. */
     for (int64_t p = 0; p < kc; p++) {
+        __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
+        __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
+
         __m256 b0 = _mm256_load_ps(bp);
         __m256 b1 = _mm256_load_ps(bp + 8);
 
@@ -378,7 +383,12 @@ static void micro_kernel(int64_t kc, const float *ap, const float *bp,
         for (int v = 0; v < NVEC; v++)
             acc[ii][v] = ax_vf32_zero();
 
+    /* prefetch 8 iterations ahead keeps both packed panels warm in l1
+       without evicting current lines. portable via __builtin_prefetch. */
     for (int64_t p = 0; p < kc; p++) {
+        __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
+        __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
+
         for (int v = 0; v < NVEC; v++) {
             ax_vf32 bv = ax_vf32_loadu(bp + v * AX_VF32_WIDTH);
             for (int ii = 0; ii < GEMM_MR; ii++) {
@@ -686,7 +696,6 @@ static void pack_b_im2col(const ax_conv_params_t *p,
                            float *packed)
 {
     const float *input = p->input;
-    const int64_t C_in = p->C_in;
     const int64_t H = p->H, W = p->W;
     const int kh = p->kh, kw = p->kw;
     const int sh = p->sh, sw = p->sw;
@@ -763,7 +772,6 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
     /* small-problem fallback: straight scalar-simd loop with on-the-fly gather.
        tiled BLIS overhead dominates below ~100k FLOPs just like opt_gemm. */
     if (m * n * k < 100000) {
-        const int64_t C_in = params->C_in;
         const int64_t H = params->H, W = params->W;
         const int kh = params->kh, kw = params->kw;
         const int sh = params->sh, sw = params->sw;
