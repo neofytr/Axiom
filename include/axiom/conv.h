@@ -20,6 +20,9 @@
 
 #include "layer.h"
 
+/* forward decls for the fused conv-bn-relu composite layer below */
+struct ax_batchnorm;
+
 /* conv2d layer.
    input:  [N, C_in, H, W]
    output: [N, C_out, H_out, W_out]
@@ -104,6 +107,49 @@ ax_layer_t *ax_global_avgpool2d_create(void);
    needed to connect conv layers to dense layers. */
 
 ax_layer_t *ax_flatten_create(void);
+
+
+/* fused conv2d + batchnorm + relu composite layer.
+   produced automatically by ax_sequential_fuse(); not meant for direct
+   construction in typical user code. shares the same weight/bias/gamma/beta
+   tensors as the original layers (ownership is transferred on fuse, so the
+   old layers must be freed without double-freeing their params). */
+
+struct ax_conv_scratch; /* reuse the conv scratch struct defined in conv.c */
+
+typedef struct
+{
+    ax_layer_t base;
+    /* conv params (shared, owned) */
+    ax_tensor_t *weight;
+    ax_tensor_t *bias;
+    int in_channels;
+    int out_channels;
+    int kernel_h, kernel_w;
+    int stride_h, stride_w;
+    int pad_h, pad_w;
+    bool use_bias;
+    /* batchnorm params (shared, owned) */
+    ax_tensor_t *gamma;
+    ax_tensor_t *beta;
+    ax_tensor_t *running_mean;
+    ax_tensor_t *running_var;
+    float bn_eps;
+    float bn_momentum;
+    /* lazily allocated conv scratch (same as ax_conv2d) */
+    struct ax_conv_scratch *scratch;
+} ax_conv_bn_relu_t;
+
+/* create directly from conv2d + batchnorm layers. takes ownership of the
+   params (weight, bias, gamma, beta, running_mean, running_var) but does NOT
+   destroy the old layer structs — the caller should free those without
+   re-destroying the params (layer structs only, not recursive). */
+ax_layer_t *ax_conv_bn_relu_create_from(ax_layer_t *conv, ax_layer_t *bn);
+
+/* walk a sequential model; replace every contiguous Conv2D -> BatchNorm -> ReLU
+   triple with a fused conv_bn_relu layer. returns the model (same pointer,
+   mutated in place) for chaining. safe to call multiple times. */
+ax_layer_t *ax_sequential_fuse(ax_layer_t *model);
 
 
 /* im2col: internal function exposed for testing.

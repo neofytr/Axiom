@@ -95,6 +95,16 @@ void ax_grad_fn_destroy(ax_grad_fn_t *gf);
 #include "memory.h"
 ax_arena_t *ax_backward_arena(void);
 
+/* get the thread-local forward scratch arena. forward fns can use this for
+   tensors that must outlive the forward pass and stay alive across backward
+   (e.g. batchnorm's saved x_hat / inv_std). reset by ax_graph_cleanup, NOT by
+   ax_backward, so saved tensors remain valid through the backward walk.
+   caveat: arena spans multiple forward calls and is reset only at cleanup, so
+   if two forwards are issued without an intervening cleanup the second forward's
+   allocations coexist with the first — that's fine for normal training where
+   each step does forward -> backward -> cleanup before the next forward. */
+ax_arena_t *ax_forward_arena(void);
+
 /* numerical gradient check for testing.
    compares analytical gradient against finite-difference approximation.
    returns the max absolute difference. */

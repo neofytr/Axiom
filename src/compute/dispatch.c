@@ -1,8 +1,23 @@
 /* dispatch.c — routes compute calls to the active backend */
 
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
+
 #include "axiom/compute.h"
 #include "axiom/error.h"
 #include <stddef.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+
+#ifdef __linux__
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -35,6 +50,11 @@ ax_status_t ax_compute_init(void) {
     active_id = AX_BACKEND_CPU_SIMD;
     active_ops = &ax_cpu_opt_ops;
     compute_initialized = 1;
+
+    /* runtime hybrid-cpu autotune. only emits a stderr line when it
+       actually calibrates (i.e. user did not pin threads explicitly). */
+    ax_autotune_threads();
+
     return AX_OK;
 }
 
@@ -212,4 +232,146 @@ int ax_get_num_threads(void)
 #else
     return 1;
 #endif
+}
+
+/* hybrid-cpu autotune.
+
+   strategy: pin a tiny serial fma-style kernel to each available logical
+   cpu via sched_setaffinity, time it, and treat cores within 25% of the
+   fastest as "fast". sets omp default to the fast-core count so that
+   p-cores aren't blocked at omp barriers waiting on slower e-cores.
+
+   bounded under 200ms total (kernel sized at ~1m ops, ~1ms per core on
+   modern hardware, ~16 cores typical -> ~16ms; 200ms gives huge headroom). */
+
+static double ax_autotune_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+#ifdef __linux__
+/* tiny serial workload. volatile sink prevents the optimizer from
+   collapsing the loop. ~1m fma-ish iterations is plenty for relative
+   speed measurement on modern x86. */
+static double ax_autotune_run_kernel(void)
+{
+    const int iters = 1000000;
+    volatile float sink = 0.0f;
+    float a = 1.0f, b = 1.0001f, c = 0.9999f, d = 0.5f;
+    double t0 = ax_autotune_now_ms();
+    for (int i = 0; i < iters; i++) {
+        a = a * b + c * d;
+        a -= 0.0001f;
+        if (a > 1e6f || a < -1e6f) a = 1.0f;
+    }
+    sink = a;
+    (void)sink;
+    return ax_autotune_now_ms() - t0;
+}
+#endif
+
+int ax_autotune_threads(void)
+{
+#ifndef _OPENMP
+    /* nothing to tune without openmp */
+    return 1;
+#else
+    /* user opt-out */
+    const char *no_auto = getenv("AX_NO_AUTOTUNE");
+    if (no_auto && no_auto[0] == '1') {
+        return omp_get_max_threads();
+    }
+
+    /* user-explicit thread count wins */
+    const char *omp_env = getenv("OMP_NUM_THREADS");
+    if (omp_env && omp_env[0] != '\0') {
+        int n = atoi(omp_env);
+        if (n > 0) return n;
+        return omp_get_max_threads();
+    }
+
+#ifndef __linux__
+    /* no affinity api on this platform; leave defaults alone */
+    return omp_get_max_threads();
+#else
+    /* enumerate the cpus we're allowed to run on */
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return omp_get_max_threads();
+    }
+
+    int max_cpus = CPU_SETSIZE;
+    int cpu_ids[CPU_SETSIZE];
+    int n_cpus = 0;
+    for (int i = 0; i < max_cpus && n_cpus < CPU_SETSIZE; i++) {
+        if (CPU_ISSET(i, &allowed)) {
+            cpu_ids[n_cpus++] = i;
+        }
+    }
+    if (n_cpus <= 1) {
+        return omp_get_max_threads();
+    }
+
+    /* save current affinity so we can restore it after probing */
+    cpu_set_t saved = allowed;
+
+    double times[CPU_SETSIZE];
+    double t_start = ax_autotune_now_ms();
+    double budget_ms = 200.0;
+
+    for (int i = 0; i < n_cpus; i++) {
+        /* abort calibration cleanly if we're about to blow the budget */
+        if (ax_autotune_now_ms() - t_start > budget_ms - 5.0) {
+            /* not enough samples to cluster; bail out */
+            sched_setaffinity(0, sizeof(saved), &saved);
+            return omp_get_max_threads();
+        }
+
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(cpu_ids[i], &one);
+        if (sched_setaffinity(0, sizeof(one), &one) != 0) {
+            /* couldn't pin; treat as worst-case */
+            times[i] = 1e9;
+            continue;
+        }
+        /* short yield so the kernel actually migrates us */
+        sched_yield();
+        times[i] = ax_autotune_run_kernel();
+    }
+
+    /* restore affinity */
+    sched_setaffinity(0, sizeof(saved), &saved);
+
+    /* find the fastest (smallest time) */
+    double best = times[0];
+    for (int i = 1; i < n_cpus; i++) {
+        if (times[i] < best) best = times[i];
+    }
+    if (best <= 0.0) {
+        return omp_get_max_threads();
+    }
+
+    /* fast cores: within 25% of best (i.e. time <= 1.25 * best) */
+    double threshold = best * 1.25;
+    int fast_count = 0;
+    for (int i = 0; i < n_cpus; i++) {
+        if (times[i] <= threshold) fast_count++;
+    }
+    if (fast_count <= 0) fast_count = 1;
+    if (fast_count > n_cpus) fast_count = n_cpus;
+
+    double total_ms = ax_autotune_now_ms() - t_start;
+
+    omp_set_num_threads(fast_count);
+
+    fprintf(stderr, "axiom: autotune chose %d fast cores (%.1fms calibration)\n",
+            fast_count, total_ms);
+
+    return fast_count;
+#endif /* __linux__ */
+#endif /* _OPENMP */
 }

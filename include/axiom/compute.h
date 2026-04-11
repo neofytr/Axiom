@@ -45,6 +45,18 @@ void ax_set_num_threads(int n);
    returns 1 if openmp is disabled. */
 int ax_get_num_threads(void);
 
+/* runtime auto-tune for hybrid cpus (intel 12th+ p-core/e-core, big.LITTLE).
+   benchmarks each logical cpu with a tiny serial workload pinned via
+   sched_setaffinity, clusters cores within 25% of the fastest as "fast",
+   and sets the default thread count to the fast-core count. this avoids
+   omp barrier stalls where slow e-cores block fast p-cores.
+
+   skipped if env AX_NO_AUTOTUNE=1 or OMP_NUM_THREADS is set (user-explicit).
+   only runs on linux; other platforms return omp_get_max_threads() unchanged.
+   total calibration time is bounded under 200ms.
+   returns the chosen thread count. */
+int ax_autotune_threads(void);
+
 /* dispatch functions */
 /* these call through to the active backend's function pointers.
    tensor.c calls these; user code normally calls the tensor-level api instead. */

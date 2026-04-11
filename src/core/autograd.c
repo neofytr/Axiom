@@ -26,6 +26,19 @@ ax_arena_t *ax_backward_arena(void)
     return backward_arena;
 }
 
+/* thread-local arena for tensors that the forward pass must save for backward
+   (e.g. batchnorm x_hat / inv_std). lifetime: spans forward + backward of one
+   training step. reset only by ax_graph_cleanup, never by ax_backward, so the
+   saved tensors stay valid through the backward walk. */
+static _Thread_local ax_arena_t *forward_arena = NULL;
+
+ax_arena_t *ax_forward_arena(void)
+{
+    if (!forward_arena)
+        forward_arena = ax_arena_create(16 * 1024 * 1024); /* 16 MB — matches backward */
+    return forward_arena;
+}
+
 void ax_no_grad(void)    { grad_tracking = false; }
 void ax_enable_grad(void){ grad_tracking = true; }
 bool ax_grad_enabled(void){ return grad_tracking; }
@@ -425,6 +438,13 @@ void ax_graph_cleanup(ax_tensor_t *root)
         slab_grad_fn_free(gf);
         root->grad_fn = NULL;
     }
+
+    /* reset forward arena now that the graph is gone — any arena-temp tensors
+       that were saved on grad_fns have already been "destroyed" (no-op) above.
+       safe to bulk free here. */
+    if (forward_arena)
+        ax_arena_reset(forward_arena);
+
     /* persistent state is reused across calls — no free here */
 }
 

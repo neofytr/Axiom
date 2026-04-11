@@ -176,9 +176,12 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
                   (input->requires_grad || bn->gamma->requires_grad || bn->beta->requires_grad);
 
     if (record) {
-        x_hat_save = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+        /* allocate from the forward arena — these live until ax_graph_cleanup
+           resets the arena after backward completes. */
+        ax_arena_t *fa = ax_forward_arena();
+        x_hat_save = ax_tensor_arena_zeros(fa, input->shape, input->ndim, input->dtype);
         int64_t is_shape[] = {feat};
-        inv_std_save = ax_tensor_zeros(is_shape, 1, input->dtype);
+        inv_std_save = ax_tensor_arena_zeros(fa, is_shape, 1, input->dtype);
         if (!x_hat_save || !inv_std_save) {
             if (x_hat_save) ax_tensor_destroy(x_hat_save);
             if (inv_std_save) ax_tensor_destroy(inv_std_save);
@@ -647,6 +650,18 @@ static void dropout_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         ig[igoff + i] += go[gooff + i] * md[i];
 }
 
+/* xorshift64* — fast per-thread prng for dropout mask. small state, no globals,
+   each thread advances its own copy so iterations stay independent. */
+static inline uint64_t xs64_next(uint64_t *state)
+{
+    uint64_t x = *state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *state = x;
+    return x * 0x2545F4914F6CDD1DULL;
+}
+
 static ax_tensor_t *dropout_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_dropout_t *dp = (ax_dropout_t *)self;
@@ -673,14 +688,62 @@ static ax_tensor_t *dropout_forward(ax_layer_t *self, ax_tensor_t *input)
         else md = (float *)mask->storage->data;
     }
 
-    for (int64_t i = 0; i < n; i++)
+    /* small-n path: serial, uses the global rng (matches pre-parallel behavior). */
+    if (n <= 65536)
     {
-        float r = ax_rng_float();
-        if (r < keep) {
-            od[out->offset + i] = id[input->offset + i] * scale;
-            if (record) md[i] = scale;
+        for (int64_t i = 0; i < n; i++)
+        {
+            float r = ax_rng_float();
+            if (r < keep) {
+                od[out->offset + i] = id[input->offset + i] * scale;
+                if (record) md[i] = scale;
+            }
+            /* else: od stays 0, md stays 0 */
         }
-        /* else: od stays 0, md stays 0 */
+    }
+    else
+    {
+        /* large-n path: parallel with per-thread xorshift64*.
+           seed = global rng draw mixed with thread id so each thread produces
+           a different sequence and the overall mask varies between calls. */
+        uint64_t call_seed = ax_rng_uint64();
+        int64_t off_in = (int64_t)input->offset;
+        int64_t off_out = (int64_t)out->offset;
+        /* xorshift requires non-zero state; OR in a constant just in case. */
+        #ifdef _OPENMP
+        #pragma omp parallel
+        {
+            int tid = omp_get_thread_num();
+            uint64_t st = (call_seed ^ ((uint64_t)tid * 0x9E3779B97F4A7C15ULL))
+                          | 0x1ULL;
+            /* burn one round to scramble correlated low bits across threads */
+            (void)xs64_next(&st);
+            /* xs64 -> float in [0,1) by taking the high 24 bits */
+            const float inv_2p24 = 1.0f / (float)(1u << 24);
+
+            #pragma omp for schedule(static)
+            for (int64_t i = 0; i < n; i++)
+            {
+                float r = (float)(xs64_next(&st) >> 40) * inv_2p24;
+                if (r < keep) {
+                    od[off_out + i] = id[off_in + i] * scale;
+                    if (record) md[i] = scale;
+                }
+            }
+        }
+        #else
+        uint64_t st = (call_seed ^ 0x9E3779B97F4A7C15ULL) | 0x1ULL;
+        (void)xs64_next(&st);
+        const float inv_2p24 = 1.0f / (float)(1u << 24);
+        for (int64_t i = 0; i < n; i++)
+        {
+            float r = (float)(xs64_next(&st) >> 40) * inv_2p24;
+            if (r < keep) {
+                od[off_out + i] = id[off_in + i] * scale;
+                if (record) md[i] = scale;
+            }
+        }
+        #endif
     }
 
     if (record) {

@@ -49,6 +49,7 @@ typedef enum
     AX_LAYER_LAYERNORM,
     AX_LAYER_DROPOUT,
     AX_LAYER_SEQUENTIAL,
+    AX_LAYER_CONV_BN_RELU,   /* fused conv2d+batchnorm+relu (see conv.h) */
     AX_LAYER_TYPE_COUNT,
 } ax_layer_type_t;
 

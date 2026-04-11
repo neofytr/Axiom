@@ -202,6 +202,11 @@ int main(void)
     ax_sequential_add(model, ax_dropout_create(0.3f));
     ax_sequential_add(model, ax_dense_create(256, N_CLASSES, true));
 
+    /* operator fusion: collapse conv2d->batchnorm->relu triples into a single
+       fused layer. single-pass bn+relu on the conv output saves one trip over
+       the activation buffer on memory-bound hardware. opt-in and safe to skip. */
+    ax_sequential_fuse(model);
+
     int64_t total_params = ax_layer_param_count(model);
     printf("model architecture:\n");
     ax_layer_summary(model);
@@ -317,11 +322,19 @@ int main(void)
     float final_test = eval_accuracy(model, test_x, test_labels, N_TEST);
     printf("final test accuracy: %.2f%%\n\n", final_test);
 
-    /* save model */
+    /* save model. serialize.c doesn't yet know how to round-trip the fused
+       conv_bn_relu layer, so skip save when the model contains one. */
+    ax_sequential_t *seq_check = (ax_sequential_t *)model;
+    bool has_fused = false;
+    for (int i = 0; i < seq_check->n_layers; i++)
+        if (seq_check->layers[i]->type == AX_LAYER_CONV_BN_RELU) { has_fused = true; break; }
+
     ax_model_t *wrapper = ax_model_create(model);
     const char *save_path = "mnist_cnn.axm";
-    if (ax_model_save(wrapper, save_path) == AX_OK)
+    if (!has_fused && ax_model_save(wrapper, save_path) == AX_OK)
         printf("model saved to %s (%ld params)\n", save_path, total_params);
+    else if (has_fused)
+        printf("model has fused layers; skipping save (round-trip not supported)\n");
 
     /* cleanup */
     ax_model_destroy(wrapper);
