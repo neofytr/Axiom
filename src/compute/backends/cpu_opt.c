@@ -11,6 +11,11 @@
 #include <string.h>
 #include <float.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -216,10 +221,6 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
    6x16 micro-kernel on AVX2: 12 YMM accumulators + 2 B loads + 1 A broadcast
    = 15 of 16 registers. no spills, near-peak FMA throughput. */
 
-#define GEMM_MC 72     /* rows of A panel (multiple of MR=6) */
-#define GEMM_NC 256    /* cols of B panel (multiple of NR=16) */
-#define GEMM_KC 256    /* depth of both panels */
-
 #if defined(AX_SIMD_AVX2)
     #define GEMM_MR 6
     #define GEMM_NR 16     /* 2 x 8-wide AVX2 vectors per row */
@@ -231,12 +232,51 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     #define GEMM_NR 4
 #endif
 
+/* macro-kernel tile sizes. compile-time defaults tuned for desktop x86
+   with ~256 KB l2. runtime-tunable via AX_GEMM_MC / AX_GEMM_NC /
+   AX_GEMM_KC env vars — embedded targets with smaller caches should
+   shrink these. the init ctor also logs a warning if the pack_b panel
+   exceeds detected l2 so users know when to tune. */
+static int64_t GEMM_MC = 72;
+static int64_t GEMM_NC = 256;
+static int64_t GEMM_KC = 256;
+
+static void ax_gemm_read_env(const char *name, int64_t *slot, int64_t multiple_of) {
+    const char *s = getenv(name);
+    if (!s || !*s) return;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    if (end == s || v <= 0) return;
+    if (multiple_of > 1) v = (v / multiple_of) * multiple_of;
+    if (v <= 0) return;
+    *slot = (int64_t)v;
+}
+
+static __attribute__((constructor)) void ax_cpu_opt_init(void) {
+    ax_gemm_read_env("AX_GEMM_MC", &GEMM_MC, GEMM_MR);
+    ax_gemm_read_env("AX_GEMM_NC", &GEMM_NC, GEMM_NR);
+    ax_gemm_read_env("AX_GEMM_KC", &GEMM_KC, 1);
+
+#ifdef __linux__
+    long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
+    if (l2 > 0) {
+        size_t pack_b_bytes = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
+        if ((long)pack_b_bytes > l2) {
+            fprintf(stderr,
+                "axiom: gemm pack_b buffer %zu kB exceeds detected l2 %ld kB; "
+                "consider setting AX_GEMM_KC / AX_GEMM_NC smaller on this target\n",
+                pack_b_bytes / 1024, l2 / 1024);
+        }
+    }
+#endif
+}
+
 /* lazily allocate this thread's pack_a and pack_b buffers (once per thread) */
 static bool ensure_tl_pack_bufs(void) {
     if (!tl_pack_a_buf)
-        tl_pack_a_buf = (float *)ax_aligned_alloc((size_t)GEMM_MC * GEMM_KC * sizeof(float), 64);
+        tl_pack_a_buf = (float *)ax_aligned_alloc((size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float), 64);
     if (!tl_pack_b_buf)
-        tl_pack_b_buf = (float *)ax_aligned_alloc((size_t)GEMM_NC * GEMM_KC * sizeof(float), 64);
+        tl_pack_b_buf = (float *)ax_aligned_alloc((size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float), 64);
     return tl_pack_a_buf && tl_pack_b_buf;
 }
 
