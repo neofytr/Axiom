@@ -12,6 +12,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 
 /* context saved during batchnorm forward for the backward pass */
 typedef struct {
@@ -65,6 +69,9 @@ static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         ig = (float *)input->grad->storage->data;
     }
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int64_t c = 0; c < feat; c++) {
         /* pass 1: SIMD reduction for sum_go, sum_go_xh (also accumulates dgamma, dbeta) */
         ax_vf32 v_sgo = ax_vf32_zero();
@@ -183,6 +190,9 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
         float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (int64_t c = 0; c < feat; c++)
         {
             /* pass 1: compute mean with SIMD reduction */
@@ -271,6 +281,9 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         /* eval path: fused scale+shift per channel.
            precompute scale = gamma * inv_std, bias_out = beta - gamma * mean * inv_std
            then out[idx] = scale * input[idx] + bias_out (single FMA per element) */
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
         for (int64_t c = 0; c < feat; c++)
         {
             float inv_std = 1.0f / sqrtf(rv[c] + bn->eps);
@@ -489,6 +502,10 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
     float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
     float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
+    /* layernorm normalizes per-sample, so each sample is independent */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int64_t b = 0; b < batch; b++)
     {
         /* pass 1: welford's online mean + variance */

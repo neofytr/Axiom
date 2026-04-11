@@ -14,6 +14,10 @@
 #include <string.h>
 #include <math.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 /* allocate optimizer base struct + state array */
 static ax_optimizer_t *optim_alloc(ax_optim_type_t type, ax_tensor_t **params, int n)
 {
@@ -78,6 +82,18 @@ static void sgd_step(ax_optimizer_t *opt)
     ax_vf32 v_wd   = ax_vf32_set1(opt->weight_decay);
     ax_vf32 v_mom  = ax_vf32_set1(opt->momentum);
 
+    /* serial pre-pass: lazily allocate momentum state for params that need it.
+       avoids ax_tensor_zeros calls inside the parallel region. */
+    if (opt->momentum > 0.0f) {
+        for (int i = 0; i < opt->n_params; i++) {
+            if (opt->params[i]->grad)
+                ensure_state_m(&opt->state[i], opt->params[i]);
+        }
+    }
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1)
+    #endif
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
@@ -190,13 +206,21 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
     float bc1 = 1.0f - powf(opt->beta1, (float)t);
     float bc2 = 1.0f - powf(opt->beta2, (float)t);
 
+    /* serial pre-pass: lazily allocate moments for params that need them */
+    for (int i = 0; i < opt->n_params; i++) {
+        if (opt->params[i]->grad) {
+            ensure_state_m(&opt->state[i], opt->params[i]);
+            ensure_state_v(&opt->state[i], opt->params[i]);
+        }
+    }
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1)
+    #endif
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
         if (!p->grad) continue;
-
-        ensure_state_m(&opt->state[i], p);
-        ensure_state_v(&opt->state[i], p);
         int64_t n = ax_tensor_numel(p);
         float *wd = (float *)p->storage->data;
         float *gd = (float *)p->grad->storage->data;
@@ -305,6 +329,14 @@ static void rmsprop_step(ax_optimizer_t *opt)
     ax_vf32 v_eps   = ax_vf32_set1(opt->eps);
     ax_vf32 v_wd    = ax_vf32_set1(opt->weight_decay);
 
+    for (int i = 0; i < opt->n_params; i++) {
+        if (opt->params[i]->grad)
+            ensure_state_v(&opt->state[i], opt->params[i]);
+    }
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1)
+    #endif
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
@@ -365,12 +397,18 @@ static void adagrad_step(ax_optimizer_t *opt)
     ax_vf32 v_eps = ax_vf32_set1(opt->eps);
     ax_vf32 v_wd  = ax_vf32_set1(opt->weight_decay);
 
+    for (int i = 0; i < opt->n_params; i++) {
+        if (opt->params[i]->grad)
+            ensure_state_v(&opt->state[i], opt->params[i]);
+    }
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 1)
+    #endif
     for (int i = 0; i < opt->n_params; i++)
     {
         ax_tensor_t *p = opt->params[i];
         if (!p->grad) continue;
-
-        ensure_state_v(&opt->state[i], p);
 
         int64_t n = ax_tensor_numel(p);
         int64_t wo = p->offset, go = p->grad->offset;

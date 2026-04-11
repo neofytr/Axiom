@@ -12,6 +12,14 @@
 #include <float.h>
 #include <stdint.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+/* threshold for parallelizing element-wise ops.
+   below this, openmp fork-join overhead exceeds compute time. */
+#define AX_PAR_THRESHOLD 65536
+
 /* reference backend for fallback */
 extern const ax_backend_ops_t ax_cpu_naive_ops;
 
@@ -65,6 +73,12 @@ static inline int64_t validate_triple_same(const ax_tensor_t *a, const ax_tensor
 /* element-wise binary ops (contiguous, no broadcast).
    separate SIMD and scalar expressions to avoid type conflicts. */
 
+#ifdef _OPENMP
+#define AX_OMP_PAR_FOR_IF(n) _Pragma("omp parallel for schedule(static) if(n > AX_PAR_THRESHOLD)")
+#else
+#define AX_OMP_PAR_FOR_IF(n)
+#endif
+
 #define DEFINE_OPT_BINOP(name, simd_expr, scalar_expr, naive_fn) \
 static ax_status_t opt_##name(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { \
     int64_t n = validate_triple_same(a, b, out); \
@@ -72,14 +86,14 @@ static ax_status_t opt_##name(const ax_tensor_t *a, const ax_tensor_t *b, ax_ten
     const float *ad = raw_f32(a); \
     const float *bd = raw_f32(b); \
     float *od = raw_f32(out); \
-    int64_t i = 0; \
     int64_t vec_end = n - (n % AX_VF32_WIDTH); \
-    for (; i < vec_end; i += AX_VF32_WIDTH) { \
+    AX_OMP_PAR_FOR_IF(n) \
+    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH) { \
         ax_vf32 va = ax_vf32_load(ad + i); \
         ax_vf32 vb = ax_vf32_load(bd + i); \
         ax_vf32_store(od + i, simd_expr); \
     } \
-    for (; i < n; i++) { \
+    for (int64_t i = vec_end; i < n; i++) { \
         float sa = ad[i], sb = bd[i]; \
         od[i] = scalar_expr; \
     } \
@@ -102,13 +116,13 @@ static ax_status_t opt_##name(const ax_tensor_t *in, ax_tensor_t *out) { \
     const float *id = raw_f32(in); \
     float *od = raw_f32(out); \
     int64_t n = ni; \
-    int64_t i = 0; \
     int64_t vec_end = n - (n % AX_VF32_WIDTH); \
-    for (; i < vec_end; i += AX_VF32_WIDTH) { \
+    AX_OMP_PAR_FOR_IF(n) \
+    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH) { \
         ax_vf32 v = ax_vf32_load(id + i); \
         ax_vf32_store(od + i, simd_expr); \
     } \
-    for (; i < n; i++) { \
+    for (int64_t i = vec_end; i < n; i++) { \
         float sv = id[i]; \
         od[i] = scalar_expr; \
     } \
@@ -128,7 +142,7 @@ DEFINE_OPT_UNOP(sigmoid, ax_vf32_sigmoid(v), (1.0f / (1.0f + expf(-sv))), sigmoi
 DEFINE_OPT_UNOP(tanh_op, ax_vf32_tanh(v), tanhf(sv), tanh_op)
 
 
-/* scalar ops */
+/* scalar ops — vectorized */
 
 static ax_status_t opt_add_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out) {
     int64_t ni = validate_contig_f32(in);
@@ -137,7 +151,12 @@ static ax_status_t opt_add_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     const float *id = raw_f32(in);
     float *od = raw_f32(out);
     float s = (float)scalar;
-    for (int64_t i = 0; i < ni; i++)
+    ax_vf32 vs = ax_vf32_set1(s);
+    int64_t i = 0;
+    int64_t vec_end = ni - (ni % AX_VF32_WIDTH);
+    for (; i < vec_end; i += AX_VF32_WIDTH)
+        ax_vf32_store(od + i, ax_vf32_add(ax_vf32_load(id + i), vs));
+    for (; i < ni; i++)
         od[i] = id[i] + s;
     return AX_OK;
 }
@@ -149,7 +168,12 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     const float *id = raw_f32(in);
     float *od = raw_f32(out);
     float s = (float)scalar;
-    for (int64_t i = 0; i < ni; i++)
+    ax_vf32 vs = ax_vf32_set1(s);
+    int64_t i = 0;
+    int64_t vec_end = ni - (ni % AX_VF32_WIDTH);
+    for (; i < vec_end; i += AX_VF32_WIDTH)
+        ax_vf32_store(od + i, ax_vf32_mul(ax_vf32_load(id + i), vs));
+    for (; i < ni; i++)
         od[i] = id[i] * s;
     return AX_OK;
 }
@@ -276,7 +300,8 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
 #else
 
 /* generic micro-kernel using the SIMD abstraction layer.
-   on NEON: 4x8 (8 accumulators). on scalar: 4x4. */
+   on NEON: 4x8 (8 accumulators). on scalar: 4x4.
+   uses loadu/storeu for safe unaligned writeback at tile edges. */
 static void micro_kernel(int64_t kc, const float *ap, const float *bp,
                           float *c, int64_t ldc, int64_t mr, int64_t nr)
 {
@@ -289,7 +314,7 @@ static void micro_kernel(int64_t kc, const float *ap, const float *bp,
 
     for (int64_t p = 0; p < kc; p++) {
         for (int v = 0; v < NVEC; v++) {
-            ax_vf32 bv = ax_vf32_load(bp + v * AX_VF32_WIDTH);
+            ax_vf32 bv = ax_vf32_loadu(bp + v * AX_VF32_WIDTH);
             for (int ii = 0; ii < GEMM_MR; ii++) {
                 ax_vf32 av = ax_vf32_set1(ap[ii]);
                 acc[ii][v] = ax_vf32_fmadd(av, bv, acc[ii][v]);
@@ -321,6 +346,10 @@ static void micro_kernel(int64_t kc, const float *ap, const float *bp,
 #endif
 
 static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
+    if (!a || !b || !out) {
+        ax_err_set(AX_ERR_NULL_ARG, "gemm: NULL tensor");
+        return AX_ERR_NULL_ARG;
+    }
     if (a->dtype != AX_FLOAT32) {
         ax_err_set(AX_ERR_DTYPE_MISMATCH, "gemm only supports float32");
         return AX_ERR_DTYPE_MISMATCH;
@@ -360,6 +389,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     /* round up tile counts for packing */
     int64_t mc_padded = ((m + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
     int64_t nc_padded = ((n + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+    (void)mc_padded; (void)nc_padded; /* used implicitly via tile loops */
 
     /* checked scratch allocation — bounded by AX_MAX_SCRATCH_BYTES */
     size_t pack_a_size = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
@@ -381,27 +411,29 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     float *od = raw_f32(out);
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    /* main tiling loop: iterate over KC tiles, then MC, then NC */
-    for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-        int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+    /* BLIS-standard tiling loop: JC → KC → IC
+       pack_b is called once per (jc, pc) tile — not once per (jc, pc, ic) tile.
+       For a 512×512 matrix with MC=72: reduces pack_b calls from ~64 to ~8. */
+    for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+        int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-        for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
-            int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+        for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+            int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
 
-            /* pack A panel [ic:ic+mc, pc:pc+kc] */
-            int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-            pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+            /* pack B panel [pc:pc+kc, jc:jc+nc] — once per (jc, pc) */
+            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
 
-            for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
-                int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+            for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
 
-                /* pack B panel [pc:pc+kc, jc:jc+nc] */
-                int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-                pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
+                /* pack A panel [ic:ic+mc, pc:pc+kc] */
+                int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
 
                 /* micro-kernel over MR x NR blocks */
-                int64_t mc_round = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                int64_t nc_round = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                int64_t mc_round = mc_pack;
+                int64_t nc_round = nc_pack;
 
                 for (int64_t ir = 0; ir < mc_round; ir += GEMM_MR) {
                     int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
@@ -425,34 +457,111 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 }
 
 
+/* helper: SIMD row sum for a contiguous float array of length n.
+   uses 4 independent accumulators to hide FP add latency. */
+static inline float simd_row_sum(const float *d, int64_t n)
+{
+    ax_vf32 acc0 = ax_vf32_zero(), acc1 = ax_vf32_zero();
+    ax_vf32 acc2 = ax_vf32_zero(), acc3 = ax_vf32_zero();
+    int64_t unroll4 = n - (n % (AX_VF32_WIDTH * 4));
+    int64_t i = 0;
+    for (; i < unroll4; i += AX_VF32_WIDTH * 4) {
+        acc0 = ax_vf32_add(acc0, ax_vf32_load(d + i));
+        acc1 = ax_vf32_add(acc1, ax_vf32_load(d + i + AX_VF32_WIDTH));
+        acc2 = ax_vf32_add(acc2, ax_vf32_load(d + i + AX_VF32_WIDTH * 2));
+        acc3 = ax_vf32_add(acc3, ax_vf32_load(d + i + AX_VF32_WIDTH * 3));
+    }
+    acc0 = ax_vf32_add(ax_vf32_add(acc0, acc1), ax_vf32_add(acc2, acc3));
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    for (; i < vec_end; i += AX_VF32_WIDTH)
+        acc0 = ax_vf32_add(acc0, ax_vf32_load(d + i));
+    double total = (double)ax_vf32_hsum(acc0);
+    for (; i < n; i++) total += (double)d[i];
+    return (float)total;
+}
+
+/* helper: SIMD row max/min for a contiguous float array */
+static inline float simd_row_max(const float *d, int64_t n)
+{
+    ax_vf32 vmax = ax_vf32_set1(-FLT_MAX);
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    int64_t i = 0;
+    for (; i < vec_end; i += AX_VF32_WIDTH)
+        vmax = ax_vf32_max(vmax, ax_vf32_load(d + i));
+    float mx = ax_vf32_hmax(vmax);
+    for (; i < n; i++) if (d[i] > mx) mx = d[i];
+    return mx;
+}
+
+static inline float simd_row_min(const float *d, int64_t n)
+{
+    ax_vf32 vmin = ax_vf32_set1(FLT_MAX);
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    int64_t i = 0;
+    for (; i < vec_end; i += AX_VF32_WIDTH)
+        vmin = ax_vf32_min(vmin, ax_vf32_load(d + i));
+    float mn = ax_vf32_hmin(vmin);
+    for (; i < n; i++) if (d[i] < mn) mn = d[i];
+    return mn;
+}
+
+
 /* reductions */
 
 static ax_status_t opt_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
-    /* fast path: full reduction on contiguous tensor */
+    /* fast path: full reduction */
     if (axis == -1) {
         int64_t n = validate_contig_f32(in);
         int64_t no = validate_contig_f32(out);
         if (n < 0 || no < 0 || no != 1) return ax_cpu_naive_ops.sum(in, axis, out);
-        const float *d = raw_f32(in);
-        double total = 0.0; /* double accumulator for precision */
-        for (int64_t i = 0; i < n; i++) total += (double)d[i];
-        raw_f32(out)[0] = (float)total;
+        raw_f32(out)[0] = simd_row_sum(raw_f32(in), n);
         return AX_OK;
     }
+
+    /* fast path: axis-1 sum on 2D contiguous tensor → row-wise reduction */
+    if (axis == 1 && in->ndim == 2) {
+        int64_t ni = validate_contig_f32(in);
+        int64_t no = validate_contig_f32(out);
+        if (ni < 0 || no < 0) return ax_cpu_naive_ops.sum(in, axis, out);
+        int64_t rows = in->shape[0], cols = in->shape[1];
+        if (out->ndim != 1 || out->shape[0] != rows)
+            return ax_cpu_naive_ops.sum(in, axis, out);
+        const float *d = raw_f32(in);
+        float *od = raw_f32(out);
+        for (int64_t i = 0; i < rows; i++)
+            od[i] = simd_row_sum(d + i * cols, cols);
+        return AX_OK;
+    }
+
     return ax_cpu_naive_ops.sum(in, axis, out);
 }
 
 static ax_status_t opt_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
+    /* fast path: full reduction */
     if (axis == -1) {
         int64_t n = validate_contig_f32(in);
         int64_t no = validate_contig_f32(out);
         if (n < 0 || no < 0 || no != 1) return ax_cpu_naive_ops.mean(in, axis, out);
-        const float *d = raw_f32(in);
-        double total = 0.0;
-        for (int64_t i = 0; i < n; i++) total += (double)d[i];
-        raw_f32(out)[0] = (float)(total / (double)n);
+        raw_f32(out)[0] = simd_row_sum(raw_f32(in), n) / (float)n;
         return AX_OK;
     }
+
+    /* fast path: axis-1 mean on 2D contiguous tensor → row-wise mean */
+    if (axis == 1 && in->ndim == 2) {
+        int64_t ni = validate_contig_f32(in);
+        int64_t no = validate_contig_f32(out);
+        if (ni < 0 || no < 0) return ax_cpu_naive_ops.mean(in, axis, out);
+        int64_t rows = in->shape[0], cols = in->shape[1];
+        if (out->ndim != 1 || out->shape[0] != rows)
+            return ax_cpu_naive_ops.mean(in, axis, out);
+        const float *d = raw_f32(in);
+        float *od = raw_f32(out);
+        float inv_cols = 1.0f / (float)cols;
+        for (int64_t i = 0; i < rows; i++)
+            od[i] = simd_row_sum(d + i * cols, cols) * inv_cols;
+        return AX_OK;
+    }
+
     return ax_cpu_naive_ops.mean(in, axis, out);
 }
 
@@ -461,10 +570,7 @@ static ax_status_t opt_max(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         int64_t n = validate_contig_f32(in);
         int64_t no = validate_contig_f32(out);
         if (n < 0 || no < 0 || no != 1) return ax_cpu_naive_ops.max_op(in, axis, out);
-        const float *d = raw_f32(in);
-        float mx = -FLT_MAX;
-        for (int64_t i = 0; i < n; i++) if (d[i] > mx) mx = d[i];
-        raw_f32(out)[0] = mx;
+        raw_f32(out)[0] = simd_row_max(raw_f32(in), n);
         return AX_OK;
     }
     return ax_cpu_naive_ops.max_op(in, axis, out);
@@ -475,17 +581,14 @@ static ax_status_t opt_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         int64_t n = validate_contig_f32(in);
         int64_t no = validate_contig_f32(out);
         if (n < 0 || no < 0 || no != 1) return ax_cpu_naive_ops.min_op(in, axis, out);
-        const float *d = raw_f32(in);
-        float mn = FLT_MAX;
-        for (int64_t i = 0; i < n; i++) if (d[i] < mn) mn = d[i];
-        raw_f32(out)[0] = mn;
+        raw_f32(out)[0] = simd_row_min(raw_f32(in), n);
         return AX_OK;
     }
     return ax_cpu_naive_ops.min_op(in, axis, out);
 }
 
 
-/* comparisons */
+/* comparisons — vectorized via simd_defs cmpeq/cmpgt */
 
 static ax_status_t opt_equal(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
     int64_t n = validate_triple_same(a, b, out);
@@ -493,7 +596,11 @@ static ax_status_t opt_equal(const ax_tensor_t *a, const ax_tensor_t *b, ax_tens
     const float *ad = raw_f32(a);
     const float *bd = raw_f32(b);
     float *od = raw_f32(out);
-    for (int64_t i = 0; i < n; i++)
+    int64_t i = 0;
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    for (; i < vec_end; i += AX_VF32_WIDTH)
+        ax_vf32_store(od + i, ax_vf32_cmpeq(ax_vf32_load(ad + i), ax_vf32_load(bd + i)));
+    for (; i < n; i++)
         od[i] = (ad[i] == bd[i]) ? 1.0f : 0.0f;
     return AX_OK;
 }
@@ -504,7 +611,11 @@ static ax_status_t opt_greater(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     const float *ad = raw_f32(a);
     const float *bd = raw_f32(b);
     float *od = raw_f32(out);
-    for (int64_t i = 0; i < n; i++)
+    int64_t i = 0;
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    for (; i < vec_end; i += AX_VF32_WIDTH)
+        ax_vf32_store(od + i, ax_vf32_cmpgt(ax_vf32_load(ad + i), ax_vf32_load(bd + i)));
+    for (; i < n; i++)
         od[i] = (ad[i] > bd[i]) ? 1.0f : 0.0f;
     return AX_OK;
 }
@@ -517,11 +628,17 @@ static ax_status_t opt_fill(ax_tensor_t *t, double value) {
     if (n < 0) return ax_cpu_naive_ops.fill(t, value);
     float v = (float)value;
     float *d = raw_f32(t);
-    /* special case: fill with 0 uses memset (fast) */
     if (v == 0.0f) {
+        /* memset is faster than any explicit loop for zeroing */
         memset(d, 0, (size_t)n * sizeof(float));
     } else {
-        for (int64_t i = 0; i < n; i++) d[i] = v;
+        ax_vf32 vv = ax_vf32_set1(v);
+        int64_t i = 0;
+        int64_t vec_end = n - (n % AX_VF32_WIDTH);
+        for (; i < vec_end; i += AX_VF32_WIDTH)
+            ax_vf32_store(d + i, vv);
+        for (; i < n; i++)
+            d[i] = v;
     }
     return AX_OK;
 }
