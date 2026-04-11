@@ -5,7 +5,9 @@
 
 #include "types.h"
 #include "error.h"
+#ifndef __cplusplus
 #include <stdatomic.h>
+#endif
 
 /* ref-counted data buffer shared across tensor views */
 typedef struct {
@@ -30,6 +32,10 @@ typedef struct ax_tensor {
     struct ax_tensor *grad;
     void *grad_fn;                     /* opaque pointer to grad function */
 } ax_tensor_t;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* storage management */
 
@@ -140,8 +146,9 @@ static inline ax_tensor_t *ax_ensure_contiguous(ax_tensor_t *t) {
 void ax_set_default_device(ax_device_t dev);
 ax_device_t ax_get_default_device(void);
 
-/* move a tensor to the CUDA device (nop + retain if already on GPU).
-   requires AX_HAVE_CUDA; returns NULL and sets error otherwise. */
+/* move a tensor to the cuda device (nop + retain if already on gpu).
+   returns NULL and sets AX_ERR_BACKEND if no backend is registered as
+   the owner of AX_DEVICE_CUDA (e.g. cuda support not compiled in). */
 ax_tensor_t *ax_tensor_to_cuda(ax_tensor_t *t);
 
 /* move a tensor to CPU (nop + retain if already on CPU). */
@@ -154,5 +161,9 @@ void ax_tensor_print(const ax_tensor_t *t);
 
 /* print just the shape */
 void ax_tensor_print_shape(const ax_tensor_t *t);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AX_TENSOR_H */

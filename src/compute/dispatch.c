@@ -7,6 +7,7 @@
 #endif
 
 #include "axiom/compute.h"
+#include "axiom/device.h"
 #include "axiom/error.h"
 #include <stddef.h>
 #include <stdlib.h>
@@ -27,13 +28,47 @@
 extern const ax_backend_ops_t ax_cpu_naive_ops;
 extern const ax_backend_ops_t ax_cpu_opt_ops;
 
+#ifdef AX_HAVE_CUDA
+extern const ax_backend_ops_t ax_cuda_ops;
+#endif
+
 /* registered backends table */
 static const ax_backend_ops_t *backends[AX_BACKEND_COUNT] = { NULL };
+
+/* device -> owning-backend table. any backend whose vtable declares
+   ops->device != AX_DEVICE_COUNT is installed here during init and its
+   lifecycle init hook is fired. core memory paths route through this
+   table instead of #ifdef'ing on specific device types. */
+static const ax_backend_ops_t *device_backends[AX_DEVICE_COUNT] = { NULL };
+static int device_backend_inited[AX_DEVICE_COUNT] = { 0 };
 
 /* currently active backend */
 static ax_backend_id_t active_id = AX_BACKEND_CPU_NAIVE;
 static const ax_backend_ops_t *active_ops = NULL;
 static int compute_initialized = 0;
+
+/* claim ownership of ops->device in the device table and fire ops->init
+   exactly once per process. safe to call with NULL or with a backend
+   that doesn't own a device. */
+static void register_device_owner(const ax_backend_ops_t *ops) {
+    if (!ops) return;
+    if ((int)ops->device < 0 || (int)ops->device >= AX_DEVICE_COUNT) return;
+    if (ops->device == AX_DEVICE_CPU) return;  /* cpu is handled inline */
+    if (device_backends[ops->device]) return;  /* first one wins */
+    device_backends[ops->device] = ops;
+    if (!device_backend_inited[ops->device] && ops->init) {
+        ops->init();
+    }
+    device_backend_inited[ops->device] = 1;
+}
+
+/* exposed to core (tensor.c etc.) so non-cpu code paths can look up
+   memory/transfer hooks. returns NULL for AX_DEVICE_CPU or for devices
+   whose owning backend is not compiled in. */
+const ax_backend_ops_t *ax_backend_for_device(ax_device_t device) {
+    if ((int)device < 0 || (int)device >= AX_DEVICE_COUNT) return NULL;
+    return device_backends[device];
+}
 
 /* ensure the compute system is ready; called lazily from dispatch macros */
 static void ensure_compute_init(void) {
@@ -45,6 +80,15 @@ ax_status_t ax_compute_init(void) {
     /* register all built-in backends */
     backends[AX_BACKEND_CPU_NAIVE] = &ax_cpu_naive_ops;
     backends[AX_BACKEND_CPU_SIMD]  = &ax_cpu_opt_ops;
+#ifdef AX_HAVE_CUDA
+    backends[AX_BACKEND_CUDA]      = &ax_cuda_ops;
+#endif
+
+    /* claim device ownership + fire init hooks for any backend that
+       manages a non-cpu device. cpu backends skip this. */
+    for (int i = 0; i < AX_BACKEND_COUNT; i++) {
+        register_device_owner(backends[i]);
+    }
 
     /* select the optimized backend by default (falls back to naive internally) */
     active_id = AX_BACKEND_CPU_SIMD;
@@ -59,6 +103,15 @@ ax_status_t ax_compute_init(void) {
 }
 
 void ax_compute_shutdown(void) {
+    /* fire device-owner shutdown hooks in reverse order */
+    for (int d = AX_DEVICE_COUNT - 1; d >= 0; d--) {
+        const ax_backend_ops_t *ops = device_backends[d];
+        if (ops && ops->shutdown && device_backend_inited[d]) {
+            ops->shutdown();
+        }
+        device_backends[d] = NULL;
+        device_backend_inited[d] = 0;
+    }
     active_ops = NULL;
     compute_initialized = 0;
 }
@@ -91,7 +144,34 @@ ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops
         return AX_ERR_NULL_ARG;
     }
     backends[id] = ops;
+    /* also install as the owner of its device, if any */
+    register_device_owner(ops);
     return AX_OK;
+}
+
+/* ---- generic device-management api (axiom/device.h) ----
+   these route through the owning backend's vtable; no device-specific
+   code leaks into core. */
+
+int ax_device_count(ax_device_t device) {
+    if (device == AX_DEVICE_CPU) return 1;
+    ensure_compute_init();
+    const ax_backend_ops_t *ops = ax_backend_for_device(device);
+    if (!ops || !ops->device_count) return 0;
+    return ops->device_count();
+}
+
+void ax_device_synchronize(ax_device_t device) {
+    if (device == AX_DEVICE_CPU) return;
+    ensure_compute_init();
+    const ax_backend_ops_t *ops = ax_backend_for_device(device);
+    if (ops && ops->synchronize) ops->synchronize();
+}
+
+int ax_device_is_available(ax_device_t device) {
+    if (device == AX_DEVICE_CPU) return 1;
+    ensure_compute_init();
+    return ax_backend_for_device(device) != NULL;
 }
 
 /* dispatch helpers */
@@ -156,6 +236,26 @@ ax_status_t ax_compute_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
 
 /* matrix ops */
 ax_status_t ax_compute_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(gemm, a, b, out); }
+
+/* implicit im2col conv gemm — optional backend op */
+ax_status_t ax_compute_conv_gemm(const ax_tensor_t *weight,
+                                  const ax_conv_params_t *params,
+                                  ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->conv_gemm) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "conv_gemm not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return active_ops->conv_gemm(weight, params, out);
+}
+
+int ax_compute_has_conv_gemm(void)
+{
+    ensure_compute_init();
+    return (active_ops && active_ops->conv_gemm) ? 1 : 0;
+}
 
 /* reduction ops */
 ax_status_t ax_compute_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {

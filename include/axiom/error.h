@@ -5,6 +5,10 @@
 
 #include "types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* max length for error messages */
 #define AX_ERR_MSG_MAX 256
 
@@ -39,5 +43,9 @@ void ax_err_set_callback(ax_err_callback_t cb, void *userdata);
             return AX_ERR_NULL_ARG; \
         } \
     } while (0)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AX_ERROR_H */

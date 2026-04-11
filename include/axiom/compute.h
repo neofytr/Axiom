@@ -35,6 +35,12 @@ const ax_backend_ops_t *ax_compute_get_ops(void);
 /* register a custom backend at runtime (for plugins/extensions) */
 ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops_t *ops);
 
+/* look up the backend that owns memory/lifecycle for a given device.
+   returns NULL for AX_DEVICE_CPU or for devices whose backend module is
+   not compiled in. core uses this to route storage allocation and
+   host<->device transfers without knowing specific device types. */
+const ax_backend_ops_t *ax_backend_for_device(ax_device_t device);
+
 /* set the maximum number of threads used by parallel ops.
    wraps omp_set_num_threads() when openmp is enabled.
    no-op when openmp is disabled (always 1 thread).
@@ -77,6 +83,18 @@ ax_status_t ax_compute_add_scalar(const ax_tensor_t *in, double scalar, ax_tenso
 ax_status_t ax_compute_mul_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out);
 
 ax_status_t ax_compute_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
+
+/* implicit im2col conv forward gemm, per-sample.
+   returns AX_ERR_NOT_IMPLEMENTED if the active backend lacks conv_gemm;
+   callers should fall back to the standard im2col + gemm path in that case. */
+ax_status_t ax_compute_conv_gemm(const ax_tensor_t *weight,
+                                  const ax_conv_params_t *params,
+                                  ax_tensor_t *out);
+
+/* returns 1 if the active backend implements conv_gemm, 0 otherwise.
+   lets conv.c choose between implicit-gemm and im2col+gemm paths once
+   per forward call instead of paying the dispatch cost per sample. */
+int ax_compute_has_conv_gemm(void);
 
 ax_status_t ax_compute_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 ax_status_t ax_compute_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out);

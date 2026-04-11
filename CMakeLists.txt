@@ -152,6 +152,7 @@ set(TEST_SOURCES
     tests/test_serialize_all.c
     tests/test_lr_sched.c
     tests/test_backend_opt.c
+    tests/test_cuda.c
 )
 
 foreach(test_src ${TEST_SOURCES})

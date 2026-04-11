@@ -4,6 +4,7 @@
 #include "axiom/autograd.h"
 #include "axiom/memory.h"
 #include "axiom/compute.h"
+#include "axiom/device.h"
 #include "axiom/rng.h"
 #include <stdalign.h>
 #include <stdlib.h>
@@ -12,10 +13,6 @@
 #include <time.h>
 #include <limits.h>
 #include <inttypes.h>
-
-#ifdef AX_HAVE_CUDA
-#include <cuda_runtime.h>
-#endif
 
 /* default device for all new tensor allocations (thread-local) */
 static _Thread_local ax_device_t tl_default_device = AX_DEVICE_CPU;
@@ -127,6 +124,8 @@ static ax_storage_t *pool_get(size_t bytes) {
 
 /* return a storage to the pool. returns true if pooled, false if caller should free. */
 static bool pool_put(ax_storage_t *s) {
+    /* CUDA unified memory must NOT mix with CPU pool — keep them separate */
+    if (s->device != AX_DEVICE_CPU) return false;
     int idx = pool_bucket_for(s->size_bytes);
     if (idx < 0) return false;
     if (pool_bucket_count[idx] >= AX_POOL_BUCKET_CAP) return false;
@@ -147,24 +146,28 @@ static bool pool_put(ax_storage_t *s) {
 #endif /* !AX_NO_STORAGE_POOL */
 
 ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device) {
-#ifdef AX_HAVE_CUDA
-    if (device == AX_DEVICE_CUDA) {
-        /* CUDA storage: bypass CPU pool entirely — data lives on GPU */
+    /* non-cpu devices are owned by a backend module; route allocation
+       through its vtable so core has zero device-specific code. */
+    if (device != AX_DEVICE_CPU) {
+        const ax_backend_ops_t *ops = ax_backend_for_device(device);
+        if (!ops || !ops->storage_alloc) {
+            ax_err_set(AX_ERR_BACKEND,
+                       "no backend registered for device %d", (int)device);
+            return NULL;
+        }
         ax_storage_t *s = slab_storage_alloc();
         if (!s) return NULL;
-        if (cudaMalloc(&s->data, size_bytes) != cudaSuccess) {
+        s->data = ops->storage_alloc(size_bytes);
+        if (!s->data) {
             slab_storage_free(s);
             return NULL;
         }
-        /* zero the GPU buffer (cudaMalloc doesn't guarantee zero) */
-        cudaMemset(s->data, 0, size_bytes);
         s->size_bytes = size_bytes;
         atomic_init(&s->refcount, 1);
-        s->device = AX_DEVICE_CUDA;
+        s->device = device;
         s->is_arena_temp = false;
         return s;
     }
-#endif
 
 #ifndef AX_NO_STORAGE_POOL
     /* try the pool first — returns a storage with pre-allocated data buffer */
@@ -203,18 +206,21 @@ void ax_storage_release(ax_storage_t *s) {
     if (s->is_arena_temp) return;
     int prev = atomic_fetch_sub(&s->refcount, 1);
     if (prev <= 1) {
-#ifndef AX_NO_STORAGE_POOL
-        /* try to return to pool; on success, struct AND data stay alive */
-        if (pool_put(s)) return;
-#endif
-        /* pool miss: free the data buffer, return the struct to slab */
-#ifdef AX_HAVE_CUDA
-        if (s->device == AX_DEVICE_CUDA) {
-            cudaFree(s->data);
+        /* non-cpu storage: ask the owning backend to free it. no pooling
+           for foreign devices — their allocators are typically hotter
+           than our pool anyway, and mixing device pointers across
+           backends would be a footgun. */
+        if (s->device != AX_DEVICE_CPU) {
+            const ax_backend_ops_t *ops = ax_backend_for_device(s->device);
+            if (ops && ops->storage_free) ops->storage_free(s->data);
             slab_storage_free(s);
             return;
         }
+#ifndef AX_NO_STORAGE_POOL
+        /* cpu path: try to return to pool; on success, struct AND data stay alive */
+        if (pool_put(s)) return;
 #endif
+        /* cpu pool miss: free the data buffer, return the struct to slab */
         ax_aligned_free(s->data);
         slab_storage_free(s);
     }
@@ -320,7 +326,7 @@ ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype) 
     size_t bytes = (size_t)n * elem_size;
     if (bytes == 0) bytes = elem_size;
 
-    t->storage = ax_storage_create(bytes, AX_DEVICE_CPU);
+    t->storage = ax_storage_create(bytes, tl_default_device);
     if (!t->storage) {
         slab_tensor_free(t);
         return NULL;
@@ -331,6 +337,7 @@ ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype) 
 ax_tensor_t *ax_tensor_zeros(const int64_t *shape, int ndim, ax_dtype_t dtype) {
     ax_tensor_t *t = ax_tensor_create(shape, ndim, dtype);
     if (!t) return NULL;
+    /* Unified memory is CPU-accessible, so memset works for both CPU and CUDA storage. */
     memset(t->storage->data, 0, t->storage->size_bytes);
     return t;
 }
@@ -713,6 +720,81 @@ ax_tensor_t *ax_tensor_contiguous(ax_tensor_t *t) {
 
     ax_compute_copy(t, c);
     return c;
+}
+
+/* device transfers.
+   both functions route through the owning backend's vtable. core has no
+   idea how the device memory is actually allocated or copied. */
+
+ax_tensor_t *ax_tensor_to_cuda(ax_tensor_t *t) {
+    if (!t) return NULL;
+    if (t->storage->device == AX_DEVICE_CUDA)
+        return ax_tensor_view(t);
+
+    const ax_backend_ops_t *ops = ax_backend_for_device(AX_DEVICE_CUDA);
+    if (!ops || !ops->storage_alloc || !ops->memcpy_h2d) {
+        ax_err_set(AX_ERR_BACKEND, "cuda backend not available");
+        return NULL;
+    }
+
+    ax_tensor_t *src = ax_ensure_contiguous(t);
+    if (!src) return NULL;
+
+    int64_t n = ax_tensor_numel(src);
+    size_t bytes = (size_t)n * ax_dtype_size(src->dtype);
+
+    ax_tensor_t *gpu = tensor_alloc_meta(src->shape, src->ndim, src->dtype);
+    if (!gpu) { if (src != t) ax_tensor_destroy(src); return NULL; }
+
+    gpu->storage = ax_storage_create(bytes, AX_DEVICE_CUDA);
+    if (!gpu->storage) {
+        slab_tensor_free(gpu);
+        if (src != t) ax_tensor_destroy(src);
+        return NULL;
+    }
+
+    /* source is cpu-contiguous here, so a single h2d memcpy suffices */
+    const char *src_bytes = (const char *)src->storage->data
+                          + src->offset * ax_dtype_size(src->dtype);
+    if (ops->memcpy_h2d(gpu->storage->data, src_bytes, bytes) != AX_OK) {
+        ax_tensor_destroy(gpu);
+        if (src != t) ax_tensor_destroy(src);
+        return NULL;
+    }
+
+    if (src != t) ax_tensor_destroy(src);
+    return gpu;
+}
+
+ax_tensor_t *ax_tensor_to_cpu(ax_tensor_t *t) {
+    if (!t) return NULL;
+    if (t->storage->device == AX_DEVICE_CPU)
+        return ax_tensor_view(t);
+
+    const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
+    if (!ops || !ops->memcpy_d2h) {
+        ax_err_set(AX_ERR_BACKEND,
+                   "no backend registered for source device %d",
+                   (int)t->storage->device);
+        return NULL;
+    }
+
+    int64_t n = ax_tensor_numel(t);
+    size_t bytes = (size_t)n * ax_dtype_size(t->dtype);
+
+    ax_tensor_t *cpu = tensor_alloc_meta(t->shape, t->ndim, t->dtype);
+    if (!cpu) return NULL;
+
+    cpu->storage = ax_storage_create(bytes, AX_DEVICE_CPU);
+    if (!cpu->storage) { slab_tensor_free(cpu); return NULL; }
+
+    const char *src_bytes = (const char *)t->storage->data
+                          + t->offset * ax_dtype_size(t->dtype);
+    if (ops->memcpy_d2h(cpu->storage->data, src_bytes, bytes) != AX_OK) {
+        ax_tensor_destroy(cpu);
+        return NULL;
+    }
+    return cpu;
 }
 
 /* printing */
