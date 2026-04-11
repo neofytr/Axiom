@@ -22,6 +22,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#define AX_OMP_MAX_THREADS() omp_get_max_threads()
+#define AX_OMP_THREAD_NUM() omp_get_thread_num()
+#else
+#define AX_OMP_MAX_THREADS() 1
+#define AX_OMP_THREAD_NUM() 0
+#endif
 #include <inttypes.h>
 #include <float.h>
 
@@ -232,71 +241,132 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         }
     }
 
-    /* pre-allocate all reusable scratch tensors outside the loop */
+    /* pre-allocate per-thread scratch tensors */
+    int T = AX_OMP_MAX_THREADS();
+    if (T > N) T = (int)N;
+    if (T < 1) T = 1;
+
     int64_t go_shape[] = {C_out, M};
     int64_t col_shape[] = {K, M};
     int64_t dw_shape[] = {C_out, K};
     int64_t dcol_shape[] = {K, M};
-    int64_t colt_shape[] = {M, K};  /* transposed col for weight grad */
-
+    int64_t colt_shape[] = {M, K};
     int64_t img_shape[] = {C_in, H, W};
-    ax_tensor_t *col_buf  = ax_tensor_create(col_shape, 2, AX_FLOAT32);
-    ax_tensor_t *go_mat   = ax_tensor_create(go_shape, 2, AX_FLOAT32);
-    ax_tensor_t *dw_buf   = weight->requires_grad ? ax_tensor_create(dw_shape, 2, AX_FLOAT32) : NULL;
-    ax_tensor_t *dcol_buf = input_orig->requires_grad ? ax_tensor_create(dcol_shape, 2, AX_FLOAT32) : NULL;
-    ax_tensor_t *colt_buf = weight->requires_grad ? ax_tensor_create(colt_shape, 2, AX_FLOAT32) : NULL;
-    ax_tensor_t *dimg_buf = input_orig->requires_grad ? ax_tensor_create(img_shape, 3, AX_FLOAT32) : NULL;
+
+    ax_tensor_t **col_bufs  = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    ax_tensor_t **go_bufs   = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    ax_tensor_t **dw_bufs   = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    ax_tensor_t **dcol_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    ax_tensor_t **colt_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    ax_tensor_t **dimg_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+
+    if (!col_bufs || !go_bufs || !dw_bufs || !dcol_bufs || !colt_bufs || !dimg_bufs) {
+        free(col_bufs); free(go_bufs); free(dw_bufs);
+        free(dcol_bufs); free(colt_bufs); free(dimg_bufs);
+        if (wt_contig) ax_tensor_destroy(wt_contig);
+        return;
+    }
+
+    bool alloc_ok = true;
+    for (int t = 0; t < T; t++) {
+        col_bufs[t] = ax_tensor_create(col_shape, 2, AX_FLOAT32);
+        go_bufs[t]  = ax_tensor_create(go_shape, 2, AX_FLOAT32);
+        if (weight->requires_grad) {
+            dw_bufs[t] = ax_tensor_create(dw_shape, 2, AX_FLOAT32);
+            colt_bufs[t] = ax_tensor_create(colt_shape, 2, AX_FLOAT32);
+            if (!dw_bufs[t] || !colt_bufs[t]) alloc_ok = false;
+            else {
+                /* zero per-thread dW; threads accumulate into it */
+                memset(dw_bufs[t]->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
+            }
+        }
+        if (input_orig->requires_grad) {
+            dcol_bufs[t] = ax_tensor_create(dcol_shape, 2, AX_FLOAT32);
+            dimg_bufs[t] = ax_tensor_create(img_shape, 3, AX_FLOAT32);
+            if (!dcol_bufs[t] || !dimg_bufs[t]) alloc_ok = false;
+        }
+        if (!col_bufs[t] || !go_bufs[t]) alloc_ok = false;
+        if (!alloc_ok) break;
+    }
+
+    if (!alloc_ok) {
+        for (int t = 0; t < T; t++) {
+            if (col_bufs[t]) ax_tensor_destroy(col_bufs[t]);
+            if (go_bufs[t]) ax_tensor_destroy(go_bufs[t]);
+            if (dw_bufs[t]) ax_tensor_destroy(dw_bufs[t]);
+            if (dcol_bufs[t]) ax_tensor_destroy(dcol_bufs[t]);
+            if (colt_bufs[t]) ax_tensor_destroy(colt_bufs[t]);
+            if (dimg_bufs[t]) ax_tensor_destroy(dimg_bufs[t]);
+        }
+        free(col_bufs); free(go_bufs); free(dw_bufs);
+        free(dcol_bufs); free(colt_bufs); free(dimg_bufs);
+        if (wt_contig) ax_tensor_destroy(wt_contig);
+        return;
+    }
 
     float *ind = (float *)input_data->storage->data;
     float *grd = (float *)grad_out->storage->data;
 
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int64_t n = 0; n < N; n++)
     {
-        /* im2col directly into pre-allocated buffer */
-        float *cbd = (float *)col_buf->storage->data;
+        int tid = AX_OMP_THREAD_NUM();
+        float *cbd = (float *)col_bufs[tid]->storage->data;
+        ax_tensor_t *go_mat = go_bufs[tid];
+
+        /* im2col into per-thread buffer */
         im2col_into(ind + n * C_in * H * W, C_in, H, W,
                      kh, kw, sh, sw, ph, pw, out_h, out_w, cbd);
 
-        /* fill pre-allocated grad_out matrix */
+        /* fill per-thread grad_out matrix */
         memcpy(go_mat->storage->data, grd + n * C_out * M,
                (size_t)(C_out * M) * sizeof(float));
 
-        /* weight gradient: dW += go_mat @ col^T */
-        if (weight->requires_grad && dw_buf && colt_buf)
+        /* weight gradient: per-thread dW accumulates across this thread's samples.
+           reduction across threads happens after the parallel loop. */
+        if (weight->requires_grad)
         {
-            /* explicit transpose into pre-allocated buffer (no alloc) */
+            ax_tensor_t *colt_buf = colt_bufs[tid];
+            ax_tensor_t *dw_local = dw_bufs[tid];
+
+            /* transpose col [K,M] -> colt [M,K] */
             float *ctd = (float *)colt_buf->storage->data;
             for (int64_t r = 0; r < K; r++)
                 for (int64_t c = 0; c < M; c++)
                     ctd[c * K + r] = cbd[r * M + c];
 
-            memset(dw_buf->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
-            ax_compute_gemm(go_mat, colt_buf, dw_buf);
-
-            float *wg = (float *)weight->grad->storage->data;
-            float *dwd = (float *)dw_buf->storage->data;
-            int64_t wn = C_out * K;
-            {
+            /* go_mat @ colt -> dw_sample, accumulated into dw_local */
+            ax_tensor_t *dw_sample = ax_tensor_zeros(dw_shape, 2, AX_FLOAT32);
+            if (dw_sample) {
+                ax_compute_gemm(go_mat, colt_buf, dw_sample);
+                float *dwl = (float *)dw_local->storage->data;
+                float *dws = (float *)dw_sample->storage->data;
+                int64_t wn = C_out * K;
                 int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
                 for (; wi < wve; wi += AX_VF32_WIDTH)
-                    ax_vf32_store(wg + wi, ax_vf32_add(ax_vf32_load(wg + wi), ax_vf32_load(dwd + wi)));
-                for (; wi < wn; wi++) wg[wi] += dwd[wi];
+                    ax_vf32_store(dwl + wi, ax_vf32_add(ax_vf32_load(dwl + wi), ax_vf32_load(dws + wi)));
+                for (; wi < wn; wi++) dwl[wi] += dws[wi];
+                ax_tensor_destroy(dw_sample);
             }
         }
 
-        /* input gradient: dcol = W^T @ go_mat, then col2im into pre-allocated buffer */
-        if (input_orig->requires_grad && wt_contig && dcol_buf && dimg_buf)
+        /* input gradient — disjoint per-sample writes, no reduction needed */
+        if (input_orig->requires_grad && wt_contig)
         {
+            ax_tensor_t *dcol_buf = dcol_bufs[tid];
+            ax_tensor_t *dimg_buf = dimg_bufs[tid];
+
             memset(dcol_buf->storage->data, 0, (size_t)(K * M) * sizeof(float));
             ax_compute_gemm(wt_contig, go_mat, dcol_buf);
 
-            /* col2im into pre-allocated buffer (no per-sample malloc) */
             float *dimg_d = (float *)dimg_buf->storage->data;
             memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));
             col2im_into((float *)dcol_buf->storage->data, C_in, H, W,
                          kh, kw, sh, sw, ph, pw, out_h, out_w, dimg_d);
 
-            /* SIMD accumulate into input gradient */
+            /* SIMD accumulate into input gradient (disjoint per n) */
             float *ig = (float *)input_orig->grad->storage->data + n * C_in * H * W;
             int64_t total = C_in * H * W;
             int64_t i = 0, ve = total - (total % AX_VF32_WIDTH);
@@ -307,12 +377,30 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         }
     }
 
-    ax_tensor_destroy(col_buf);
-    ax_tensor_destroy(go_mat);
-    if (dw_buf) ax_tensor_destroy(dw_buf);
-    if (dcol_buf) ax_tensor_destroy(dcol_buf);
-    if (colt_buf) ax_tensor_destroy(colt_buf);
-    if (dimg_buf) ax_tensor_destroy(dimg_buf);
+    /* serial reduction: sum all per-thread dW buffers into weight->grad */
+    if (weight->requires_grad) {
+        float *wg = (float *)weight->grad->storage->data;
+        int64_t wn = C_out * K;
+        for (int t = 0; t < T; t++) {
+            float *dwl = (float *)dw_bufs[t]->storage->data;
+            int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
+            for (; wi < wve; wi += AX_VF32_WIDTH)
+                ax_vf32_store(wg + wi, ax_vf32_add(ax_vf32_load(wg + wi), ax_vf32_load(dwl + wi)));
+            for (; wi < wn; wi++) wg[wi] += dwl[wi];
+        }
+    }
+
+    /* free all per-thread scratch */
+    for (int t = 0; t < T; t++) {
+        if (col_bufs[t]) ax_tensor_destroy(col_bufs[t]);
+        if (go_bufs[t]) ax_tensor_destroy(go_bufs[t]);
+        if (dw_bufs[t]) ax_tensor_destroy(dw_bufs[t]);
+        if (dcol_bufs[t]) ax_tensor_destroy(dcol_bufs[t]);
+        if (colt_bufs[t]) ax_tensor_destroy(colt_bufs[t]);
+        if (dimg_bufs[t]) ax_tensor_destroy(dimg_bufs[t]);
+    }
+    free(col_bufs); free(go_bufs); free(dw_bufs);
+    free(dcol_bufs); free(colt_bufs); free(dimg_bufs);
     if (wt_contig) ax_tensor_destroy(wt_contig);
 }
 
@@ -364,37 +452,66 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     if (!w2d) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
     memcpy(w2d->storage->data, wd, (size_t)(C_out * K) * sizeof(float));
 
-    /* pre-allocate reusable scratch: col buffer, result buffer */
+    /* pre-allocate per-thread scratch: T col buffers, T result buffers.
+       T = max threads (1 in single-threaded mode). each thread uses its own slot. */
+    int T = AX_OMP_MAX_THREADS();
+    if (T > N) T = (int)N; /* cap at batch size to avoid wasted allocations */
+    if (T < 1) T = 1;
+
     int64_t col_shape[] = {K, M};
     int64_t res_shape[] = {C_out, M};
-    ax_tensor_t *col = ax_tensor_create(col_shape, 2, AX_FLOAT32);
-    ax_tensor_t *res = ax_tensor_create(res_shape, 2, AX_FLOAT32);
-    if (!col || !res) {
+    ax_tensor_t **col_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    ax_tensor_t **res_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    if (!col_bufs || !res_bufs) {
+        free(col_bufs); free(res_bufs);
         ax_tensor_destroy(w2d);
-        if (col) ax_tensor_destroy(col);
-        if (res) ax_tensor_destroy(res);
         if (inp != input) ax_tensor_destroy(inp);
         ax_tensor_destroy(output); return NULL;
     }
-    float *ind = (float *)inp->storage->data;
-    float *cd = (float *)col->storage->data;
+    bool alloc_ok = true;
+    for (int t = 0; t < T; t++) {
+        col_bufs[t] = ax_tensor_create(col_shape, 2, AX_FLOAT32);
+        res_bufs[t] = ax_tensor_create(res_shape, 2, AX_FLOAT32);
+        if (!col_bufs[t] || !res_bufs[t]) { alloc_ok = false; break; }
+    }
+    if (!alloc_ok) {
+        for (int t = 0; t < T; t++) {
+            if (col_bufs[t]) ax_tensor_destroy(col_bufs[t]);
+            if (res_bufs[t]) ax_tensor_destroy(res_bufs[t]);
+        }
+        free(col_bufs); free(res_bufs);
+        ax_tensor_destroy(w2d);
+        if (inp != input) ax_tensor_destroy(inp);
+        ax_tensor_destroy(output); return NULL;
+    }
 
+    float *ind = (float *)inp->storage->data;
+    const float *bias_data = (conv->use_bias && conv->bias)
+        ? (const float *)conv->bias->storage->data : NULL;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
     for (int64_t n = 0; n < N; n++)
     {
-        /* im2col directly into pre-allocated buffer (no per-sample malloc) */
+        int tid = AX_OMP_THREAD_NUM();
+        ax_tensor_t *col = col_bufs[tid];
+        ax_tensor_t *res = res_bufs[tid];
+        float *cd = (float *)col->storage->data;
+        float *rd = (float *)res->storage->data;
+
+        /* im2col directly into per-thread buffer */
         im2col_into(ind + n * C_in * H * W, C_in, H, W,
                      kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
 
-        /* result = w2d @ col via dispatch GEMM */
-        memset(res->storage->data, 0, (size_t)(C_out * M) * sizeof(float));
+        /* result = w2d @ col via dispatch GEMM (serial inside, no nested parallelism) */
+        memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
         ax_compute_gemm(w2d, col, res);
 
-        /* copy to output with bias */
-        float *rd = (float *)res->storage->data;
+        /* copy to output with bias — disjoint output region per n */
         for (int64_t co = 0; co < C_out; co++)
         {
-            float bias_val = (conv->use_bias && conv->bias)
-                ? ((float *)conv->bias->storage->data)[co] : 0.0f;
+            float bias_val = bias_data ? bias_data[co] : 0.0f;
             for (int64_t m = 0; m < M; m++)
             {
                 od[((n * C_out + co) * out_h + m / out_w) * out_w + m % out_w]
@@ -402,9 +519,13 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             }
         }
     }
+
+    for (int t = 0; t < T; t++) {
+        ax_tensor_destroy(col_bufs[t]);
+        ax_tensor_destroy(res_bufs[t]);
+    }
+    free(col_bufs); free(res_bufs);
     ax_tensor_destroy(w2d);
-    ax_tensor_destroy(col);
-    ax_tensor_destroy(res);
 
     /* hook up backward */
     if (ax_grad_enabled() && (input->requires_grad || conv->weight->requires_grad))
@@ -511,19 +632,28 @@ static void maxpool2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *ig = (float *)input->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *idx = (float *)indices->storage->data;
+    int64_t NC = N * C;
 
-    for (int64_t n = 0; n < N; n++)
-        for (int64_t c = 0; c < C; c++)
-            for (int64_t y = 0; y < oh; y++)
-                for (int64_t x = 0; x < ow; x++) {
-                    int64_t out_idx = ((n * C + c) * oh + y) * ow + x;
-                    int64_t max_pos = (int64_t)idx[out_idx];
-                    if (max_pos >= 0) {
-                        int64_t iy = max_pos / W;
-                        int64_t ix = max_pos % W;
-                        ig[((n * C + c) * H + iy) * W + ix] += go[out_idx];
-                    }
+    /* per-(n,c) writes are disjoint: each (n,c) writes only into its own
+       channel slab of the input gradient. safe to parallelize. */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t nc = 0; nc < NC; nc++)
+    {
+        int64_t n = nc / C;
+        int64_t c = nc % C;
+        for (int64_t y = 0; y < oh; y++)
+            for (int64_t x = 0; x < ow; x++) {
+                int64_t out_idx = ((n * C + c) * oh + y) * ow + x;
+                int64_t max_pos = (int64_t)idx[out_idx];
+                if (max_pos >= 0) {
+                    int64_t iy = max_pos / W;
+                    int64_t ix = max_pos % W;
+                    ig[((n * C + c) * H + iy) * W + ix] += go[out_idx];
                 }
+            }
+    }
     free(ctx); self->ctx = NULL;
 }
 
@@ -570,44 +700,49 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     float *id = (float *)inp->storage->data;
     float *od = (float *)output->storage->data;
 
+    /* parallelize over (n*C) — each (n,c) pair is independent.
+       collapse(2) requires perfectly nested loops with no code between, so we use a fused index. */
+    int64_t NC = N * C;
+
     /* fast path: k=2, s=2, p=0 (most common maxpool config).
        no boundary checks needed, unrolled 2x2 window comparison. */
     if (k == 2 && s == 2 && p == 0)
     {
-        for (int64_t n = 0; n < N; n++)
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t nc = 0; nc < NC; nc++)
         {
-            for (int64_t c = 0; c < C; c++)
+            int64_t n = nc / C;
+            int64_t c = nc % C;
+            const float *ic = id + (n * C + c) * H * W;
+            float *oc = od + (n * C + c) * oh * ow;
+            float *ix = record ? idxd + (n * C + c) * oh * ow : NULL;
+
+            for (int64_t y = 0; y < oh; y++)
             {
-                const float *ic = id + (n * C + c) * H * W;
-                float *oc = od + (n * C + c) * oh * ow;
-                float *ix = record ? idxd + (n * C + c) * oh * ow : NULL;
+                int64_t iy = y * 2;
+                const float *row0 = ic + iy * W;
+                const float *row1 = ic + (iy + 1) * W;
 
-                for (int64_t y = 0; y < oh; y++)
+                for (int64_t x = 0; x < ow; x++)
                 {
-                    int64_t iy = y * 2;
-                    const float *row0 = ic + iy * W;
-                    const float *row1 = ic + (iy + 1) * W;
+                    int64_t ix2 = x * 2;
+                    float a = row0[ix2], b = row0[ix2 + 1];
+                    float c2 = row1[ix2], d = row1[ix2 + 1];
 
-                    for (int64_t x = 0; x < ow; x++)
-                    {
-                        int64_t ix2 = x * 2;
-                        float a = row0[ix2], b = row0[ix2 + 1];
-                        float c2 = row1[ix2], d = row1[ix2 + 1];
+                    float m01 = a > b ? a : b;
+                    float m23 = c2 > d ? c2 : d;
+                    float mx = m01 > m23 ? m01 : m23;
+                    oc[y * ow + x] = mx;
 
-                        /* branchless 4-way max */
-                        float m01 = a > b ? a : b;
-                        float m23 = c2 > d ? c2 : d;
-                        float mx = m01 > m23 ? m01 : m23;
-                        oc[y * ow + x] = mx;
-
-                        if (record) {
-                            int64_t mi;
-                            if (mx == a)      mi = iy * W + ix2;
-                            else if (mx == b) mi = iy * W + ix2 + 1;
-                            else if (mx == c2) mi = (iy+1) * W + ix2;
-                            else               mi = (iy+1) * W + ix2 + 1;
-                            ix[y * ow + x] = (float)mi;
-                        }
+                    if (record) {
+                        int64_t mi;
+                        if (mx == a)      mi = iy * W + ix2;
+                        else if (mx == b) mi = iy * W + ix2 + 1;
+                        else if (mx == c2) mi = (iy+1) * W + ix2;
+                        else               mi = (iy+1) * W + ix2 + 1;
+                        ix[y * ow + x] = (float)mi;
                     }
                 }
             }
@@ -616,34 +751,36 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     else
     {
         /* general path with boundary checks */
-        for (int64_t n = 0; n < N; n++)
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t nc = 0; nc < NC; nc++)
         {
-            for (int64_t c = 0; c < C; c++)
+            int64_t n = nc / C;
+            int64_t c = nc % C;
+            for (int64_t y = 0; y < oh; y++)
             {
-                for (int64_t y = 0; y < oh; y++)
+                for (int64_t x = 0; x < ow; x++)
                 {
-                    for (int64_t x = 0; x < ow; x++)
+                    float mx = -FLT_MAX;
+                    int64_t max_iy = -1, max_ix = -1;
+                    for (int ky = 0; ky < k; ky++)
                     {
-                        float mx = -FLT_MAX;
-                        int64_t max_iy = -1, max_ix = -1;
-                        for (int ky = 0; ky < k; ky++)
+                        for (int kx = 0; kx < k; kx++)
                         {
-                            for (int kx = 0; kx < k; kx++)
+                            int64_t iy = y * s - p + ky;
+                            int64_t ix2 = x * s - p + kx;
+                            if (iy >= 0 && iy < H && ix2 >= 0 && ix2 < W)
                             {
-                                int64_t iy = y * s - p + ky;
-                                int64_t ix2 = x * s - p + kx;
-                                if (iy >= 0 && iy < H && ix2 >= 0 && ix2 < W)
-                                {
-                                    float v = id[((n * C + c) * H + iy) * W + ix2];
-                                    if (v > mx) { mx = v; max_iy = iy; max_ix = ix2; }
-                                }
+                                float v = id[((n * C + c) * H + iy) * W + ix2];
+                                if (v > mx) { mx = v; max_iy = iy; max_ix = ix2; }
                             }
                         }
-                        int64_t oi = ((n * C + c) * oh + y) * ow + x;
-                        od[oi] = mx;
-                        if (record)
-                            idxd[oi] = (max_iy >= 0) ? (float)(max_iy * W + max_ix) : -1.0f;
                     }
+                    int64_t oi = ((n * C + c) * oh + y) * ow + x;
+                    od[oi] = mx;
+                    if (record)
+                        idxd[oi] = (max_iy >= 0) ? (float)(max_iy * W + max_ix) : -1.0f;
                 }
             }
         }
@@ -707,30 +844,38 @@ static void avgpool2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     float *ig = (float *)input->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
+    int64_t NC = N * C;
 
-    for (int64_t n = 0; n < N; n++)
-        for (int64_t c = 0; c < C; c++)
-            for (int64_t y = 0; y < oh; y++)
-                for (int64_t x = 0; x < ow; x++) {
-                    /* count valid positions in this window */
-                    int count = 0;
-                    for (int ky = 0; ky < k; ky++)
-                        for (int kx = 0; kx < k; kx++) {
-                            int64_t iy = y * s - p + ky;
-                            int64_t ix = x * s - p + kx;
-                            if (iy >= 0 && iy < H && ix >= 0 && ix < W)
-                                count++;
-                        }
-                    if (count == 0) continue;
-                    float g = go[((n * C + c) * oh + y) * ow + x] / (float)count;
-                    for (int ky = 0; ky < k; ky++)
-                        for (int kx = 0; kx < k; kx++) {
-                            int64_t iy = y * s - p + ky;
-                            int64_t ix = x * s - p + kx;
-                            if (iy >= 0 && iy < H && ix >= 0 && ix < W)
-                                ig[((n * C + c) * H + iy) * W + ix] += g;
-                        }
-                }
+    /* per-(n,c) writes are disjoint: each (n,c) writes only into its own
+       channel slab. safe to parallelize over (n,c). */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t nc = 0; nc < NC; nc++)
+    {
+        int64_t n = nc / C;
+        int64_t c = nc % C;
+        for (int64_t y = 0; y < oh; y++)
+            for (int64_t x = 0; x < ow; x++) {
+                int count = 0;
+                for (int ky = 0; ky < k; ky++)
+                    for (int kx = 0; kx < k; kx++) {
+                        int64_t iy = y * s - p + ky;
+                        int64_t ix = x * s - p + kx;
+                        if (iy >= 0 && iy < H && ix >= 0 && ix < W)
+                            count++;
+                    }
+                if (count == 0) continue;
+                float g = go[((n * C + c) * oh + y) * ow + x] / (float)count;
+                for (int ky = 0; ky < k; ky++)
+                    for (int kx = 0; kx < k; kx++) {
+                        int64_t iy = y * s - p + ky;
+                        int64_t ix = x * s - p + kx;
+                        if (iy >= 0 && iy < H && ix >= 0 && ix < W)
+                            ig[((n * C + c) * H + iy) * W + ix] += g;
+                    }
+            }
+    }
     free(ctx); self->ctx = NULL;
 }
 
@@ -761,32 +906,36 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
 
     float *id = (float *)inp->storage->data;
     float *od = (float *)output->storage->data;
+    int64_t NC = N * C;
 
-    for (int64_t n = 0; n < N; n++)
+    /* parallelize over (n,c) — disjoint output regions */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t nc = 0; nc < NC; nc++)
     {
-        for (int64_t c = 0; c < C; c++)
+        int64_t n = nc / C;
+        int64_t c = nc % C;
+        for (int64_t y = 0; y < oh; y++)
         {
-            for (int64_t y = 0; y < oh; y++)
+            for (int64_t x = 0; x < ow; x++)
             {
-                for (int64_t x = 0; x < ow; x++)
+                float sum = 0;
+                int count = 0;
+                for (int ky = 0; ky < k; ky++)
                 {
-                    float sum = 0;
-                    int count = 0;
-                    for (int ky = 0; ky < k; ky++)
+                    for (int kx = 0; kx < k; kx++)
                     {
-                        for (int kx = 0; kx < k; kx++)
+                        int64_t iy = y * s - p + ky;
+                        int64_t ix = x * s - p + kx;
+                        if (iy >= 0 && iy < H && ix >= 0 && ix < W)
                         {
-                            int64_t iy = y * s - p + ky;
-                            int64_t ix = x * s - p + kx;
-                            if (iy >= 0 && iy < H && ix >= 0 && ix < W)
-                            {
-                                sum += id[((n * C + c) * H + iy) * W + ix];
-                                count++;
-                            }
+                            sum += id[((n * C + c) * H + iy) * W + ix];
+                            count++;
                         }
                     }
-                    od[((n * C + c) * oh + y) * ow + x] = count > 0 ? sum / count : 0;
                 }
+                od[((n * C + c) * oh + y) * ow + x] = count > 0 ? sum / count : 0;
             }
         }
     }

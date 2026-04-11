@@ -1,0 +1,15 @@
+# tsan suppressions for openmp/libgomp false positives.
+# libgomp tracks stack frames across parallel regions in ways that
+# tsan cannot reason about; the suppressed reports involve main-thread
+# stack memory that worker threads only "saw" via libgomp's runtime
+# bookkeeping, not actual user-level data races.
+
+# stack frame race reports inside openmp-parallel-call functions
+race:_omp_fn
+
+# libgomp internals
+called_from_lib:libgomp
+race:libgomp
+
+# tsan does not understand openmp barrier semantics
+race:GOMP_parallel

@@ -31,6 +31,8 @@ endif()
 
 if(AX_TSAN)
     message(STATUS "thread sanitizer enabled")
+    message(STATUS "  note: run TSan tests via 'setarch -R ctest' on linux with high-entropy ASLR")
+    message(STATUS "  PIE/ASLR remain enabled in the binary; setarch only affects test runtime")
     add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=thread)
 endif()
@@ -133,14 +135,24 @@ foreach(test_src ${TEST_SOURCES})
     add_executable(${test_name} ${test_src})
     target_include_directories(${test_name} PRIVATE tests)
     target_link_libraries(${test_name} PRIVATE axiom_static)
-    add_test(NAME ${test_name} COMMAND ${test_name})
+    if(AX_TSAN)
+        # tsan needs reduced ASLR; setarch -R disables address space randomization
+        # for the test process only (host system unchanged)
+        add_test(NAME ${test_name}
+                 COMMAND setarch ${CMAKE_SYSTEM_PROCESSOR} -R $<TARGET_FILE:${test_name}>)
+    else()
+        add_test(NAME ${test_name} COMMAND ${test_name})
+    endif()
     # tests intentionally don't clean up every intermediate tensor in the
     # computation graph (that's the model api's job via ax_graph_cleanup).
-    # suppress leak detection for tests so asan only catches real bugs
-    # (use-after-free, buffer overflow, etc.)
+    # suppress leak detection for tests so asan only catches real bugs.
     if(AX_SANITIZE)
         set_tests_properties(${test_name} PROPERTIES
             ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    endif()
+    if(AX_TSAN)
+        set_tests_properties(${test_name} PROPERTIES
+            ENVIRONMENT "TSAN_OPTIONS=ignore_noninstrumented_modules=1 suppressions=${CMAKE_SOURCE_DIR}/.tsan_suppressions")
     endif()
 endforeach()
 
