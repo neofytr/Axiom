@@ -386,23 +386,46 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         return AX_OK;
     }
 
-    /* round up tile counts for packing */
-    int64_t mc_padded = ((m + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-    int64_t nc_padded = ((n + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-    (void)mc_padded; (void)nc_padded; /* used implicitly via tile loops */
+    /* checked scratch allocation — bounded by AX_MAX_SCRATCH_BYTES.
+       per-thread pack buffers. when called from inside a parallel region
+       (e.g., conv2d batch loop), we use a single thread to avoid nested
+       over-subscription. */
+    int gemm_threads = 1;
+    #ifdef _OPENMP
+    if (!omp_in_parallel()) {
+        gemm_threads = omp_get_max_threads();
+        /* don't waste threads on tiny problems */
+        int64_t jc_tiles = (n + GEMM_NC - 1) / GEMM_NC;
+        if (gemm_threads > jc_tiles) gemm_threads = (int)jc_tiles;
+        if (gemm_threads < 1) gemm_threads = 1;
+    }
+    #endif
 
-    /* checked scratch allocation — bounded by AX_MAX_SCRATCH_BYTES */
     size_t pack_a_size = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
     size_t pack_b_size = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
-    if (pack_a_size + pack_b_size > AX_MAX_SCRATCH_BYTES) {
+    if ((pack_a_size + pack_b_size) * (size_t)gemm_threads > AX_MAX_SCRATCH_BYTES) {
         return ax_cpu_naive_ops.gemm(a, b, out);
     }
 
-    float *pack_a_buf = (float *)ax_aligned_alloc(pack_a_size, 64);
-    float *pack_b_buf = (float *)ax_aligned_alloc(pack_b_size, 64);
-    if (!pack_a_buf || !pack_b_buf) {
-        ax_aligned_free(pack_a_buf);
-        ax_aligned_free(pack_b_buf);
+    /* allocate per-thread packing buffers */
+    float **pack_a_bufs = (float **)calloc((size_t)gemm_threads, sizeof(float *));
+    float **pack_b_bufs = (float **)calloc((size_t)gemm_threads, sizeof(float *));
+    if (!pack_a_bufs || !pack_b_bufs) {
+        free(pack_a_bufs); free(pack_b_bufs);
+        return ax_cpu_naive_ops.gemm(a, b, out);
+    }
+    bool alloc_ok = true;
+    for (int t = 0; t < gemm_threads; t++) {
+        pack_a_bufs[t] = (float *)ax_aligned_alloc(pack_a_size, 64);
+        pack_b_bufs[t] = (float *)ax_aligned_alloc(pack_b_size, 64);
+        if (!pack_a_bufs[t] || !pack_b_bufs[t]) { alloc_ok = false; break; }
+    }
+    if (!alloc_ok) {
+        for (int t = 0; t < gemm_threads; t++) {
+            ax_aligned_free(pack_a_bufs[t]);
+            ax_aligned_free(pack_b_bufs[t]);
+        }
+        free(pack_a_bufs); free(pack_b_bufs);
         return ax_cpu_naive_ops.gemm(a, b, out);
     }
 
@@ -411,27 +434,38 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     float *od = raw_f32(out);
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    /* BLIS-standard tiling loop: JC → KC → IC
-       pack_b is called once per (jc, pc) tile — not once per (jc, pc, ic) tile.
-       For a 512×512 matrix with MC=72: reduces pack_b calls from ~64 to ~8. */
-    for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+    /* count of jc tiles for parallelization */
+    int64_t n_jc_tiles = (n + GEMM_NC - 1) / GEMM_NC;
+
+    /* parallelize JC tiles: each tile writes to disjoint output columns.
+       guarded by !omp_in_parallel() to avoid nesting from conv2d batch loop. */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(gemm_threads > 1)
+    #endif
+    for (int64_t jct = 0; jct < n_jc_tiles; jct++)
+    {
+        int tid = 0;
+        #ifdef _OPENMP
+        tid = omp_get_thread_num();
+        if (tid >= gemm_threads) tid = 0; /* defensive */
+        #endif
+        float *pack_a_buf = pack_a_bufs[tid];
+        float *pack_b_buf = pack_b_bufs[tid];
+
+        int64_t jc = jct * GEMM_NC;
         int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
         int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
         for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
             int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
 
-            /* pack B panel [pc:pc+kc, jc:jc+nc] — once per (jc, pc) */
             pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
 
             for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                 int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
-
-                /* pack A panel [ic:ic+mc, pc:pc+kc] */
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
                 pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
 
-                /* micro-kernel over MR x NR blocks */
                 int64_t mc_round = mc_pack;
                 int64_t nc_round = nc_pack;
 
@@ -451,8 +485,11 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         }
     }
 
-    ax_aligned_free(pack_a_buf);
-    ax_aligned_free(pack_b_buf);
+    for (int t = 0; t < gemm_threads; t++) {
+        ax_aligned_free(pack_a_bufs[t]);
+        ax_aligned_free(pack_b_bufs[t]);
+    }
+    free(pack_a_bufs); free(pack_b_bufs);
     return AX_OK;
 }
 
