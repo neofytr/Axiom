@@ -17,8 +17,21 @@
 #endif
 
 /* threshold for parallelizing element-wise ops.
-   below this, openmp fork-join overhead exceeds compute time. */
-#define AX_PAR_THRESHOLD 65536
+   below this, openmp fork-join overhead exceeds compute time. scales
+   with thread count so more threads only kick in for proportionally
+   more work. the 8k-per-thread constant matches measured fork-join
+   overhead of ~5us on modern x86. */
+#define AX_PAR_THRESHOLD_PER_THREAD 8192
+
+#ifdef _OPENMP
+static inline int64_t ax_par_threshold(void) {
+    int nt = omp_in_parallel() ? 1 : omp_get_max_threads();
+    if (nt < 1) nt = 1;
+    return (int64_t)AX_PAR_THRESHOLD_PER_THREAD * nt;
+}
+#else
+static inline int64_t ax_par_threshold(void) { return (int64_t)1 << 62; }
+#endif
 
 /* thread-local persistent pack buffers for GEMM — allocated once per thread,
    reused on every call. eliminates ~16 malloc/free per GEMM invocation. */
@@ -92,7 +105,7 @@ static inline int64_t validate_triple_same(const ax_tensor_t *a, const ax_tensor
    separate SIMD and scalar expressions to avoid type conflicts. */
 
 #ifdef _OPENMP
-#define AX_OMP_PAR_FOR_IF(n) _Pragma("omp parallel for schedule(static) if(n > AX_PAR_THRESHOLD)")
+#define AX_OMP_PAR_FOR_IF(n) _Pragma("omp parallel for schedule(static) if((n) > ax_par_threshold())")
 #else
 #define AX_OMP_PAR_FOR_IF(n)
 #endif
@@ -1062,19 +1075,30 @@ static ax_status_t opt_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
     int64_t ns = validate_contig_f32(src);
     int64_t nd = validate_contig_f32(dst);
     if (ns < 0 || nd < 0 || ns != nd) return ax_cpu_naive_ops.copy(src, dst);
-    /* for large copies parallelize with per-thread memcpy chunks; for small
-       copies the serial memcpy path is faster (no fork-join overhead). */
-    if (ns > AX_PAR_THRESHOLD) {
-        const float *sd = raw_f32(src);
-        float *dd = raw_f32(dst);
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-        #endif
-        for (int64_t i = 0; i < ns; i++)
-            dd[i] = sd[i];
-    } else {
-        memcpy(raw_f32(dst), raw_f32(src), (size_t)ns * sizeof(float));
+    const float *sd = raw_f32(src);
+    float *dd = raw_f32(dst);
+    /* small copies: a single glibc memcpy beats fork-join. large copies
+       chunk the buffer so each worker calls memcpy on its own slice —
+       lets the simd-tuned libc routine run per thread without the
+       element-at-a-time overhead of a parallel scalar loop. */
+    if (ns <= ax_par_threshold()) {
+        memcpy(dd, sd, (size_t)ns * sizeof(float));
+        return AX_OK;
     }
+#ifdef _OPENMP
+    int nt = omp_in_parallel() ? 1 : omp_get_max_threads();
+    if (nt < 1) nt = 1;
+    int64_t chunk = (ns + nt - 1) / nt;
+    #pragma omp parallel for schedule(static) num_threads(nt)
+    for (int t = 0; t < nt; t++) {
+        int64_t start = (int64_t)t * chunk;
+        int64_t end = start + chunk;
+        if (end > ns) end = ns;
+        if (end > start) memcpy(dd + start, sd + start, (size_t)(end - start) * sizeof(float));
+    }
+#else
+    memcpy(dd, sd, (size_t)ns * sizeof(float));
+#endif
     return AX_OK;
 }
 
