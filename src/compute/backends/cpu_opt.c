@@ -971,6 +971,96 @@ static inline float simd_row_min(const float *d, int64_t n)
 }
 
 
+/* axis-0 reductions for contig tensors: treat shape[0] as rows and the
+   product of the remaining dims as cols. output is a contig [cols]-shape
+   buffer. vectorize the col axis (simd-wide chunks) so each output lane
+   has its own vector accumulator that traverses rows linearly — unit-stride
+   loads, no horizontal reduction. parallel over col chunks (disjoint
+   output writes). used by dense bias gradients (sum axis=0) and
+   classification paths (argmax axis=0). */
+
+static void simd_axis0_sum(const float *d, float *od, int64_t rows, int64_t cols) {
+    int64_t vec_end = cols - (cols % AX_VF32_WIDTH);
+    int64_t work = rows * cols;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(work > ax_par_threshold())
+#else
+    (void)work;
+#endif
+    for (int64_t j = 0; j < vec_end; j += AX_VF32_WIDTH) {
+        ax_vf32 acc = ax_vf32_zero();
+        for (int64_t i = 0; i < rows; i++)
+            acc = ax_vf32_add(acc, ax_vf32_loadu(d + i * cols + j));
+        ax_vf32_storeu(od + j, acc);
+    }
+    for (int64_t j = vec_end; j < cols; j++) {
+        float acc = 0.0f;
+        for (int64_t i = 0; i < rows; i++) acc += d[i * cols + j];
+        od[j] = acc;
+    }
+}
+
+static void simd_axis0_max(const float *d, float *od, int64_t rows, int64_t cols) {
+    int64_t vec_end = cols - (cols % AX_VF32_WIDTH);
+    int64_t work = rows * cols;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(work > ax_par_threshold())
+#else
+    (void)work;
+#endif
+    for (int64_t j = 0; j < vec_end; j += AX_VF32_WIDTH) {
+        ax_vf32 acc = ax_vf32_set1(-FLT_MAX);
+        for (int64_t i = 0; i < rows; i++)
+            acc = ax_vf32_max(acc, ax_vf32_loadu(d + i * cols + j));
+        ax_vf32_storeu(od + j, acc);
+    }
+    for (int64_t j = vec_end; j < cols; j++) {
+        float acc = -FLT_MAX;
+        for (int64_t i = 0; i < rows; i++) { float v = d[i * cols + j]; if (v > acc) acc = v; }
+        od[j] = acc;
+    }
+}
+
+static void simd_axis0_min(const float *d, float *od, int64_t rows, int64_t cols) {
+    int64_t vec_end = cols - (cols % AX_VF32_WIDTH);
+    int64_t work = rows * cols;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(work > ax_par_threshold())
+#else
+    (void)work;
+#endif
+    for (int64_t j = 0; j < vec_end; j += AX_VF32_WIDTH) {
+        ax_vf32 acc = ax_vf32_set1(FLT_MAX);
+        for (int64_t i = 0; i < rows; i++)
+            acc = ax_vf32_min(acc, ax_vf32_loadu(d + i * cols + j));
+        ax_vf32_storeu(od + j, acc);
+    }
+    for (int64_t j = vec_end; j < cols; j++) {
+        float acc = FLT_MAX;
+        for (int64_t i = 0; i < rows; i++) { float v = d[i * cols + j]; if (v < acc) acc = v; }
+        od[j] = acc;
+    }
+}
+
+/* validate an axis-0 reduction: input must be contig, output must be
+   contig with numel == product(in->shape[1..]) and shape match.
+   returns rows, cols via out params; returns -1 on failure. */
+static int axis0_shape_ok(const ax_tensor_t *in, const ax_tensor_t *out,
+                           int64_t *rows, int64_t *cols) {
+    if (in->ndim < 2) return -1;
+    if (out->ndim != in->ndim - 1) return -1;
+    for (int d = 0; d < out->ndim; d++)
+        if (out->shape[d] != in->shape[d + 1]) return -1;
+    int64_t r = in->shape[0];
+    int64_t c = 1;
+    for (int d = 1; d < in->ndim; d++) c *= in->shape[d];
+    if (r <= 0 || c <= 0) return -1;
+    *rows = r;
+    *cols = c;
+    return 0;
+}
+
+
 /* reductions */
 
 static ax_status_t opt_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
@@ -997,6 +1087,19 @@ static ax_status_t opt_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         AX_OMP_PAR_FOR_IF(n)
         for (int64_t i = 0; i < rows; i++)
             od[i] = simd_row_sum(d + i * cols, cols);
+        return AX_OK;
+    }
+
+    /* fast path: axis-0 sum on contig nd tensor. column-parallel
+       vector accumulators; hot for dense bias gradients. */
+    if (axis == 0) {
+        int64_t ni = validate_contig_f32(in);
+        int64_t no = validate_contig_f32(out);
+        if (ni < 0 || no < 0) return ax_cpu_naive_ops.sum(in, axis, out);
+        int64_t rows, cols;
+        if (axis0_shape_ok(in, out, &rows, &cols) < 0)
+            return ax_cpu_naive_ops.sum(in, axis, out);
+        simd_axis0_sum(raw_f32(in), raw_f32(out), rows, cols);
         return AX_OK;
     }
 
@@ -1031,6 +1134,25 @@ static ax_status_t opt_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         return AX_OK;
     }
 
+    /* fast path: axis-0 mean = axis-0 sum / rows. */
+    if (axis == 0) {
+        int64_t ni = validate_contig_f32(in);
+        int64_t no = validate_contig_f32(out);
+        if (ni < 0 || no < 0) return ax_cpu_naive_ops.mean(in, axis, out);
+        int64_t rows, cols;
+        if (axis0_shape_ok(in, out, &rows, &cols) < 0)
+            return ax_cpu_naive_ops.mean(in, axis, out);
+        float *od = raw_f32(out);
+        simd_axis0_sum(raw_f32(in), od, rows, cols);
+        float inv_rows = 1.0f / (float)rows;
+        ax_vf32 vinv = ax_vf32_set1(inv_rows);
+        int64_t vec_end = cols - (cols % AX_VF32_WIDTH);
+        for (int64_t j = 0; j < vec_end; j += AX_VF32_WIDTH)
+            ax_vf32_storeu(od + j, ax_vf32_mul(ax_vf32_loadu(od + j), vinv));
+        for (int64_t j = vec_end; j < cols; j++) od[j] *= inv_rows;
+        return AX_OK;
+    }
+
     return ax_cpu_naive_ops.mean(in, axis, out);
 }
 
@@ -1042,6 +1164,16 @@ static ax_status_t opt_max(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         raw_f32(out)[0] = simd_row_max(raw_f32(in), n);
         return AX_OK;
     }
+    if (axis == 0) {
+        int64_t ni = validate_contig_f32(in);
+        int64_t no = validate_contig_f32(out);
+        if (ni < 0 || no < 0) return ax_cpu_naive_ops.max_op(in, axis, out);
+        int64_t rows, cols;
+        if (axis0_shape_ok(in, out, &rows, &cols) < 0)
+            return ax_cpu_naive_ops.max_op(in, axis, out);
+        simd_axis0_max(raw_f32(in), raw_f32(out), rows, cols);
+        return AX_OK;
+    }
     return ax_cpu_naive_ops.max_op(in, axis, out);
 }
 
@@ -1051,6 +1183,16 @@ static ax_status_t opt_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         int64_t no = validate_contig_f32(out);
         if (n < 0 || no < 0 || no != 1) return ax_cpu_naive_ops.min_op(in, axis, out);
         raw_f32(out)[0] = simd_row_min(raw_f32(in), n);
+        return AX_OK;
+    }
+    if (axis == 0) {
+        int64_t ni = validate_contig_f32(in);
+        int64_t no = validate_contig_f32(out);
+        if (ni < 0 || no < 0) return ax_cpu_naive_ops.min_op(in, axis, out);
+        int64_t rows, cols;
+        if (axis0_shape_ok(in, out, &rows, &cols) < 0)
+            return ax_cpu_naive_ops.min_op(in, axis, out);
+        simd_axis0_min(raw_f32(in), raw_f32(out), rows, cols);
         return AX_OK;
     }
     return ax_cpu_naive_ops.min_op(in, axis, out);
