@@ -55,4 +55,11 @@ void ax_arena_destroy(ax_arena_t *arena);
 void *ax_aligned_alloc(size_t size, size_t alignment);
 void ax_aligned_free(void *ptr);
 
+/* allocation counting (compile with -DAX_COUNT_ALLOCS to enable) */
+#ifdef AX_COUNT_ALLOCS
+#include <stdint.h>
+uint64_t ax_get_alloc_count(void);
+void ax_reset_alloc_count(void);
+#endif
+
 #endif /* AX_MEMORY_H */

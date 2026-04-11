@@ -118,8 +118,18 @@ void ax_arena_destroy(ax_arena_t *arena) {
 
 /* aligned alloc wrappers */
 
+#ifdef AX_COUNT_ALLOCS
+#include <stdatomic.h>
+static _Atomic uint64_t g_alloc_count = 0;
+uint64_t ax_get_alloc_count(void) { return atomic_load(&g_alloc_count); }
+void ax_reset_alloc_count(void) { atomic_store(&g_alloc_count, 0); }
+#endif
+
 void *ax_aligned_alloc(size_t size, size_t alignment) {
     if (size == 0) return NULL;
+#ifdef AX_COUNT_ALLOCS
+    atomic_fetch_add(&g_alloc_count, 1);
+#endif
     if (alignment == 0) alignment = 1;
     /* round up to next power of two if not already */
     if (!is_power_of_two(alignment)) {

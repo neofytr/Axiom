@@ -45,6 +45,164 @@ static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int p
 }
 
 
+/* per-thread scratch buffers cached on ax_conv2d_t.
+   sized for the largest seen (N, H, W) signature; reallocated only when
+   the signature changes (e.g., batch size differs from training). */
+struct ax_conv_scratch {
+    /* signature: shapes are determined by these */
+    int64_t N, H, W;
+    int T;  /* number of per-thread slots */
+
+    /* per-thread buffers (T slots each) */
+    ax_tensor_t **col_bufs;   /* [K, M] for forward and backward im2col */
+    ax_tensor_t **res_bufs;   /* [C_out, M] for forward GEMM result */
+    ax_tensor_t **go_bufs;    /* [C_out, M] for backward grad_out matrix */
+    ax_tensor_t **dw_bufs;    /* [C_out, K] per-thread weight grad accumulator */
+    ax_tensor_t **dws_bufs;   /* [C_out, K] per-thread per-sample weight grad scratch */
+    ax_tensor_t **dcol_bufs;  /* [K, M] for input gradient via gemm */
+    ax_tensor_t **colt_bufs;  /* [M, K] transposed col for weight grad gemm */
+    ax_tensor_t **dimg_bufs;  /* [C_in, H, W] for col2im result */
+
+    /* shared (read-only across threads) */
+    ax_tensor_t *w2d;       /* [C_out, K] reshaped forward weight */
+    ax_tensor_t *wt_contig; /* [K, C_out] transposed weight for backward dx */
+};
+
+static void scratch_destroy(struct ax_conv_scratch *s)
+{
+    if (!s) return;
+    int T = s->T;
+    #define FREE_BUF_ARR(arr) \
+        if (arr) { \
+            for (int t = 0; t < T; t++) if (arr[t]) ax_tensor_destroy(arr[t]); \
+            free(arr); \
+        }
+    FREE_BUF_ARR(s->col_bufs);
+    FREE_BUF_ARR(s->res_bufs);
+    FREE_BUF_ARR(s->go_bufs);
+    FREE_BUF_ARR(s->dw_bufs);
+    FREE_BUF_ARR(s->dws_bufs);
+    FREE_BUF_ARR(s->dcol_bufs);
+    FREE_BUF_ARR(s->colt_bufs);
+    FREE_BUF_ARR(s->dimg_bufs);
+    #undef FREE_BUF_ARR
+    if (s->w2d) ax_tensor_destroy(s->w2d);
+    if (s->wt_contig) ax_tensor_destroy(s->wt_contig);
+    free(s);
+}
+
+/* helper: allocate an array of T tensors with the given shape */
+static ax_tensor_t **alloc_buf_array(int T, const int64_t *shape, int ndim)
+{
+    ax_tensor_t **arr = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
+    if (!arr) return NULL;
+    for (int t = 0; t < T; t++) {
+        arr[t] = ax_tensor_create(shape, ndim, AX_FLOAT32);
+        if (!arr[t]) {
+            for (int u = 0; u < t; u++) ax_tensor_destroy(arr[u]);
+            free(arr);
+            return NULL;
+        }
+    }
+    return arr;
+}
+
+/* lazily allocate or reallocate scratch buffers if signature differs.
+   call this from conv2d_forward/backward before any parallel region
+   (single-threaded init guarantees no race on the scratch pointer). */
+static struct ax_conv_scratch *ensure_scratch(ax_conv2d_t *conv,
+                                                int64_t N, int64_t H, int64_t W,
+                                                bool need_backward)
+{
+    int64_t C_in = conv->in_channels;
+    int64_t C_out = conv->out_channels;
+    int kh = conv->kernel_h, kw = conv->kernel_w;
+    int sh = conv->stride_h, sw = conv->stride_w;
+    int ph = conv->pad_h, pw = conv->pad_w;
+    int64_t out_h = conv_out_dim(H, kh, sh, ph);
+    int64_t out_w = conv_out_dim(W, kw, sw, pw);
+    if (out_h <= 0 || out_w <= 0) return NULL;
+    int64_t K = C_in * kh * kw;
+    int64_t M = out_h * out_w;
+
+    /* compute desired thread count: capped at batch size */
+    int T = AX_OMP_MAX_THREADS();
+    if (T > N) T = (int)N;
+    if (T < 1) T = 1;
+
+    struct ax_conv_scratch *s = conv->scratch;
+    if (s && s->N == N && s->H == H && s->W == W && s->T == T) {
+        /* signature matches; reuse existing buffers. for backward we need
+           the dw/dcol/colt/dimg arrays — reallocate them lazily if missing. */
+        if (need_backward && !s->dw_bufs) {
+            int64_t dw_shape[] = {C_out, K};
+            int64_t dcol_shape[] = {K, M};
+            int64_t colt_shape[] = {M, K};
+            int64_t dimg_shape[] = {C_in, H, W};
+            int64_t go_shape[] = {C_out, M};
+            s->go_bufs   = alloc_buf_array(T, go_shape, 2);
+            s->dw_bufs   = alloc_buf_array(T, dw_shape, 2);
+            s->dws_bufs  = alloc_buf_array(T, dw_shape, 2);
+            s->dcol_bufs = alloc_buf_array(T, dcol_shape, 2);
+            s->colt_bufs = alloc_buf_array(T, colt_shape, 2);
+            s->dimg_bufs = alloc_buf_array(T, dimg_shape, 3);
+            if (!s->go_bufs || !s->dw_bufs || !s->dws_bufs || !s->dcol_bufs || !s->colt_bufs || !s->dimg_bufs) {
+                /* partial alloc failure: tear down and rebuild from scratch below */
+                scratch_destroy(s);
+                conv->scratch = s = NULL;
+            } else {
+                /* wt_contig is allocated lazily by conv2d_forward when need_bwd */
+                return s;
+            }
+        }
+        if (s) return s;
+    }
+
+    /* signature changed (or first call): destroy old, build new */
+    if (s) { scratch_destroy(s); conv->scratch = NULL; }
+
+    s = (struct ax_conv_scratch *)calloc(1, sizeof(struct ax_conv_scratch));
+    if (!s) return NULL;
+    s->N = N; s->H = H; s->W = W; s->T = T;
+
+    int64_t col_shape[] = {K, M};
+    int64_t res_shape[] = {C_out, M};
+
+    s->col_bufs = alloc_buf_array(T, col_shape, 2);
+    s->res_bufs = alloc_buf_array(T, res_shape, 2);
+
+    /* w2d is built once from current weights; if weights change between
+       forward calls (which happens during training!), we need to refresh
+       it. that's done in conv2d_forward itself, not here. */
+    int64_t w2d_shape[] = {C_out, K};
+    s->w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
+
+    if (need_backward) {
+        int64_t go_shape[] = {C_out, M};
+        int64_t dw_shape[] = {C_out, K};
+        int64_t dcol_shape[] = {K, M};
+        int64_t colt_shape[] = {M, K};
+        int64_t dimg_shape[] = {C_in, H, W};
+        s->go_bufs   = alloc_buf_array(T, go_shape, 2);
+        s->dw_bufs   = alloc_buf_array(T, dw_shape, 2);
+        s->dws_bufs  = alloc_buf_array(T, dw_shape, 2);
+        s->dcol_bufs = alloc_buf_array(T, dcol_shape, 2);
+        s->colt_bufs = alloc_buf_array(T, colt_shape, 2);
+        s->dimg_bufs = alloc_buf_array(T, dimg_shape, 3);
+    }
+
+    if (!s->col_bufs || !s->res_bufs || !s->w2d ||
+        (need_backward && (!s->go_bufs || !s->dw_bufs || !s->dws_bufs || !s->dcol_bufs ||
+                            !s->colt_bufs || !s->dimg_bufs))) {
+        scratch_destroy(s);
+        return NULL;
+    }
+
+    conv->scratch = s;
+    return s;
+}
+
+
 /* im2col: for a single image [C, H, W], produce a matrix
    [C*kh*kw, out_h*out_w] where each column is a flattened patch */
 
@@ -226,82 +384,29 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t K = C_in * kh * kw;
     int64_t M = out_h * out_w;
 
-    /* pre-compute W^T once outside the loop (weights don't change during backward) */
-    ax_tensor_t *wt_contig = NULL;
-    if (input_orig->requires_grad)
-    {
-        int64_t w2d_shape[] = {C_out, K};
-        ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
-        if (w2d) {
-            memcpy(w2d->storage->data, wdata, (size_t)(C_out * K) * sizeof(float));
-            ax_tensor_t *w2d_t = ax_tensor_transpose(w2d, 0, 1);
-            wt_contig = ax_tensor_contiguous(w2d_t);
-            ax_tensor_destroy(w2d_t);
-            ax_tensor_destroy(w2d);
-        }
+    /* use cached scratch from layer struct (allocated in forward via ensure_scratch).
+       if scratch is missing for some reason, allocate fresh as fallback. */
+    struct ax_conv_scratch *s = conv->scratch;
+    if (!s || s->N != N || s->H != H || s->W != W || !s->dw_bufs) {
+        /* scratch missing or stale — call ensure_scratch to (re)build */
+        s = ensure_scratch(conv, N, H, W, true);
+        if (!s) return;
     }
 
-    /* pre-allocate per-thread scratch tensors */
-    int T = AX_OMP_MAX_THREADS();
-    if (T > N) T = (int)N;
-    if (T < 1) T = 1;
-
-    int64_t go_shape[] = {C_out, M};
-    int64_t col_shape[] = {K, M};
-    int64_t dw_shape[] = {C_out, K};
-    int64_t dcol_shape[] = {K, M};
-    int64_t colt_shape[] = {M, K};
-    int64_t img_shape[] = {C_in, H, W};
-
-    ax_tensor_t **col_bufs  = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-    ax_tensor_t **go_bufs   = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-    ax_tensor_t **dw_bufs   = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-    ax_tensor_t **dcol_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-    ax_tensor_t **colt_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-    ax_tensor_t **dimg_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-
-    if (!col_bufs || !go_bufs || !dw_bufs || !dcol_bufs || !colt_bufs || !dimg_bufs) {
-        free(col_bufs); free(go_bufs); free(dw_bufs);
-        free(dcol_bufs); free(colt_bufs); free(dimg_bufs);
-        if (wt_contig) ax_tensor_destroy(wt_contig);
-        return;
+    int T = s->T;
+    ax_tensor_t *wt_contig = s->wt_contig;
+    /* refresh wt_contig with current weights (they change every step) */
+    if (input_orig->requires_grad && wt_contig) {
+        float *wtd = (float *)wt_contig->storage->data;
+        for (int64_t r = 0; r < C_out; r++)
+            for (int64_t c = 0; c < K; c++)
+                wtd[c * C_out + r] = wdata[r * K + c];
     }
 
-    bool alloc_ok = true;
-    for (int t = 0; t < T; t++) {
-        col_bufs[t] = ax_tensor_create(col_shape, 2, AX_FLOAT32);
-        go_bufs[t]  = ax_tensor_create(go_shape, 2, AX_FLOAT32);
-        if (weight->requires_grad) {
-            dw_bufs[t] = ax_tensor_create(dw_shape, 2, AX_FLOAT32);
-            colt_bufs[t] = ax_tensor_create(colt_shape, 2, AX_FLOAT32);
-            if (!dw_bufs[t] || !colt_bufs[t]) alloc_ok = false;
-            else {
-                /* zero per-thread dW; threads accumulate into it */
-                memset(dw_bufs[t]->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
-            }
-        }
-        if (input_orig->requires_grad) {
-            dcol_bufs[t] = ax_tensor_create(dcol_shape, 2, AX_FLOAT32);
-            dimg_bufs[t] = ax_tensor_create(img_shape, 3, AX_FLOAT32);
-            if (!dcol_bufs[t] || !dimg_bufs[t]) alloc_ok = false;
-        }
-        if (!col_bufs[t] || !go_bufs[t]) alloc_ok = false;
-        if (!alloc_ok) break;
-    }
-
-    if (!alloc_ok) {
-        for (int t = 0; t < T; t++) {
-            if (col_bufs[t]) ax_tensor_destroy(col_bufs[t]);
-            if (go_bufs[t]) ax_tensor_destroy(go_bufs[t]);
-            if (dw_bufs[t]) ax_tensor_destroy(dw_bufs[t]);
-            if (dcol_bufs[t]) ax_tensor_destroy(dcol_bufs[t]);
-            if (colt_bufs[t]) ax_tensor_destroy(colt_bufs[t]);
-            if (dimg_bufs[t]) ax_tensor_destroy(dimg_bufs[t]);
-        }
-        free(col_bufs); free(go_bufs); free(dw_bufs);
-        free(dcol_bufs); free(colt_bufs); free(dimg_bufs);
-        if (wt_contig) ax_tensor_destroy(wt_contig);
-        return;
+    /* zero per-thread dW buffers (we accumulate into them across samples) */
+    if (weight->requires_grad) {
+        for (int t = 0; t < T; t++)
+            memset(s->dw_bufs[t]->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
     }
 
     float *ind = (float *)input_data->storage->data;
@@ -313,8 +418,9 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     for (int64_t n = 0; n < N; n++)
     {
         int tid = AX_OMP_THREAD_NUM();
-        float *cbd = (float *)col_bufs[tid]->storage->data;
-        ax_tensor_t *go_mat = go_bufs[tid];
+        if (tid >= T) tid = 0;
+        float *cbd = (float *)s->col_bufs[tid]->storage->data;
+        ax_tensor_t *go_mat = s->go_bufs[tid];
 
         /* im2col into per-thread buffer */
         im2col_into(ind + n * C_in * H * W, C_in, H, W,
@@ -324,12 +430,12 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         memcpy(go_mat->storage->data, grd + n * C_out * M,
                (size_t)(C_out * M) * sizeof(float));
 
-        /* weight gradient: per-thread dW accumulates across this thread's samples.
-           reduction across threads happens after the parallel loop. */
+        /* weight gradient: per-thread dW accumulates across this thread's samples */
         if (weight->requires_grad)
         {
-            ax_tensor_t *colt_buf = colt_bufs[tid];
-            ax_tensor_t *dw_local = dw_bufs[tid];
+            ax_tensor_t *colt_buf = s->colt_bufs[tid];
+            ax_tensor_t *dw_local = s->dw_bufs[tid];
+            ax_tensor_t *dw_sample = s->dws_bufs[tid];
 
             /* transpose col [K,M] -> colt [M,K] */
             float *ctd = (float *)colt_buf->storage->data;
@@ -337,26 +443,24 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 for (int64_t c = 0; c < M; c++)
                     ctd[c * K + r] = cbd[r * M + c];
 
-            /* go_mat @ colt -> dw_sample, accumulated into dw_local */
-            ax_tensor_t *dw_sample = ax_tensor_zeros(dw_shape, 2, AX_FLOAT32);
-            if (dw_sample) {
-                ax_compute_gemm(go_mat, colt_buf, dw_sample);
-                float *dwl = (float *)dw_local->storage->data;
-                float *dws = (float *)dw_sample->storage->data;
-                int64_t wn = C_out * K;
-                int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
-                for (; wi < wve; wi += AX_VF32_WIDTH)
-                    ax_vf32_store(dwl + wi, ax_vf32_add(ax_vf32_load(dwl + wi), ax_vf32_load(dws + wi)));
-                for (; wi < wn; wi++) dwl[wi] += dws[wi];
-                ax_tensor_destroy(dw_sample);
-            }
+            /* gemm into pre-allocated per-thread sample buffer, then accumulate */
+            float *dws = (float *)dw_sample->storage->data;
+            memset(dws, 0, (size_t)(C_out * K) * sizeof(float));
+            ax_compute_gemm(go_mat, colt_buf, dw_sample);
+
+            float *dwl = (float *)dw_local->storage->data;
+            int64_t wn = C_out * K;
+            int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
+            for (; wi < wve; wi += AX_VF32_WIDTH)
+                ax_vf32_store(dwl + wi, ax_vf32_add(ax_vf32_load(dwl + wi), ax_vf32_load(dws + wi)));
+            for (; wi < wn; wi++) dwl[wi] += dws[wi];
         }
 
         /* input gradient — disjoint per-sample writes, no reduction needed */
         if (input_orig->requires_grad && wt_contig)
         {
-            ax_tensor_t *dcol_buf = dcol_bufs[tid];
-            ax_tensor_t *dimg_buf = dimg_bufs[tid];
+            ax_tensor_t *dcol_buf = s->dcol_bufs[tid];
+            ax_tensor_t *dimg_buf = s->dimg_bufs[tid];
 
             memset(dcol_buf->storage->data, 0, (size_t)(K * M) * sizeof(float));
             ax_compute_gemm(wt_contig, go_mat, dcol_buf);
@@ -382,26 +486,14 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         float *wg = (float *)weight->grad->storage->data;
         int64_t wn = C_out * K;
         for (int t = 0; t < T; t++) {
-            float *dwl = (float *)dw_bufs[t]->storage->data;
+            float *dwl = (float *)s->dw_bufs[t]->storage->data;
             int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
             for (; wi < wve; wi += AX_VF32_WIDTH)
                 ax_vf32_store(wg + wi, ax_vf32_add(ax_vf32_load(wg + wi), ax_vf32_load(dwl + wi)));
             for (; wi < wn; wi++) wg[wi] += dwl[wi];
         }
     }
-
-    /* free all per-thread scratch */
-    for (int t = 0; t < T; t++) {
-        if (col_bufs[t]) ax_tensor_destroy(col_bufs[t]);
-        if (go_bufs[t]) ax_tensor_destroy(go_bufs[t]);
-        if (dw_bufs[t]) ax_tensor_destroy(dw_bufs[t]);
-        if (dcol_bufs[t]) ax_tensor_destroy(dcol_bufs[t]);
-        if (colt_bufs[t]) ax_tensor_destroy(colt_bufs[t]);
-        if (dimg_bufs[t]) ax_tensor_destroy(dimg_bufs[t]);
-    }
-    free(col_bufs); free(go_bufs); free(dw_bufs);
-    free(dcol_bufs); free(colt_bufs); free(dimg_bufs);
-    if (wt_contig) ax_tensor_destroy(wt_contig);
+    /* note: scratch buffers are kept on the layer for reuse — no free here */
 }
 
 static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
@@ -437,7 +529,6 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
 
     /* reshape weight to [C_out, C_in*kh*kw] for gemm */
     int64_t K = C_in * kh * kw;
-
     int64_t M = out_h * out_w;
     int64_t out_shape[] = {N, C_out, out_h, out_w};
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
@@ -446,45 +537,25 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     float *od = (float *)output->storage->data;
     float *wd = (float *)conv->weight->storage->data;
 
-    /* pre-allocate weight as 2D tensor once (weights don't change during forward) */
-    int64_t w2d_shape[] = {C_out, K};
-    ax_tensor_t *w2d = ax_tensor_create(w2d_shape, 2, AX_FLOAT32);
-    if (!w2d) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
+    /* lazily allocate (or reuse) per-layer scratch — eliminates per-call malloc */
+    bool need_bwd = ax_grad_enabled() && (input->requires_grad || conv->weight->requires_grad);
+    struct ax_conv_scratch *s = ensure_scratch(conv, N, H, W, need_bwd);
+    if (!s) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
+
+    /* refresh w2d from current weights (they change every training step) */
+    ax_tensor_t *w2d = s->w2d;
     memcpy(w2d->storage->data, wd, (size_t)(C_out * K) * sizeof(float));
 
-    /* pre-allocate per-thread scratch: T col buffers, T result buffers.
-       T = max threads (1 in single-threaded mode). each thread uses its own slot. */
-    int T = AX_OMP_MAX_THREADS();
-    if (T > N) T = (int)N; /* cap at batch size to avoid wasted allocations */
-    if (T < 1) T = 1;
-
-    int64_t col_shape[] = {K, M};
-    int64_t res_shape[] = {C_out, M};
-    ax_tensor_t **col_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-    ax_tensor_t **res_bufs = (ax_tensor_t **)calloc((size_t)T, sizeof(ax_tensor_t *));
-    if (!col_bufs || !res_bufs) {
-        free(col_bufs); free(res_bufs);
-        ax_tensor_destroy(w2d);
-        if (inp != input) ax_tensor_destroy(inp);
-        ax_tensor_destroy(output); return NULL;
-    }
-    bool alloc_ok = true;
-    for (int t = 0; t < T; t++) {
-        col_bufs[t] = ax_tensor_create(col_shape, 2, AX_FLOAT32);
-        res_bufs[t] = ax_tensor_create(res_shape, 2, AX_FLOAT32);
-        if (!col_bufs[t] || !res_bufs[t]) { alloc_ok = false; break; }
-    }
-    if (!alloc_ok) {
-        for (int t = 0; t < T; t++) {
-            if (col_bufs[t]) ax_tensor_destroy(col_bufs[t]);
-            if (res_bufs[t]) ax_tensor_destroy(res_bufs[t]);
-        }
-        free(col_bufs); free(res_bufs);
-        ax_tensor_destroy(w2d);
-        if (inp != input) ax_tensor_destroy(inp);
-        ax_tensor_destroy(output); return NULL;
+    /* lazily allocate wt_contig on first backward-enabled call.
+       weights change every step but the wt_contig refresh is done in BACKWARD
+       (which knows it's about to use it), not in forward — saves wasted work
+       on calls that won't need it. */
+    if (need_bwd && !s->wt_contig) {
+        int64_t wt_shape[] = {K, C_out};
+        s->wt_contig = ax_tensor_create(wt_shape, 2, AX_FLOAT32);
     }
 
+    int T = s->T;
     float *ind = (float *)inp->storage->data;
     const float *bias_data = (conv->use_bias && conv->bias)
         ? (const float *)conv->bias->storage->data : NULL;
@@ -495,8 +566,9 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     for (int64_t n = 0; n < N; n++)
     {
         int tid = AX_OMP_THREAD_NUM();
-        ax_tensor_t *col = col_bufs[tid];
-        ax_tensor_t *res = res_bufs[tid];
+        if (tid >= T) tid = 0; /* defensive */
+        ax_tensor_t *col = s->col_bufs[tid];
+        ax_tensor_t *res = s->res_bufs[tid];
         float *cd = (float *)col->storage->data;
         float *rd = (float *)res->storage->data;
 
@@ -504,7 +576,7 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         im2col_into(ind + n * C_in * H * W, C_in, H, W,
                      kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
 
-        /* result = w2d @ col via dispatch GEMM (serial inside, no nested parallelism) */
+        /* result = w2d @ col via dispatch GEMM */
         memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
         ax_compute_gemm(w2d, col, res);
 
@@ -519,13 +591,6 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             }
         }
     }
-
-    for (int t = 0; t < T; t++) {
-        ax_tensor_destroy(col_bufs[t]);
-        ax_tensor_destroy(res_bufs[t]);
-    }
-    free(col_bufs); free(res_bufs);
-    ax_tensor_destroy(w2d);
 
     /* hook up backward */
     if (ax_grad_enabled() && (input->requires_grad || conv->weight->requires_grad))
@@ -551,6 +616,7 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
 static void conv2d_destroy(ax_layer_t *self)
 {
     ax_conv2d_t *c = (ax_conv2d_t *)self;
+    if (c->scratch) scratch_destroy(c->scratch);
     if (c->weight) ax_tensor_destroy(c->weight);
     if (c->bias) ax_tensor_destroy(c->bias);
     free(c);

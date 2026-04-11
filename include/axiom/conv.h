@@ -30,6 +30,11 @@
    weight shape: [C_out, C_in, kernel_h, kernel_w]
    bias shape:   [C_out] */
 
+/* opaque scratch struct (defined in conv.c).
+   caches per-thread im2col buffers, GEMM scratch, and gradient temporaries
+   so that they're reused across batches instead of malloc'd fresh each call. */
+struct ax_conv_scratch;
+
 typedef struct
 {
     ax_layer_t base;
@@ -41,6 +46,7 @@ typedef struct
     int stride_h, stride_w;
     int pad_h, pad_w;
     bool use_bias;
+    struct ax_conv_scratch *scratch; /* lazily allocated, lives until layer destroy */
 } ax_conv2d_t;
 
 ax_layer_t *ax_conv2d_create(int in_channels, int out_channels,
