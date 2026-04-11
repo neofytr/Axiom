@@ -213,7 +213,76 @@ static void im2col_into(const float *id, int64_t C, int64_t H, int64_t W,
                          int pad_h, int pad_w, int64_t out_h, int64_t out_w,
                          float *cd)
 {
+    const int64_t M = out_h * out_w;
     int64_t col_idx = 0;
+
+    /* fast path: stride_w == 1 lets each oh row be a contiguous memcpy
+       of the input row, with memset zeroing the pad regions. */
+    if (stride_w == 1)
+    {
+        for (int64_t c = 0; c < C; c++)
+        {
+            for (int ky = 0; ky < kh; ky++)
+            {
+                for (int kx = 0; kx < kw; kx++)
+                {
+                    /* iw as a function of ow: iw = ow + iw_start */
+                    const int64_t iw_start = (int64_t)kx - (int64_t)pad_w;
+
+                    /* valid ow range where iw in [0, W) */
+                    int64_t ow_lo = 0;
+                    if (iw_start < 0) ow_lo = -iw_start;
+                    int64_t ow_hi = out_w;
+                    const int64_t iw_last = iw_start + out_w - 1;
+                    if (iw_last >= W) ow_hi = W - iw_start;
+                    if (ow_lo > out_w) ow_lo = out_w;
+                    if (ow_hi < 0) ow_hi = 0;
+                    if (ow_lo > ow_hi) ow_lo = ow_hi;
+
+                    const int64_t lead_bytes = ow_lo * (int64_t)sizeof(float);
+                    const int64_t mid_len = ow_hi - ow_lo;
+                    const int64_t mid_bytes = mid_len * (int64_t)sizeof(float);
+                    const int64_t tail_n = out_w - ow_hi;
+                    const int64_t tail_bytes = tail_n * (int64_t)sizeof(float);
+
+                    for (int64_t oh = 0; oh < out_h; oh++)
+                    {
+                        const int64_t ih = oh * stride_h - pad_h + ky;
+                        float *dst_row = cd + col_idx * M + oh * out_w;
+
+                        if (ih < 0 || ih >= H)
+                        {
+                            /* whole row is pad */
+                            memset(dst_row, 0, (size_t)(out_w * (int64_t)sizeof(float)));
+                            continue;
+                        }
+
+                        const int64_t src_row_base = c * H * W + ih * W;
+
+                        /* leading pad zone */
+                        if (lead_bytes > 0)
+                            memset(dst_row, 0, (size_t)lead_bytes);
+
+                        /* valid middle zone */
+                        if (mid_len > 0)
+                        {
+                            memcpy(dst_row + ow_lo,
+                                   id + src_row_base + (iw_start + ow_lo),
+                                   (size_t)mid_bytes);
+                        }
+
+                        /* trailing pad zone */
+                        if (tail_bytes > 0)
+                            memset(dst_row + ow_hi, 0, (size_t)tail_bytes);
+                    }
+                    col_idx++;
+                }
+            }
+        }
+        return;
+    }
+
+    /* fallback: fully general scalar gather for strided width. */
     for (int64_t c = 0; c < C; c++)
     {
         for (int ky = 0; ky < kh; ky++)
@@ -231,7 +300,7 @@ static void im2col_into(const float *id, int64_t C, int64_t H, int64_t W,
                         if (ih >= 0 && ih < H && iw >= 0 && iw < W)
                             val = id[c * H * W + ih * W + iw];
 
-                        cd[col_idx * out_h * out_w + oh * out_w + ow] = val;
+                        cd[col_idx * M + oh * out_w + ow] = val;
                     }
                 }
                 col_idx++;
