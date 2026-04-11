@@ -93,20 +93,61 @@ static inline ax_vf32 ax_vf32_exp(ax_vf32 x) {
     return _mm256_mul_ps(p, pow2n);
 }
 
-/* log via standard scalar fallback (vectorized log is complex and error-prone) */
-static inline ax_vf32 ax_vf32_log(ax_vf32 a) {
-    float tmp[8] __attribute__((aligned(32)));
-    _mm256_store_ps(tmp, a);
-    for (int i = 0; i < 8; i++) tmp[i] = logf(tmp[i]);
-    return _mm256_load_ps(tmp);
-}
+/* vectorized log via frexp-style decomposition plus degree-8 cephes poly.
+   extracts mantissa into [0.5, 1), optionally doubles to center around 1,
+   then evaluates log(1+z) = z - 0.5*z^2 + z^3 * P(z). ~ulp accurate.
+   coefficients from cephes / julien pommier's public domain avx math lib. */
+static inline ax_vf32 ax_vf32_log(ax_vf32 x) {
+    /* clamp negatives/zero to smallest normal so result is finite */
+    __m256 min_norm = _mm256_set1_ps(1.17549435e-38f);
+    x = _mm256_max_ps(x, min_norm);
 
-/* tanh via scalar fallback */
-static inline ax_vf32 ax_vf32_tanh(ax_vf32 a) {
-    float tmp[8] __attribute__((aligned(32)));
-    _mm256_store_ps(tmp, a);
-    for (int i = 0; i < 8; i++) tmp[i] = tanhf(tmp[i]);
-    return _mm256_load_ps(tmp);
+    __m256i xi = _mm256_castps_si256(x);
+
+    /* extract biased exponent, unbias by 127, will add 1 back after shift */
+    __m256i ei = _mm256_srli_epi32(xi, 23);
+    ei = _mm256_sub_epi32(ei, _mm256_set1_epi32(0x7f));
+
+    /* mantissa m in [0.5, 1): clear exponent bits, or in 0.5 pattern (0x3F000000) */
+    __m256i mi = _mm256_and_si256(xi, _mm256_set1_epi32(0x007FFFFF));
+    mi = _mm256_or_si256(mi, _mm256_set1_epi32(0x3F000000));
+    __m256 m = _mm256_castsi256_ps(mi);
+
+    __m256 e = _mm256_cvtepi32_ps(ei);
+    e = _mm256_add_ps(e, _mm256_set1_ps(1.0f));
+
+    /* if m < sqrt(0.5), set m = 2*m - 1 and e -= 1. else set m = m - 1.
+       this centers the poly around 0 with |z| < sqrt(2) - 1 ~ 0.414. */
+    __m256 sqrt_half = _mm256_set1_ps(0.707106781f);
+    __m256 mask = _mm256_cmp_ps(m, sqrt_half, _CMP_LT_OQ);
+    __m256 m_masked = _mm256_and_ps(mask, m);
+    m = _mm256_sub_ps(m, _mm256_set1_ps(1.0f));
+    e = _mm256_sub_ps(e, _mm256_and_ps(mask, _mm256_set1_ps(1.0f)));
+    m = _mm256_add_ps(m, m_masked);
+
+    __m256 z = m;
+    __m256 z2 = _mm256_mul_ps(z, z);
+
+    /* degree-8 horner poly, cephes coefficients */
+    __m256 p = _mm256_set1_ps(7.0376836292e-2f);
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(-1.1514610310e-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps( 1.1676998740e-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(-1.2420140846e-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps( 1.4249322787e-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(-1.6668057665e-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps( 2.0000714765e-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(-2.4999993993e-1f));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps( 3.3333331174e-1f));
+    p = _mm256_mul_ps(p, z);
+    p = _mm256_mul_ps(p, z2);
+
+    /* log(1+z) = z - 0.5*z^2 + z^3 * P(z) */
+    __m256 half_z2 = _mm256_mul_ps(z2, _mm256_set1_ps(-0.5f));
+    __m256 log1pz = _mm256_add_ps(_mm256_add_ps(z, half_z2), p);
+
+    /* combine: log(x) = e * ln2 + log(1+z) */
+    __m256 ln2 = _mm256_set1_ps(0.6931471805f);
+    return _mm256_fmadd_ps(e, ln2, log1pz);
 }
 
 /* sigmoid: 1 / (1 + exp(-x)) — uses fast exp */
@@ -115,6 +156,14 @@ static inline ax_vf32 ax_vf32_sigmoid(ax_vf32 x) {
     __m256 exp_neg = ax_vf32_exp(neg_x);
     __m256 one = _mm256_set1_ps(1.0f);
     return _mm256_div_ps(one, _mm256_add_ps(one, exp_neg));
+}
+
+/* tanh via identity tanh(x) = 2*sigmoid(2x) - 1. reuses vectorized sigmoid. */
+static inline ax_vf32 ax_vf32_tanh(ax_vf32 x) {
+    __m256 two = _mm256_set1_ps(2.0f);
+    __m256 one = _mm256_set1_ps(1.0f);
+    __m256 s = ax_vf32_sigmoid(_mm256_mul_ps(two, x));
+    return _mm256_sub_ps(_mm256_mul_ps(two, s), one);
 }
 
 /* comparison returning float mask */
@@ -190,14 +239,10 @@ static inline ax_vf32 ax_vf32_exp(ax_vf32 a) {
     }
     return vld1q_f32(tmp);
 }
+/* TODO: port AVX2 poly log to NEON */
 static inline ax_vf32 ax_vf32_log(ax_vf32 a) {
     float tmp[4]; vst1q_f32(tmp, a);
     for (int i = 0; i < 4; i++) tmp[i] = logf(tmp[i]);
-    return vld1q_f32(tmp);
-}
-static inline ax_vf32 ax_vf32_tanh(ax_vf32 a) {
-    float tmp[4]; vst1q_f32(tmp, a);
-    for (int i = 0; i < 4; i++) tmp[i] = tanhf(tmp[i]);
     return vld1q_f32(tmp);
 }
 static inline ax_vf32 ax_vf32_sigmoid(ax_vf32 x) {
@@ -205,6 +250,13 @@ static inline ax_vf32 ax_vf32_sigmoid(ax_vf32 x) {
     ax_vf32 exp_neg = ax_vf32_exp(neg_x);
     ax_vf32 one = vdupq_n_f32(1.0f);
     return vdivq_f32(one, vaddq_f32(one, exp_neg));
+}
+/* tanh via identity tanh(x) = 2*sigmoid(2x) - 1. reuses vectorized sigmoid. */
+static inline ax_vf32 ax_vf32_tanh(ax_vf32 x) {
+    ax_vf32 two = vdupq_n_f32(2.0f);
+    ax_vf32 one = vdupq_n_f32(1.0f);
+    ax_vf32 s = ax_vf32_sigmoid(vmulq_f32(two, x));
+    return vsubq_f32(vmulq_f32(two, s), one);
 }
 static inline ax_vf32 ax_vf32_cmpgt(ax_vf32 a, ax_vf32 b) {
     uint32x4_t mask = vcgtq_f32(a, b);
