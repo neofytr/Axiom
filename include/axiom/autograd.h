@@ -65,7 +65,16 @@ void ax_zero_grad(ax_tensor_t *t);
 /* free the computation graph reachable from this tensor.
    destroys all intermediate (non-leaf) tensors created during the forward pass.
    leaf tensors (those without grad_fn, i.e. parameters and user-created tensors)
-   are NOT destroyed. call this after backward to prevent memory leaks. */
+   are NOT destroyed. the root tensor itself is NOT destroyed — the caller owns it.
+
+   typical training loop usage:
+     ax_backward(loss);
+     ax_optimizer_step(opt);
+     ax_graph_cleanup(loss);   // frees intermediates, detaches root from graph
+     ax_tensor_destroy(loss);  // frees the root (scalar loss) itself
+
+   if ax_tensor_destroy(loss) is called without ax_graph_cleanup first,
+   all intermediate tensors from the forward pass will leak. */
 void ax_graph_cleanup(ax_tensor_t *root);
 
 /* gradient context: disable/enable gradient tracking.
@@ -74,8 +83,11 @@ void ax_no_grad(void);
 void ax_enable_grad(void);
 bool ax_grad_enabled(void);
 
-/* allocate a grad_fn (just a malloc + zeroing) */
+/* allocate a grad_fn (uses thread-local slab free-list) */
 ax_grad_fn_t *ax_grad_fn_create(ax_backward_fn_t fn);
+
+/* free a grad_fn (returns to thread-local slab free-list) */
+void ax_grad_fn_destroy(ax_grad_fn_t *gf);
 
 /* get the thread-local backward scratch arena. backward functions can
    use this for temporary buffers that are freed in bulk after ax_backward().

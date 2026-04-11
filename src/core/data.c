@@ -437,7 +437,14 @@ bool ax_dataloader_next(ax_dataloader_t *dl, ax_batch_t *batch)
     batch->target = ax_tensor_zeros(tgt_shape, first_tgt->ndim + 1, AX_FLOAT32);
     batch->batch_size = bs;
 
-    if (!batch->input || !batch->target) return false;
+    if (!batch->input || !batch->target)
+    {
+        ax_tensor_destroy(batch->input);
+        ax_tensor_destroy(batch->target);
+        batch->input = NULL;
+        batch->target = NULL;
+        return false;
+    }
 
     /* fill batch by copying each sample */
     float *in_data = (float *)batch->input->storage->data;
@@ -451,6 +458,14 @@ bool ax_dataloader_next(ax_dataloader_t *dl, ax_batch_t *batch)
         int64_t idx = dl->indices[dl->current_pos + i];
         ax_tensor_t *item_in, *item_tgt;
         ax_dataset_get_item(dl->dataset, idx, &item_in, &item_tgt);
+        if (!item_in || !item_tgt)
+        {
+            ax_tensor_destroy(batch->input);
+            ax_tensor_destroy(batch->target);
+            batch->input = NULL;
+            batch->target = NULL;
+            return false;
+        }
 
         /* copy sample data into batch position */
         float *src_in = (float *)item_in->storage->data;

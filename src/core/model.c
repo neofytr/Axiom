@@ -49,14 +49,24 @@ float ax_model_train_step(ax_model_t *model, ax_tensor_t *input, ax_tensor_t *ta
 
     /* compute loss */
     ax_tensor_t *loss = model->loss_fn(pred, target);
-    if (!loss) return -1.0f;
+    if (!loss)
+    {
+        ax_graph_cleanup(pred);
+        ax_tensor_destroy(pred);
+        return -1.0f;
+    }
 
     /* read loss value before backward potentially messes with things */
     int64_t i0[] = {0};
     float loss_val = ax_tensor_get_f32(loss, i0);
 
     /* backward */
-    ax_backward(loss);
+    if (ax_backward(loss) != AX_OK)
+    {
+        ax_graph_cleanup(loss);
+        ax_tensor_destroy(loss);
+        return -1.0f;
+    }
 
     /* update weights */
     ax_optimizer_step(model->opt);

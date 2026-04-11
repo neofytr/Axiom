@@ -158,10 +158,13 @@ static bool write_tensor(FILE *f, ax_tensor_t *t)
     return write_tensor_crc(f, t, NULL);
 }
 
-/* safe multiply for serialization validation */
+/* safe multiply for serialization validation — all four sign combinations */
 static bool ser_safe_mul(int64_t a, int64_t b, int64_t *result) {
     if (a == 0 || b == 0) { *result = 0; return true; }
     if (a > 0 && b > 0 && a > INT64_MAX / b) return false;
+    if (a > 0 && b < 0 && b < INT64_MIN / a) return false;
+    if (a < 0 && b > 0 && a < INT64_MIN / b) return false;
+    if (a < 0 && b < 0 && a < INT64_MAX / b) return false;
     *result = a * b;
     return true;
 }

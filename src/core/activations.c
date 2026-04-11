@@ -46,32 +46,25 @@ static inline bool needs_grad(ax_tensor_t *a)
 
 static void leaky_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
+    if (!self->inputs[0]->requires_grad) return;
+
     ax_tensor_t *input = self->saved[0];
     float alpha = (float)self->scalar_ctx;
     int64_t n = ax_tensor_numel(grad_out);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gd = (float *)grad_a->storage->data;
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!self->inputs[0]->grad) return;
+
+    float *ig = (float *)self->inputs[0]->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
 
     for (int64_t i = 0; i < n; i++)
     {
         float x = ad[input->offset + i];
-        gd[grad_a->offset + i] = go[grad_out->offset + i] * (x > 0.0f ? 1.0f : alpha);
+        ig[self->inputs[0]->grad->offset + i] += go[grad_out->offset + i] * (x > 0.0f ? 1.0f : alpha);
     }
-
-    /* accumulate into input grad */
-    if (self->inputs[0]->requires_grad)
-    {
-        if (!self->inputs[0]->grad)
-            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-        float *ig = (float *)self->inputs[0]->grad->storage->data;
-        for (int64_t i = 0; i < n; i++)
-            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
-    }
-    ax_tensor_destroy(grad_a);
 }
 
 ax_tensor_t *ax_leaky_relu(ax_tensor_t *a, float alpha)
@@ -111,14 +104,18 @@ ax_tensor_t *ax_leaky_relu(ax_tensor_t *a, float alpha)
 
 static void elu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
+    if (!self->inputs[0]->requires_grad) return;
+
     ax_tensor_t *input = self->saved[0];
     ax_tensor_t *output = self->saved[1];
     float alpha = (float)self->scalar_ctx;
     int64_t n = ax_tensor_numel(grad_out);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gd = (float *)grad_a->storage->data;
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!self->inputs[0]->grad) return;
+
+    float *ig = (float *)self->inputs[0]->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
     float *od = (float *)output->storage->data;
@@ -127,19 +124,9 @@ static void elu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     {
         float x = ad[input->offset + i];
         /* elu'(x) = 1 if x > 0, else output + alpha (since output = alpha*(exp(x)-1)) */
-        gd[grad_a->offset + i] = go[grad_out->offset + i] *
+        ig[self->inputs[0]->grad->offset + i] += go[grad_out->offset + i] *
             (x > 0.0f ? 1.0f : od[output->offset + i] + alpha);
     }
-
-    if (self->inputs[0]->requires_grad)
-    {
-        if (!self->inputs[0]->grad)
-            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-        float *ig = (float *)self->inputs[0]->grad->storage->data;
-        for (int64_t i = 0; i < n; i++)
-            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
-    }
-    ax_tensor_destroy(grad_a);
 }
 
 ax_tensor_t *ax_elu(ax_tensor_t *a, float alpha)
@@ -181,12 +168,16 @@ ax_tensor_t *ax_elu(ax_tensor_t *a, float alpha)
 
 static void selu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
+    if (!self->inputs[0]->requires_grad) return;
+
     ax_tensor_t *input = self->saved[0];
     int64_t n = ax_tensor_numel(grad_out);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gd = (float *)grad_a->storage->data;
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!self->inputs[0]->grad) return;
+
+    float *ig = (float *)self->inputs[0]->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
 
@@ -195,18 +186,8 @@ static void selu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         float x = ad[input->offset + i];
         /* selu'(x) = lambda if x > 0, lambda * alpha * exp(x) otherwise */
         float deriv = (x > 0.0f) ? SELU_LAMBDA : SELU_LAMBDA * SELU_ALPHA * expf(x);
-        gd[grad_a->offset + i] = go[grad_out->offset + i] * deriv;
+        ig[self->inputs[0]->grad->offset + i] += go[grad_out->offset + i] * deriv;
     }
-
-    if (self->inputs[0]->requires_grad)
-    {
-        if (!self->inputs[0]->grad)
-            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-        float *ig = (float *)self->inputs[0]->grad->storage->data;
-        for (int64_t i = 0; i < n; i++)
-            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
-    }
-    ax_tensor_destroy(grad_a);
 }
 
 ax_tensor_t *ax_selu(ax_tensor_t *a)
@@ -247,12 +228,16 @@ ax_tensor_t *ax_selu(ax_tensor_t *a)
 
 static void gelu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
+    if (!self->inputs[0]->requires_grad) return;
+
     ax_tensor_t *input = self->saved[0];
     int64_t n = ax_tensor_numel(grad_out);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gd = (float *)grad_a->storage->data;
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!self->inputs[0]->grad) return;
+
+    float *ig = (float *)self->inputs[0]->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
 
@@ -260,25 +245,14 @@ static void gelu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     {
         float x = ad[input->offset + i];
         /* gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-           derivative is messy but well-known:
            let t = tanh(sqrt(2/pi) * (x + 0.044715*x^3))
            gelu'(x) = 0.5*(1+t) + 0.5*x*(1-t^2)*sqrt(2/pi)*(1 + 3*0.044715*x^2) */
         float inner = SQRT_2_PI * (x + GELU_COEFF * x * x * x);
         float t = tanhf(inner);
         float deriv = 0.5f * (1.0f + t) +
                       0.5f * x * (1.0f - t * t) * SQRT_2_PI * (1.0f + 3.0f * GELU_COEFF * x * x);
-        gd[grad_a->offset + i] = go[grad_out->offset + i] * deriv;
+        ig[self->inputs[0]->grad->offset + i] += go[grad_out->offset + i] * deriv;
     }
-
-    if (self->inputs[0]->requires_grad)
-    {
-        if (!self->inputs[0]->grad)
-            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-        float *ig = (float *)self->inputs[0]->grad->storage->data;
-        for (int64_t i = 0; i < n; i++)
-            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
-    }
-    ax_tensor_destroy(grad_a);
 }
 
 ax_tensor_t *ax_gelu(ax_tensor_t *a)
@@ -318,13 +292,17 @@ ax_tensor_t *ax_gelu(ax_tensor_t *a)
 
 static void swish_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
+    if (!self->inputs[0]->requires_grad) return;
+
     ax_tensor_t *input = self->saved[0];
     ax_tensor_t *output = self->saved[1];
     int64_t n = ax_tensor_numel(grad_out);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gd = (float *)grad_a->storage->data;
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!self->inputs[0]->grad) return;
+
+    float *ig = (float *)self->inputs[0]->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
     float *od = (float *)output->storage->data;
@@ -333,23 +311,10 @@ static void swish_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     {
         float x = ad[input->offset + i];
         float sig = 1.0f / (1.0f + expf(-x));
-        /* swish'(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
-                      = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-                      = swish(x) + sigmoid(x) * (1 - swish(x)) */
+        /* swish'(x) = swish(x) + sigmoid(x) * (1 - swish(x)) */
         float sw = od[output->offset + i];
-        float deriv = sw + sig * (1.0f - sw);
-        gd[grad_a->offset + i] = go[grad_out->offset + i] * deriv;
+        ig[self->inputs[0]->grad->offset + i] += go[grad_out->offset + i] * (sw + sig * (1.0f - sw));
     }
-
-    if (self->inputs[0]->requires_grad)
-    {
-        if (!self->inputs[0]->grad)
-            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-        float *ig = (float *)self->inputs[0]->grad->storage->data;
-        for (int64_t i = 0; i < n; i++)
-            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
-    }
-    ax_tensor_destroy(grad_a);
 }
 
 ax_tensor_t *ax_swish(ax_tensor_t *a)
@@ -389,12 +354,16 @@ ax_tensor_t *ax_swish(ax_tensor_t *a)
 
 static void softplus_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
+    if (!self->inputs[0]->requires_grad) return;
+
     ax_tensor_t *input = self->saved[0];
     int64_t n = ax_tensor_numel(grad_out);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gd = (float *)grad_a->storage->data;
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!self->inputs[0]->grad) return;
+
+    float *ig = (float *)self->inputs[0]->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
 
@@ -402,19 +371,8 @@ static void softplus_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     for (int64_t i = 0; i < n; i++)
     {
         float x = ad[input->offset + i];
-        float sig = 1.0f / (1.0f + expf(-x));
-        gd[grad_a->offset + i] = go[grad_out->offset + i] * sig;
+        ig[self->inputs[0]->grad->offset + i] += go[grad_out->offset + i] / (1.0f + expf(-x));
     }
-
-    if (self->inputs[0]->requires_grad)
-    {
-        if (!self->inputs[0]->grad)
-            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-        float *ig = (float *)self->inputs[0]->grad->storage->data;
-        for (int64_t i = 0; i < n; i++)
-            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
-    }
-    ax_tensor_destroy(grad_a);
 }
 
 ax_tensor_t *ax_softplus(ax_tensor_t *a)
@@ -461,12 +419,16 @@ ax_tensor_t *ax_softplus(ax_tensor_t *a)
 
 static void mish_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
+    if (!self->inputs[0]->requires_grad) return;
+
     ax_tensor_t *input = self->saved[0];
     int64_t n = ax_tensor_numel(grad_out);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
-    if (!grad_a) return;
-    float *gd = (float *)grad_a->storage->data;
+    if (!self->inputs[0]->grad)
+        self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+    if (!self->inputs[0]->grad) return;
+
+    float *ig = (float *)self->inputs[0]->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *ad = (float *)input->storage->data;
 
@@ -476,19 +438,9 @@ static void mish_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         float sp = (x > 20.0f) ? x : ((x < -20.0f) ? expf(x) : logf(1.0f + expf(x)));
         float tsp = tanhf(sp);
         float sig = 1.0f / (1.0f + expf(-x));
-        float deriv = tsp + x * sig * (1.0f - tsp * tsp);
-        gd[grad_a->offset + i] = go[grad_out->offset + i] * deriv;
+        ig[self->inputs[0]->grad->offset + i] += go[grad_out->offset + i] *
+            (tsp + x * sig * (1.0f - tsp * tsp));
     }
-
-    if (self->inputs[0]->requires_grad)
-    {
-        if (!self->inputs[0]->grad)
-            self->inputs[0]->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
-        float *ig = (float *)self->inputs[0]->grad->storage->data;
-        for (int64_t i = 0; i < n; i++)
-            ig[self->inputs[0]->grad->offset + i] += gd[grad_a->offset + i];
-    }
-    ax_tensor_destroy(grad_a);
 }
 
 ax_tensor_t *ax_mish(ax_tensor_t *a)

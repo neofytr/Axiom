@@ -21,7 +21,14 @@
 /* max layers in a sequential model */
 #define AX_SEQ_MAX_LAYERS 64
 
-/* layer types — every layer MUST have its own value here */
+/* layer types — every layer MUST have its own value here.
+   adding a new layer type requires touching exactly three places:
+     1. this enum (add the new value before AX_LAYER_TYPE_COUNT)
+     2. layer_type_name() in layer.c (add a case returning the display name)
+     3. serialize.c: ax_model_save() layer header write + ax_model_load()
+        layer reconstruction (add cases for the new type in both)
+   missing any one of these will cause serialization to silently skip or
+   misidentify the new layer type. */
 typedef enum
 {
     AX_LAYER_DENSE = 0,

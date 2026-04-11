@@ -38,6 +38,8 @@ static ax_tensor_t *alloc_like(ax_tensor_t *t)
 /* compute the shape that results from reducing along an axis */
 static ax_tensor_t *alloc_reduce_result(ax_tensor_t *t, int axis)
 {
+    if (!t) return NULL;
+
     if (axis == -1)
     {
         /* full reduction -> scalar (1d with 1 element) */
@@ -281,6 +283,11 @@ ax_tensor_t *ax_mul_scalar(ax_tensor_t *a, double s)
 
 ax_tensor_t *ax_matmul(ax_tensor_t *a, ax_tensor_t *b)
 {
+    if (!a || !b)
+    {
+        ax_err_set(AX_ERR_NULL_ARG, "matmul: NULL tensor");
+        return NULL;
+    }
     if (a->ndim != 2 || b->ndim != 2)
     {
         ax_err_set(AX_ERR_SHAPE_MISMATCH, "matmul needs 2d tensors");

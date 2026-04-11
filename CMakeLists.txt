@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.18)
 project(axiom C)
 
 set(CMAKE_C_STANDARD 11)
@@ -35,6 +35,17 @@ if(AX_TSAN)
     message(STATUS "  PIE/ASLR remain enabled in the binary; setarch only affects test runtime")
     add_compile_options(-fsanitize=thread -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=thread)
+endif()
+
+# CUDA GPU backend: cmake -DAX_CUDA=ON ..
+option(AX_CUDA "enable NVIDIA GPU backend via CUDA + cuBLAS" OFF)
+if(AX_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 14)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+    message(STATUS "CUDA enabled (toolkit ${CUDAToolkit_VERSION})")
+    add_compile_definitions(AX_HAVE_CUDA)
 endif()
 
 # openmp parallelism: cmake -DAX_OPENMP=ON .. (default ON for desktop)
@@ -81,6 +92,10 @@ set(AXIOM_SOURCES
     src/compute/backends/cpu_opt.c
 )
 
+if(AX_CUDA)
+    list(APPEND AXIOM_SOURCES src/compute/backends/cuda_backend.cu)
+endif()
+
 # enable SIMD for the optimized backend on x86
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
     set_source_files_properties(src/compute/backends/cpu_opt.c
@@ -94,6 +109,12 @@ target_link_libraries(axiom_static PUBLIC m)
 if(AX_OPENMP AND OpenMP_C_FOUND)
     target_link_libraries(axiom_static PUBLIC OpenMP::OpenMP_C)
 endif()
+if(AX_CUDA)
+    target_link_libraries(axiom_static PUBLIC CUDA::cudart CUDA::cublas)
+    # suppress C-only warning flags when nvcc compiles the CUDA backend as C++
+    set_source_files_properties(src/compute/backends/cuda_backend.cu
+        PROPERTIES COMPILE_FLAGS "-Xcompiler -Wno-pedantic,-Wno-strict-prototypes")
+endif()
 set_target_properties(axiom_static PROPERTIES OUTPUT_NAME axiom)
 
 # shared library
@@ -102,6 +123,9 @@ target_include_directories(axiom_shared PUBLIC include)
 target_link_libraries(axiom_shared PUBLIC m)
 if(AX_OPENMP AND OpenMP_C_FOUND)
     target_link_libraries(axiom_shared PUBLIC OpenMP::OpenMP_C)
+endif()
+if(AX_CUDA)
+    target_link_libraries(axiom_shared PUBLIC CUDA::cudart CUDA::cublas)
 endif()
 set_target_properties(axiom_shared PROPERTIES OUTPUT_NAME axiom)
 
@@ -157,23 +181,17 @@ foreach(test_src ${TEST_SOURCES})
 endforeach()
 
 # examples (leak detection stays on for these — they use the full api)
-add_executable(example_xor examples/xor.c)
-target_link_libraries(example_xor PRIVATE axiom_static)
-
 add_executable(example_mnist examples/mnist.c)
 target_link_libraries(example_mnist PRIVATE axiom_static)
 
-add_executable(example_spiral examples/spiral.c)
-target_link_libraries(example_spiral PRIVATE axiom_static)
+add_executable(mnist_cnn examples/mnist_cnn.c)
+target_link_libraries(mnist_cnn PRIVATE axiom_static)
 
-add_executable(example_regression examples/regression.c)
-target_link_libraries(example_regression PRIVATE axiom_static)
+add_executable(deep_mlp examples/deep_mlp.c)
+target_link_libraries(deep_mlp PRIVATE axiom_static)
 
 add_executable(bench_backend examples/bench_backend.c)
 target_link_libraries(bench_backend PRIVATE axiom_static)
-
-add_executable(mnist_cnn examples/mnist_cnn.c)
-target_link_libraries(mnist_cnn PRIVATE axiom_static)
 
 # convenience target: run all tests
 add_custom_target(run_tests

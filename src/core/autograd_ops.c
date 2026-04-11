@@ -140,8 +140,9 @@ static void sub_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     accumulate_grad(self->inputs[0], grad_out);
 
-    /* negate grad for b */
-    ax_tensor_t *neg_grad = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    /* negate grad for b — arena temp, freed in bulk by ax_backward */
+    ax_arena_t *ar = ax_backward_arena();
+    ax_tensor_t *neg_grad = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!neg_grad) return;
     ax_compute_neg(grad_out, neg_grad);
     accumulate_grad(self->inputs[1], neg_grad);
@@ -164,16 +165,17 @@ static void mul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
     ax_tensor_t *b = self->saved[1];
+    ax_arena_t *ar = ax_backward_arena();
 
     /* grad_a = grad_out * b */
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_a) return;
     ax_compute_mul(grad_out, b, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
     ax_tensor_destroy(grad_a);
 
     /* grad_b = grad_out * a */
-    ax_tensor_t *grad_b = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_tensor_t *grad_b = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_b) return;
     ax_compute_mul(grad_out, a, grad_b);
     accumulate_grad(self->inputs[1], grad_b);
@@ -203,20 +205,21 @@ static void div_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
     ax_tensor_t *b = self->saved[1];
+    ax_arena_t *ar = ax_backward_arena();
 
     /* grad_a = grad_out / b */
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_a) return;
     ax_compute_div(grad_out, b, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
     ax_tensor_destroy(grad_a);
 
     /* grad_b = -grad_out * a / b^2 */
-    ax_tensor_t *b_sq = ax_tensor_zeros(b->shape, b->ndim, b->dtype);
+    ax_tensor_t *b_sq = ax_tensor_arena_zeros(ar, b->shape, b->ndim, b->dtype);
     if (!b_sq) return;
     ax_compute_square(b, b_sq);
 
-    ax_tensor_t *tmp = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_tensor_t *tmp = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!tmp) { ax_tensor_destroy(b_sq); return; }
     ax_compute_mul(grad_out, a, tmp);
     ax_compute_div(tmp, b_sq, tmp);
@@ -247,7 +250,8 @@ ax_grad_fn_t *ax_make_div_backward(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *
 /* neg: d/da(-a) = -1 */
 static void neg_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
-    ax_tensor_t *neg_grad = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_arena_t *ar = ax_backward_arena();
+    ax_tensor_t *neg_grad = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!neg_grad) return;
     ax_compute_neg(grad_out, neg_grad);
     accumulate_grad(self->inputs[0], neg_grad);
@@ -268,7 +272,8 @@ ax_grad_fn_t *ax_make_neg_backward(ax_tensor_t *a, ax_tensor_t *out)
 static void exp_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *exp_out = self->saved[0]; /* = exp(a) */
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_arena_t *ar = ax_backward_arena();
+    ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_a) return;
     ax_compute_mul(grad_out, exp_out, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
@@ -291,7 +296,8 @@ ax_grad_fn_t *ax_make_exp_backward(ax_tensor_t *a, ax_tensor_t *out)
 static void log_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_arena_t *ar = ax_backward_arena();
+    ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_a) return;
     ax_compute_div(grad_out, a, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
@@ -316,13 +322,14 @@ ax_grad_fn_t *ax_make_log_backward(ax_tensor_t *a, ax_tensor_t *out)
 static void sqrt_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *sqrt_out = self->saved[0];
+    ax_arena_t *ar = ax_backward_arena();
 
     /* grad = grad_out / (2 * sqrt(a)) */
-    ax_tensor_t *denom = ax_tensor_zeros(sqrt_out->shape, sqrt_out->ndim, sqrt_out->dtype);
+    ax_tensor_t *denom = ax_tensor_arena_zeros(ar, sqrt_out->shape, sqrt_out->ndim, sqrt_out->dtype);
     if (!denom) return;
     ax_compute_mul_scalar(sqrt_out, 2.0, denom);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_a) { ax_tensor_destroy(denom); return; }
     ax_compute_div(grad_out, denom, grad_a);
 
@@ -347,13 +354,14 @@ ax_grad_fn_t *ax_make_sqrt_backward(ax_tensor_t *a, ax_tensor_t *out)
 static void square_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
+    ax_arena_t *ar = ax_backward_arena();
 
     /* grad = grad_out * 2 * a */
-    ax_tensor_t *two_a = ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+    ax_tensor_t *two_a = ax_tensor_arena_zeros(ar, a->shape, a->ndim, a->dtype);
     if (!two_a) return;
     ax_compute_mul_scalar(a, 2.0, two_a);
 
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_a) { ax_tensor_destroy(two_a); return; }
     ax_compute_mul(grad_out, two_a, grad_a);
 
@@ -394,7 +402,8 @@ ax_grad_fn_t *ax_make_add_scalar_backward(ax_tensor_t *a, ax_tensor_t *out)
 static void mul_scalar_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     double c = self->scalar_ctx;
-    ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+    ax_arena_t *ar = ax_backward_arena();
+    ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
     if (!grad_a) return;
     ax_compute_mul_scalar(grad_out, c, grad_a);
     accumulate_grad(self->inputs[0], grad_a);
@@ -419,24 +428,26 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *a = self->saved[0];
     ax_tensor_t *b = self->saved[1];
+    ax_arena_t *ar = ax_backward_arena();
 
     /* d/da = grad_out @ b^T */
     if (self->inputs[0]->requires_grad)
     {
         ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
         if (!bt) return;
-        ax_tensor_t *bt_contig = ax_tensor_contiguous(bt);
+        /* arena copy — avoids heap malloc for the transposed contiguous buffer */
+        ax_tensor_t *bt_contig = ax_tensor_arena_zeros(ar, bt->shape, bt->ndim, bt->dtype);
         if (!bt_contig) { ax_tensor_destroy(bt); return; }
+        ax_compute_copy(bt, bt_contig);
 
         int64_t ga_shape[] = {grad_out->shape[0], bt_contig->shape[1]};
-        ax_tensor_t *grad_a = ax_tensor_zeros(ga_shape, 2, grad_out->dtype);
-        if (!grad_a) { ax_tensor_destroy(bt); ax_tensor_destroy(bt_contig); return; }
+        ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, ga_shape, 2, grad_out->dtype);
+        if (!grad_a) { ax_tensor_destroy(bt); return; }
         ax_compute_gemm(grad_out, bt_contig, grad_a);
 
         accumulate_grad(self->inputs[0], grad_a);
         ax_tensor_destroy(bt);
-        ax_tensor_destroy(bt_contig);
-        ax_tensor_destroy(grad_a);
+        /* bt_contig and grad_a are arena-allocated — freed in bulk by ax_backward */
     }
 
     /* d/db = a^T @ grad_out */
@@ -444,18 +455,19 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     {
         ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
         if (!at) return;
-        ax_tensor_t *at_contig = ax_tensor_contiguous(at);
+        /* arena copy — avoids heap malloc for the transposed contiguous buffer */
+        ax_tensor_t *at_contig = ax_tensor_arena_zeros(ar, at->shape, at->ndim, at->dtype);
         if (!at_contig) { ax_tensor_destroy(at); return; }
+        ax_compute_copy(at, at_contig);
 
         int64_t gb_shape[] = {at_contig->shape[0], grad_out->shape[1]};
-        ax_tensor_t *grad_b = ax_tensor_zeros(gb_shape, 2, grad_out->dtype);
-        if (!grad_b) { ax_tensor_destroy(at); ax_tensor_destroy(at_contig); return; }
+        ax_tensor_t *grad_b = ax_tensor_arena_zeros(ar, gb_shape, 2, grad_out->dtype);
+        if (!grad_b) { ax_tensor_destroy(at); return; }
         ax_compute_gemm(at_contig, grad_out, grad_b);
 
         accumulate_grad(self->inputs[1], grad_b);
         ax_tensor_destroy(at);
-        ax_tensor_destroy(at_contig);
-        ax_tensor_destroy(grad_b);
+        /* at_contig and grad_b are arena-allocated — freed in bulk by ax_backward */
     }
 }
 
@@ -488,12 +500,14 @@ static void sum_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
        grad_out back to the input shape.
        simplest way: create a ones tensor and multiply by grad_out element */
 
+    ax_arena_t *ar = ax_backward_arena();
     if (axis == -1)
     {
         /* full reduction: grad_out is scalar, broadcast to input shape */
         float g = ((float *)grad_out->storage->data)[grad_out->offset];
-        ax_tensor_t *grad_a = ax_tensor_full(a->shape, a->ndim, a->dtype, (double)g);
+        ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, a->shape, a->ndim, a->dtype);
         if (!grad_a) return;
+        ax_compute_fill(grad_a, (double)g);
         accumulate_grad(self->inputs[0], grad_a);
         ax_tensor_destroy(grad_a);
     }
@@ -502,7 +516,7 @@ static void sum_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         /* axis reduction: expand grad_out along the reduced axis.
            e.g., if a is [2,3] and we summed axis 0, grad_out is [3].
            we need to expand it to [2,3] by repeating along axis 0. */
-        ax_tensor_t *grad_a = ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+        ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, a->shape, a->ndim, a->dtype);
         if (!grad_a) return;
         int64_t n = ax_tensor_numel(grad_a);
 
@@ -674,7 +688,7 @@ static void relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     else
     {
         /* slow path: non-contiguous */
-        ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+        ax_tensor_t *grad_a = ax_tensor_arena_zeros(ax_backward_arena(), grad_out->shape, grad_out->ndim, grad_out->dtype);
         if (!grad_a) return;
         float *gad = (float *)grad_a->storage->data;
         for (int64_t i = 0; i < n; i++) {
@@ -731,7 +745,7 @@ static void sigmoid_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
     else
     {
-        ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+        ax_tensor_t *grad_a = ax_tensor_arena_zeros(ax_backward_arena(), grad_out->shape, grad_out->ndim, grad_out->dtype);
         if (!grad_a) return;
         float *gad = (float *)grad_a->storage->data;
         for (int64_t i = 0; i < n; i++) {
@@ -786,7 +800,7 @@ static void tanh_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
     else
     {
-        ax_tensor_t *grad_a = ax_tensor_zeros(grad_out->shape, grad_out->ndim, grad_out->dtype);
+        ax_tensor_t *grad_a = ax_tensor_arena_zeros(ax_backward_arena(), grad_out->shape, grad_out->ndim, grad_out->dtype);
         if (!grad_a) return;
         float *gad = (float *)grad_a->storage->data;
         for (int64_t i = 0; i < n; i++) {

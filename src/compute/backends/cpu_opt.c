@@ -20,6 +20,24 @@
    below this, openmp fork-join overhead exceeds compute time. */
 #define AX_PAR_THRESHOLD 65536
 
+/* thread-local persistent pack buffers for GEMM — allocated once per thread,
+   reused on every call. eliminates ~16 malloc/free per GEMM invocation. */
+static _Thread_local float *tl_pack_a_buf = NULL;  /* GEMM_MC * GEMM_KC floats */
+static _Thread_local float *tl_pack_b_buf = NULL;  /* GEMM_NC * GEMM_KC floats */
+
+/* thread-local pack_b cache: skip re-packing B when the same tile is requested
+   back-to-back. hit path is typical in backward passes where the same weight
+   matrix is used twice (e.g. dY @ W for dX, then X^T @ dY for dW). the key is
+   the exact set of inputs pack_b reads: B base ptr, ldb, and (jc, pc, kc, nc_pack, nc).
+   a NULL ptr means the cache is empty / invalidated. */
+static _Thread_local const float *tl_pack_b_cache_bptr = NULL;
+static _Thread_local int64_t tl_pack_b_cache_ldb = 0;
+static _Thread_local int64_t tl_pack_b_cache_jc = 0;
+static _Thread_local int64_t tl_pack_b_cache_pc = 0;
+static _Thread_local int64_t tl_pack_b_cache_kc = 0;
+static _Thread_local int64_t tl_pack_b_cache_nc = 0;
+static _Thread_local int64_t tl_pack_b_cache_ncp = 0;
+
 /* reference backend for fallback */
 extern const ax_backend_ops_t ax_cpu_naive_ops;
 
@@ -152,11 +170,12 @@ static ax_status_t opt_add_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     float *od = raw_f32(out);
     float s = (float)scalar;
     ax_vf32 vs = ax_vf32_set1(s);
-    int64_t i = 0;
-    int64_t vec_end = ni - (ni % AX_VF32_WIDTH);
-    for (; i < vec_end; i += AX_VF32_WIDTH)
+    int64_t n = ni; /* alias so AX_OMP_PAR_FOR_IF(n) resolves correctly */
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    AX_OMP_PAR_FOR_IF(n)
+    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH)
         ax_vf32_store(od + i, ax_vf32_add(ax_vf32_load(id + i), vs));
-    for (; i < ni; i++)
+    for (int64_t i = vec_end; i < n; i++)
         od[i] = id[i] + s;
     return AX_OK;
 }
@@ -169,11 +188,12 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     float *od = raw_f32(out);
     float s = (float)scalar;
     ax_vf32 vs = ax_vf32_set1(s);
-    int64_t i = 0;
-    int64_t vec_end = ni - (ni % AX_VF32_WIDTH);
-    for (; i < vec_end; i += AX_VF32_WIDTH)
+    int64_t n = ni; /* alias so AX_OMP_PAR_FOR_IF(n) resolves correctly */
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    AX_OMP_PAR_FOR_IF(n)
+    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH)
         ax_vf32_store(od + i, ax_vf32_mul(ax_vf32_load(id + i), vs));
-    for (; i < ni; i++)
+    for (int64_t i = vec_end; i < n; i++)
         od[i] = id[i] * s;
     return AX_OK;
 }
@@ -197,6 +217,52 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     #define GEMM_MR 4
     #define GEMM_NR 4
 #endif
+
+/* lazily allocate this thread's pack_a and pack_b buffers (once per thread) */
+static bool ensure_tl_pack_bufs(void) {
+    if (!tl_pack_a_buf)
+        tl_pack_a_buf = (float *)ax_aligned_alloc((size_t)GEMM_MC * GEMM_KC * sizeof(float), 64);
+    if (!tl_pack_b_buf)
+        tl_pack_b_buf = (float *)ax_aligned_alloc((size_t)GEMM_NC * GEMM_KC * sizeof(float), 64);
+    return tl_pack_a_buf && tl_pack_b_buf;
+}
+
+/* forward decl — pack_b is defined further down */
+static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
+                    int64_t n_remain, float *packed);
+
+/* invalidate pack_b cache — call when any pack_b buffer contents might differ
+   from what the cache key currently describes. */
+static inline void pack_b_cache_invalidate(void) {
+    tl_pack_b_cache_bptr = NULL;
+}
+
+/* pack_b with cache: if the last pack_b into tl_pack_b_buf used the exact
+   same (bptr, ldb, jc, pc, kc, nc, nc_pack), the buffer is still valid and
+   we can skip the copy. otherwise re-pack and update the cache key.
+   'tile_bptr' must be (bd + pc*ldb + jc) — the actual address pack_b reads from. */
+static inline void pack_b_cached(const float *tile_bptr, int64_t ldb,
+                                  int64_t kc, int64_t nc_pack, int64_t nc,
+                                  int64_t jc, int64_t pc)
+{
+    if (tl_pack_b_cache_bptr == tile_bptr
+        && tl_pack_b_cache_ldb == ldb
+        && tl_pack_b_cache_jc  == jc
+        && tl_pack_b_cache_pc  == pc
+        && tl_pack_b_cache_kc  == kc
+        && tl_pack_b_cache_nc  == nc
+        && tl_pack_b_cache_ncp == nc_pack) {
+        return;  /* hit — buffer already contains exactly this tile */
+    }
+    pack_b(tile_bptr, ldb, kc, nc_pack, nc, tl_pack_b_buf);
+    tl_pack_b_cache_bptr = tile_bptr;
+    tl_pack_b_cache_ldb  = ldb;
+    tl_pack_b_cache_jc   = jc;
+    tl_pack_b_cache_pc   = pc;
+    tl_pack_b_cache_kc   = kc;
+    tl_pack_b_cache_nc   = nc;
+    tl_pack_b_cache_ncp  = nc_pack;
+}
 
 /* pack a MC x KC panel of A (row-major) into contiguous MR-row strips */
 static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
@@ -371,125 +437,229 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         return ax_cpu_naive_ops.gemm(a, b, out);
     }
 
-    /* for very small matrices, use simple loop (tiling overhead not worth it) */
-    if (m * n * k < 4096) {
-        const float *ad = raw_f32(a);
-        const float *bd = raw_f32(b);
-        float *od = raw_f32(out);
+    /* pack_b cache invalidation: if A's data pointer equals the cached B pointer
+       range, a prior call's pack_b data no longer describes the current B and must
+       be re-packed. we only hold a base tile pointer, so also invalidate when the
+       output buffer equals it (aliased write). the usual backward pattern
+       (same B, different A and out) is still a clean cache hit. */
+    const float *a_raw = raw_f32(a);
+    const float *b_raw = raw_f32(b);
+    float *o_raw = raw_f32(out);
+    if (tl_pack_b_cache_bptr != NULL) {
+        /* bptr points into b_raw region; if a or out aliases b's storage or the
+           role of a and b swapped, drop the cache. cheap conservative check: any
+           pointer overlap of a or out with the cached tile invalidates it. */
+        if ((const float *)a_raw == tl_pack_b_cache_bptr
+            || (const float *)o_raw == tl_pack_b_cache_bptr) {
+            pack_b_cache_invalidate();
+        }
+    }
+
+    /* SIMD small/medium path. tiled BLIS overhead dominates below ~100k FLOPs;
+       a straight vectorized AXPY (C[i,j] += a_ip * B[p,j]) with SIMD inner on j
+       runs faster for small-to-medium shapes. */
+    if (m * n * k < 100000) {
+        const float *ad = a_raw;
+        const float *bd = b_raw;
+        float *od = o_raw;
         memset(od, 0, (size_t)(m * n) * sizeof(float));
-        for (int64_t i = 0; i < m; i++)
+        int64_t vec_end = n - (n % AX_VF32_WIDTH);
+        for (int64_t i = 0; i < m; i++) {
+            float *oi = od + i * n;
+            const float *ai = ad + i * k;
             for (int64_t p = 0; p < k; p++) {
-                float a_ip = ad[i * k + p];
-                for (int64_t j = 0; j < n; j++)
-                    od[i * n + j] += a_ip * bd[p * n + j];
+                float a_ip = ai[p];
+                const float *bp = bd + p * n;
+                ax_vf32 va = ax_vf32_set1(a_ip);
+                int64_t j = 0;
+                for (; j < vec_end; j += AX_VF32_WIDTH) {
+                    ax_vf32 vo = ax_vf32_loadu(oi + j);
+                    ax_vf32 vb = ax_vf32_loadu(bp + j);
+                    ax_vf32_storeu(oi + j, ax_vf32_fmadd(va, vb, vo));
+                }
+                for (; j < n; j++)
+                    oi[j] += a_ip * bp[j];
             }
+        }
+        /* this path writes nothing to tl_pack_b_buf, so the cache remains valid. */
         return AX_OK;
     }
 
-    /* checked scratch allocation — bounded by AX_MAX_SCRATCH_BYTES.
-       per-thread pack buffers. when called from inside a parallel region
-       (e.g., conv2d batch loop), we use a single thread to avoid nested
-       over-subscription. */
-    int gemm_threads = 1;
+    /* per-thread pack buffers — guarded against nested parallel regions
+       (conv2d batch loop already runs in a parallel region). */
+    int max_threads = 1;
     #ifdef _OPENMP
-    if (!omp_in_parallel()) {
-        gemm_threads = omp_get_max_threads();
-        /* don't waste threads on tiny problems */
-        int64_t jc_tiles = (n + GEMM_NC - 1) / GEMM_NC;
-        if (gemm_threads > jc_tiles) gemm_threads = (int)jc_tiles;
-        if (gemm_threads < 1) gemm_threads = 1;
-    }
+    if (!omp_in_parallel()) max_threads = omp_get_max_threads();
     #endif
 
-    size_t pack_a_size = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
-    size_t pack_b_size = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
-    if ((pack_a_size + pack_b_size) * (size_t)gemm_threads > AX_MAX_SCRATCH_BYTES) {
-        return ax_cpu_naive_ops.gemm(a, b, out);
+    int64_t n_jc_tiles = (n + GEMM_NC - 1) / GEMM_NC;
+    int64_t n_ic_tiles = (m + GEMM_MC - 1) / GEMM_MC;
+
+    /* parallelism strategy:
+       - JC (column strips): each thread takes a JC tile, needs its own pack_b.
+         best when n is large (n_jc_tiles >= 2).
+       - IC (row strips): pack_b is done once, threads split IC tiles, each needs
+         its own pack_a. best when n is small (e.g. MNIST: n=128 → jc_tiles=1).
+       - Fine: when neither M nor N is big enough for tile-level splitting, pack
+         A and B once, then parallelize the inner (ir, jr) micro-kernel grid. This
+         covers the typical "narrow forward dense GEMM" case (e.g., m=batch=64,
+         n=hidden=256, k=3136 — m<MC=72 and n=NC=256 so both tile counts are 1,
+         but m has ~11 MR-rows of independent work). */
+    int64_t n_mr_tiles = (m + GEMM_MR - 1) / GEMM_MR;
+    int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
+    int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
+
+    bool use_jc_par = (max_threads > 1) && (n_jc_tiles >= 2);
+    bool use_ic_par = !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
+    /* fine-grained parallel is only worth it when there's enough total work to
+       amortize OMP fork-join overhead AND enough work units per thread. ~1M
+       FLOPs is a conservative threshold (< 50us serial). */
+    int64_t total_flops = m * n * k;
+    bool use_fine_par = !use_jc_par && !use_ic_par && (max_threads > 1)
+                        && (m <= GEMM_MC) && (fine_units >= 4)
+                        && (total_flops > 1000000);
+
+    int gemm_threads = 1;
+    if (use_jc_par) {
+        gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
+    } else if (use_ic_par) {
+        gemm_threads = (int)(n_ic_tiles < (int64_t)max_threads ? n_ic_tiles : (int64_t)max_threads);
+    } else if (use_fine_par) {
+        gemm_threads = (int)(fine_units < (int64_t)max_threads ? fine_units : (int64_t)max_threads);
     }
 
-    /* allocate per-thread packing buffers */
-    float **pack_a_bufs = (float **)calloc((size_t)gemm_threads, sizeof(float *));
-    float **pack_b_bufs = (float **)calloc((size_t)gemm_threads, sizeof(float *));
-    if (!pack_a_bufs || !pack_b_bufs) {
-        free(pack_a_bufs); free(pack_b_bufs);
+    /* ensure the calling thread has its pack buffers (serial init before parallel region) */
+    if (!ensure_tl_pack_bufs())
         return ax_cpu_naive_ops.gemm(a, b, out);
-    }
-    bool alloc_ok = true;
-    for (int t = 0; t < gemm_threads; t++) {
-        pack_a_bufs[t] = (float *)ax_aligned_alloc(pack_a_size, 64);
-        pack_b_bufs[t] = (float *)ax_aligned_alloc(pack_b_size, 64);
-        if (!pack_a_bufs[t] || !pack_b_bufs[t]) { alloc_ok = false; break; }
-    }
-    if (!alloc_ok) {
-        for (int t = 0; t < gemm_threads; t++) {
-            ax_aligned_free(pack_a_bufs[t]);
-            ax_aligned_free(pack_b_bufs[t]);
-        }
-        free(pack_a_bufs); free(pack_b_bufs);
-        return ax_cpu_naive_ops.gemm(a, b, out);
-    }
 
-    const float *ad = raw_f32(a);
-    const float *bd = raw_f32(b);
-    float *od = raw_f32(out);
+    const float *ad = a_raw;
+    const float *bd = b_raw;
+    float *od = o_raw;
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    /* count of jc tiles for parallelization */
-    int64_t n_jc_tiles = (n + GEMM_NC - 1) / GEMM_NC;
-
-    /* parallelize JC tiles: each tile writes to disjoint output columns.
-       guarded by !omp_in_parallel() to avoid nesting from conv2d batch loop. */
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if(gemm_threads > 1)
-    #endif
-    for (int64_t jct = 0; jct < n_jc_tiles; jct++)
-    {
-        int tid = 0;
+    if (use_jc_par) {
+        /* JC parallel: each thread owns a column strip of C and its own pack buffers.
+           Thread-local buffers — lazily allocated once per thread, reused every call.
+           Writes to disjoint columns → no synchronization needed. */
         #ifdef _OPENMP
-        tid = omp_get_thread_num();
-        if (tid >= gemm_threads) tid = 0; /* defensive */
+        #pragma omp parallel for num_threads(gemm_threads) schedule(static)
         #endif
-        float *pack_a_buf = pack_a_bufs[tid];
-        float *pack_b_buf = pack_b_bufs[tid];
+        for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+            /* each thread lazily inits its own TLS pack buffers on first use */
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            if (!pack_a_buf || !pack_b_buf) continue;
 
-        int64_t jc = jct * GEMM_NC;
-        int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
-        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            int64_t jc = jct * GEMM_NC;
+            int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-        for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-            int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+                /* jc-parallel: pack_b target is this thread's TLS buffer,
+                   which pack_b_cached also writes to via tl_pack_b_buf. */
+                pack_b_cached(bd + pc * n + jc, n, kc, nc_pack, nc, jc, pc);
 
-            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
+                for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
 
-            for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
-                int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                         od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_fine_par) {
+        /* Fine-grained parallel: pack A and B serially (small data), then
+           parallelize over the (ir, jr) micro-kernel grid using collapse(2).
+           Each (ir, jr) writes a disjoint MR x NR block of C. Used when neither
+           m nor n is big enough for MC/NC-level tile splitting. */
+        float *main_pack_b = tl_pack_b_buf;
+        float *main_pack_a = tl_pack_a_buf;
+
+        for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+            int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+                int64_t mc = m;  /* whole m fits since m <= GEMM_MC */
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
 
-                int64_t mc_round = mc_pack;
-                int64_t nc_round = nc_pack;
+                /* fine-parallel: pack_b target is main_pack_b == tl_pack_b_buf,
+                   same target as pack_b_cached. */
+                pack_b_cached(bd + pc * n + jc, n, kc, nc_pack, nc, jc, pc);
+                pack_a(ad + pc, k, mc_pack, kc, mc, main_pack_a);
 
-                for (int64_t ir = 0; ir < mc_round; ir += GEMM_MR) {
-                    int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
-                    for (int64_t jr = 0; jr < nc_round; jr += GEMM_NR) {
+                int64_t ir_tiles = mc_pack / GEMM_MR;
+                int64_t jr_tiles = nc_pack / GEMM_NR;
+
+                #ifdef _OPENMP
+                #pragma omp parallel for num_threads(gemm_threads) schedule(static) collapse(2)
+                #endif
+                for (int64_t irt = 0; irt < ir_tiles; irt++) {
+                    for (int64_t jrt = 0; jrt < jr_tiles; jrt++) {
+                        int64_t ir = irt * GEMM_MR;
+                        int64_t jr = jrt * GEMM_NR;
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                         int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                        micro_kernel(kc, main_pack_a + ir * kc, main_pack_b + jr * kc,
+                                     od + ir * n + (jc + jr), n, mr, nr);
+                    }
+                }
+            }
+        }
+    } else {
+        /* IC parallel (or serial): pack_b once per (jc, pc) into the calling thread's
+           TLS pack_b buffer, pass as a raw pointer into the parallel region (read-only
+           from worker threads — safe, TLS buffer is ordinary memory).
+           Serial path: gemm_threads==1, pragma is a no-op. */
+        float *main_pack_b = tl_pack_b_buf;  /* packed by serial outer loop */
 
-                        const float *ap = pack_a_buf + ir * kc;
-                        const float *bp = pack_b_buf + jr * kc;
-                        float *cp = od + (ic + ir) * n + (jc + jr);
+        for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+            int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-                        micro_kernel(kc, ap, bp, cp, n, mr, nr);
+            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+                /* serial/IC path: pack_b target is tl_pack_b_buf of the calling thread. */
+                pack_b_cached(bd + pc * n + jc, n, kc, nc_pack, nc, jc, pc);
+                const float *pack_b_buf = main_pack_b;  /* shared read-only in parallel region */
+
+                #ifdef _OPENMP
+                #pragma omp parallel for num_threads(gemm_threads) schedule(static) if(use_ic_par)
+                #endif
+                for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                    ensure_tl_pack_bufs();
+                    float *pack_a_buf = tl_pack_a_buf;
+                    if (!pack_a_buf) continue;
+
+                    int64_t ic = ict * GEMM_MC;
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                         od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                        }
                     }
                 }
             }
         }
     }
 
-    for (int t = 0; t < gemm_threads; t++) {
-        ax_aligned_free(pack_a_bufs[t]);
-        ax_aligned_free(pack_b_bufs[t]);
-    }
-    free(pack_a_bufs); free(pack_b_bufs);
     return AX_OK;
 }
 
@@ -503,15 +673,15 @@ static inline float simd_row_sum(const float *d, int64_t n)
     int64_t unroll4 = n - (n % (AX_VF32_WIDTH * 4));
     int64_t i = 0;
     for (; i < unroll4; i += AX_VF32_WIDTH * 4) {
-        acc0 = ax_vf32_add(acc0, ax_vf32_load(d + i));
-        acc1 = ax_vf32_add(acc1, ax_vf32_load(d + i + AX_VF32_WIDTH));
-        acc2 = ax_vf32_add(acc2, ax_vf32_load(d + i + AX_VF32_WIDTH * 2));
-        acc3 = ax_vf32_add(acc3, ax_vf32_load(d + i + AX_VF32_WIDTH * 3));
+        acc0 = ax_vf32_add(acc0, ax_vf32_loadu(d + i));
+        acc1 = ax_vf32_add(acc1, ax_vf32_loadu(d + i + AX_VF32_WIDTH));
+        acc2 = ax_vf32_add(acc2, ax_vf32_loadu(d + i + AX_VF32_WIDTH * 2));
+        acc3 = ax_vf32_add(acc3, ax_vf32_loadu(d + i + AX_VF32_WIDTH * 3));
     }
     acc0 = ax_vf32_add(ax_vf32_add(acc0, acc1), ax_vf32_add(acc2, acc3));
     int64_t vec_end = n - (n % AX_VF32_WIDTH);
     for (; i < vec_end; i += AX_VF32_WIDTH)
-        acc0 = ax_vf32_add(acc0, ax_vf32_load(d + i));
+        acc0 = ax_vf32_add(acc0, ax_vf32_loadu(d + i));
     double total = (double)ax_vf32_hsum(acc0);
     for (; i < n; i++) total += (double)d[i];
     return (float)total;
@@ -520,24 +690,42 @@ static inline float simd_row_sum(const float *d, int64_t n)
 /* helper: SIMD row max/min for a contiguous float array */
 static inline float simd_row_max(const float *d, int64_t n)
 {
-    ax_vf32 vmax = ax_vf32_set1(-FLT_MAX);
-    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    ax_vf32 v0 = ax_vf32_set1(-FLT_MAX), v1 = ax_vf32_set1(-FLT_MAX);
+    ax_vf32 v2 = ax_vf32_set1(-FLT_MAX), v3 = ax_vf32_set1(-FLT_MAX);
+    int64_t unroll4 = n - (n % (AX_VF32_WIDTH * 4));
     int64_t i = 0;
+    for (; i < unroll4; i += AX_VF32_WIDTH * 4) {
+        v0 = ax_vf32_max(v0, ax_vf32_loadu(d + i));
+        v1 = ax_vf32_max(v1, ax_vf32_loadu(d + i + AX_VF32_WIDTH));
+        v2 = ax_vf32_max(v2, ax_vf32_loadu(d + i + AX_VF32_WIDTH * 2));
+        v3 = ax_vf32_max(v3, ax_vf32_loadu(d + i + AX_VF32_WIDTH * 3));
+    }
+    v0 = ax_vf32_max(ax_vf32_max(v0, v1), ax_vf32_max(v2, v3));
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
     for (; i < vec_end; i += AX_VF32_WIDTH)
-        vmax = ax_vf32_max(vmax, ax_vf32_load(d + i));
-    float mx = ax_vf32_hmax(vmax);
+        v0 = ax_vf32_max(v0, ax_vf32_loadu(d + i));
+    float mx = ax_vf32_hmax(v0);
     for (; i < n; i++) if (d[i] > mx) mx = d[i];
     return mx;
 }
 
 static inline float simd_row_min(const float *d, int64_t n)
 {
-    ax_vf32 vmin = ax_vf32_set1(FLT_MAX);
-    int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    ax_vf32 v0 = ax_vf32_set1(FLT_MAX), v1 = ax_vf32_set1(FLT_MAX);
+    ax_vf32 v2 = ax_vf32_set1(FLT_MAX), v3 = ax_vf32_set1(FLT_MAX);
+    int64_t unroll4 = n - (n % (AX_VF32_WIDTH * 4));
     int64_t i = 0;
+    for (; i < unroll4; i += AX_VF32_WIDTH * 4) {
+        v0 = ax_vf32_min(v0, ax_vf32_loadu(d + i));
+        v1 = ax_vf32_min(v1, ax_vf32_loadu(d + i + AX_VF32_WIDTH));
+        v2 = ax_vf32_min(v2, ax_vf32_loadu(d + i + AX_VF32_WIDTH * 2));
+        v3 = ax_vf32_min(v3, ax_vf32_loadu(d + i + AX_VF32_WIDTH * 3));
+    }
+    v0 = ax_vf32_min(ax_vf32_min(v0, v1), ax_vf32_min(v2, v3));
+    int64_t vec_end = n - (n % AX_VF32_WIDTH);
     for (; i < vec_end; i += AX_VF32_WIDTH)
-        vmin = ax_vf32_min(vmin, ax_vf32_load(d + i));
-    float mn = ax_vf32_hmin(vmin);
+        v0 = ax_vf32_min(v0, ax_vf32_loadu(d + i));
+    float mn = ax_vf32_hmin(v0);
     for (; i < n; i++) if (d[i] < mn) mn = d[i];
     return mn;
 }
@@ -565,6 +753,8 @@ static ax_status_t opt_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
             return ax_cpu_naive_ops.sum(in, axis, out);
         const float *d = raw_f32(in);
         float *od = raw_f32(out);
+        int64_t n = rows; /* alias so AX_OMP_PAR_FOR_IF(n) resolves correctly */
+        AX_OMP_PAR_FOR_IF(n)
         for (int64_t i = 0; i < rows; i++)
             od[i] = simd_row_sum(d + i * cols, cols);
         return AX_OK;
@@ -594,6 +784,8 @@ static ax_status_t opt_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         const float *d = raw_f32(in);
         float *od = raw_f32(out);
         float inv_cols = 1.0f / (float)cols;
+        int64_t n = rows; /* alias so AX_OMP_PAR_FOR_IF(n) resolves correctly */
+        AX_OMP_PAR_FOR_IF(n)
         for (int64_t i = 0; i < rows; i++)
             od[i] = simd_row_sum(d + i * cols, cols) * inv_cols;
         return AX_OK;
@@ -666,15 +858,14 @@ static ax_status_t opt_fill(ax_tensor_t *t, double value) {
     float v = (float)value;
     float *d = raw_f32(t);
     if (v == 0.0f) {
-        /* memset is faster than any explicit loop for zeroing */
         memset(d, 0, (size_t)n * sizeof(float));
     } else {
         ax_vf32 vv = ax_vf32_set1(v);
-        int64_t i = 0;
         int64_t vec_end = n - (n % AX_VF32_WIDTH);
-        for (; i < vec_end; i += AX_VF32_WIDTH)
+        AX_OMP_PAR_FOR_IF(n)
+        for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH)
             ax_vf32_store(d + i, vv);
-        for (; i < n; i++)
+        for (int64_t i = vec_end; i < n; i++)
             d[i] = v;
     }
     return AX_OK;
@@ -684,7 +875,19 @@ static ax_status_t opt_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
     int64_t ns = validate_contig_f32(src);
     int64_t nd = validate_contig_f32(dst);
     if (ns < 0 || nd < 0 || ns != nd) return ax_cpu_naive_ops.copy(src, dst);
-    memcpy(raw_f32(dst), raw_f32(src), (size_t)ns * sizeof(float));
+    /* for large copies parallelize with per-thread memcpy chunks; for small
+       copies the serial memcpy path is faster (no fork-join overhead). */
+    if (ns > AX_PAR_THRESHOLD) {
+        const float *sd = raw_f32(src);
+        float *dd = raw_f32(dst);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t i = 0; i < ns; i++)
+            dd[i] = sd[i];
+    } else {
+        memcpy(raw_f32(dst), raw_f32(src), (size_t)ns * sizeof(float));
+    }
     return AX_OK;
 }
 

@@ -13,6 +13,7 @@ typedef struct {
     size_t size_bytes;     /* total allocated bytes */
     atomic_int refcount;   /* atomic reference count; freed when it hits 0 */
     ax_device_t device;    /* where this memory lives */
+    bool is_arena_temp;    /* true if allocated from a bump arena (release is no-op) */
 } ax_storage_t;
 
 /* the tensor: metadata wrapper around a storage buffer */
@@ -48,6 +49,15 @@ ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype);
 
 /* create and fill with zeros */
 ax_tensor_t *ax_tensor_zeros(const int64_t *shape, int ndim, ax_dtype_t dtype);
+
+/* arena-allocated zero tensor: metadata, storage struct, AND data buffer all bumped
+   from the supplied arena. extremely fast (no malloc, no slab, no atomics).
+   the returned tensor is invalidated when the arena is reset. ax_tensor_destroy
+   on it is a safe no-op. intended for short-lived backward-pass scratch tensors.
+   never store the returned pointer in grad_fn->saved[] — it becomes stale after
+   ax_arena_reset. on arena exhaustion, falls back to ax_tensor_zeros. */
+struct ax_arena;
+ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape, int ndim, ax_dtype_t dtype);
 
 /* create and fill with ones */
 ax_tensor_t *ax_tensor_ones(const int64_t *shape, int ndim, ax_dtype_t dtype);
@@ -120,6 +130,22 @@ static inline ax_tensor_t *ax_ensure_contiguous(ax_tensor_t *t) {
     if (ax_tensor_is_contiguous(t) && t->offset == 0) return t;
     return ax_tensor_contiguous(t);
 }
+
+/* device management */
+
+/* set/get the default device for all new tensor allocations.
+   ax_set_default_device(AX_DEVICE_CUDA) combined with
+   ax_compute_set_backend(AX_BACKEND_CUDA) routes all tensor creation
+   and compute to the GPU with no changes to training code. */
+void ax_set_default_device(ax_device_t dev);
+ax_device_t ax_get_default_device(void);
+
+/* move a tensor to the CUDA device (nop + retain if already on GPU).
+   requires AX_HAVE_CUDA; returns NULL and sets error otherwise. */
+ax_tensor_t *ax_tensor_to_cuda(ax_tensor_t *t);
+
+/* move a tensor to CPU (nop + retain if already on CPU). */
+ax_tensor_t *ax_tensor_to_cpu(ax_tensor_t *t);
 
 /* printing */
 

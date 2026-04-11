@@ -213,7 +213,8 @@ int main(void)
     ax_optimizer_t *opt = ax_adam_create(params, n_params,
                                          1e-3f, 0.9f, 0.999f, 1e-8f, 0.0f);
 
-    const int epochs = 10;
+    const char *epochs_env = getenv("EPOCHS");
+    const int epochs = epochs_env ? atoi(epochs_env) : 10;
     ax_lr_scheduler_t *sched = ax_sched_cosine(opt, epochs, 1e-5f);
 
     /* dataloader: we need 4D images but 2D labels.

@@ -58,36 +58,48 @@ void *ax_arena_alloc(ax_arena_t *arena, size_t size, size_t alignment) {
     if (alignment == 0) alignment = 1;
     if (!is_power_of_two(alignment)) return NULL;
 
-    /* compute the aligned address relative to the block's data pointer.
-       we need to align the actual address, not just the offset. */
-    uintptr_t base = (uintptr_t)arena->head->data;
-    uintptr_t current = base + arena->head->used;
-    uintptr_t aligned = (current + alignment - 1) & ~(alignment - 1);
-    size_t aligned_offset = (size_t)(aligned - base);
-
-    /* check if there's room in the current block */
-    if (aligned_offset + size <= arena->head->size) {
-        arena->head->used = aligned_offset + size;
-        return (void *)aligned;
+    /* try the current block first; on overflow, walk the chain looking for an
+       existing block with room. only allocate a new block if every block in the
+       chain is exhausted. without this, ax_arena_reset() leaves older blocks
+       unused and each subsequent pass grows the arena unboundedly. */
+    ax_arena_block_t *blk = arena->head;
+    while (blk) {
+        uintptr_t base = (uintptr_t)blk->data;
+        uintptr_t current = base + blk->used;
+        uintptr_t aligned = (current + alignment - 1) & ~(alignment - 1);
+        size_t aligned_offset = (size_t)(aligned - base);
+        if (aligned_offset + size <= blk->size) {
+            blk->used = aligned_offset + size;
+            arena->head = blk; /* remember which block we're using */
+            return (void *)aligned;
+        }
+        blk = blk->next;
     }
 
-    /* need a new block — at least big enough for this allocation + alignment padding */
+    /* every existing block is full — append a fresh block big enough for this
+       request. chain grows in insertion order: first -> ... -> tail. */
     size_t new_size = arena->block_size;
-    if (size > SIZE_MAX - alignment) return NULL; /* overflow check */
+    if (size > SIZE_MAX - alignment) return NULL;
     size_t needed = size + alignment;
     if (needed > new_size) new_size = needed;
 
     ax_arena_block_t *block = arena_block_create(new_size);
     if (!block) return NULL;
 
-    /* prepend new block as the active head */
-    block->next = arena->head;
+    /* append at the end of the chain (walk from first) */
+    if (!arena->first) {
+        arena->first = block;
+    } else {
+        ax_arena_block_t *tail = arena->first;
+        while (tail->next) tail = tail->next;
+        tail->next = block;
+    }
     arena->head = block;
     arena->total_allocated += new_size;
 
     /* allocate from the fresh block with proper alignment */
-    base = (uintptr_t)block->data;
-    aligned = (base + alignment - 1) & ~(alignment - 1);
+    uintptr_t base = (uintptr_t)block->data;
+    uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
     block->used = (size_t)(aligned - base) + size;
     return (void *)aligned;
 }
@@ -95,19 +107,21 @@ void *ax_arena_alloc(ax_arena_t *arena, size_t size, size_t alignment) {
 void ax_arena_reset(ax_arena_t *arena) {
     if (!arena) return;
 
-    /* reset used counter on every block */
-    ax_arena_block_t *block = arena->head;
+    /* reset used counter on every block, then rewind the active head to first.
+       walks the whole chain so the next alloc can start at the oldest block. */
+    ax_arena_block_t *block = arena->first;
     while (block) {
         block->used = 0;
         block = block->next;
     }
+    arena->head = arena->first;
 }
 
 void ax_arena_destroy(ax_arena_t *arena) {
     if (!arena) return;
 
-    /* free all blocks in the chain */
-    ax_arena_block_t *block = arena->head;
+    /* free all blocks in the chain (walk from first — head may point mid-chain) */
+    ax_arena_block_t *block = arena->first;
     while (block) {
         ax_arena_block_t *next = block->next;
         free(block);

@@ -5,12 +5,23 @@
 #include "axiom/memory.h"
 #include "axiom/compute.h"
 #include "axiom/rng.h"
+#include <stdalign.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <time.h>
 #include <limits.h>
 #include <inttypes.h>
+
+#ifdef AX_HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
+/* default device for all new tensor allocations (thread-local) */
+static _Thread_local ax_device_t tl_default_device = AX_DEVICE_CPU;
+
+void ax_set_default_device(ax_device_t dev) { tl_default_device = dev; }
+ax_device_t ax_get_default_device(void)     { return tl_default_device; }
 
 void ax_set_seed(unsigned int seed)
 {
@@ -19,19 +30,166 @@ void ax_set_seed(unsigned int seed)
 
 /* storage */
 
+/* thread-local slab allocator for ax_tensor_t and ax_storage_t structs.
+   these fixed-size metadata structs are allocated/freed hundreds of times per
+   training step — a free-list eliminates all per-struct malloc traffic. */
+
+static _Thread_local ax_tensor_t *tensor_freelist = NULL;
+static _Thread_local ax_storage_t *storage_freelist = NULL;
+
+static ax_tensor_t *slab_tensor_alloc(void) {
+    ax_tensor_t *t = tensor_freelist;
+    if (t) {
+        tensor_freelist = *(ax_tensor_t **)t; /* next pointer lives in first slot */
+        memset(t, 0, sizeof(ax_tensor_t));
+        return t;
+    }
+    return (ax_tensor_t *)calloc(1, sizeof(ax_tensor_t));
+}
+
+static void slab_tensor_free(ax_tensor_t *t) {
+    if (!t) return;
+    *(ax_tensor_t **)t = tensor_freelist;
+    tensor_freelist = t;
+}
+
+static ax_storage_t *slab_storage_alloc(void) {
+    ax_storage_t *s = storage_freelist;
+    if (s) {
+        storage_freelist = *(ax_storage_t **)s;
+        return s;
+    }
+    return (ax_storage_t *)malloc(sizeof(ax_storage_t));
+}
+
+static void slab_storage_free(ax_storage_t *s) {
+    if (!s) return;
+    *(ax_storage_t **)s = storage_freelist;
+    storage_freelist = s;
+}
+
+
+/* thread-local storage DATA pool — eliminates malloc/free for buffer bytes.
+   buckets are indexed by ceil(log2(size_bytes)), from 6 (64 B) to 28 (256 MB).
+   each bucket is a singly-linked free list capped at AX_POOL_BUCKET_CAP entries.
+   storages keep their original capacity in size_bytes; pool reuses if capacity
+   meets the request. _Thread_local means zero locking on the fast path. */
+
+#ifndef AX_NO_STORAGE_POOL
+#define AX_POOL_MIN_BITS    6        /* 64 B  */
+#define AX_POOL_MAX_BITS    28       /* 256 MB */
+#define AX_POOL_NUM_BUCKETS (AX_POOL_MAX_BITS - AX_POOL_MIN_BITS + 1)
+#define AX_POOL_BUCKET_CAP  64       /* raised from 16 per agent report point 9 */
+
+typedef struct pool_node {
+    ax_storage_t *storage;
+    struct pool_node *next;
+} pool_node_t;
+
+/* per-thread bucket state */
+static _Thread_local pool_node_t *pool_buckets[AX_POOL_NUM_BUCKETS] = {0};
+static _Thread_local int pool_bucket_count[AX_POOL_NUM_BUCKETS] = {0};
+/* free-list of empty pool_node_t structs to avoid mallocing those too */
+static _Thread_local pool_node_t *node_freelist = NULL;
+
+/* ceil(log2(x)) for x >= 1; returns AX_POOL_MIN_BITS for tiny x */
+static inline int pool_bucket_for(size_t bytes) {
+    if (bytes <= (1u << AX_POOL_MIN_BITS)) return 0;
+    int b = 0;
+    size_t v = bytes - 1;
+    while (v) { v >>= 1; b++; }
+    /* b is now ceil(log2(bytes)); subtract MIN to get bucket index */
+    if (b < AX_POOL_MIN_BITS) b = AX_POOL_MIN_BITS;
+    int idx = b - AX_POOL_MIN_BITS;
+    if (idx >= AX_POOL_NUM_BUCKETS) return -1; /* too large for pool */
+    return idx;
+}
+
+/* try to pop a storage from the pool that has at least `bytes` capacity.
+   returns NULL on miss. */
+static ax_storage_t *pool_get(size_t bytes) {
+    int idx = pool_bucket_for(bytes);
+    if (idx < 0) return NULL;
+    pool_node_t *n = pool_buckets[idx];
+    if (!n) return NULL;
+    /* the bucket holds storages whose capacity is >= 2^(MIN+idx-1)+1 and <= 2^(MIN+idx).
+       so head storage's capacity is at least 2^(MIN+idx-1)+1 which may be < bytes.
+       guard: only return if capacity >= bytes. */
+    if (n->storage->size_bytes < bytes) return NULL;
+    pool_buckets[idx] = n->next;
+    pool_bucket_count[idx]--;
+    ax_storage_t *s = n->storage;
+    /* recycle the node */
+    n->next = node_freelist;
+    node_freelist = n;
+    return s;
+}
+
+/* return a storage to the pool. returns true if pooled, false if caller should free. */
+static bool pool_put(ax_storage_t *s) {
+    int idx = pool_bucket_for(s->size_bytes);
+    if (idx < 0) return false;
+    if (pool_bucket_count[idx] >= AX_POOL_BUCKET_CAP) return false;
+
+    pool_node_t *n = node_freelist;
+    if (n) {
+        node_freelist = n->next;
+    } else {
+        n = (pool_node_t *)malloc(sizeof(pool_node_t));
+        if (!n) return false;
+    }
+    n->storage = s;
+    n->next = pool_buckets[idx];
+    pool_buckets[idx] = n;
+    pool_bucket_count[idx]++;
+    return true;
+}
+#endif /* !AX_NO_STORAGE_POOL */
+
 ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device) {
-    ax_storage_t *s = (ax_storage_t *)malloc(sizeof(ax_storage_t));
+#ifdef AX_HAVE_CUDA
+    if (device == AX_DEVICE_CUDA) {
+        /* CUDA storage: bypass CPU pool entirely — data lives on GPU */
+        ax_storage_t *s = slab_storage_alloc();
+        if (!s) return NULL;
+        if (cudaMalloc(&s->data, size_bytes) != cudaSuccess) {
+            slab_storage_free(s);
+            return NULL;
+        }
+        /* zero the GPU buffer (cudaMalloc doesn't guarantee zero) */
+        cudaMemset(s->data, 0, size_bytes);
+        s->size_bytes = size_bytes;
+        atomic_init(&s->refcount, 1);
+        s->device = AX_DEVICE_CUDA;
+        s->is_arena_temp = false;
+        return s;
+    }
+#endif
+
+#ifndef AX_NO_STORAGE_POOL
+    /* try the pool first — returns a storage with pre-allocated data buffer */
+    ax_storage_t *pooled = pool_get(size_bytes);
+    if (pooled) {
+        atomic_init(&pooled->refcount, 1);
+        pooled->device = device;
+        pooled->is_arena_temp = false;
+        return pooled;
+    }
+#endif
+    /* slab-allocate the struct; only the data buffer hits aligned_alloc */
+    ax_storage_t *s = slab_storage_alloc();
     if (!s) return NULL;
 
     s->data = ax_aligned_alloc(size_bytes, AX_DEFAULT_ALIGNMENT);
     if (!s->data) {
-        free(s);
+        slab_storage_free(s);
         return NULL;
     }
 
     s->size_bytes = size_bytes;
     atomic_init(&s->refcount, 1);
     s->device = device;
+    s->is_arena_temp = false;
     return s;
 }
 
@@ -41,11 +199,24 @@ void ax_storage_retain(ax_storage_t *s) {
 
 void ax_storage_release(ax_storage_t *s) {
     if (!s) return;
+    /* arena-allocated storages are owned by the arena — never free or pool them. */
+    if (s->is_arena_temp) return;
     int prev = atomic_fetch_sub(&s->refcount, 1);
     if (prev <= 1) {
-        /* was 1 (or already corrupted), now 0 — free */
+#ifndef AX_NO_STORAGE_POOL
+        /* try to return to pool; on success, struct AND data stay alive */
+        if (pool_put(s)) return;
+#endif
+        /* pool miss: free the data buffer, return the struct to slab */
+#ifdef AX_HAVE_CUDA
+        if (s->device == AX_DEVICE_CUDA) {
+            cudaFree(s->data);
+            slab_storage_free(s);
+            return;
+        }
+#endif
         ax_aligned_free(s->data);
-        free(s);
+        slab_storage_free(s);
     }
 }
 
@@ -112,21 +283,18 @@ static ax_tensor_t *tensor_alloc_meta(const int64_t *shape, int ndim, ax_dtype_t
         }
     }
 
-    ax_tensor_t *t = (ax_tensor_t *)calloc(1, sizeof(ax_tensor_t));
+    /* slab-allocated; already zeroed by slab_tensor_alloc */
+    ax_tensor_t *t = slab_tensor_alloc();
     if (!t) return NULL;
 
     t->ndim = ndim;
     t->dtype = dtype;
-    t->offset = 0;
-    t->requires_grad = false;
-    t->grad = NULL;
-    t->grad_fn = NULL;
 
     for (int i = 0; i < ndim; i++) {
         t->shape[i] = shape[i];
     }
     if (!compute_strides(shape, ndim, t->strides)) {
-        free(t);
+        slab_tensor_free(t);
         return NULL;
     }
 
@@ -140,22 +308,21 @@ ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype) 
     if (!t) return NULL;
 
     int64_t n = compute_numel(shape, ndim);
-    if (n < 0) { free(t); return NULL; } /* overflow in numel */
+    if (n < 0) { slab_tensor_free(t); return NULL; } /* overflow in numel */
 
     size_t elem_size = ax_dtype_size(dtype);
-    /* check for size_t overflow: n * elem_size */
     if (elem_size > 0 && (size_t)n > SIZE_MAX / elem_size) {
         ax_err_set(AX_ERR_INVALID_SHAPE,
                    "allocation size overflow: %" PRId64 " elements * %zu bytes", n, elem_size);
-        free(t);
+        slab_tensor_free(t);
         return NULL;
     }
     size_t bytes = (size_t)n * elem_size;
-    if (bytes == 0) bytes = elem_size; /* scalar: at least one element */
+    if (bytes == 0) bytes = elem_size;
 
     t->storage = ax_storage_create(bytes, AX_DEVICE_CPU);
     if (!t->storage) {
-        free(t);
+        slab_tensor_free(t);
         return NULL;
     }
     return t;
@@ -235,10 +402,59 @@ ax_tensor_t *ax_tensor_scalar(float value) {
     return t;
 }
 
+/* arena-allocated zero tensor — metadata struct, storage struct, and data buffer
+   are all bumped from the supplied arena. release/destroy are no-ops; the caller
+   resets the arena to free in bulk. on arena exhaustion, falls back to the heap
+   path so call sites don't need NULL handling. intended for short-lived backward
+   scratch tensors that never escape ax_backward(). */
+ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape, int ndim, ax_dtype_t dtype) {
+    if (!arena) return ax_tensor_zeros(shape, ndim, dtype);
+    if (ndim < 0 || ndim > AX_MAX_DIMS) return NULL;
+    if ((int)dtype < 0 || dtype >= AX_DTYPE_COUNT) return NULL;
+
+    int64_t n = 1;
+    for (int i = 0; i < ndim; i++) {
+        if (shape[i] <= 0) return NULL;
+        if (!safe_mul_i64(n, shape[i], &n)) return NULL;
+    }
+    size_t elem_size = ax_dtype_size(dtype);
+    if (elem_size > 0 && (size_t)n > SIZE_MAX / elem_size) return NULL;
+    size_t bytes = (size_t)n * elem_size;
+    if (bytes == 0) bytes = elem_size;
+
+    ax_tensor_t *t = (ax_tensor_t *)ax_arena_alloc(arena, sizeof(ax_tensor_t), alignof(ax_tensor_t));
+    ax_storage_t *s = t ? (ax_storage_t *)ax_arena_alloc(arena, sizeof(ax_storage_t), alignof(ax_storage_t)) : NULL;
+    void *data = s ? ax_arena_alloc(arena, bytes, AX_DEFAULT_ALIGNMENT) : NULL;
+    if (!t || !s || !data) {
+        /* arena exhausted (rare) — fall back to a normal heap zero tensor */
+        return ax_tensor_zeros(shape, ndim, dtype);
+    }
+
+    memset(t, 0, sizeof(*t));
+    t->ndim = ndim;
+    t->dtype = dtype;
+    for (int i = 0; i < ndim; i++) t->shape[i] = shape[i];
+    compute_strides(shape, ndim, t->strides);
+
+    s->data = data;
+    s->size_bytes = bytes;
+    atomic_init(&s->refcount, 1);
+    s->device = AX_DEVICE_CPU;
+    s->is_arena_temp = true;
+    memset(data, 0, bytes);
+
+    t->storage = s;
+    return t;
+}
+
 /* destruction */
 
 void ax_tensor_destroy(ax_tensor_t *t) {
     if (!t) return;
+    /* arena-temp tensors live in a bump arena — caller resets the arena to free
+       them in bulk. skip everything (including slab return, which would corrupt
+       arena memory). */
+    if (t->storage && t->storage->is_arena_temp) return;
     if (t->grad) {
         ax_tensor_destroy(t->grad);
         t->grad = NULL;
@@ -265,11 +481,11 @@ void ax_tensor_destroy(ax_tensor_t *t) {
             gf->ctx_cleanup(gf->ctx);
             gf->ctx = NULL;
         }
-        free(gf);
+        ax_grad_fn_destroy(gf);
         t->grad_fn = NULL;
     }
     ax_storage_release(t->storage);
-    free(t);
+    slab_tensor_free(t);
 }
 
 /* shape queries */

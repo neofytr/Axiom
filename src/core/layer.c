@@ -53,11 +53,20 @@ static ax_tensor_t *dense_forward(ax_layer_t *self, ax_tensor_t *input)
     if (d->use_bias && d->bias)
     {
         ax_tensor_t *biased = ax_add(out, d->bias);
-        /* in inference mode we can free the matmul intermediate.
+        if (!biased)
+        {
+            /* ax_add failed: clean up the matmul intermediate and bail.
+               in training mode, out may be in a partial graph — still safe
+               to destroy here because ax_add failed before recording it. */
+            if (!ax_grad_enabled() && !out->grad_fn)
+                ax_tensor_destroy(out);
+            return NULL;
+        }
+        /* in inference mode we can free the matmul intermediate now.
            in training mode, backward needs it, so leave it. */
         if (!ax_grad_enabled() && !out->grad_fn)
             ax_tensor_destroy(out);
-        if (biased) return biased;
+        return biased;
     }
     return out;
 }

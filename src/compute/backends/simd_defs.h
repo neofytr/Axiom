@@ -135,6 +135,26 @@ static inline float ax_vf32_hsum(ax_vf32 v) {
     return _mm_cvtss_f32(sum);
 }
 
+/* horizontal max of 8 floats */
+static inline float ax_vf32_hmax(ax_vf32 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 m = _mm_max_ps(lo, hi);
+    m = _mm_max_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_max_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
+
+/* horizontal min of 8 floats */
+static inline float ax_vf32_hmin(ax_vf32 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 m = _mm_min_ps(lo, hi);
+    m = _mm_min_ps(m, _mm_movehl_ps(m, m));
+    m = _mm_min_ss(m, _mm_shuffle_ps(m, m, 1));
+    return _mm_cvtss_f32(m);
+}
+
 
 #elif defined(AX_SIMD_NEON)
 
@@ -199,6 +219,16 @@ static inline float ax_vf32_hsum(ax_vf32 v) {
     s = vpadd_f32(s, s);
     return vget_lane_f32(s, 0);
 }
+static inline float ax_vf32_hmax(ax_vf32 v) {
+    float32x2_t s = vpmax_f32(vget_low_f32(v), vget_high_f32(v));
+    s = vpmax_f32(s, s);
+    return vget_lane_f32(s, 0);
+}
+static inline float ax_vf32_hmin(ax_vf32 v) {
+    float32x2_t s = vpmin_f32(vget_low_f32(v), vget_high_f32(v));
+    s = vpmin_f32(s, s);
+    return vget_lane_f32(s, 0);
+}
 
 
 #else
@@ -235,6 +265,8 @@ static inline ax_vf32 ax_vf32_sigmoid(ax_vf32 a)       { return 1.0f / (1.0f + e
 static inline ax_vf32 ax_vf32_cmpgt(ax_vf32 a, ax_vf32 b) { return a > b ? 1.0f : 0.0f; }
 static inline ax_vf32 ax_vf32_cmpeq(ax_vf32 a, ax_vf32 b) { return a == b ? 1.0f : 0.0f; }
 static inline float   ax_vf32_hsum(ax_vf32 v)          { return v; }
+static inline float   ax_vf32_hmax(ax_vf32 v)          { return v; }
+static inline float   ax_vf32_hmin(ax_vf32 v)          { return v; }
 
 #endif
 

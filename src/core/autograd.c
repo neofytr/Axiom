@@ -22,7 +22,7 @@ static _Thread_local ax_arena_t *backward_arena = NULL;
 ax_arena_t *ax_backward_arena(void)
 {
     if (!backward_arena)
-        backward_arena = ax_arena_create(0); /* default 1 MB */
+        backward_arena = ax_arena_create(16 * 1024 * 1024); /* 16 MB — deep_mlp backward temps can exceed 1 MB per tensor */
     return backward_arena;
 }
 
@@ -30,12 +30,39 @@ void ax_no_grad(void)    { grad_tracking = false; }
 void ax_enable_grad(void){ grad_tracking = true; }
 bool ax_grad_enabled(void){ return grad_tracking; }
 
+/* thread-local slab allocator for ax_grad_fn_t — eliminates per-op calloc.
+   freed grad_fns are pushed onto a free-list; new allocations pop from it. */
+static _Thread_local ax_grad_fn_t *grad_fn_freelist = NULL;
+
+static ax_grad_fn_t *slab_grad_fn_alloc(void)
+{
+    ax_grad_fn_t *gf = grad_fn_freelist;
+    if (gf) {
+        grad_fn_freelist = *(ax_grad_fn_t **)gf; /* next pointer in first slot */
+        memset(gf, 0, sizeof(ax_grad_fn_t));
+        return gf;
+    }
+    return (ax_grad_fn_t *)calloc(1, sizeof(ax_grad_fn_t));
+}
+
+static void slab_grad_fn_free(ax_grad_fn_t *gf)
+{
+    if (!gf) return;
+    *(ax_grad_fn_t **)gf = grad_fn_freelist;
+    grad_fn_freelist = gf;
+}
+
 ax_grad_fn_t *ax_grad_fn_create(ax_backward_fn_t fn)
 {
-    ax_grad_fn_t *gf = calloc(1, sizeof(ax_grad_fn_t));
+    ax_grad_fn_t *gf = slab_grad_fn_alloc();
     if (!gf) return NULL;
     gf->backward = fn;
     return gf;
+}
+
+void ax_grad_fn_destroy(ax_grad_fn_t *gf)
+{
+    slab_grad_fn_free(gf);
 }
 
 void ax_zero_grad(ax_tensor_t *t)
@@ -70,6 +97,14 @@ static bool ps_init(ptr_set_t *s, int cap)
     s->capacity = cap;
     s->count = 0;
     return true;
+}
+
+/* fast reset: zero buckets in place, preserve capacity */
+static void ps_reset(ptr_set_t *s)
+{
+    if (s->buckets && s->capacity > 0)
+        memset(s->buckets, 0, (size_t)s->capacity * sizeof(uintptr_t));
+    s->count = 0;
 }
 
 static void ps_free(ptr_set_t *s)
@@ -163,6 +198,9 @@ static bool tl_init(topo_list_t *l)
     return true;
 }
 
+/* fast reset: preserve capacity, just clear count */
+static void tl_reset(topo_list_t *l) { l->count = 0; }
+
 static void tl_free(topo_list_t *l)
 {
     free(l->nodes);
@@ -192,21 +230,41 @@ typedef struct {
     int child_idx;
 } dfs_frame_t;
 
+/* thread-local persistent state for backward/cleanup — reused across calls.
+   reset between uses instead of free+calloc. eliminates ~3 x (32KB + 32KB + 32KB)
+   of metadata malloc traffic per training step. */
+static _Thread_local ptr_set_t tl_visited = {0};
+static _Thread_local topo_list_t tl_order = {0};
+static _Thread_local dfs_frame_t *tl_dfs_stack = NULL;
+static _Thread_local int tl_dfs_stack_cap = 0;
+
+static bool ensure_autograd_state(void)
+{
+    if (!tl_visited.buckets) {
+        if (!ps_init(&tl_visited, TOPO_INIT_CAP)) return false;
+    }
+    if (!tl_order.nodes) {
+        if (!tl_init(&tl_order)) return false;
+    }
+    if (!tl_dfs_stack) {
+        tl_dfs_stack_cap = TOPO_INIT_CAP;
+        tl_dfs_stack = (dfs_frame_t *)malloc((size_t)tl_dfs_stack_cap * sizeof(dfs_frame_t));
+        if (!tl_dfs_stack) { tl_dfs_stack_cap = 0; return false; }
+    }
+    return true;
+}
+
 static void topo_sort_dfs(ax_tensor_t *t, ptr_set_t *visited, topo_list_t *order)
 {
     if (!t) return;
 
-    int stack_cap = TOPO_INIT_CAP;
-    dfs_frame_t *stack = (dfs_frame_t *)malloc((size_t)stack_cap * sizeof(dfs_frame_t));
-    if (!stack) return;
     int stack_top = 0;
-
-    stack[stack_top++] = (dfs_frame_t){ .node = t, .child_idx = 0 };
+    tl_dfs_stack[stack_top++] = (dfs_frame_t){ .node = t, .child_idx = 0 };
 
     while (stack_top > 0)
     {
-        ax_tensor_t *node = stack[stack_top - 1].node;
-        int cidx = stack[stack_top - 1].child_idx;
+        ax_tensor_t *node = tl_dfs_stack[stack_top - 1].node;
+        int cidx = tl_dfs_stack[stack_top - 1].child_idx;
 
         if (cidx == 0)
         {
@@ -218,25 +276,25 @@ static void topo_sort_dfs(ax_tensor_t *t, ptr_set_t *visited, topo_list_t *order
 
         if (cidx < n_children)
         {
-            stack[stack_top - 1].child_idx++;
+            tl_dfs_stack[stack_top - 1].child_idx++;
             ax_tensor_t *child = gf->inputs[cidx];
 
             if (child && !ps_contains(visited, child))
             {
-                if (stack_top >= stack_cap)
+                if (stack_top >= tl_dfs_stack_cap)
                 {
-                    int new_cap = stack_cap * 2;
-                    dfs_frame_t *ns = (dfs_frame_t *)realloc(stack,
+                    int new_cap = tl_dfs_stack_cap * 2;
+                    dfs_frame_t *ns = (dfs_frame_t *)realloc(tl_dfs_stack,
                                           (size_t)new_cap * sizeof(dfs_frame_t));
                     if (!ns)
                     {
                         ax_err_set(AX_ERR_ALLOC, "topo_sort_dfs: stack growth failed");
                         break;
                     }
-                    stack = ns;
-                    stack_cap = new_cap;
+                    tl_dfs_stack = ns;
+                    tl_dfs_stack_cap = new_cap;
                 }
-                stack[stack_top++] = (dfs_frame_t){ .node = child, .child_idx = 0 };
+                tl_dfs_stack[stack_top++] = (dfs_frame_t){ .node = child, .child_idx = 0 };
             }
         }
         else
@@ -245,8 +303,6 @@ static void topo_sort_dfs(ax_tensor_t *t, ptr_set_t *visited, topo_list_t *order
             stack_top--;
         }
     }
-
-    free(stack);
 }
 
 ax_status_t ax_backward(ax_tensor_t *loss)
@@ -280,27 +336,21 @@ ax_status_t ax_backward(ax_tensor_t *loss)
         ax_compute_fill(loss->grad, 1.0);
     }
 
-    /* build topological order */
-    ptr_set_t visited;
-    topo_list_t order;
-    if (!ps_init(&visited, TOPO_INIT_CAP))
+    /* use persistent thread-local state — no per-call calloc */
+    if (!ensure_autograd_state())
     {
-        ax_err_set(AX_ERR_ALLOC, "ax_backward: visited alloc failed");
+        ax_err_set(AX_ERR_ALLOC, "ax_backward: state alloc failed");
         return AX_ERR_ALLOC;
     }
-    if (!tl_init(&order))
-    {
-        ps_free(&visited);
-        ax_err_set(AX_ERR_ALLOC, "ax_backward: order alloc failed");
-        return AX_ERR_ALLOC;
-    }
+    ps_reset(&tl_visited);
+    tl_reset(&tl_order);
 
-    topo_sort_dfs(loss, &visited, &order);
+    topo_sort_dfs(loss, &tl_visited, &tl_order);
 
     /* walk in reverse (from loss toward leaves) and call backward fns */
-    for (int i = order.count - 1; i >= 0; i--)
+    for (int i = tl_order.count - 1; i >= 0; i--)
     {
-        ax_tensor_t *node = order.nodes[i];
+        ax_tensor_t *node = tl_order.nodes[i];
         ax_grad_fn_t *gf = (ax_grad_fn_t *)node->grad_fn;
 
         if (!gf || !gf->backward) continue;
@@ -308,9 +358,6 @@ ax_status_t ax_backward(ax_tensor_t *loss)
 
         gf->backward(gf, node->grad);
     }
-
-    ps_free(&visited);
-    tl_free(&order);
 
     /* reset backward arena — frees all scratch from this pass in bulk */
     if (backward_arena)
@@ -323,21 +370,20 @@ void ax_graph_cleanup(ax_tensor_t *root)
 {
     if (!root) return;
 
-    ptr_set_t visited;
-    topo_list_t order;
-    if (!ps_init(&visited, TOPO_INIT_CAP)) return;
-    if (!tl_init(&order)) { ps_free(&visited); return; }
+    if (!ensure_autograd_state()) return;
+    ps_reset(&tl_visited);
+    tl_reset(&tl_order);
 
-    topo_sort_dfs(root, &visited, &order);
+    topo_sort_dfs(root, &tl_visited, &tl_order);
 
     /* for every non-leaf node: run ctx_cleanup (if backward never ran),
        free saved_owned tensors (most backward fns leave these alive),
        free the grad_fn struct, then destroy the intermediate tensor.
        leaf nodes (no grad_fn) are parameters — leave them alone.
        the root is skipped here and handled below (caller destroys it). */
-    for (int i = 0; i < order.count; i++)
+    for (int i = 0; i < tl_order.count; i++)
     {
-        ax_tensor_t *node = order.nodes[i];
+        ax_tensor_t *node = tl_order.nodes[i];
         if (node == root || !node->grad_fn) continue;
 
         ax_grad_fn_t *gf = (ax_grad_fn_t *)node->grad_fn;
@@ -354,7 +400,7 @@ void ax_graph_cleanup(ax_tensor_t *root)
                 gf->saved[j] = NULL;
             }
         }
-        free(gf);
+        slab_grad_fn_free(gf);
         node->grad_fn = NULL;
         ax_tensor_destroy(node);
     }
@@ -376,12 +422,10 @@ void ax_graph_cleanup(ax_tensor_t *root)
                 gf->saved[i] = NULL;
             }
         }
-        free(gf);
+        slab_grad_fn_free(gf);
         root->grad_fn = NULL;
     }
-
-    ps_free(&visited);
-    tl_free(&order);
+    /* persistent state is reused across calls — no free here */
 }
 
 /* gradient checking utility: compare analytical vs numerical gradient.

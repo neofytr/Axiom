@@ -23,6 +23,7 @@
 #include "conv.h"
 #include "norm.h"
 #include "lr_scheduler.h"
+#include "cuda.h"
 
 /* initialize axiom — must be called before any other axiom functions.
    sets up compute backends, memory systems, etc. */

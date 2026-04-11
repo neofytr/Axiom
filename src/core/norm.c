@@ -70,7 +70,8 @@ static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
 
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    /* dynamic-1 for hybrid P/E core load balancing: fast cores steal from slow ones */
+    #pragma omp parallel for schedule(dynamic, 1)
     #endif
     for (int64_t c = 0; c < feat; c++) {
         /* pass 1: SIMD reduction for sum_go, sum_go_xh (also accumulates dgamma, dbeta) */
@@ -191,7 +192,8 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
         #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
+        /* dynamic-1 for hybrid P/E core load balancing: fast cores steal from slow ones */
+        #pragma omp parallel for schedule(dynamic, 1)
         #endif
         for (int64_t c = 0; c < feat; c++)
         {
@@ -282,7 +284,8 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
            precompute scale = gamma * inv_std, bias_out = beta - gamma * mean * inv_std
            then out[idx] = scale * input[idx] + bias_out (single FMA per element) */
         #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
+        /* dynamic-1 for hybrid P/E core load balancing: fast cores steal from slow ones */
+        #pragma omp parallel for schedule(dynamic, 1)
         #endif
         for (int64_t c = 0; c < feat; c++)
         {
@@ -502,9 +505,10 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
     float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
     float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
-    /* layernorm normalizes per-sample, so each sample is independent */
+    /* layernorm normalizes per-sample, so each sample is independent.
+       dynamic-1 for hybrid P/E core load balancing */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(dynamic, 1)
     #endif
     for (int64_t b = 0; b < batch; b++)
     {
@@ -616,9 +620,31 @@ static void dropout_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *ig = (float *)input->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
     float *md = (float *)mask->storage->data;
+    int64_t igoff = (int64_t)input->grad->offset;
+    int64_t gooff = (int64_t)grad_out->offset;
 
+    /* fast path: all contiguous, offset 0 — SIMD fused multiply-add accumulate */
+    if (igoff == 0 && gooff == 0
+        && ax_tensor_is_contiguous(input->grad)
+        && ax_tensor_is_contiguous(grad_out))
+    {
+        int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(n > 65536)
+        #endif
+        for (int64_t j = 0; j < ve; j += AX_VF32_WIDTH) {
+            ax_vf32 g = ax_vf32_load(go + j);
+            ax_vf32 m = ax_vf32_load(md + j);
+            ax_vf32_store(ig + j, ax_vf32_fmadd(g, m, ax_vf32_load(ig + j)));
+        }
+        for (i = ve; i < n; i++)
+            ig[i] += go[i] * md[i];
+        return;
+    }
+
+    /* fallback */
     for (int64_t i = 0; i < n; i++)
-        ig[input->grad->offset + i] += go[grad_out->offset + i] * md[i];
+        ig[igoff + i] += go[gooff + i] * md[i];
 }
 
 static ax_tensor_t *dropout_forward(ax_layer_t *self, ax_tensor_t *input)
@@ -710,17 +736,35 @@ float ax_clip_grad_norm(ax_tensor_t **params, int n_params, float max_norm)
 {
     if (!params || max_norm <= 0) return 0.0f;
 
+    /* sum-of-squares — parallelize across params with reduction.
+       per-param SIMD reduction with 4 independent accumulators. */
     double total_norm_sq = 0.0;
+    #ifdef _OPENMP
+    #pragma omp parallel for reduction(+:total_norm_sq) schedule(dynamic, 1)
+    #endif
     for (int i = 0; i < n_params; i++)
     {
         if (!params[i] || !params[i]->grad) continue;
         int64_t n = ax_tensor_numel(params[i]->grad);
-        float *gd = (float *)params[i]->grad->storage->data;
-        for (int64_t j = 0; j < n; j++)
-        {
-            float g = gd[params[i]->grad->offset + j];
-            total_norm_sq += (double)g * (double)g;
+        float *gd = (float *)params[i]->grad->storage->data + params[i]->grad->offset;
+
+        ax_vf32 a0 = ax_vf32_zero(), a1 = ax_vf32_zero();
+        ax_vf32 a2 = ax_vf32_zero(), a3 = ax_vf32_zero();
+        int64_t j = 0, ve = n - (n % (AX_VF32_WIDTH * 4));
+        for (; j < ve; j += AX_VF32_WIDTH * 4) {
+            ax_vf32 v0 = ax_vf32_load(gd + j);
+            ax_vf32 v1 = ax_vf32_load(gd + j + AX_VF32_WIDTH);
+            ax_vf32 v2 = ax_vf32_load(gd + j + AX_VF32_WIDTH * 2);
+            ax_vf32 v3 = ax_vf32_load(gd + j + AX_VF32_WIDTH * 3);
+            a0 = ax_vf32_fmadd(v0, v0, a0);
+            a1 = ax_vf32_fmadd(v1, v1, a1);
+            a2 = ax_vf32_fmadd(v2, v2, a2);
+            a3 = ax_vf32_fmadd(v3, v3, a3);
         }
+        a0 = ax_vf32_add(ax_vf32_add(a0, a1), ax_vf32_add(a2, a3));
+        double s = (double)ax_vf32_hsum(a0);
+        for (; j < n; j++) s += (double)gd[j] * (double)gd[j];
+        total_norm_sq += s;
     }
 
     float total_norm = (float)sqrt(total_norm_sq);
@@ -728,13 +772,19 @@ float ax_clip_grad_norm(ax_tensor_t **params, int n_params, float max_norm)
     if (total_norm > max_norm)
     {
         float scale = max_norm / total_norm;
+        ax_vf32 v_scale = ax_vf32_set1(scale);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(dynamic, 1)
+        #endif
         for (int i = 0; i < n_params; i++)
         {
             if (!params[i] || !params[i]->grad) continue;
             int64_t n = ax_tensor_numel(params[i]->grad);
-            float *gd = (float *)params[i]->grad->storage->data;
-            for (int64_t j = 0; j < n; j++)
-                gd[params[i]->grad->offset + j] *= scale;
+            float *gd = (float *)params[i]->grad->storage->data + params[i]->grad->offset;
+            int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+            for (; j < ve; j += AX_VF32_WIDTH)
+                ax_vf32_store(gd + j, ax_vf32_mul(ax_vf32_load(gd + j), v_scale));
+            for (; j < n; j++) gd[j] *= scale;
         }
     }
     return total_norm;
