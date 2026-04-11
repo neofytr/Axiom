@@ -664,6 +664,185 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 }
 
 
+/* implicit im2col conv gemm.
+
+   computes out[C_out, M] = weight[C_out, K] @ im2col(input)[K, M]
+   for a single sample [C_in, H, W], without ever materializing the im2col
+   matrix. reuses pack_a and the micro_kernel; only pack_b is replaced by
+   pack_b_im2col, which gathers directly from the input image.
+
+   index mapping for a packed b element at (row r in [0..kc), col jj in [0..NR)):
+     global k = pc + r, global m = jc + jr + jj
+     ci = k / (kh*kw); rem = k % (kh*kw); ky = rem / kw; kx = rem % kw
+     oh = m / out_w; ow = m % out_w
+     ih = oh*sh - ph + ky; iw = ow*sw - pw + kx
+     value = input[ci, ih, iw] if in-bounds else 0 */
+
+/* pack a KC x NC panel of im2col(input) into NR-col strips. identical layout
+   to pack_b() so the micro_kernel is untouched. */
+static void pack_b_im2col(const ax_conv_params_t *p,
+                           int64_t kc, int64_t nc_pack, int64_t nc,
+                           int64_t jc, int64_t pc,
+                           float *packed)
+{
+    const float *input = p->input;
+    const int64_t C_in = p->C_in;
+    const int64_t H = p->H, W = p->W;
+    const int kh = p->kh, kw = p->kw;
+    const int sh = p->sh, sw = p->sw;
+    const int ph = p->ph, pw = p->pw;
+    const int64_t out_w = p->out_w;
+    const int64_t khkw = (int64_t)kh * (int64_t)kw;
+    const int64_t HW = H * W;
+
+    for (int64_t j = 0; j < nc_pack; j += GEMM_NR) {
+        int64_t nr = (j + GEMM_NR <= nc) ? GEMM_NR : (nc > j ? nc - j : 0);
+        for (int64_t r = 0; r < kc; r++) {
+            /* translate global k = pc + r → (ci, ky, kx) */
+            int64_t gk = pc + r;
+            int64_t ci = gk / khkw;
+            int64_t rem = gk - ci * khkw;
+            int ky = (int)(rem / kw);
+            int kx = (int)(rem - (int64_t)ky * kw);
+
+            for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                float val = 0.0f;
+                if (jj < nr) {
+                    /* translate global m = jc + j + jj → (oh, ow) */
+                    int64_t gm = jc + j + jj;
+                    int64_t oh = gm / out_w;
+                    int64_t ow = gm - oh * out_w;
+                    int64_t ih = oh * sh - ph + ky;
+                    int64_t iw = ow * sw - pw + kx;
+                    if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                        val = input[ci * HW + ih * W + iw];
+                    }
+                }
+                packed[jj] = val;
+            }
+            packed += GEMM_NR;
+        }
+    }
+}
+
+static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
+                                  const ax_conv_params_t *params,
+                                  ax_tensor_t *out)
+{
+    if (!weight || !params || !out) {
+        ax_err_set(AX_ERR_NULL_ARG, "conv_gemm: NULL arg");
+        return AX_ERR_NULL_ARG;
+    }
+    if (weight->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32) {
+        ax_err_set(AX_ERR_DTYPE_MISMATCH, "conv_gemm only supports float32");
+        return AX_ERR_DTYPE_MISMATCH;
+    }
+    if (weight->ndim != 2 || out->ndim != 2) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "conv_gemm expects 2d weight and out");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+    int64_t C_out = weight->shape[0];
+    int64_t K = weight->shape[1];
+    int64_t M = params->out_h * params->out_w;
+    int64_t K_expected = params->C_in * params->kh * params->kw;
+    if (K != K_expected || out->shape[0] != C_out || out->shape[1] != M) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "conv_gemm shape mismatch");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+    if (validate_contig_f32(weight) < 0 || validate_contig_f32(out) < 0 || !params->input) {
+        ax_err_set(AX_ERR_BACKEND, "conv_gemm: non-contiguous or null input");
+        return AX_ERR_BACKEND;
+    }
+
+    const float *wd = raw_f32(weight);
+    float *od = raw_f32(out);
+    memset(od, 0, (size_t)(C_out * M) * sizeof(float));
+
+    int64_t m = C_out, n = M, k = K;
+
+    /* small-problem fallback: straight scalar-simd loop with on-the-fly gather.
+       tiled BLIS overhead dominates below ~100k FLOPs just like opt_gemm. */
+    if (m * n * k < 100000) {
+        const int64_t C_in = params->C_in;
+        const int64_t H = params->H, W = params->W;
+        const int kh = params->kh, kw = params->kw;
+        const int sh = params->sh, sw = params->sw;
+        const int ph = params->ph, pw = params->pw;
+        const int64_t out_w = params->out_w;
+        const int64_t khkw = (int64_t)kh * (int64_t)kw;
+        const int64_t HW = H * W;
+        const float *input = params->input;
+
+        for (int64_t i = 0; i < m; i++) {
+            float *oi = od + i * n;
+            const float *wi = wd + i * k;
+            for (int64_t p = 0; p < k; p++) {
+                float w_ip = wi[p];
+                int64_t ci = p / khkw;
+                int64_t rem = p - ci * khkw;
+                int ky = (int)(rem / kw);
+                int kx = (int)(rem - (int64_t)ky * kw);
+                for (int64_t j = 0; j < n; j++) {
+                    int64_t oh = j / out_w;
+                    int64_t ow = j - oh * out_w;
+                    int64_t ih = oh * sh - ph + ky;
+                    int64_t iw = ow * sw - pw + kx;
+                    if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                        oi[j] += w_ip * input[ci * HW + ih * W + iw];
+                }
+            }
+        }
+        return AX_OK;
+    }
+
+    /* ensure this thread has pack buffers. conv_gemm is typically called from
+       inside conv2d_forward's parallel batch loop — each thread already has its
+       own tl_pack_a/b_buf. */
+    if (!ensure_tl_pack_bufs()) {
+        ax_err_set(AX_ERR_ALLOC, "conv_gemm: pack buffer alloc failed");
+        return AX_ERR_ALLOC;
+    }
+
+    /* our pack_b writes custom data into tl_pack_b_buf; invalidate the cache so
+       a subsequent plain opt_gemm call re-packs. */
+    pack_b_cache_invalidate();
+
+    float *pack_a_buf = tl_pack_a_buf;
+    float *pack_b_buf = tl_pack_b_buf;
+
+    for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+        int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+        for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+            int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+
+            /* gather B directly from input image */
+            pack_b_im2col(params, kc, nc_pack, nc, jc, pc, pack_b_buf);
+
+            for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                pack_a(wd + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+
+                for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                    int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                    for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                        int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                        micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                     od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                    }
+                }
+            }
+        }
+    }
+
+    /* leave pack_b cache invalidated (we clobbered it with custom data). */
+    pack_b_cache_invalidate();
+    return AX_OK;
+}
+
+
 /* helper: SIMD row sum for a contiguous float array of length n.
    uses 4 independent accumulators to hide FP add latency. */
 static inline float simd_row_sum(const float *d, int64_t n)
@@ -909,6 +1088,7 @@ const ax_backend_ops_t ax_cpu_opt_ops = {
     .add_scalar = opt_add_scalar,
     .mul_scalar = opt_mul_scalar,
     .gemm       = opt_gemm,
+    .conv_gemm  = opt_conv_gemm,
     .sum        = opt_sum,
     .mean       = opt_mean,
     .max_op     = opt_max,

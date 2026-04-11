@@ -356,13 +356,18 @@ static void test_backend_selection(void) {
     AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CPU_NAIVE,
                        "backend should be cpu_naive after switch");
 
-    /* trying to set unavailable backend should fail */
+    /* CUDA backend: available when compiled with AX_HAVE_CUDA, absent otherwise */
+#ifdef AX_HAVE_CUDA
     ax_status_t s2 = ax_compute_set_backend(AX_BACKEND_CUDA);
-    AX_TEST_ASSERT(s2 != AX_OK, "setting cuda backend should fail (not available)");
-
-    /* should still be naive after failed switch */
+    AX_TEST_ASSERT(s2 == AX_OK, "setting cuda backend should succeed (compiled with CUDA)");
+    AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CUDA,
+                       "backend should be cuda after switch");
+#else
+    ax_status_t s2 = ax_compute_set_backend(AX_BACKEND_CUDA);
+    AX_TEST_ASSERT(s2 != AX_OK, "setting cuda backend should fail (not compiled with CUDA)");
     AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CPU_NAIVE,
                        "backend should still be cpu_naive after failed switch");
+#endif
 
     /* switch back to opt */
     ax_compute_set_backend(AX_BACKEND_CPU_SIMD);

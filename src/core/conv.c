@@ -467,8 +467,10 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *ind = (float *)input_data->storage->data;
     float *grd = (float *)grad_out->storage->data;
 
+    /* num_threads(T) prevents oversubscription of per-thread scratch slots
+       (col_bufs, go_bufs, dw_bufs, etc. — all sized to T). */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
     #endif
     for (int64_t n = 0; n < N; n++)
     {
@@ -572,6 +574,95 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     /* note: scratch buffers are kept on the layer for reuse — no free here */
 }
 
+/* direct 3x3 stride=1 pad=1 conv for a single sample.
+   skips the gemm/im2col detour when the kernel is small enough to stay
+   hot in L1. output shape [C_out, H, W] (pad=1 keeps spatial size).
+   bias is folded into the row init. */
+static void conv2d_direct_3x3_sample(
+    const float *in_n,
+    const float *wd,
+    const float *bias,
+    float *out_n,
+    int64_t C_in, int64_t C_out,
+    int64_t H, int64_t W)
+{
+    const int64_t HW = H * W;
+    const int64_t K9 = C_in * 9;
+
+    for (int64_t co = 0; co < C_out; co++) {
+        float bias_val = bias ? bias[co] : 0.0f;
+        ax_vf32 vb = ax_vf32_set1(bias_val);
+        const float *wco = wd + co * K9;
+        float *out_co = out_n + co * HW;
+
+        for (int64_t y = 0; y < H; y++) {
+            float *out_row = out_co + y * W;
+            int64_t xi = 0, vend_init = W - (W % AX_VF32_WIDTH);
+            for (; xi < vend_init; xi += AX_VF32_WIDTH)
+                ax_vf32_storeu(out_row + xi, vb);
+            for (; xi < W; xi++) out_row[xi] = bias_val;
+
+            for (int64_t ci = 0; ci < C_in; ci++) {
+                const float *win = wco + ci * 9;
+                const float *in_ci = in_n + ci * HW;
+
+                for (int ky = 0; ky < 3; ky++) {
+                    int64_t in_y = y + ky - 1;
+                    if (in_y < 0 || in_y >= H) continue;
+                    const float *in_row = in_ci + in_y * W;
+
+                    for (int kx = 0; kx < 3; kx++) {
+                        float wv = win[ky * 3 + kx];
+                        ax_vf32 vw = ax_vf32_set1(wv);
+                        int64_t shift = (int64_t)kx - 1;
+
+                        int64_t x_lo = (kx == 0) ? 1 : 0;
+                        int64_t x_hi = (kx == 2) ? (W - 1) : W;
+                        int64_t x = x_lo;
+                        int64_t span = x_hi - x_lo;
+                        int64_t xvec_end = x_lo + (span - (span % AX_VF32_WIDTH));
+                        for (; x < xvec_end; x += AX_VF32_WIDTH) {
+                            ax_vf32 vi = ax_vf32_loadu(in_row + x + shift);
+                            ax_vf32 vo = ax_vf32_loadu(out_row + x);
+                            ax_vf32_storeu(out_row + x, ax_vf32_fmadd(vi, vw, vo));
+                        }
+                        for (; x < x_hi; x++)
+                            out_row[x] += in_row[x + shift] * wv;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* shape-aware path selection. measurement note: in practice the BLIS-style
+   tiled gemm with explicit im2col beats this hand-rolled direct conv on
+   typical mnist conv shapes (74s vs 137s at T=1) because the micro-kernel
+   hits ~96 GFLOPS while the direct loop is bandwidth-bound on the bias init
+   and the per-tap fmadd. direct 3x3 is kept here as available infrastructure
+   for workloads where im2col cost truly dominates (very small spatial dims
+   with many channels), but the default predicate disables it. flip
+   `AX_USE_DIRECT_3X3=1` at compile time to opt back in. */
+#ifndef AX_USE_DIRECT_3X3
+#define AX_USE_DIRECT_3X3 0
+#endif
+static inline bool can_direct_3x3(int kh, int kw, int sh, int sw, int ph, int pw, int64_t C_in)
+{
+#if AX_USE_DIRECT_3X3
+    return kh == 3 && kw == 3 && sh == 1 && sw == 1 && ph == 1 && pw == 1 && (C_in * 9) < 512;
+#else
+    (void)kh; (void)kw; (void)sh; (void)sw; (void)ph; (void)pw; (void)C_in;
+    return false;
+#endif
+}
+
+/* implicit gemm: useful when K is large (typically C_in >= 64 with 3x3+ kernels)
+   AND M is large enough that the gemm dominates over the gather overhead. */
+static inline bool prefer_implicit_gemm(int64_t K, int64_t M)
+{
+    return K >= 1024 && M >= 256;
+}
+
 static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_conv2d_t *conv = (ax_conv2d_t *)self;
@@ -636,35 +727,68 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     const float *bias_data = (conv->use_bias && conv->bias)
         ? (const float *)conv->bias->storage->data : NULL;
 
+    /* shape-aware path selection. direct 3x3 wins for small kernels (mnist:
+       both convs hit this). implicit gemm wins for large K + large M.
+       otherwise fall back to explicit im2col + gemm. */
+    bool use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
+    bool use_implicit = !use_direct && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+
+    /* num_threads(T) caps the team to the number of per-thread scratch slots
+       so workers never share col_bufs/res_bufs[0] with the tid>=T fallback. */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
     #endif
     for (int64_t n = 0; n < N; n++)
     {
+        if (use_direct) {
+            /* writes directly into output[n], bias folded in. no scratch needed. */
+            conv2d_direct_3x3_sample(
+                ind + n * C_in * H * W, wd, bias_data,
+                od + n * C_out * M, C_in, C_out, H, W);
+            continue;
+        }
+
         int tid = AX_OMP_THREAD_NUM();
         if (tid >= T) tid = 0; /* defensive */
         ax_tensor_t *col = s->col_bufs[tid];
         ax_tensor_t *res = s->res_bufs[tid];
-        float *cd = (float *)col->storage->data;
         float *rd = (float *)res->storage->data;
 
-        /* im2col directly into per-thread buffer */
-        im2col_into(ind + n * C_in * H * W, C_in, H, W,
-                     kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
+        if (use_implicit) {
+            /* gather im2col patches on-the-fly inside packed b buffers.
+               wins on large convs (C_in >= 64 with 3x3+) where the explicit
+               im2col copy dominates over the gather overhead. */
+            ax_conv_params_t cp = {
+                .input = ind + n * C_in * H * W,
+                .C_in = C_in, .H = H, .W = W,
+                .kh = kh, .kw = kw,
+                .sh = sh, .sw = sw,
+                .ph = ph, .pw = pw,
+                .out_h = out_h, .out_w = out_w,
+            };
+            ax_compute_conv_gemm(w2d, &cp, res);
+        } else {
+            float *cd = (float *)col->storage->data;
+            /* explicit im2col + dispatch gemm. fastest for medium K. */
+            im2col_into(ind + n * C_in * H * W, C_in, H, W,
+                         kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
+            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            ax_compute_gemm(w2d, col, res);
+        }
 
-        /* result = w2d @ col via dispatch GEMM */
-        memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
-        ax_compute_gemm(w2d, col, res);
-
-        /* copy to output with bias — disjoint output region per n */
+        /* copy to output with bias — disjoint output region per n.
+           SIMD broadcast-add of bias along the M=out_h*out_w axis. */
         for (int64_t co = 0; co < C_out; co++)
         {
             float bias_val = bias_data ? bias_data[co] : 0.0f;
-            for (int64_t m = 0; m < M; m++)
-            {
-                od[((n * C_out + co) * out_h + m / out_w) * out_w + m % out_w]
-                    = rd[co * M + m] + bias_val;
-            }
+            float *dst = od + (n * C_out + co) * M;
+            const float *src = rd + co * M;
+            ax_vf32 vb = ax_vf32_set1(bias_val);
+            int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
+            for (; m < ve; m += AX_VF32_WIDTH)
+                ax_vf32_store(dst + m, ax_vf32_add(ax_vf32_load(src + m), vb));
+            for (; m < M; m++)
+                dst[m] = src[m] + bias_val;
         }
     }
 
@@ -1059,26 +1183,51 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
     const float *bias_data = (L->use_bias && L->bias)
         ? (const float *)L->bias->storage->data : NULL;
 
+    /* shape-aware path selection mirrors conv2d_forward. */
+    bool use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
+    bool use_implicit = !use_direct && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+
     /* pass 1: materialize conv output (including bias) into the final output buffer.
        pass 2/3 (bn stats + fused bn+relu apply) overwrite it in place. this saves
        one buffer pass compared to the unfused path which would first write bn
-       output into a separate tensor and then relu into another. */
+       output into a separate tensor and then relu into another.
+       num_threads(T) caps the team to per-thread scratch slot count. */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic, 1)
+    #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
     #endif
     for (int64_t n = 0; n < N; n++) {
+        if (use_direct) {
+            /* direct conv writes [C_out, H, W] for the sample, bias folded in.
+               this gives us the conv result directly in `od` without scratch. */
+            conv2d_direct_3x3_sample(
+                ind + n * C_in * H * W, wd, bias_data,
+                od + n * C_out * M, C_in, C_out, H, W);
+            continue;
+        }
+
         int tid = AX_OMP_THREAD_NUM();
         if (tid >= T) tid = 0;
         ax_tensor_t *col = s->col_bufs[tid];
         ax_tensor_t *res = s->res_bufs[tid];
-        float *cd = (float *)col->storage->data;
         float *rd = (float *)res->storage->data;
 
-        im2col_into(ind + n * C_in * H * W, C_in, H, W,
-                     kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
-
-        memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
-        ax_compute_gemm(w2d, col, res);
+        if (use_implicit) {
+            ax_conv_params_t cp = {
+                .input = ind + n * C_in * H * W,
+                .C_in = C_in, .H = H, .W = W,
+                .kh = kh, .kw = kw,
+                .sh = sh, .sw = sw,
+                .ph = ph, .pw = pw,
+                .out_h = out_h, .out_w = out_w,
+            };
+            ax_compute_conv_gemm(w2d, &cp, res);
+        } else {
+            float *cd = (float *)col->storage->data;
+            im2col_into(ind + n * C_in * H * W, C_in, H, W,
+                         kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
+            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            ax_compute_gemm(w2d, col, res);
+        }
 
         for (int64_t co = 0; co < C_out; co++) {
             float bias_val = bias_data ? bias_data[co] : 0.0f;

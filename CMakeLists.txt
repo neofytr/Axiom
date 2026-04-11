@@ -93,7 +93,15 @@ set(AXIOM_SOURCES
 )
 
 if(AX_CUDA)
-    list(APPEND AXIOM_SOURCES src/compute/backends/cuda_backend.cu)
+    # cuda backend is a self-contained module under backends/cuda/
+    set(AX_CUDA_SOURCES
+        src/compute/backends/cuda/backend.cu
+        src/compute/backends/cuda/memory.cu
+        src/compute/backends/cuda/ops_elementwise.cu
+        src/compute/backends/cuda/ops_reduce.cu
+        src/compute/backends/cuda/ops_gemm.cu
+    )
+    list(APPEND AXIOM_SOURCES ${AX_CUDA_SOURCES})
 endif()
 
 # enable SIMD for the optimized backend on x86
@@ -111,8 +119,8 @@ if(AX_OPENMP AND OpenMP_C_FOUND)
 endif()
 if(AX_CUDA)
     target_link_libraries(axiom_static PUBLIC CUDA::cudart CUDA::cublas)
-    # suppress C-only warning flags when nvcc compiles the CUDA backend as C++
-    set_source_files_properties(src/compute/backends/cuda_backend.cu
+    # suppress C-only warning flags when nvcc compiles cuda sources as C++
+    set_source_files_properties(${AX_CUDA_SOURCES}
         PROPERTIES COMPILE_FLAGS "-Xcompiler -Wno-pedantic,-Wno-strict-prototypes")
 endif()
 set_target_properties(axiom_static PROPERTIES OUTPUT_NAME axiom)
@@ -152,6 +160,7 @@ set(TEST_SOURCES
     tests/test_serialize_all.c
     tests/test_lr_sched.c
     tests/test_backend_opt.c
+    tests/test_inplace.c
     tests/test_cuda.c
 )
 
@@ -193,6 +202,9 @@ target_link_libraries(deep_mlp PRIVATE axiom_static)
 
 add_executable(bench_backend examples/bench_backend.c)
 target_link_libraries(bench_backend PRIVATE axiom_static)
+
+add_executable(bench_optimizations examples/bench_optimizations.c)
+target_link_libraries(bench_optimizations PRIVATE axiom_static)
 
 # convenience target: run all tests
 add_custom_target(run_tests

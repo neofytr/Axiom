@@ -8,6 +8,7 @@
 #include "axiom/error.h"
 #include "axiom/autograd.h"
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <inttypes.h>
 
 /* internal helpers */
@@ -410,6 +411,139 @@ ax_tensor_t *ax_tanh_op(ax_tensor_t *a)
         out->grad_fn = ax_make_tanh_backward(a, out);
     }
     return out;
+}
+
+/* in-place activations.
+   check storage refcount == 1 so we don't clobber a shared buffer.
+   also require that the tensor has no existing grad_fn (i.e., it's a
+   graph leaf). otherwise fall back to the allocating variant — replacing
+   grad_fn in place would lose the upstream chain of backward fns.
+   backend ops read id[i] then write od[i] at the same index, so passing
+   out == in is safe for all elementwise activations. */
+
+static inline bool storage_is_unique(const ax_tensor_t *t)
+{
+    if (!t || !t->storage) return false;
+    return atomic_load(&t->storage->refcount) == 1;
+}
+
+/* inplace is only safe for contiguous, zero-offset tensors because the
+   backward transform walks grad/data linearly via a flat index. */
+static inline bool inplace_safe(const ax_tensor_t *t)
+{
+    if (!t) return false;
+    if (!storage_is_unique(t)) return false;
+    if (t->grad_fn != NULL) return false;
+    if (t->offset != 0) return false;
+    if (!ax_tensor_is_contiguous(t)) return false;
+    return true;
+}
+
+/* backward fn for inplace activations. because the input and output alias
+   the same storage, input->grad IS grad_out — we transform it in place.
+   n_inputs is set to 0 so the topo walker doesn't try to recurse on self.
+   for this reason inplace is only safe when the tensor is a leaf from the
+   graph's perspective (no prior grad_fn). */
+
+static void relu_inplace_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *t = self->saved[0]; /* same pointer as the tensor being backprop'd */
+    if (!t || !t->requires_grad || !t->grad) return;
+
+    int64_t n = ax_tensor_numel(grad_out);
+    float *gd = (float *)t->grad->storage->data + t->grad->offset;
+    const float *td = (const float *)t->storage->data + t->offset;
+    /* post-relu values: td[i] > 0 iff pre-relu was positive. transform in place. */
+    for (int64_t i = 0; i < n; i++)
+        gd[i] = (td[i] > 0.0f) ? gd[i] : 0.0f;
+}
+
+static void sigmoid_inplace_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *t = self->saved[0];
+    if (!t || !t->requires_grad || !t->grad) return;
+
+    int64_t n = ax_tensor_numel(grad_out);
+    float *gd = (float *)t->grad->storage->data + t->grad->offset;
+    const float *sd = (const float *)t->storage->data + t->offset;
+    /* sigmoid derivative = s * (1 - s) where s is the output */
+    for (int64_t i = 0; i < n; i++) {
+        float s = sd[i];
+        gd[i] = gd[i] * s * (1.0f - s);
+    }
+}
+
+static void tanh_inplace_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *t = self->saved[0];
+    if (!t || !t->requires_grad || !t->grad) return;
+
+    int64_t n = ax_tensor_numel(grad_out);
+    float *gd = (float *)t->grad->storage->data + t->grad->offset;
+    const float *td = (const float *)t->storage->data + t->offset;
+    /* tanh derivative = 1 - t^2 where t is the output */
+    for (int64_t i = 0; i < n; i++) {
+        float tv = td[i];
+        gd[i] = gd[i] * (1.0f - tv * tv);
+    }
+}
+
+static ax_grad_fn_t *make_inplace_grad_fn(ax_tensor_t *t, ax_backward_fn_t fn)
+{
+    ax_grad_fn_t *gf = ax_grad_fn_create(fn);
+    if (!gf) return NULL;
+    /* no recorded inputs — inputs[0] would alias self and confuse topo walk */
+    gf->n_inputs = 0;
+    gf->saved[0] = t;
+    gf->saved_owned[0] = false;
+    gf->n_saved = 1;
+    return gf;
+}
+
+ax_tensor_t *ax_relu_inplace(ax_tensor_t *a)
+{
+    if (!a) return NULL;
+    /* fallback conditions: shared storage or already part of a grad chain */
+    if (!inplace_safe(a)) return ax_relu(a);
+
+    ax_compute_relu(a, a);
+
+    if (needs_grad(a, NULL))
+    {
+        a->requires_grad = true;
+        a->grad_fn = make_inplace_grad_fn(a, relu_inplace_backward);
+    }
+    return a;
+}
+
+ax_tensor_t *ax_sigmoid_inplace(ax_tensor_t *a)
+{
+    if (!a) return NULL;
+    if (!inplace_safe(a)) return ax_sigmoid(a);
+
+    ax_compute_sigmoid(a, a);
+
+    if (needs_grad(a, NULL))
+    {
+        a->requires_grad = true;
+        a->grad_fn = make_inplace_grad_fn(a, sigmoid_inplace_backward);
+    }
+    return a;
+}
+
+ax_tensor_t *ax_tanh_inplace(ax_tensor_t *a)
+{
+    if (!a) return NULL;
+    if (!inplace_safe(a)) return ax_tanh_op(a);
+
+    ax_compute_tanh(a, a);
+
+    if (needs_grad(a, NULL))
+    {
+        a->requires_grad = true;
+        a->grad_fn = make_inplace_grad_fn(a, tanh_inplace_backward);
+    }
+    return a;
 }
 
 /* comparisons (no grad — these return 0/1) */

@@ -47,6 +47,17 @@ ax_tensor_t *ax_relu(ax_tensor_t *a);
 ax_tensor_t *ax_sigmoid(ax_tensor_t *a);
 ax_tensor_t *ax_tanh_op(ax_tensor_t *a);
 
+/* in-place activation variants. these mutate the input buffer and return
+   the same tensor pointer, avoiding one allocation + one full pass.
+   preconditions: input storage refcount must be 1 (no shared views).
+   if refcount > 1 these fall back to the non-inplace variant for safety.
+   autograd-compatible: relu/sigmoid/tanh backward all work with the
+   post-activation values (output), which inplace preserves. */
+
+ax_tensor_t *ax_relu_inplace(ax_tensor_t *a);
+ax_tensor_t *ax_sigmoid_inplace(ax_tensor_t *a);
+ax_tensor_t *ax_tanh_inplace(ax_tensor_t *a);
+
 /* comparison (returns float tensor with 0/1 values) */
 
 ax_tensor_t *ax_equal(ax_tensor_t *a, ax_tensor_t *b);
