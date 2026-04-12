@@ -352,41 +352,48 @@ static void ax_cpu_opt_init_impl(void) {
     ax_gemm_read_env("AX_GEMM_NC", &GEMM_NC, GEMM_NR);
     ax_gemm_read_env("AX_GEMM_KC", &GEMM_KC, 1);
 
-    /* runtime cache-size auto-tuning. if the user didn't set env vars,
-       detect L2 from sysconf and adjust NC/KC so pack_a + pack_b fit
-       in L2 with ~20% headroom for output tiles and other data.
-       this replaces microarchitecture-specific tile defaults — the
-       framework adapts to any cpu's cache hierarchy automatically. */
+    /* runtime cache-size auto-tuning. detect L1d and L2, then adjust
+       MC and NC so pack_a fits in L1d and pack_a+pack_b fits in L2.
+       general: adapts to any cpu's cache hierarchy automatically.
+       env vars always override. */
 #if defined(__linux__) && !defined(AX_NO_STDIO)
+    /* L1d auto-tune: pack_a (MC×KC) should fit in ~80% of L1d.
+       when it doesn't, shrink MC (rounded to MR). this matters on
+       neoverse-n2 (64KB L1d) where the desktop default MC=72 gives
+       pack_a=72KB > 64KB, and on zen3/4 (32KB L1d). */
+    long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+    if (l1d > 0) {
+        long l1_budget = (long)(l1d * 0.80);
+        size_t pack_a_bytes = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
+        if ((long)pack_a_bytes > l1_budget) {
+            int64_t new_mc = l1_budget / ((int64_t)GEMM_KC * (int64_t)sizeof(float));
+            new_mc = (new_mc / GEMM_MR) * GEMM_MR;
+            if (new_mc >= GEMM_MR && new_mc < GEMM_MC) {
+                AX_LOG("axiom: auto-tuned MC from %ld to %ld to fit L1d (%ld kB)\n",
+                       (long)GEMM_MC, (long)new_mc, l1d / 1024);
+                GEMM_MC = new_mc;
+            }
+        }
+    }
+
+    /* L2 auto-tune: pack_a (MC×KC) + pack_b (NC×KC) ≤ 80% of L2 */
     long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
     if (l2 > 0) {
-        /* target: pack_a (MC×KC) + pack_b (NC×KC) ≤ 80% of L2 */
         long budget = (long)(l2 * 0.80);
         size_t pack_a_bytes = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
         size_t pack_b_bytes = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
 
-        /* if pack_a + pack_b exceeds the budget, shrink NC first
-           (NC is the outermost tile dimension, easiest to reduce
-           without harming parallelism). */
         if ((long)(pack_a_bytes + pack_b_bytes) > budget) {
             long avail_for_b = budget - (long)pack_a_bytes;
             if (avail_for_b > 0) {
                 int64_t new_nc = avail_for_b / ((int64_t)GEMM_KC * (int64_t)sizeof(float));
-                new_nc = (new_nc / GEMM_NR) * GEMM_NR; /* round down to NR */
+                new_nc = (new_nc / GEMM_NR) * GEMM_NR;
                 if (new_nc >= GEMM_NR && new_nc < GEMM_NC) {
                     AX_LOG("axiom: auto-tuned NC from %ld to %ld to fit L2 (%ld kB)\n",
                            (long)GEMM_NC, (long)new_nc, l2 / 1024);
                     GEMM_NC = new_nc;
                 }
             }
-        }
-
-        /* re-check after adjustment */
-        pack_b_bytes = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
-        if ((long)pack_b_bytes > l2) {
-            AX_LOG("axiom: gemm pack_b buffer %zu kB exceeds detected l2 %ld kB; "
-                   "consider setting AX_GEMM_KC / AX_GEMM_NC smaller on this target\n",
-                   pack_b_bytes / 1024, l2 / 1024);
         }
     }
 #endif
