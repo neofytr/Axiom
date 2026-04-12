@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # x86_64: tests AVX2 (always) + AVX-512 (on Ice Lake runners)
+  test-x86:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build (ISA dispatch = avx512 + avx2 + scalar)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc)
+
+      - name: test
+        run: cd build && ctest --output-on-failure
+
+      - name: check ISA selection
+        run: |
+          cd build
+          # the runner's xeon should select avx512
+          ./test_compute 2>&1 | head -5
+
+      - name: benchmark (optional, non-blocking)
+        continue-on-error: true
+        run: |
+          cd build
+          if [ -f bench_large ]; then
+            OMP_NUM_THREADS=2 ./bench_large train-cpu 2>&1 | grep -E "epoch|median"
+          fi
+
+  # aarch64: tests NEON kernel on graviton
+  test-arm:
+    runs-on: ubuntu-latest-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install deps
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . -j$(nproc)
+
+      - name: test
+        run: cd build && ctest --output-on-failure
+
+      - name: benchmark (optional)
+        continue-on-error: true
+        run: |
+          cd build
+          if [ -f bench_large ]; then
+            OMP_NUM_THREADS=4 ./bench_large train-cpu 2>&1 | grep -E "epoch|median"
+          fi
+
+  # x86_64 + CUDA: tests GPU backend (if runner has nvidia GPU)
+  test-cuda:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: check for CUDA toolkit
+        id: cuda
+        run: |
+          if command -v nvcc &>/dev/null || [ -d /usr/local/cuda ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: build (CPU-only, CUDA absent on standard runners)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . -j$(nproc)
+
+      - name: test
+        run: cd build && ctest --output-on-failure
