@@ -1,0 +1,16 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Axiom Docs</title>
+    <script>
+      // SPA redirect for GitHub Pages.
+      // Converts the path into a query string so index.html can restore it.
+      var seg = location.pathname.replace(/\/Axiom/, '').replace(/^\//, '');
+      var url = '/Axiom/?' + seg;
+      if (location.search) url += '&' + location.search.slice(1);
+      location.replace(url);
+    </script>
+  </head>
+  <body></body>
+</html>

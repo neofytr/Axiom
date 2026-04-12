@@ -4,10 +4,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>docs-site</title>
+    <title>Axiom - Deep Learning in C</title>
   </head>
   <body>
     <div id="app"></div>
+    <script>
+      // Restore SPA route from 404.html redirect query string
+      (function () {
+        var q = location.search.slice(1);
+        if (q && !q.includes('=')) {
+          history.replaceState(null, '', '/Axiom/' + q + location.hash);
+        }
+      })();
+    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
