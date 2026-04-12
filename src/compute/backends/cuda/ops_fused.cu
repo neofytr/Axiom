@@ -167,4 +167,46 @@ ax_status_t cuda_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
     return AX_OK;
 }
 
+/* bias_add: out[..., axis, ...] = in[..., axis, ...] + bias[axis].
+   broadcast along the given axis. generic: computes (outer, axis_len,
+   inner) strides and runs one thread per output element. */
+__global__ static void k_bias_add(
+    const float *in, const float *bias, float *out,
+    int64_t in_off, int64_t b_off, int64_t out_off,
+    int64_t outer, int64_t axis_len, int64_t inner, int64_t total)
+{
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    int64_t a = (i / inner) % axis_len;
+    out[out_off + i] = in[in_off + i] + bias[b_off + a];
+}
+
+ax_status_t cuda_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
+                           int axis, ax_tensor_t *out)
+{
+    if (!in || !bias || !out) return AX_ERR_NULL_ARG;
+    if (in->dtype != AX_FLOAT32 || bias->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (bias->ndim != 1 || axis < 0 || axis >= in->ndim)
+        return AX_ERR_SHAPE_MISMATCH;
+    if (bias->shape[0] != in->shape[axis])
+        return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t outer = 1, inner = 1;
+    for (int d = 0; d < axis; d++) outer *= in->shape[d];
+    int64_t axis_len = in->shape[axis];
+    for (int d = axis + 1; d < in->ndim; d++) inner *= in->shape[d];
+    int64_t total = outer * axis_len * inner;
+
+    int blocks = (int)((total + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
+    k_bias_add<<<blocks, AX_CUDA_BLOCK>>>(
+        (const float *)in->storage->data,
+        (const float *)bias->storage->data,
+        (float *)out->storage->data,
+        (int64_t)in->offset, (int64_t)bias->offset, (int64_t)out->offset,
+        outer, axis_len, inner, total);
+    AX_CUDA_CHECK_LAUNCH("bias_add");
+    return AX_OK;
+}
+
 } /* extern "C" */

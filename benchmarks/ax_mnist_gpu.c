@@ -1,10 +1,15 @@
-/* ax_mnist_gpu.c — same mnist mlp benchmark as ax_mnist.c but on the
-   gpu. switches to the cuda backend + device after ax_init. */
+/* ax_mnist_gpu.c — mnist mlp training on gpu via cuda backend.
 
-#define AX_USE_GPU 1
+   same model and hyperparameters as ax_mnist.c (cpu benchmark):
+   784 -> 128 relu -> 64 relu -> 10, adam lr=1e-3, bs=256, 8 epochs.
 
-/* reuse the entire benchmark body from the cpu version. the only
-   difference is the 4 lines below that switch backend + device. */
+   gpu training flow:
+   1. data loaded on cpu (disk i/o is always cpu-side)
+   2. model created on gpu (default device = cuda during layer creation)
+   3. per batch: cpu batch tensors -> ax_tensor_to_cuda -> forward ->
+      loss -> backward -> optimizer step (all on gpu)
+   4. eval: forward on gpu, read logits back to cpu for accuracy count */
+
 #include "axiom/axiom.h"
 #include "axiom/compute.h"
 #include <stdio.h>
@@ -68,24 +73,48 @@ static uint8_t *load_labels_raw(const char *path, int64_t n) {
     fclose(f); return labels;
 }
 
-static float eval_accuracy(ax_layer_t *model, ax_tensor_t *images,
+/* evaluate accuracy: forward on gpu, read logits back to cpu */
+static float eval_accuracy(ax_layer_t *model, ax_tensor_t *images_cpu,
                             const uint8_t *labels, int64_t n) {
     ax_layer_eval(model); ax_no_grad();
     const int64_t bs = 512;
     int64_t correct = 0;
     for (int64_t start = 0; start < n; start += bs) {
         int64_t b = (start + bs <= n) ? bs : (n - start);
+        /* create batch on cpu, copy data, move to gpu */
+        ax_device_t prev = ax_get_default_device();
+        ax_set_default_device(AX_DEVICE_CPU);
         int64_t xs[] = {b, N_PIXELS};
         ax_tensor_t *x = ax_tensor_create(xs, 2, AX_FLOAT32);
-        memcpy(x->storage->data, (float*)images->storage->data + start*N_PIXELS, (size_t)(b*N_PIXELS)*sizeof(float));
-        ax_tensor_t *logits = ax_layer_forward(model, x);
+        memcpy(x->storage->data, (float*)images_cpu->storage->data + start*N_PIXELS,
+               (size_t)(b*N_PIXELS)*sizeof(float));
+        ax_set_default_device(prev);
+
+#ifdef AX_HAVE_CUDA
+        ax_tensor_t *gx = ax_tensor_to_cuda(x);
         ax_tensor_destroy(x);
-        float *ld = (float *)logits->storage->data;
+#else
+        ax_tensor_t *gx = x;
+#endif
+        ax_tensor_t *logits = ax_layer_forward(model, gx);
+        ax_tensor_destroy(gx);
+        if (!logits) continue;
+
+        /* read logits back to cpu for argmax */
+#ifdef AX_HAVE_CUDA
+        ax_tensor_t *logits_cpu = ax_tensor_to_cpu(logits);
+#else
+        ax_tensor_t *logits_cpu = logits;
+#endif
+        float *ld = (float *)logits_cpu->storage->data;
         for (int64_t i = 0; i < b; i++) {
             int pred = 0; float best = ld[i*N_CLASSES];
             for (int c = 1; c < N_CLASSES; c++) if (ld[i*N_CLASSES+c] > best) { best = ld[i*N_CLASSES+c]; pred = c; }
             if (pred == (int)labels[start+i]) correct++;
         }
+#ifdef AX_HAVE_CUDA
+        ax_tensor_destroy(logits_cpu);
+#endif
         ax_tensor_destroy(logits);
     }
     ax_layer_train(model); ax_enable_grad();
@@ -96,22 +125,23 @@ int main(void) {
     ax_init();
     ax_set_seed(42);
 
-#ifdef AX_HAVE_CUDA
-    /* switch to gpu backend */
-    ax_compute_set_backend(AX_BACKEND_CUDA);
-    ax_set_default_device(AX_DEVICE_CUDA);
-    printf("backend: CUDA (gpu)\n");
-#else
-    printf("backend: CPU (compiled without CUDA)\n");
-#endif
-
-    printf("loading mnist...\n"); fflush(stdout);
+    /* step 1: load data on cpu */
+    printf("loading mnist (cpu)...\n"); fflush(stdout);
     ax_tensor_t *train_x = load_images(TRAIN_IMAGES, N_TRAIN);
     ax_tensor_t *train_y = load_labels_onehot(TRAIN_LABELS, N_TRAIN);
     ax_tensor_t *test_x  = load_images(TEST_IMAGES, N_TEST);
     uint8_t *test_labels = load_labels_raw(TEST_LABELS, N_TEST);
     if (!train_x || !train_y || !test_x || !test_labels) { fprintf(stderr, "load failed\n"); return 1; }
     printf("  train: %d  test: %d  pixels: %d\n", N_TRAIN, N_TEST, N_PIXELS);
+
+#ifdef AX_HAVE_CUDA
+    /* step 2: switch to cuda for model creation */
+    ax_compute_set_backend(AX_BACKEND_CUDA);
+    ax_set_default_device(AX_DEVICE_CUDA);
+    printf("backend: CUDA (gpu)\n");
+#else
+    printf("backend: CPU (compiled without CUDA)\n");
+#endif
 
     ax_layer_t *model = ax_sequential_create();
     ax_sequential_add(model, ax_dense_create(N_PIXELS, 128, true));
@@ -123,24 +153,37 @@ int main(void) {
     ax_tensor_t *params[32];
     int n_params = ax_layer_get_params(model, params, 32);
     ax_optimizer_t *opt = ax_adam_create(params, n_params, 1e-3f, 0.9f, 0.999f, 1e-8f, 0.0f);
+
+    /* step 3: dataloader works on cpu source data */
+    ax_set_default_device(AX_DEVICE_CPU);
     ax_dataset_t *ds = ax_tensor_dataset_create(train_x, train_y);
     ax_dataloader_t *dl = ax_dataloader_create(ds, 256, true);
 
     printf("model: %ld parameters\n", ax_layer_param_count(model));
     printf("training: %ld batches/epoch\n\n", ax_dataloader_num_batches(dl)); fflush(stdout);
 
-    /* warmup */
-    { ax_dataloader_reset(dl); ax_batch_t b;
-      if (ax_dataloader_next(dl, &b)) {
-          ax_enable_grad();
-          ax_tensor_t *logits = ax_layer_forward(model, b.input);
-          ax_tensor_t *loss = ax_cross_entropy_loss(logits, b.target);
-          if (logits && loss) {
-              ax_optimizer_zero_grad(opt); ax_backward(loss);
-              ax_optimizer_step(opt); ax_graph_cleanup(loss); ax_tensor_destroy(loss);
-          }
-          ax_tensor_destroy(b.input); ax_tensor_destroy(b.target);
-      }
+    /* warmup: one training step */
+    {
+        ax_dataloader_reset(dl); ax_batch_t b;
+        if (ax_dataloader_next(dl, &b)) {
+#ifdef AX_HAVE_CUDA
+            ax_tensor_t *gi = ax_tensor_to_cuda(b.input);
+            ax_tensor_t *gt = ax_tensor_to_cuda(b.target);
+            ax_tensor_destroy(b.input); ax_tensor_destroy(b.target);
+            ax_set_default_device(AX_DEVICE_CUDA);
+#else
+            ax_tensor_t *gi = b.input, *gt = b.target;
+#endif
+            ax_enable_grad();
+            ax_tensor_t *logits = ax_layer_forward(model, gi);
+            ax_tensor_t *loss = ax_cross_entropy_loss(logits, gt);
+            if (logits && loss) {
+                ax_optimizer_zero_grad(opt); ax_backward(loss);
+                ax_optimizer_step(opt); ax_graph_cleanup(loss); ax_tensor_destroy(loss);
+            }
+            ax_tensor_destroy(gi); ax_tensor_destroy(gt);
+            ax_set_default_device(AX_DEVICE_CPU);
+        }
     }
 
     const int epochs = 8;
@@ -149,23 +192,33 @@ int main(void) {
 
     for (int ep = 0; ep < epochs; ep++) {
         double t_ep = now_s();
+        ax_set_default_device(AX_DEVICE_CPU);
         ax_dataloader_reset(dl); ax_layer_train(model);
         double total_loss = 0.0; int64_t n_seen = 0;
         ax_batch_t b;
         while (ax_dataloader_next(dl, &b)) {
+#ifdef AX_HAVE_CUDA
+            ax_tensor_t *gi = ax_tensor_to_cuda(b.input);
+            ax_tensor_t *gt = ax_tensor_to_cuda(b.target);
+            ax_tensor_destroy(b.input); ax_tensor_destroy(b.target);
+            ax_set_default_device(AX_DEVICE_CUDA);
+#else
+            ax_tensor_t *gi = b.input, *gt = b.target;
+#endif
             ax_enable_grad();
-            ax_tensor_t *logits = ax_layer_forward(model, b.input);
-            ax_tensor_t *loss = ax_cross_entropy_loss(logits, b.target);
+            ax_tensor_t *logits = ax_layer_forward(model, gi);
+            ax_tensor_t *loss = ax_cross_entropy_loss(logits, gt);
             if (!logits || !loss) {
                 if (logits) ax_tensor_destroy(logits);
-                ax_tensor_destroy(b.input); ax_tensor_destroy(b.target); continue;
+                ax_tensor_destroy(gi); ax_tensor_destroy(gt); continue;
             }
-            total_loss += (double)((float*)loss->storage->data)[0] * (double)b.input->shape[0];
-            n_seen += b.input->shape[0];
+            /* read scalar loss via d2h round-trip */
+            int64_t i0[] = {0};
+            total_loss += (double)ax_tensor_get_f32(loss, i0) * (double)gi->shape[0];
+            n_seen += gi->shape[0];
             ax_optimizer_zero_grad(opt); ax_backward(loss);
-            ax_optimizer_step(opt); ax_graph_cleanup(loss);
-            ax_tensor_destroy(loss);
-            ax_tensor_destroy(b.input); ax_tensor_destroy(b.target);
+            ax_optimizer_step(opt); ax_graph_cleanup(loss); ax_tensor_destroy(loss);
+            ax_tensor_destroy(gi); ax_tensor_destroy(gt);
         }
         float acc = eval_accuracy(model, test_x, test_labels, N_TEST);
         double dt = now_s() - t_ep;

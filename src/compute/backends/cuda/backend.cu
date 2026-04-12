@@ -145,6 +145,7 @@ extern const ax_backend_ops_t ax_cuda_ops = {
     .add_relu   = cuda_add_relu,
     .axpy       = cuda_axpy,
     .softmax_rowwise = cuda_softmax_rowwise,
+    .bias_add   = cuda_bias_add,
     .conv_gemm  = cuda_conv_gemm,
     .sum        = cuda_sum,
     .mean       = cuda_mean,
