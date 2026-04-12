@@ -42,12 +42,11 @@ jobs:
       - name: build ISA-specific benchmarks
         run: |
           cd build
-          # avx-512 bench (already built via ISA dispatch, but make a dedicated one)
-          gcc -O3 -mavx512f -mavx2 -mfma -fopenmp -o bench_avx512 ../benchmarks/bench_large.c \
-            -I../include -L. -laxiom -lm -lgomp -Wl,-rpath,.
-          # avx2-only bench (same binary, different compile flags = different codegen)
-          gcc -O3 -mavx2 -mfma -mno-avx512f -fopenmp -o bench_avx2 ../benchmarks/bench_large.c \
-            -I../include -L. -laxiom -lm -lgomp -Wl,-rpath,.
+          # link against static lib (has all ISA variants bundled)
+          # the benchmark binary itself doesn't need ISA flags — the library
+          # dispatch selects the kernel at runtime via __builtin_cpu_supports.
+          # bench_large is already built by cmake; just use it directly.
+          echo "bench_large already built by cmake"
 
       - name: benchmark all ISA tiers + tensorflow
         continue-on-error: true
@@ -56,12 +55,8 @@ jobs:
           echo "Cores: $(nproc) logical, $(lscpu | grep 'Core(s) per socket' | sed 's/.*: *//')"
           echo ""
 
-          echo "=== AXIOM AVX-512 (14x32 ZMM kernel, 2 threads) ==="
-          OMP_NUM_THREADS=2 timeout 120 build/bench_avx512 train-cpu 2>&1 | grep -E "epoch|median|threads"
-          echo ""
-
-          echo "=== AXIOM AVX2 (6x16 YMM kernel, 2 threads) ==="
-          OMP_NUM_THREADS=2 timeout 120 build/bench_avx2 train-cpu 2>&1 | grep -E "epoch|median|threads"
+          echo "=== AXIOM (ISA dispatch selects best kernel, 2 threads) ==="
+          OMP_NUM_THREADS=2 timeout 120 build/bench_large train-cpu 2>&1 | grep -E "epoch|median|threads"
           echo ""
 
           echo "=== TENSORFLOW oneDNN (2 threads) ==="
@@ -188,7 +183,7 @@ jobs:
 
           cd build
           gcc -O3 -mavx512f -mavx2 -mfma -fopenmp -o bench_xlarge /tmp/bench_xlarge.c \
-            -I../include -L. -laxiom -lm -lgomp -Wl,-rpath,.
+            -I../include libaxiom.a -lm -lgomp
           cd ..
 
           echo "--- Axiom AVX-512 ---"

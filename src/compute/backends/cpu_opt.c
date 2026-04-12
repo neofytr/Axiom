@@ -390,8 +390,14 @@ static __attribute__((constructor)) void ax_cpu_opt_ctor(void) {
 static bool ensure_tl_pack_bufs(void) {
     if (!tl_pack_a_buf)
         tl_pack_a_buf = (float *)ax_aligned_alloc((size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float), 64);
-    if (!tl_pack_b_buf)
-        tl_pack_b_buf = (float *)ax_aligned_alloc((size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float), 64);
+    if (!tl_pack_b_buf) {
+        /* round NC up to a multiple of NR for the pack buffer. when NR
+           doesn't evenly divide NC (e.g. NR=12, NC=128 → nc_pack=132),
+           pack_b writes ceil(NC/NR)*NR floats per KC row. without the
+           round-up the buffer overflows. */
+        size_t nc_rounded = (size_t)((GEMM_NC + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+        tl_pack_b_buf = (float *)ax_aligned_alloc(nc_rounded * (size_t)GEMM_KC * sizeof(float), 64);
+    }
     return tl_pack_a_buf && tl_pack_b_buf;
 }
 
