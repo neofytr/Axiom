@@ -691,17 +691,22 @@ int ax_autotune_threads(void)
        gemm throughput on alder lake due to fma port sharing.
 
        detect siblings via /sys thread_siblings_list: if cpu A lists
-       cpu B as a sibling and B is already in the deduped set, skip A. */
+       cpu B as a sibling and B is already in the deduped set, skip A.
+
+       exception: when the deduped count would be ≤ 3 physical cores,
+       keep ALL fast logical cores. on small machines (2 physical cores,
+       4 smt threads) the smt parallelism adds ~20% total throughput
+       that outweighs the per-thread fma contention. the breakeven
+       is around 4 physical cores — above that, dedup wins. */
     int fast_cpus[CPU_SETSIZE];
     int fc = 0;
     int used_physical[CPU_SETSIZE];
     memset(used_physical, 0, sizeof(used_physical));
 
+    /* first pass: count unique physical cores */
+    int n_physical = 0;
     for (int i = 0; i < fast_all; i++) {
         int cpu = fast_cpus_all[i];
-        /* read the thread_siblings_list to find the physical core id.
-           format: "a-b" or "a,b" or just "a" (no ht). we use the
-           LOWEST numbered sibling as the physical core identifier. */
         int phys_id = cpu;
         char path[128];
         snprintf(path, sizeof(path),
@@ -712,10 +717,36 @@ int ax_autotune_threads(void)
             if (fscanf(f, "%d", &lo) == 1 && lo < cpu) phys_id = lo;
             fclose(f);
         }
-        /* skip if we already have a thread on this physical core */
-        if (phys_id < CPU_SETSIZE && used_physical[phys_id]) continue;
-        if (phys_id < CPU_SETSIZE) used_physical[phys_id] = 1;
-        fast_cpus[fc++] = cpu;
+        if (phys_id < CPU_SETSIZE && !used_physical[phys_id]) {
+            used_physical[phys_id] = 1;
+            n_physical++;
+        }
+    }
+
+    /* decide: dedup or keep all */
+    if (n_physical >= 4) {
+        /* enough physical cores — dedup to avoid smt fma contention */
+        memset(used_physical, 0, sizeof(used_physical));
+        for (int i = 0; i < fast_all; i++) {
+            int cpu = fast_cpus_all[i];
+            int phys_id = cpu;
+            char path[128];
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+            FILE *f = fopen(path, "r");
+            if (f) {
+                int lo = cpu;
+                if (fscanf(f, "%d", &lo) == 1 && lo < cpu) phys_id = lo;
+                fclose(f);
+            }
+            if (phys_id < CPU_SETSIZE && used_physical[phys_id]) continue;
+            if (phys_id < CPU_SETSIZE) used_physical[phys_id] = 1;
+            fast_cpus[fc++] = cpu;
+        }
+    } else {
+        /* small machine — keep all fast logical cores (smt helps) */
+        for (int i = 0; i < fast_all; i++)
+            fast_cpus[fc++] = fast_cpus_all[i];
     }
     if (fc == 0) { fast_cpus[fc++] = fast_cpus_all[0]; }
 
