@@ -50,6 +50,23 @@ typedef struct {
     /* general matrix multiply: out = a @ b */
     ax_status_t (*gemm)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+    /* optional: out = a @ b^T. b is [N, K] stored normally; backend walks
+       it as if transposed without materializing a physical copy. saves a
+       full pass in the common backward pattern dX = dY @ W^T.
+       NULL when unimplemented — dispatch falls back to a physical transpose. */
+    ax_status_t (*gemm_nt)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
+
+    /* optional: out = a^T @ b. a is [K, M] stored normally; backend walks
+       it as if transposed. saves a physical transpose in dW = X^T @ dY.
+       NULL when unimplemented. */
+    ax_status_t (*gemm_tn)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
+
+    /* optional: fused bias add. out = in + broadcast(bias) along `axis`.
+       bias is rank-1 with numel matching in->shape[axis]. saves a separate
+       pass over out after linear/conv. NULL when unimplemented. */
+    ax_status_t (*bias_add)(const ax_tensor_t *in, const ax_tensor_t *bias,
+                             int axis, ax_tensor_t *out);
+
     /* implicit im2col conv forward gemm, per-sample.
        weight is [C_out, C_in*kh*kw] (row-major), out is [C_out, out_h*out_w].
        the backend gathers input patches directly into packed b buffers during
@@ -66,6 +83,11 @@ typedef struct {
     ax_status_t (*mean)(const ax_tensor_t *in, int axis, ax_tensor_t *out);
     ax_status_t (*max_op)(const ax_tensor_t *in, int axis, ax_tensor_t *out);
     ax_status_t (*min_op)(const ax_tensor_t *in, int axis, ax_tensor_t *out);
+
+    /* optional: argmax along an axis. output is rank in->ndim-1 (reduced
+       dim removed) with dtype int64. axis=-1 reduces all dims to a single
+       scalar index. NULL when unimplemented. */
+    ax_status_t (*argmax)(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 
     /* comparison ops */
     ax_status_t (*equal)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);

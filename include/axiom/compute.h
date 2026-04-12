@@ -84,6 +84,24 @@ ax_status_t ax_compute_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
 
 ax_status_t ax_compute_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+/* out = a @ b^T (b stored normally, walked transposed). returns
+   AX_ERR_NOT_IMPLEMENTED if the active backend lacks gemm_nt; callers
+   should fall back to physical transpose + plain gemm. */
+ax_status_t ax_compute_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
+
+/* out = a^T @ b. same fallback contract as gemm_nt. */
+ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
+
+int ax_compute_has_gemm_nt(void);
+int ax_compute_has_gemm_tn(void);
+
+/* fused bias add. returns AX_ERR_NOT_IMPLEMENTED when the backend
+   doesn't provide a fused path; callers can either fall back to a
+   broadcast add or accept the error. */
+ax_status_t ax_compute_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
+                                 int axis, ax_tensor_t *out);
+int ax_compute_has_bias_add(void);
+
 /* implicit im2col conv forward gemm, per-sample.
    returns AX_ERR_NOT_IMPLEMENTED if the active backend lacks conv_gemm;
    callers should fall back to the standard im2col + gemm path in that case. */
@@ -100,6 +118,10 @@ ax_status_t ax_compute_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 ax_status_t ax_compute_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 ax_status_t ax_compute_max(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 ax_status_t ax_compute_min(const ax_tensor_t *in, int axis, ax_tensor_t *out);
+
+/* argmax along an axis. out must be int64 rank (in->ndim - 1) with
+   reduced-dim removed. axis=-1 reduces all dims to a single scalar. */
+ax_status_t ax_compute_argmax(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 
 ax_status_t ax_compute_equal(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 ax_status_t ax_compute_greater(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);

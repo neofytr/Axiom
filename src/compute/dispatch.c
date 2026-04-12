@@ -237,6 +237,62 @@ ax_status_t ax_compute_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
 /* matrix ops */
 ax_status_t ax_compute_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) { DISPATCH_BINOP(gemm, a, b, out); }
 
+/* optional transposed-b gemm: out = a @ b^T. returns
+   AX_ERR_NOT_IMPLEMENTED when the active backend lacks the slot — callers
+   should check and fall back to physical transpose + plain gemm. */
+ax_status_t ax_compute_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->gemm_nt) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "gemm_nt not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return active_ops->gemm_nt(a, b, out);
+}
+
+/* optional transposed-a gemm: out = a^T @ b. */
+ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->gemm_tn) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "gemm_tn not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return active_ops->gemm_tn(a, b, out);
+}
+
+int ax_compute_has_gemm_nt(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_nt) ? 1 : 0; }
+int ax_compute_has_gemm_tn(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_tn) ? 1 : 0; }
+
+/* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias. */
+ax_status_t ax_compute_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
+                                 int axis, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->bias_add) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "bias_add not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return active_ops->bias_add(in, bias, axis, out);
+}
+
+int ax_compute_has_bias_add(void) { ensure_compute_init(); return (active_ops && active_ops->bias_add) ? 1 : 0; }
+
+/* argmax along an axis; output is int64 with reduced dim removed. */
+ax_status_t ax_compute_argmax(const ax_tensor_t *in, int axis, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->argmax) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "argmax not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return active_ops->argmax(in, axis, out);
+}
+
 /* implicit im2col conv gemm — optional backend op */
 ax_status_t ax_compute_conv_gemm(const ax_tensor_t *weight,
                                   const ax_conv_params_t *params,
