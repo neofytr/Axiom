@@ -68,8 +68,8 @@ static ax_tensor_t *make_row_view(ax_tensor_t *t, int64_t row)
     v->ndim = new_ndim;
     v->dtype = t->dtype;
     v->offset = t->offset + row * t->strides[0];
-    memcpy(v->shape, new_shape, sizeof(int64_t) * new_ndim);
-    memcpy(v->strides, new_strides, sizeof(int64_t) * new_ndim);
+    memcpy(v->shape, new_shape, sizeof(int64_t) * (size_t)new_ndim);
+    memcpy(v->strides, new_strides, sizeof(int64_t) * (size_t)new_ndim);
     return v;
 }
 
@@ -284,7 +284,7 @@ ax_dataset_t *ax_csv_dataset_load(const char *path,
     #define CSV_LINE_MAX 8192
     #define CSV_FIELDS_MAX 256
     char line[CSV_LINE_MAX];
-    if (has_header) fgets(line, sizeof(line), f); /* skip header */
+    if (has_header) (void)fgets(line, sizeof(line), f); /* skip header */
 
     int64_t row = 0;
     while (fgets(line, sizeof(line), f) && row < n_rows)
@@ -473,11 +473,11 @@ bool ax_dataloader_next(ax_dataloader_t *dl, ax_batch_t *batch)
 
         memcpy(in_data + i * in_sample_size,
                src_in + item_in->offset,
-               in_sample_size * sizeof(float));
+               (size_t)in_sample_size * sizeof(float));
 
         memcpy(tgt_data + i * tgt_sample_size,
                src_tgt + item_tgt->offset,
-               tgt_sample_size * sizeof(float));
+               (size_t)tgt_sample_size * sizeof(float));
     }
 
     dl->current_pos += bs;

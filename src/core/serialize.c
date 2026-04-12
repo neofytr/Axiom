@@ -110,9 +110,6 @@ static bool write_bytes(FILE *f, const void *data, size_t len, uint32_t *crc)
 }
 
 static bool write_u32(FILE *f, uint32_t v)  { return write_bytes(f, &v, 4, NULL); }
-static bool write_i64(FILE *f, int64_t v)   { return write_bytes(f, &v, 8, NULL); }
-static bool write_f32(FILE *f, float v)     { return write_bytes(f, &v, 4, NULL); }
-static bool write_u8(FILE *f, uint8_t v)    { return write_bytes(f, &v, 1, NULL); }
 
 /* crc-tracked variants */
 static bool write_u32_c(FILE *f, uint32_t v, uint32_t *c)  { return write_bytes(f, &v, 4, c); }
@@ -545,21 +542,21 @@ ax_model_t *ax_model_load(const char *path)
                     !read_u32(f, &ph) || !read_u32(f, &pw) ||
                     !read_u8(f, &bias))
                 { ax_layer_destroy(seq); fclose(f); return NULL; }
-                layer = ax_conv2d_create_ex(in_ch, out_ch, kh, kw, sh, sw, ph, pw, bias & 1);
+                layer = ax_conv2d_create_ex((int)in_ch, (int)out_ch, (int)kh, (int)kw, (int)sh, (int)sw, (int)ph, (int)pw, bias & 1);
                 break;
             }
             case AX_LAYER_MAXPOOL2D: {
                 uint32_t ks, st, pd;
                 if (!read_u32(f, &ks) || !read_u32(f, &st) || !read_u32(f, &pd))
                 { ax_layer_destroy(seq); fclose(f); return NULL; }
-                layer = ax_maxpool2d_create(ks, st, pd);
+                layer = ax_maxpool2d_create((int)ks, (int)st, (int)pd);
                 break;
             }
             case AX_LAYER_AVGPOOL2D: {
                 uint32_t ks, st, pd;
                 if (!read_u32(f, &ks) || !read_u32(f, &st) || !read_u32(f, &pd))
                 { ax_layer_destroy(seq); fclose(f); return NULL; }
-                layer = ax_avgpool2d_create(ks, st, pd);
+                layer = ax_avgpool2d_create((int)ks, (int)st, (int)pd);
                 break;
             }
             case AX_LAYER_BATCHNORM: {

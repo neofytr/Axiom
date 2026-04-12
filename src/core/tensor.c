@@ -381,7 +381,7 @@ static ax_status_t tensor_fill_value(ax_tensor_t *t, double value) {
 /* copy `bytes` from host buffer `data` into tensor storage at t->offset.
    `bytes` must equal numel * dtype_size; caller's job to enforce. */
 static ax_status_t tensor_write_from_host(ax_tensor_t *t, const void *data, size_t bytes) {
-    void *dst = (char *)t->storage->data + t->offset * ax_dtype_size(t->dtype);
+    void *dst = (char *)t->storage->data + (size_t)t->offset * ax_dtype_size(t->dtype);
     if (t->storage->device == AX_DEVICE_CPU) {
         memcpy(dst, data, bytes);
         ax_storage_touch(t->storage);
@@ -775,9 +775,9 @@ float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
             return 0.0f;
         }
     }
-    size_t offset = t->offset;
+    size_t offset = (size_t)t->offset;
     for (int i = 0; i < t->ndim; i++) {
-        offset += indices[i] * t->strides[i];
+        offset += (size_t)(indices[i] * t->strides[i]);
     }
     /* non-cpu: one-element d2h round trip. expensive for bulk access;
        callers that care about throughput should ax_tensor_to_cpu() the
@@ -790,7 +790,7 @@ float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
         ops->memcpy_d2h(&v, src, sizeof(float));
         return v;
     }
-    return ((float *)t->storage->data)[offset];
+    return ((float *)t->storage->data)[(size_t)offset];
 }
 
 void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
@@ -802,9 +802,9 @@ void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
             return;
         }
     }
-    size_t offset = t->offset;
+    size_t offset = (size_t)t->offset;
     for (int i = 0; i < t->ndim; i++) {
-        offset += indices[i] * t->strides[i];
+        offset += (size_t)(indices[i] * t->strides[i]);
     }
     /* non-cpu: one-element h2d round trip. same cost caveat as get. */
     if (t->storage->device != AX_DEVICE_CPU) {
@@ -814,7 +814,7 @@ void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
         ops->memcpy_h2d(dst, &value, sizeof(float));
         return;
     }
-    ((float *)t->storage->data)[offset] = value;
+    ((float *)t->storage->data)[(size_t)offset] = value;
 }
 
 /* view / copy */
@@ -881,7 +881,7 @@ ax_tensor_t *ax_tensor_to_cuda(ax_tensor_t *t) {
 
     /* source is cpu-contiguous here, so a single h2d memcpy suffices */
     const char *src_bytes = (const char *)src->storage->data
-                          + src->offset * ax_dtype_size(src->dtype);
+                          + (size_t)src->offset * ax_dtype_size(src->dtype);
     if (ops->memcpy_h2d(gpu->storage->data, src_bytes, bytes) != AX_OK) {
         ax_tensor_destroy(gpu);
         if (src != t) ax_tensor_destroy(src);
@@ -915,7 +915,7 @@ ax_tensor_t *ax_tensor_to_cpu(ax_tensor_t *t) {
     if (!cpu->storage) { slab_tensor_free(cpu); return NULL; }
 
     const char *src_bytes = (const char *)t->storage->data
-                          + t->offset * ax_dtype_size(t->dtype);
+                          + (size_t)t->offset * ax_dtype_size(t->dtype);
     if (ops->memcpy_d2h(cpu->storage->data, src_bytes, bytes) != AX_OK) {
         ax_tensor_destroy(cpu);
         return NULL;

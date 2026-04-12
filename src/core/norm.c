@@ -158,7 +158,7 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
     int64_t H = (inp->ndim == 4) ? inp->shape[2] : 1;
     int64_t W = (inp->ndim == 4) ? inp->shape[3] : 1;
     int64_t spatial = H * W;
-    float eff_batch = (float)(batch * spatial); /* elements per channel */
+    /* float eff_batch removed — unused */
     float *id = (float *)inp->storage->data;
 
     ax_tensor_t *out = ax_tensor_zeros(inp->shape, inp->ndim, inp->dtype);
@@ -255,8 +255,8 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
                 if (record) {
                     int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
                     for (; s < se; s += AX_VF32_WIDTH) {
-                        ax_vf32 inp = ax_vf32_load(id + base + s);
-                        ax_vf32 xh = ax_vf32_mul(ax_vf32_sub(inp, v_mn), v_is);
+                        ax_vf32 inp_val = ax_vf32_load(id + base + s); (void)inp_val;
+                        ax_vf32 xh = ax_vf32_mul(ax_vf32_sub(inp_val, v_mn), v_is);
                         ax_vf32_store(od + base + s, ax_vf32_fmadd(v_sc, ax_vf32_load(id + base + s), v_bi));
                         ax_vf32_store(xh_d + base + s, xh);
                     }
@@ -714,7 +714,7 @@ static ax_tensor_t *dropout_forward(ax_layer_t *self, ax_tensor_t *input)
         #pragma omp parallel
         {
             int tid = omp_get_thread_num();
-            uint64_t st = (call_seed ^ ((uint64_t)tid * 0x9E3779B97F4A7C15ULL))
+            uint64_t st = (call_seed ^ ((uint64_t)(unsigned)tid * (uint64_t)0x9E3779B97F4A7C15ULL))
                           | 0x1ULL;
             /* burn one round to scramble correlated low bits across threads */
             (void)xs64_next(&st);

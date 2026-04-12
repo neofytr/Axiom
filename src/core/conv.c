@@ -1960,7 +1960,7 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
                         }
                     }
                 }
-                od[((n * C + c) * oh + y) * ow + x] = count > 0 ? sum / count : 0;
+                od[((n * C + c) * oh + y) * ow + x] = count > 0 ? sum / (float)count : 0.0f;
             }
         }
     }

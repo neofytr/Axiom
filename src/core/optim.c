@@ -27,7 +27,7 @@ static ax_optimizer_t *optim_alloc(ax_optim_type_t type, ax_tensor_t **params, i
     opt->type = type;
     opt->params = params;
     opt->n_params = n;
-    opt->state = calloc(n, sizeof(ax_param_state_t));
+    opt->state = calloc((size_t)n, sizeof(ax_param_state_t));
     if (!opt->state)
     {
         free(opt);

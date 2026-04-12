@@ -129,13 +129,6 @@ static void ps_reset(ptr_set_t *s)
     s->count = 0;
 }
 
-static void ps_free(ptr_set_t *s)
-{
-    free(s->buckets);
-    s->buckets = NULL;
-    s->capacity = s->count = 0;
-}
-
 /* fibonacci hashing for pointer -> slot */
 static inline int ps_slot(uintptr_t key, int cap)
 {
@@ -222,13 +215,6 @@ static bool tl_init(topo_list_t *l)
 
 /* fast reset: preserve capacity, just clear count */
 static void tl_reset(topo_list_t *l) { l->count = 0; }
-
-static void tl_free(topo_list_t *l)
-{
-    free(l->nodes);
-    l->nodes = NULL;
-    l->count = l->capacity = 0;
-}
 
 static bool tl_push(topo_list_t *l, ax_tensor_t *t)
 {

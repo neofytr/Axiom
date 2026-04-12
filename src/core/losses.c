@@ -12,6 +12,7 @@
 #include "axiom/autograd.h"
 #include "axiom/activations.h"
 #include "axiom/error.h"
+#include "axiom/compute.h"
 #include "../compute/backends/simd_defs.h"
 #include <math.h>
 #include <float.h>

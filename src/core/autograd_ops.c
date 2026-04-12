@@ -134,13 +134,42 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
        gradient flows backwards: if a was broadcast from [3] to [2,3],
        we need to sum the [2,3] gradient along axis 0 to get [3]. */
 
-    /* non-cpu broadcast accumulation is not yet supported. mlp training
-       doesn't hit this path (all dense layers produce matching shapes).
-       conv/batchnorm backward may need this for bias gradients; when it
-       does, dispatch through ax_compute_sum + ax_compute_axpy. */
+    /* non-cpu broadcast accumulation: reduce grad_to_add along the dims
+       that were broadcast, then axpy the reduced result into t->grad.
+       uses existing dispatch sum + axpy which route to cuda kernels. */
     if (t->grad->storage->device != AX_DEVICE_CPU) {
-        ax_err_set(AX_ERR_NOT_IMPLEMENTED,
-                   "broadcast accumulate_grad on non-cpu tensor not yet supported");
+        ax_tensor_t *reduced = grad_to_add;
+        bool owns_reduced = false;
+        /* walk dims from the left. if grad_to_add has more dims than
+           t->grad, or a dim where t->grad is 1 but grad_to_add > 1,
+           sum it away. */
+        for (int d = 0; d < reduced->ndim; d++) {
+            int pd = d - (reduced->ndim - t->grad->ndim);
+            bool need_sum = (pd < 0) || (t->grad->shape[pd] == 1 && reduced->shape[d] > 1);
+            if (!need_sum) continue;
+
+            int rnd = reduced->ndim - 1;
+            if (rnd < 1) rnd = 1;
+            int64_t rshape[AX_MAX_DIMS];
+            int ri = 0;
+            for (int j = 0; j < reduced->ndim; j++)
+                if (j != d) rshape[ri++] = reduced->shape[j];
+            if (ri == 0) { rshape[0] = 1; ri = 1; }
+
+            ax_tensor_t *tmp = ax_tensor_zeros(rshape, ri, reduced->dtype);
+            if (!tmp) { if (owns_reduced) ax_tensor_destroy(reduced); return; }
+            ax_compute_sum(reduced, d, tmp);
+            if (owns_reduced) ax_tensor_destroy(reduced);
+            reduced = tmp;
+            owns_reduced = true;
+            d--;
+        }
+        if (t->grad->storage->generation == 0)
+            ax_compute_copy(reduced, t->grad);
+        else
+            ax_compute_axpy(reduced, 1.0f, t->grad);
+        ax_storage_touch(t->grad->storage);
+        if (owns_reduced) ax_tensor_destroy(reduced);
         return;
     }
 

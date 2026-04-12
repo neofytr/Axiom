@@ -610,7 +610,7 @@ int ax_autotune_threads(void)
     int cpu_ids[CPU_SETSIZE];
     int n_cpus = 0;
     for (int i = 0; i < max_cpus && n_cpus < CPU_SETSIZE; i++) {
-        if (CPU_ISSET(i, &allowed)) {
+        if (CPU_ISSET((size_t)i, &allowed)) {
             cpu_ids[n_cpus++] = i;
         }
     }
@@ -635,7 +635,7 @@ int ax_autotune_threads(void)
 
         cpu_set_t one;
         CPU_ZERO(&one);
-        CPU_SET(cpu_ids[i], &one);
+        CPU_SET((size_t)cpu_ids[i], &one);
         if (sched_setaffinity(0, sizeof(one), &one) != 0) {
             /* couldn't pin; treat as worst-case */
             times[i] = 1e9;
@@ -722,7 +722,7 @@ int ax_autotune_threads(void)
         int cpu = fast_cpus[w % fc];
         cpu_set_t one;
         CPU_ZERO(&one);
-        CPU_SET(cpu, &one);
+        CPU_SET((size_t)cpu, &one);
         if (sched_setaffinity(0, sizeof(one), &one) != 0) {
             pin_failures += 1;
         }

@@ -48,7 +48,7 @@ static void init_host_commit(ax_tensor_t *t, float *buf, int64_t n, bool is_scra
     if (!is_scratch) return;
     const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
     if (ops && ops->memcpy_h2d) {
-        void *dst = (char *)t->storage->data + t->offset * sizeof(float);
+        void *dst = (char *)t->storage->data + (size_t)t->offset * sizeof(float);
         ops->memcpy_h2d(dst, buf, (size_t)n * sizeof(float));
     }
     free(buf);
