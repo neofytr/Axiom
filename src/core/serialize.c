@@ -50,10 +50,14 @@
 /* crc32 (iso 3309 polynomial, same as zlib/png).
    computed incrementally so we don't need to buffer the whole file. */
 static uint32_t crc32_table[256];
-static int crc32_table_built = 0;
+static volatile int crc32_table_built = 0;
 
 static void crc32_build_table(void)
 {
+    /* benign race: worst case two threads build the same table
+       simultaneously. the result is identical either way because
+       the polynomial is fixed. volatile flag ensures visibility. */
+    if (crc32_table_built) return;
     for (uint32_t i = 0; i < 256; i++)
     {
         uint32_t c = i;
@@ -78,7 +82,6 @@ static uint32_t crc32_update(uint32_t crc, const void *data, size_t len)
    if end_pos < 0, reads to EOF. */
 static uint32_t crc32_of_file(FILE *f, long start_pos, long end_pos)
 {
-    if (!crc32_table_built) crc32_build_table();
     fseek(f, start_pos, SEEK_SET);
     uint32_t crc = 0;
     uint8_t buf[4096];

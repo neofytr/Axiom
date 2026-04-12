@@ -57,6 +57,7 @@ static void init_host_commit(ax_tensor_t *t, float *buf, int64_t n, bool is_scra
 
 void ax_init_xavier_uniform(ax_tensor_t *t, int64_t fan_in, int64_t fan_out)
 {
+    if (!t || !t->storage) return;
     float limit = sqrtf(6.0f / (float)(fan_in + fan_out));
     int64_t n = ax_tensor_numel(t);
     bool scratch;
@@ -68,6 +69,7 @@ void ax_init_xavier_uniform(ax_tensor_t *t, int64_t fan_in, int64_t fan_out)
 
 void ax_init_xavier_normal(ax_tensor_t *t, int64_t fan_in, int64_t fan_out)
 {
+    if (!t || !t->storage) return;
     float std = sqrtf(2.0f / (float)(fan_in + fan_out));
     int64_t n = ax_tensor_numel(t);
     bool scratch;
@@ -79,6 +81,7 @@ void ax_init_xavier_normal(ax_tensor_t *t, int64_t fan_in, int64_t fan_out)
 
 void ax_init_kaiming_uniform(ax_tensor_t *t, int64_t fan_in)
 {
+    if (!t || !t->storage) return;
     float limit = sqrtf(6.0f / (float)fan_in);
     int64_t n = ax_tensor_numel(t);
     bool scratch;
@@ -90,6 +93,7 @@ void ax_init_kaiming_uniform(ax_tensor_t *t, int64_t fan_in)
 
 void ax_init_kaiming_normal(ax_tensor_t *t, int64_t fan_in)
 {
+    if (!t || !t->storage) return;
     float std = sqrtf(2.0f / (float)fan_in);
     int64_t n = ax_tensor_numel(t);
     bool scratch;
@@ -101,6 +105,7 @@ void ax_init_kaiming_normal(ax_tensor_t *t, int64_t fan_in)
 
 void ax_init_lecun_normal(ax_tensor_t *t, int64_t fan_in)
 {
+    if (!t || !t->storage) return;
     float std = sqrtf(1.0f / (float)fan_in);
     int64_t n = ax_tensor_numel(t);
     bool scratch;
@@ -112,6 +117,7 @@ void ax_init_lecun_normal(ax_tensor_t *t, int64_t fan_in)
 
 void ax_init_uniform(ax_tensor_t *t, float low, float high)
 {
+    if (!t || !t->storage) return;
     int64_t n = ax_tensor_numel(t);
     bool scratch;
     float *d = init_host_acquire(t, n, &scratch);
@@ -122,6 +128,7 @@ void ax_init_uniform(ax_tensor_t *t, float low, float high)
 
 void ax_init_normal(ax_tensor_t *t, float mean, float std)
 {
+    if (!t || !t->storage) return;
     int64_t n = ax_tensor_numel(t);
     bool scratch;
     float *d = init_host_acquire(t, n, &scratch);
@@ -135,6 +142,7 @@ void ax_init_normal(ax_tensor_t *t, float mean, float std)
    for cpu tensors. this makes init_zeros on a cuda tensor safe even
    if the caller hasn't set the active backend to cuda. */
 static void init_fill(ax_tensor_t *t, double value) {
+    if (!t || !t->storage) return;
     if (t->storage->device == AX_DEVICE_CPU) {
         ax_compute_fill(t, value);
         return;

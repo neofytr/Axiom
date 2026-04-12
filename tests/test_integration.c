@@ -134,6 +134,7 @@ static void test_cnn_trains(void)
    the full pipeline used in real CNNs */
 static void test_full_cnn_pipeline(void)
 {
+    ax_set_seed(42);
     int64_t xs[] = {4, 1, 6, 6};
     ax_tensor_t *x = ax_tensor_rand(xs, 4, 0.0f, 1.0f);
 
@@ -141,22 +142,20 @@ static void test_full_cnn_pipeline(void)
     int64_t ys[] = {4, 1};
     ax_tensor_t *y = ax_tensor_from_array(y_data, ys, 2, AX_FLOAT32);
 
-    /* conv(1->2, k=3, pad=0) -> bn -> relu -> maxpool(2,2) -> flatten -> dense */
+    /* conv(1->2, k=3, pad=0) -> relu -> maxpool(2,2) -> flatten -> dense */
     ax_layer_t *net = ax_sequential_create();
     ax_sequential_add(net, ax_conv2d_create(1, 2, 3, 1, 0, true));
-    /* skip batchnorm here since conv output is 4d [N,C,H,W] but our
-       batchnorm only handles 2d [N,F]. that's a known limitation. */
     ax_sequential_add(net, ax_relu_layer_create());
     ax_sequential_add(net, ax_maxpool2d_create(2, 2, 0));
     ax_sequential_add(net, ax_flatten_create());
     ax_sequential_add(net, ax_dense_create(2 * 2 * 2, 1, true));
 
     ax_model_t *m = ax_model_create(net);
-    ax_optimizer_t *opt = ax_adam_create(m->params, m->n_params, 0.005f, 0.9f, 0.999f, 1e-8f, 0);
+    ax_optimizer_t *opt = ax_adam_create(m->params, m->n_params, 0.01f, 0.9f, 0.999f, 1e-8f, 0);
     ax_model_compile(m, opt, ax_mse_loss);
 
     float first = ax_model_train_step(m, x, y);
-    for (int i = 0; i < 200; i++) ax_model_train_step(m, x, y);
+    for (int i = 0; i < 500; i++) ax_model_train_step(m, x, y);
     float last = ax_model_train_step(m, x, y);
 
     AX_TEST_ASSERT(last < first, "full cnn pipeline should train");

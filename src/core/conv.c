@@ -930,6 +930,24 @@ ax_layer_t *ax_conv2d_create_ex(int in_ch, int out_ch,
                                  int kh, int kw, int sh, int sw,
                                  int ph, int pw, bool use_bias)
 {
+    /* validate parameters before allocating anything */
+    if (in_ch <= 0 || out_ch <= 0) {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "conv2d: channels must be positive (got in=%d out=%d)", in_ch, out_ch);
+        return NULL;
+    }
+    if (kh <= 0 || kw <= 0) {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "conv2d: kernel size must be positive (got %dx%d)", kh, kw);
+        return NULL;
+    }
+    if (sh <= 0 || sw <= 0) {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "conv2d: stride must be positive (got %dx%d)", sh, sw);
+        return NULL;
+    }
+    if (ph < 0 || pw < 0) {
+        ax_err_set(AX_ERR_INVALID_SHAPE, "conv2d: padding must be non-negative (got %dx%d)", ph, pw);
+        return NULL;
+    }
+
     ax_conv2d_t *c = calloc(1, sizeof(ax_conv2d_t));
     if (!c) return NULL;
 
