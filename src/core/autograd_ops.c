@@ -503,38 +503,20 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
        when the grad already existed (residual connections, shared params),
        we fall back to the temp + accumulate path so += semantics are
        preserved. */
-    /* dA = grad_out @ b^T. direct-write when fresh, temp + accumulate otherwise. */
+    /* dA = grad_out @ b^T. direct-write when fresh. */
     if (self->inputs[0]->requires_grad)
     {
         bool fresh_a;
         if (!ensure_grad_ex(self->inputs[0], &fresh_a)) return;
 
         if (fresh_a) {
-            if (ax_compute_has_gemm_nt()) {
-                ax_compute_gemm_nt(grad_out, b, self->inputs[0]->grad);
-            } else {
-                ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
-                ax_tensor_t *bt_c = bt ? ax_tensor_contiguous(bt) : NULL;
-                if (bt) ax_tensor_destroy(bt);
-                if (!bt_c) return;
-                ax_compute_gemm(grad_out, bt_c, self->inputs[0]->grad);
-                ax_tensor_destroy(bt_c);
-            }
+            ax_compute_gemm_nt(grad_out, b, self->inputs[0]->grad);
             ax_storage_touch(self->inputs[0]->grad->storage);
         } else {
             int64_t ga_shape[] = {grad_out->shape[0], b->shape[0]};
             ax_tensor_t *grad_a = ax_tensor_arena_create(ar, ga_shape, 2, grad_out->dtype);
             if (!grad_a) return;
-            if (ax_compute_has_gemm_nt()) {
-                ax_compute_gemm_nt(grad_out, b, grad_a);
-            } else {
-                ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
-                ax_tensor_t *bt_c = bt ? ax_tensor_contiguous(bt) : NULL;
-                if (bt) ax_tensor_destroy(bt);
-                if (!bt_c) return;
-                ax_compute_gemm(grad_out, bt_c, grad_a);
-                ax_tensor_destroy(bt_c);
-            }
+            ax_compute_gemm_nt(grad_out, b, grad_a);
             accumulate_grad(self->inputs[0], grad_a);
         }
     }
@@ -630,10 +612,11 @@ ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
     gf->inputs[0] = a;
     gf->inputs[1] = b;
     gf->n_inputs = 2;
-    /* save a and b (contiguous copies) for dA/dB computation */
+    /* save a (contiguous) for dW computation via gemm_tn */
     ax_tensor_t *a_safe = ax_ensure_contiguous(a);
     gf->saved[0] = a_safe;
     gf->saved_owned[0] = (a_safe != a);
+    /* save b contiguous for dX computation via gemm_nt */
     ax_tensor_t *b_safe = ax_ensure_contiguous(b);
     gf->saved[1] = b_safe;
     gf->saved_owned[1] = (b_safe != b);
@@ -641,6 +624,7 @@ ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
     gf->saved[2] = bias;  /* NULL if no bias */
     gf->saved_owned[2] = false;
     gf->n_saved = 3;
+    gf->int_ctx = 0;
     return gf;
 }
 
