@@ -623,31 +623,46 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
         if (nr > 8) __builtin_prefetch(c + row * ldc + 8, 0, 3);
     }
 
-    /* prefetch distance 4 iterations ahead (~96 B for A, ~256 B for B).
-       tighter than 8 to avoid evicting hot data from L1 on small kc. */
-    for (int64_t p = 0; p < kc; p++) {
+    /* 2× unrolled K loop. processes two K iterations per loop body:
+       - amortizes the loop branch overhead (cmp+jne every 2 iters instead of 1)
+       - the ooo engine can overlap iteration N+1's loads with N's FMA
+       - prefetch at 4-iteration distance into L1 */
+
+    #define KERNEL_BODY(a_ptr, b_ptr) \
+    { \
+        __m256 b0 = _mm256_load_ps(b_ptr); \
+        __m256 b1 = _mm256_load_ps(b_ptr + 8); \
+        __m256 a0 = _mm256_broadcast_ss(a_ptr + 0); \
+        c00 = _mm256_fmadd_ps(a0, b0, c00); c01 = _mm256_fmadd_ps(a0, b1, c01); \
+        __m256 a1 = _mm256_broadcast_ss(a_ptr + 1); \
+        c10 = _mm256_fmadd_ps(a1, b0, c10); c11 = _mm256_fmadd_ps(a1, b1, c11); \
+        __m256 a2 = _mm256_broadcast_ss(a_ptr + 2); \
+        c20 = _mm256_fmadd_ps(a2, b0, c20); c21 = _mm256_fmadd_ps(a2, b1, c21); \
+        __m256 a3 = _mm256_broadcast_ss(a_ptr + 3); \
+        c30 = _mm256_fmadd_ps(a3, b0, c30); c31 = _mm256_fmadd_ps(a3, b1, c31); \
+        __m256 a4 = _mm256_broadcast_ss(a_ptr + 4); \
+        c40 = _mm256_fmadd_ps(a4, b0, c40); c41 = _mm256_fmadd_ps(a4, b1, c41); \
+        __m256 a5 = _mm256_broadcast_ss(a_ptr + 5); \
+        c50 = _mm256_fmadd_ps(a5, b0, c50); c51 = _mm256_fmadd_ps(a5, b1, c51); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);  /* round down to even */
+    for (; p < kc2; p += 2) {
         __builtin_prefetch(ap + 4 * GEMM_MR, 0, 3);
         __builtin_prefetch(bp + 4 * GEMM_NR, 0, 3);
-
-        __m256 b0 = _mm256_load_ps(bp);
-        __m256 b1 = _mm256_load_ps(bp + 8);
-
-        __m256 a0 = _mm256_broadcast_ss(ap + 0);
-        c00 = _mm256_fmadd_ps(a0, b0, c00); c01 = _mm256_fmadd_ps(a0, b1, c01);
-        __m256 a1 = _mm256_broadcast_ss(ap + 1);
-        c10 = _mm256_fmadd_ps(a1, b0, c10); c11 = _mm256_fmadd_ps(a1, b1, c11);
-        __m256 a2 = _mm256_broadcast_ss(ap + 2);
-        c20 = _mm256_fmadd_ps(a2, b0, c20); c21 = _mm256_fmadd_ps(a2, b1, c21);
-        __m256 a3 = _mm256_broadcast_ss(ap + 3);
-        c30 = _mm256_fmadd_ps(a3, b0, c30); c31 = _mm256_fmadd_ps(a3, b1, c31);
-        __m256 a4 = _mm256_broadcast_ss(ap + 4);
-        c40 = _mm256_fmadd_ps(a4, b0, c40); c41 = _mm256_fmadd_ps(a4, b1, c41);
-        __m256 a5 = _mm256_broadcast_ss(ap + 5);
-        c50 = _mm256_fmadd_ps(a5, b0, c50); c51 = _mm256_fmadd_ps(a5, b1, c51);
-
+        KERNEL_BODY(ap, bp);
+        KERNEL_BODY(ap + GEMM_MR, bp + GEMM_NR);
+        ap += 2 * GEMM_MR;
+        bp += 2 * GEMM_NR;
+    }
+    /* odd tail */
+    if (p < kc) {
+        KERNEL_BODY(ap, bp);
         ap += GEMM_MR;
         bp += GEMM_NR;
     }
+    #undef KERNEL_BODY
 
     /* writeback: C matrix may not be aligned at tile boundaries, use unaligned ops */
     if (mr == GEMM_MR && nr == GEMM_NR) {
@@ -746,10 +761,6 @@ static inline int64_t ax_adaptive_nc(int64_t n, int max_threads) {
    the L2 budget constraint: pack_a (MC×KC) + pack_b (NC×KC) must fit.
    for MC=72, NC=256: (72+256)×KC×4 ≤ ~768 KB → KC ≤ ~600.
    use 512 as a safe maximum that fits comfortably in any L2 ≥ 1 MB. */
-static inline int64_t ax_adaptive_kc(int64_t k) {
-    if (k <= 512) return k;  /* single tile: no re-packing */
-    return GEMM_KC;          /* default tiled path */
-}
 
 static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
     if (!a || !b || !out) {
