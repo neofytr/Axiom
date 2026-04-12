@@ -230,7 +230,6 @@ int main(void)
     fflush(stdout);
 
     const int64_t batch_size = 64;
-    int64_t n_batches = (N_TRAIN + batch_size - 1) / batch_size;
 
     /* shuffle index array */
     int64_t *indices = malloc((size_t)N_TRAIN * sizeof(int64_t));

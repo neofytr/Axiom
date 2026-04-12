@@ -65,7 +65,7 @@ static void test_arena_grow(void) {
 static void test_arena_reset(void) {
     ax_arena_t *arena = ax_arena_create(4096);
 
-    void *p1 = ax_arena_alloc(arena, 128, 16);
+    (void)ax_arena_alloc(arena, 128, 16);
     ax_arena_reset(arena);
 
     /* after reset, next alloc should reuse the same block */

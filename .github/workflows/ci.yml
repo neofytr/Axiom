@@ -28,12 +28,25 @@ jobs:
           # the runner's xeon should select avx512
           ./test_compute 2>&1 | head -5
 
+      - name: download mnist data
+        continue-on-error: true
+        run: |
+          mkdir -p examples/data && cd examples/data
+          for f in train-images-idx3-ubyte train-labels-idx1-ubyte \
+                   t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+            [ -f "$f" ] && continue
+            curl -sLO "https://storage.googleapis.com/cvdf-datasets/mnist/${f}.gz"
+            gunzip "${f}.gz"
+          done
+
       - name: benchmark (optional, non-blocking)
         continue-on-error: true
         run: |
           cd build
-          if [ -f bench_large ]; then
+          if [ -f bench_large ] && [ -f ../examples/data/train-images-idx3-ubyte ]; then
             OMP_NUM_THREADS=2 ./bench_large train-cpu 2>&1 | grep -E "epoch|median"
+          else
+            echo "skipped: bench_large or mnist data not available"
           fi
 
   # aarch64: cross-compile + QEMU correctness test for NEON kernel

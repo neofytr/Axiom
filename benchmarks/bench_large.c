@@ -263,7 +263,7 @@ static void run_train_cpu(void) {
         per_epoch[ep] = dt;
         float test_acc = evaluate(&m, test_x, test_labels);
         printf("epoch %d/%d  loss=%.4f  test_acc=%.2f%%  time=%.3fs\n",
-               ep + 1, EPOCHS, loss_sum / n_batches, test_acc, dt);
+               ep + 1, EPOCHS, loss_sum / (float)n_batches, test_acc, dt);
     }
 
     double t_total = now_s() - t_start;

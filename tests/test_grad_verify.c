@@ -95,8 +95,6 @@ static float verify_grad(ax_tensor_t *param, forward_fn_t forward, ax_tensor_t *
 /* global state for forward functions (ugly but necessary since
    the callback signature can't carry extra args) */
 static ax_tensor_t *g_weight = NULL;
-static ax_tensor_t *g_bias = NULL;
-static ax_layer_t *g_layer = NULL;
 
 
 /* dense gradient check */

@@ -167,7 +167,6 @@ static void test_normalize(void)
     AX_TEST_ASSERT(normed != NULL, "normalize should work");
 
     /* feature 0: mean=15, std~11.18. normalized should have ~zero mean */
-    int64_t i00[] = {0, 0}, i10[] = {1, 0}, i20[] = {2, 0};
     float sum = 0;
     for (int i = 0; i < 4; i++)
     {

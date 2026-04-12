@@ -284,7 +284,7 @@ ax_dataset_t *ax_csv_dataset_load(const char *path,
     #define CSV_LINE_MAX 8192
     #define CSV_FIELDS_MAX 256
     char line[CSV_LINE_MAX];
-    if (has_header) (void)fgets(line, sizeof(line), f); /* skip header */
+    if (has_header && !fgets(line, sizeof(line), f)) { /* skip header; empty file is handled below */ }
 
     int64_t row = 0;
     while (fgets(line, sizeof(line), f) && row < n_rows)
