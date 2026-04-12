@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en" data-page="quickstart">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Quickstart - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html" class="active">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link active">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Quickstart</h1>
+        <p>Get Axiom running and train your first model in under five minutes.</p>
+
+        <h2>Prerequisites</h2>
+        <p>You need a C compiler (GCC or Clang) and CMake 3.14+. That is the entire dependency list.</p>
+
+        <h2>Clone and Build</h2>
+<pre><code><span class="cmt"># clone the repository</span>
+git clone https://github.com/neofytr/neoNN.git
+<span class="kw">cd</span> neoNN
+
+<span class="cmt"># build</span>
+mkdir build && <span class="kw">cd</span> build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+
+<span class="cmt"># run the tests to make sure everything works</span>
+ctest --output-on-failure</code></pre>
+
+        <p>All 22 tests should pass. If you are on x86 with AVX-512 or AVX2, or ARM with NEON, the optimized GEMM backend is selected automatically at runtime.</p>
+
+        <h2>Your First Model</h2>
+        <p>Create a file called <code>hello.c</code> in the project root:</p>
+
+<pre><code><span class="pp">#include</span> <span class="str">"axiom/axiom.h"</span>
+<span class="pp">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+<span class="typ">int</span> <span class="fn">main</span>(<span class="typ">void</span>) {
+    <span class="fn">ax_init</span>();
+    <span class="fn">ax_set_seed</span>(<span class="num">42</span>);
+
+    <span class="cmt">// xor dataset</span>
+    <span class="typ">float</span> x_data[] = {<span class="num">0</span>,<span class="num">0</span>, <span class="num">0</span>,<span class="num">1</span>, <span class="num">1</span>,<span class="num">0</span>, <span class="num">1</span>,<span class="num">1</span>};
+    <span class="typ">float</span> y_data[] = {<span class="num">0</span>, <span class="num">1</span>, <span class="num">1</span>, <span class="num">0</span>};
+    <span class="typ">ax_tensor_t</span> *X = <span class="fn">ax_tensor_from_array</span>(x_data, (<span class="typ">int64_t</span>[]){<span class="num">4</span>, <span class="num">2</span>}, <span class="num">2</span>, AX_FLOAT32);
+    <span class="typ">ax_tensor_t</span> *Y = <span class="fn">ax_tensor_from_array</span>(y_data, (<span class="typ">int64_t</span>[]){<span class="num">4</span>, <span class="num">1</span>}, <span class="num">2</span>, AX_FLOAT32);
+
+    <span class="cmt">// 2 -> 16 -> 1 network</span>
+    <span class="typ">ax_layer_t</span> *net = <span class="fn">ax_sequential_create</span>();
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">2</span>, <span class="num">16</span>, <span class="num">true</span>));
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">16</span>, <span class="num">1</span>, <span class="num">true</span>));
+
+    <span class="typ">ax_model_t</span> *m = <span class="fn">ax_model_create</span>(net);
+    <span class="typ">ax_optimizer_t</span> *opt = <span class="fn">ax_adam_create</span>(
+        m->params, m->n_params,
+        <span class="num">1e-3f</span>, <span class="num">0.9f</span>, <span class="num">0.999f</span>, <span class="num">1e-8f</span>, <span class="num">0</span>);
+    <span class="fn">ax_model_compile</span>(m, opt, ax_mse_loss);
+
+    <span class="cmt">// train for 2000 steps</span>
+    <span class="kw">for</span> (<span class="typ">int</span> i = <span class="num">0</span>; i &lt; <span class="num">2000</span>; i++) {
+        <span class="typ">float</span> loss = <span class="fn">ax_model_train_step</span>(m, X, Y);
+        <span class="kw">if</span> (i % <span class="num">500</span> == <span class="num">0</span>)
+            printf(<span class="str">"step %d  loss %.6f\n"</span>, i, loss);
+    }
+
+    <span class="cmt">// predict</span>
+    <span class="typ">ax_tensor_t</span> *pred = <span class="fn">ax_model_predict</span>(m, X);
+    <span class="fn">ax_tensor_print</span>(pred);
+
+    <span class="fn">ax_tensor_destroy</span>(pred);
+    <span class="fn">ax_tensor_destroy</span>(X);
+    <span class="fn">ax_tensor_destroy</span>(Y);
+    <span class="fn">ax_model_destroy</span>(m);
+    <span class="fn">ax_shutdown</span>();
+    <span class="kw">return</span> <span class="num">0</span>;
+}</code></pre>
+
+        <h2>Compile and Run</h2>
+<pre><code><span class="cmt"># from the build directory</span>
+gcc -O2 -I../include ../hello.c -L. -laxiom -lm -lpthread -o hello
+./hello</code></pre>
+
+        <p>You should see the loss dropping and predictions converging to <code>[0, 1, 1, 0]</code>.</p>
+
+        <h2>Next Steps</h2>
+        <ul>
+            <li><a href="building.html">Building</a> covers CMake flags, profiles, and cross-compilation.</li>
+            <li><a href="architecture.html">Architecture</a> explains how the framework is structured internally.</li>
+            <li><a href="guide-training.html">Training Guide</a> walks through a full training loop with data loading, batching, and LR scheduling.</li>
+            <li><a href="api-tensor.html">API Reference</a> documents every public function.</li>
+        </ul>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

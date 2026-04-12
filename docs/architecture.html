@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en" data-page="architecture">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Architecture - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html" class="active">Architecture</a>
+            <a href="api-tensor.html">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link active">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Architecture Overview</h1>
+        <p>How Axiom is structured internally, from the lowest backend layer up to the model API.</p>
+
+        <h2>The Four-Layer Pipeline</h2>
+        <p>Every computation in Axiom flows through a clean four-layer pipeline. Each layer has a well-defined responsibility and a clean boundary with its neighbors:</p>
+
+<pre><code>  User code
+     |
+  <span class="typ">Layers</span>       ax_dense_create, ax_layer_forward, ax_sequential_add
+     |
+  <span class="typ">Ops</span>          ax_add, ax_matmul, ax_relu  (autograd recording)
+     |
+  <span class="typ">Compute</span>      ax_compute_gemm, ax_compute_add  (dispatch + broadcast)
+     |
+  <span class="typ">Backend</span>      cpu_naive, cpu_opt, cuda  (raw kernel implementations)</code></pre>
+
+        <p><strong>Backend</strong> is the bottom layer. Each backend fills in an <code>ax_backend_ops_t</code> vtable with raw kernel implementations: element-wise ops, GEMM, reductions, activations. A backend is pure compute with no knowledge of autograd or broadcasting. The CPU naive backend is always available as a fallback. The optimized CPU backend adds SIMD GEMM, fused ops, and parallel reductions. The CUDA backend routes to cuBLAS and custom kernels.</p>
+
+        <p><strong>Compute</strong> is the dispatch layer. It holds a pointer to the active backend's vtable and routes every call through it. This is where ISA dispatch happens: at startup, <code>ax_compute_init()</code> probes available backends and selects the best one. The compute layer also handles device routing, so <code>ax_compute_gemm()</code> on a CUDA tensor goes to the CUDA backend automatically.</p>
+
+        <p><strong>Ops</strong> is the user-facing math layer. Functions like <code>ax_add()</code>, <code>ax_matmul()</code>, and <code>ax_relu()</code> live here. They handle output tensor allocation, shape validation, broadcasting, and (when grad tracking is enabled) recording the operation into the autograd computation graph. They call down into compute for the actual math.</p>
+
+        <p><strong>Layers</strong> is the highest layer. A layer is a struct with a forward function pointer, parameter tensors, and train/eval mode. Layers compose into sequential models. <code>ax_layer_forward()</code> calls the layer's forward function, which calls ops, which call compute, which calls the backend. The chain is clean and each level adds exactly one concern.</p>
+
+        <h2>Tensor Internals</h2>
+        <p>The tensor is the fundamental data type. Understanding its internals is key to understanding everything else.</p>
+
+        <h3>Structure</h3>
+<pre><code><span class="kw">typedef struct</span> <span class="typ">ax_tensor</span> {
+    <span class="typ">ax_storage_t</span> *storage;         <span class="cmt">// shared data buffer</span>
+    <span class="typ">int64_t</span> shape[AX_MAX_DIMS];    <span class="cmt">// size of each dimension</span>
+    <span class="typ">int64_t</span> strides[AX_MAX_DIMS];  <span class="cmt">// element stride per dimension</span>
+    <span class="typ">int</span> ndim;                      <span class="cmt">// number of dimensions</span>
+    <span class="typ">ax_dtype_t</span> dtype;              <span class="cmt">// element type</span>
+    <span class="typ">int64_t</span> offset;                <span class="cmt">// element offset into storage</span>
+    <span class="typ">bool</span> requires_grad;
+    <span class="kw">struct</span> <span class="typ">ax_tensor</span> *grad;
+    <span class="typ">void</span> *grad_fn;                 <span class="cmt">// opaque pointer to grad function</span>
+} <span class="typ">ax_tensor_t</span>;</code></pre>
+
+        <p>A tensor is a metadata wrapper around a storage buffer. The shape and strides arrays describe how to index into the flat data. Strides make zero-copy operations possible: a transpose just swaps two stride values without touching the data.</p>
+
+        <h3>Storage and Refcounting</h3>
+        <p>The actual data lives in <code>ax_storage_t</code>, a refcounted buffer:</p>
+
+<pre><code><span class="kw">typedef struct</span> {
+    <span class="typ">void</span> *data;            <span class="cmt">// raw data pointer (aligned)</span>
+    <span class="typ">size_t</span> size_bytes;
+    <span class="typ">atomic_int</span> refcount;   <span class="cmt">// freed when it hits 0</span>
+    <span class="typ">ax_device_t</span> device;    <span class="cmt">// where this memory lives</span>
+    <span class="typ">bool</span> is_arena_temp;    <span class="cmt">// true if from a bump arena</span>
+    <span class="typ">uint64_t</span> generation;   <span class="cmt">// bumped on every write</span>
+} <span class="typ">ax_storage_t</span>;</code></pre>
+
+        <p>Multiple tensors can share the same storage. When you call <code>ax_tensor_view()</code>, <code>ax_tensor_reshape()</code>, or <code>ax_tensor_transpose()</code>, you get a new tensor struct that points to the same storage with a different shape/strides/offset. The storage's refcount tracks how many tensors reference it. When the last tensor is destroyed, the storage is freed.</p>
+
+        <h3>The Generation Counter</h3>
+        <p>The <code>generation</code> field on storage is a subtle but important optimization. Caches (like the packed matrix buffers in the GEMM backend) key on the storage pointer. But optimizers update weights in-place without changing the pointer. The generation counter is bumped on every in-place write via <code>ax_storage_touch()</code>, so caches can detect stale entries and invalidate them. It starts at 1 and only goes up.</p>
+
+        <h3>Views</h3>
+        <p>Views are the reason tensors have strides and an offset. A view shares the same underlying data buffer but presents a different shape. This means:</p>
+        <ul>
+            <li><code>ax_tensor_transpose(t, 0, 1)</code> returns instantly by swapping strides. No data movement.</li>
+            <li><code>ax_tensor_reshape(t, new_shape, new_ndim)</code> returns a view if the tensor is contiguous, or makes a copy if it is not.</li>
+            <li><code>ax_tensor_squeeze()</code> and <code>ax_tensor_unsqueeze()</code> are pure metadata operations.</li>
+        </ul>
+        <p>The tradeoff is that non-contiguous tensors require strided access patterns in compute kernels. Most backends check <code>ax_tensor_is_contiguous()</code> and fall back to a slower strided loop when needed.</p>
+
+        <h2>Autograd Engine</h2>
+        <p>Axiom uses reverse-mode automatic differentiation: it records a computation graph during the forward pass, then walks it backward to compute gradients.</p>
+
+        <h3>The grad_fn Struct</h3>
+<pre><code><span class="kw">struct</span> <span class="typ">ax_grad_fn</span> {
+    <span class="typ">ax_backward_fn_t</span> backward;     <span class="cmt">// the backward function</span>
+    <span class="typ">ax_tensor_t</span> *inputs[<span class="num">2</span>];        <span class="cmt">// inputs to the forward op</span>
+    <span class="typ">int</span> n_inputs;
+    <span class="typ">ax_tensor_t</span> *saved[<span class="num">4</span>];         <span class="cmt">// tensors saved for backward</span>
+    <span class="typ">bool</span> saved_owned[<span class="num">4</span>];           <span class="cmt">// whether grad_fn owns saved[i]</span>
+    <span class="typ">int</span> n_saved;
+    <span class="typ">double</span> scalar_ctx;             <span class="cmt">// e.g. mul_scalar's scalar</span>
+    <span class="typ">int</span> int_ctx;                   <span class="cmt">// e.g. axis for sum</span>
+    <span class="typ">void</span> *ctx;                     <span class="cmt">// opaque extra context</span>
+    <span class="typ">void</span> (*ctx_cleanup)(<span class="typ">void</span> *);   <span class="cmt">// cleanup if backward never called</span>
+};</code></pre>
+
+        <p>Every differentiable op in the ops layer creates a <code>grad_fn</code> and attaches it to the output tensor. The grad_fn stores:</p>
+        <ul>
+            <li>A backward function pointer that computes input gradients given the output gradient</li>
+            <li>References to the input tensors (so gradients can be routed back)</li>
+            <li>Saved tensors that the backward function needs (e.g., ReLU saves its output to know which elements were zeroed)</li>
+            <li>Scalar/integer context for ops like <code>ax_mul_scalar</code> or <code>ax_sum</code></li>
+        </ul>
+
+        <h3>Computation Graph and Backward Pass</h3>
+        <p>The computation graph is implicit: it is the chain of grad_fn pointers attached to tensors. When you call <code>ax_backward(loss)</code>, the engine:</p>
+        <ol>
+            <li>Performs a topological sort starting from the loss tensor, walking backward through grad_fn chains</li>
+            <li>Initializes the loss gradient to 1.0</li>
+            <li>Visits each node in reverse topological order, calling its backward function</li>
+            <li>Each backward function computes gradients for its inputs and accumulates them (grad += computed_grad)</li>
+        </ol>
+        <p>The topological sort ensures that when we visit a node, all its consumers have already contributed their gradients. This is the standard reverse-mode AD algorithm.</p>
+
+        <h3>Memory Management in Autograd</h3>
+        <p>Autograd is where memory management gets interesting. Three mechanisms keep allocations fast and leaks impossible:</p>
+
+        <p><strong>Slab allocator for grad_fn.</strong> Instead of calling <code>malloc</code> for every grad_fn, Axiom uses a thread-local slab free-list. <code>ax_grad_fn_create()</code> pops from the free list (or allocates a slab of 64 grad_fn structs at once). <code>ax_grad_fn_destroy()</code> pushes back. This means creating a grad_fn is a pointer bump, not a syscall.</p>
+
+        <p><strong>Backward arena.</strong> <code>ax_backward_arena()</code> returns a thread-local bump arena used for temporary buffers during the backward pass. Backward functions allocate from this arena instead of malloc. After <code>ax_backward()</code> completes, the arena is reset in bulk. This is much faster than individual frees and eliminates the risk of forgetting to free a temporary.</p>
+
+        <p><strong>Forward arena.</strong> <code>ax_forward_arena()</code> provides similar arena allocation for forward-pass temporaries that need to outlive the forward pass and stay alive through backward. For example, batchnorm saves its normalized input (<code>x_hat</code>) and inverse standard deviation (<code>inv_std</code>) from the forward arena. These are only freed when <code>ax_graph_cleanup()</code> is called after the backward pass.</p>
+
+        <p><strong>Graph cleanup.</strong> <code>ax_graph_cleanup(loss)</code> walks the computation graph from the loss tensor and destroys all intermediate (non-leaf) tensors. Leaf tensors (parameters, user-created tensors) are not touched. This is the companion call to <code>ax_backward()</code> and together they ensure a clean training loop with no leaks.</p>
+
+        <h3>Lazy Zero Grad</h3>
+        <p>A common optimization: instead of memset'ing every gradient tensor to zero before each step, Axiom uses a generation-counter approach. Fresh gradients skip the accumulate step and write directly. This avoids a full memory pass over every parameter at the start of each training step.</p>
+
+        <h2>Compute Dispatch</h2>
+        <p>The compute layer is a vtable-based dispatch mechanism. Every math operation goes through a function pointer in the <code>ax_backend_ops_t</code> struct.</p>
+
+        <h3>The vtable Pattern</h3>
+<pre><code><span class="kw">typedef struct</span> {
+    <span class="kw">const</span> <span class="typ">char</span> *name;
+    <span class="typ">ax_status_t</span> (*add)(<span class="kw">const</span> <span class="typ">ax_tensor_t</span> *a, <span class="kw">const</span> <span class="typ">ax_tensor_t</span> *b, <span class="typ">ax_tensor_t</span> *out);
+    <span class="typ">ax_status_t</span> (*gemm)(<span class="kw">const</span> <span class="typ">ax_tensor_t</span> *a, <span class="kw">const</span> <span class="typ">ax_tensor_t</span> *b, <span class="typ">ax_tensor_t</span> *out);
+    <span class="typ">ax_status_t</span> (*gemm_nt)(...);   <span class="cmt">// optional: a @ b^T</span>
+    <span class="typ">ax_status_t</span> (*gemm_relu)(...);  <span class="cmt">// optional: relu(a @ b + bias)</span>
+    <span class="cmt">// ... 30+ more slots</span>
+} <span class="typ">ax_backend_ops_t</span>;</code></pre>
+
+        <p>Optional operations (like fused GEMM+ReLU, AXPY, softmax) can be NULL. The dispatch layer checks for NULL and falls back to a decomposed path. For example, if <code>gemm_relu</code> is NULL, the caller falls back to <code>gemm()</code> + <code>relu()</code> as separate calls.</p>
+
+        <h3>ISA Dispatch</h3>
+        <p>On x86, <code>ax_compute_init()</code> probes CPUID for AVX-512 and AVX2 support. On ARM, it checks for NEON (which is always present on aarch64). The best available backend is selected automatically. You can also force a specific backend with <code>ax_compute_set_backend()</code>.</p>
+
+        <h3>Device Routing</h3>
+        <p>Each backend can declare a <code>device</code> field. The CUDA backend sets <code>device = AX_DEVICE_CUDA</code>. When core code needs to allocate storage or transfer data for a CUDA tensor, it looks up the backend that owns <code>AX_DEVICE_CUDA</code> via <code>ax_backend_for_device()</code> and calls its memory hooks (<code>storage_alloc</code>, <code>storage_free</code>, <code>memcpy_h2d</code>, etc.).</p>
+
+        <h2>GEMM: The Heart of Performance</h2>
+        <p>Matrix multiplication dominates the runtime of neural network training and inference. Axiom implements BLIS-style tiled GEMM, the same algorithm used by production BLAS libraries.</p>
+
+        <h3>The BLIS 5-Loop Structure</h3>
+        <p>BLIS organizes GEMM into 5 nested loops that tile the computation to fit each level of the cache hierarchy:</p>
+
+<pre><code><span class="cmt">// C [M x N] = A [M x K] @ B [K x N]</span>
+<span class="kw">for</span> jc = <span class="num">0</span> .. N, step NC      <span class="cmt">// 5th loop: tiles columns of B for L3</span>
+  <span class="kw">for</span> pc = <span class="num">0</span> .. K, step KC    <span class="cmt">// 4th loop: tiles K dimension for L2</span>
+    pack_b(B[pc:pc+KC, jc:jc+NC])  <span class="cmt">// pack B panel into contiguous buffer</span>
+    <span class="kw">for</span> ic = <span class="num">0</span> .. M, step MC  <span class="cmt">// 3rd loop: tiles rows of A for L1</span>
+      pack_a(A[ic:ic+MC, pc:pc+KC])  <span class="cmt">// pack A panel</span>
+      <span class="kw">for</span> jr = <span class="num">0</span> .. NC, step NR  <span class="cmt">// 2nd loop: micro-panel of B</span>
+        <span class="kw">for</span> ir = <span class="num">0</span> .. MC, step MR  <span class="cmt">// 1st loop: micro-panel of A</span>
+          micro_kernel(A[ir:ir+MR, :], B[:, jr:jr+NR], C[ir:ir+MR, jr:jr+NR])</code></pre>
+
+        <p>The key insight is that packing and tiling transform the random-stride access pattern of the original matrices into sequential scans that hit the cache hierarchy perfectly.</p>
+
+        <h3>Micro-Kernel Sizes</h3>
+        <p>The micro-kernel is the innermost loop: it computes an MR x NR block of C using an MR x K slice of A and a K x NR slice of B. The sizes are chosen to fill the register file:</p>
+        <table>
+            <thead>
+                <tr><th>ISA</th><th>MR x NR</th><th>Registers Used</th><th>Notes</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>AVX-512</td><td>14 x 32</td><td>All 32 ZMM registers</td><td>14 accumulators + broadcast + load</td></tr>
+                <tr><td>AVX2</td><td>6 x 16</td><td>16 YMM registers</td><td>6 accumulators + broadcast + load</td></tr>
+                <tr><td>NEON</td><td>8 x 12</td><td>32 NEON registers</td><td>24 accumulators + 4 A loads + 3 B loads + 1 spare</td></tr>
+                <tr><td>Scalar</td><td>4 x 4</td><td>General-purpose regs</td><td>Fallback, no SIMD</td></tr>
+            </tbody>
+        </table>
+
+        <h3>Cache Tuning</h3>
+        <p>The tile sizes NC, MC, KC are auto-tuned at startup to match the CPU's actual cache sizes. The goal is:</p>
+        <ul>
+            <li>KC chosen so that the packed A micro-panel (MR x KC) fits in L1</li>
+            <li>MC chosen so that the packed A panel (MC x KC) fits in L2</li>
+            <li>NC chosen so that the packed B panel (KC x NC) fits in L3 (or a reasonable fraction of it)</li>
+        </ul>
+        <p>This auto-tuning means the same binary performs well on different hardware without manual configuration.</p>
+
+        <h3>Packing</h3>
+        <p>Before the micro-kernel runs, slices of A and B are copied into contiguous, alignment-friendly buffers (<code>pack_a</code> and <code>pack_b</code>). This serves two purposes:</p>
+        <ul>
+            <li>Eliminates stride arithmetic in the inner loop (the packed buffer is sequential)</li>
+            <li>Ensures proper alignment for SIMD loads (the pack buffers are 64-byte aligned)</li>
+        </ul>
+        <p>Pack buffers are per-thread to avoid lock contention. The generation counter on storage lets the framework cache packed B buffers and invalidate them when the underlying weights change.</p>
+
+        <h3>Threading</h3>
+        <p>The JC loop (outermost, over columns of B) is parallelized with OpenMP. Each thread gets its own pack buffers. The thread count auto-shrinks when there are not enough JC tiles to fill all threads, avoiding the overhead of idle threads waiting at a barrier.</p>
+        <p>On hybrid CPUs (Intel 12th gen+ with P/E cores), <code>ax_autotune_threads()</code> benchmarks each logical core and restricts the thread pool to the fast cores, preventing slow E-cores from bottlenecking the barrier.</p>
+
+        <h2>CUDA Backend</h2>
+        <p>The CUDA backend provides GPU acceleration for all core operations.</p>
+
+        <h3>cuBLAS Integration</h3>
+        <p>GEMM is dispatched to cuBLAS via <code>cublasSgemm</code>. The backend maintains a cuBLAS handle and CUDA stream. All operations on the stream are serialized, matching Axiom's synchronous execution model.</p>
+
+        <h3>Fused Kernels</h3>
+        <p>Element-wise operations (add, mul, relu, sigmoid, tanh) are implemented as custom CUDA kernels. The fused variants (add_relu, gemm_relu, bias_add) run as single kernel launches, avoiding extra global memory round-trips.</p>
+
+        <h3>Memory Model</h3>
+        <p>CUDA tensors live in device memory. The <code>ax_storage_t</code> struct's <code>device</code> field tracks placement. Transfers between host and device use the backend's <code>memcpy_h2d</code> and <code>memcpy_d2h</code> hooks. The user-facing API is <code>ax_tensor_to_cuda()</code> and <code>ax_tensor_to_cpu()</code>.</p>
+        <p>The global default device (<code>ax_set_default_device(AX_DEVICE_CUDA)</code>) controls where new tensors are allocated. Combined with <code>ax_compute_set_backend(AX_BACKEND_CUDA)</code>, this routes the entire training loop to the GPU with no code changes.</p>
+
+        <h2>Op Fusion</h2>
+        <p>Axiom fuses several common operation patterns to reduce memory traffic:</p>
+
+        <h3>MatMul + Bias + ReLU</h3>
+        <p><code>ax_matmul_bias_relu()</code> computes <code>relu(A @ B + bias)</code> in a single GEMM call. The ReLU is applied during the micro-kernel's writeback step, while the output is still in registers. This eliminates one full read+write pass over the output matrix.</p>
+
+        <h3>Conv2D + BatchNorm + ReLU</h3>
+        <p><code>ax_sequential_fuse()</code> walks a sequential model and replaces every contiguous Conv2D-BatchNorm-ReLU triple with a single fused <code>ax_conv_bn_relu_t</code> layer. The fused forward pass computes all three operations in a single traversal of the output feature map.</p>
+
+        <h3>Cross-Entropy Backward</h3>
+        <p>The backward pass for cross-entropy loss with softmax computes <code>softmax(pred) - target</code> in one SIMD pass, instead of materializing the full softmax Jacobian matrix. For a batch of 256 with 10 classes, this avoids a 10x10 matrix per sample.</p>
+
+        <h3>In-Place Activations</h3>
+        <p><code>ax_relu_inplace()</code>, <code>ax_sigmoid_inplace()</code>, and <code>ax_tanh_inplace()</code> mutate the input buffer directly when the storage refcount is 1 (no shared views). This halves the memory traffic for activation layers.</p>
+
+        <h2>Layer System</h2>
+        <p>Layers use C polymorphism: a base <code>ax_layer_t</code> struct with function pointers, and concrete layer types embed it as their first field.</p>
+
+<pre><code><span class="kw">struct</span> <span class="typ">ax_layer</span> {
+    <span class="typ">ax_layer_ops_t</span> ops;       <span class="cmt">// vtable: forward + destroy</span>
+    <span class="typ">ax_layer_type_t</span> type;
+    <span class="typ">bool</span> training;
+    <span class="typ">ax_tensor_t</span> *params[<span class="num">4</span>];  <span class="cmt">// flat array, no heap</span>
+    <span class="typ">int</span> n_params;
+    <span class="typ">ax_tensor_t</span> *buffers[<span class="num">4</span>]; <span class="cmt">// non-trainable (running stats)</span>
+    <span class="typ">int</span> n_buffers;
+};</code></pre>
+
+        <p>The design is intentionally minimal for embedded targets: no heap-allocated strings, no dynamic arrays where avoidable, just function pointers and flat structs. Parameters are tracked in a fixed-size array (max 4 per layer, which covers weight+bias for dense and weight+bias+gamma+beta for batchnorm).</p>
+
+        <h2>Error Handling</h2>
+        <p>Axiom uses thread-safe error state. Every operation that can fail returns an <code>ax_status_t</code> enum. Detailed error messages are stored in thread-local storage and retrieved via <code>ax_err_last_message()</code>. An optional callback (<code>ax_err_set_callback</code>) can be installed for logging or custom error handling.</p>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

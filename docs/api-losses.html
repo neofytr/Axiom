@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en" data-page="api-losses">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Losses API - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html" class="active">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link active">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Losses API</h1>
+        <p>Loss functions for training. Each returns a scalar tensor (1 element) suitable for <code>ax_backward()</code>.</p>
+
+        <h2>Regression Losses</h2>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_mse_loss</span>(<span class="typ">ax_tensor_t</span> *pred, <span class="typ">ax_tensor_t</span> *target)</div>
+        <p class="api-desc">Mean Squared Error: <code>(1/n) * sum((pred - target)^2)</code>. The classic regression loss. Penalizes large errors heavily due to the squaring.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_mae_loss</span>(<span class="typ">ax_tensor_t</span> *pred, <span class="typ">ax_tensor_t</span> *target)</div>
+        <p class="api-desc">Mean Absolute Error: <code>(1/n) * sum(|pred - target|)</code>. More robust to outliers than MSE.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_huber_loss</span>(<span class="typ">ax_tensor_t</span> *pred, <span class="typ">ax_tensor_t</span> *target, <span class="typ">float</span> delta)</div>
+        <p class="api-desc">Huber loss (smooth L1): quadratic for small errors (<code>|x| &lt;= delta</code>), linear for large. Best of both worlds: smooth gradients near zero (like MSE) and robust to outliers (like MAE).</p>
+
+        <h2>Classification Losses</h2>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_cross_entropy_loss</span>(<span class="typ">ax_tensor_t</span> *pred, <span class="typ">ax_tensor_t</span> *target)</div>
+        <p class="api-desc">Cross-entropy loss for multi-class classification. <code>pred</code> should be raw logits (NOT softmax'd); log-softmax is applied internally for numerical stability. <code>target</code> is one-hot encoded. Shapes: pred <code>[batch, classes]</code>, target <code>[batch, classes]</code>.</p>
+
+        <blockquote><p>The backward pass for cross-entropy computes <code>softmax(pred) - target</code> in a single SIMD pass, avoiding the full softmax Jacobian.</p></blockquote>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_bce_with_logits_loss</span>(<span class="typ">ax_tensor_t</span> *pred, <span class="typ">ax_tensor_t</span> *target)</div>
+        <p class="api-desc">Binary cross-entropy with logits. <code>pred</code> is raw logits (before sigmoid). Target is 0 or 1. Uses the numerically stable formulation: <code>mean(max(pred, 0) - pred*target + log(1 + exp(-|pred|)))</code>.</p>
+
+        <h2>Which Loss to Use</h2>
+        <table>
+            <thead>
+                <tr><th>Task</th><th>Loss Function</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>Regression (continuous output)</td><td><code>ax_mse_loss</code></td></tr>
+                <tr><td>Regression with outliers</td><td><code>ax_huber_loss</code> or <code>ax_mae_loss</code></td></tr>
+                <tr><td>Multi-class classification</td><td><code>ax_cross_entropy_loss</code></td></tr>
+                <tr><td>Binary classification</td><td><code>ax_bce_with_logits_loss</code></td></tr>
+                <tr><td>Multi-label classification</td><td><code>ax_bce_with_logits_loss</code> (per label)</td></tr>
+            </tbody>
+        </table>
+
+        <h2>Example</h2>
+<pre><code><span class="cmt">// classification: raw logits in, cross-entropy handles softmax</span>
+<span class="typ">ax_tensor_t</span> *logits = <span class="fn">ax_layer_forward</span>(net, input);
+<span class="typ">ax_tensor_t</span> *loss = <span class="fn">ax_cross_entropy_loss</span>(logits, one_hot_labels);
+
+<span class="cmt">// backward + update</span>
+<span class="fn">ax_backward</span>(loss);
+<span class="fn">ax_optimizer_step</span>(opt);
+<span class="fn">ax_graph_cleanup</span>(loss);
+<span class="fn">ax_tensor_destroy</span>(loss);
+
+<span class="cmt">// regression with huber loss (delta=1.0)</span>
+<span class="typ">ax_tensor_t</span> *pred = <span class="fn">ax_layer_forward</span>(net, input);
+<span class="typ">ax_tensor_t</span> *loss = <span class="fn">ax_huber_loss</span>(pred, targets, <span class="num">1.0f</span>);</code></pre>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

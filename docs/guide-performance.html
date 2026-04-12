@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en" data-page="guide-performance">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Performance Guide - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html">API</a>
+            <a href="guide-training.html" class="active">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link active">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Performance Guide</h1>
+        <p>How to get the most out of Axiom. Covers threading, GEMM tuning, op fusion, memory management, and profiling.</p>
+
+        <h2>Threading</h2>
+        <p>Axiom uses OpenMP for parallelism. The default thread count is the number of physical cores (not hyperthreads).</p>
+
+        <h3>Manual Thread Control</h3>
+<pre><code><span class="cmt">// set to 4 threads</span>
+<span class="fn">ax_set_num_threads</span>(<span class="num">4</span>);
+
+<span class="cmt">// reset to default</span>
+<span class="fn">ax_set_num_threads</span>(<span class="num">0</span>);
+
+<span class="cmt">// query current count</span>
+<span class="typ">int</span> n = <span class="fn">ax_get_num_threads</span>();</code></pre>
+
+        <h3>Hybrid CPUs</h3>
+        <p>On Intel 12th gen+ (Alder Lake, Raptor Lake) with P-cores and E-cores, the default OpenMP behavior can be catastrophic: slow E-cores hold up fast P-cores at barriers. Axiom provides:</p>
+<pre><code><span class="typ">int</span> n = <span class="fn">ax_autotune_threads</span>();
+printf(<span class="str">"using %d fast cores\n"</span>, n);</code></pre>
+        <p>This benchmarks each logical core with a pinned micro-workload, clusters them by speed, and restricts the thread pool to the fast cores. Total calibration time is under 200ms. Skipped if <code>OMP_NUM_THREADS</code> is set or <code>AX_NO_AUTOTUNE=1</code>.</p>
+
+        <h3>Threading Best Practices</h3>
+        <ul>
+            <li>For small batch sizes (batch &lt; 32), fewer threads can be faster because the per-thread overhead exceeds the compute savings.</li>
+            <li>The GEMM JC loop auto-shrinks when there are not enough column tiles to fill all threads.</li>
+            <li>OpenMP nesting is disabled: the conv2d batch loop and the GEMM JC loop use a guard (<code>omp_in_parallel</code>) to avoid nested parallelism.</li>
+        </ul>
+
+        <h2>Op Fusion</h2>
+        <p>Fused operations reduce memory traffic by combining multiple ops into a single kernel pass. Use them whenever possible.</p>
+
+        <h3>Fused Dense + ReLU</h3>
+        <p>Instead of separate matmul and relu calls:</p>
+<pre><code><span class="cmt">// slow: two passes over the output matrix</span>
+<span class="typ">ax_tensor_t</span> *h = <span class="fn">ax_matmul_bias</span>(x, w, b);
+<span class="typ">ax_tensor_t</span> *a = <span class="fn">ax_relu</span>(h);
+
+<span class="cmt">// fast: one pass, relu applied during gemm writeback</span>
+<span class="typ">ax_tensor_t</span> *a = <span class="fn">ax_matmul_bias_relu</span>(x, w, b);</code></pre>
+
+        <h3>In-Place Activations</h3>
+<pre><code><span class="cmt">// allocates a new tensor</span>
+<span class="typ">ax_tensor_t</span> *a = <span class="fn">ax_relu</span>(h);
+
+<span class="cmt">// mutates h in place (when refcount is 1)</span>
+<span class="fn">ax_relu_inplace</span>(h);  <span class="cmt">// returns h, no allocation</span></code></pre>
+        <p>In-place variants save one allocation and one full memory pass. They are safe when the storage refcount is 1 (no other tensors sharing the buffer). If refcount > 1, they silently fall back to the out-of-place variant.</p>
+
+        <h3>Conv+BN+ReLU Fusion</h3>
+<pre><code><span class="cmt">// after building the model, fuse eligible triples</span>
+<span class="fn">ax_sequential_fuse</span>(net);</code></pre>
+        <p>This replaces every contiguous Conv2D + BatchNorm + ReLU sequence in the sequential model with a single fused layer. The fused forward pass computes all three in one traversal of the output feature map.</p>
+
+        <h2>GEMM Performance</h2>
+        <p>Matrix multiplication dominates runtime for dense layers. Axiom's BLIS-style GEMM auto-tunes its tile sizes to your CPU's cache hierarchy at startup.</p>
+
+        <h3>ISA Selection</h3>
+        <p>The best SIMD backend is selected automatically at <code>ax_compute_init()</code> time:</p>
+        <table>
+            <thead>
+                <tr><th>ISA</th><th>Micro-kernel</th><th>Peak FLOPS/cycle</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>AVX-512</td><td>14x32</td><td>64 (2 FMA units x 16 floats x 2)</td></tr>
+                <tr><td>AVX2</td><td>6x16</td><td>32 (2 FMA units x 8 floats x 2)</td></tr>
+                <tr><td>NEON</td><td>8x12</td><td>16 (2 FMLA units x 4 floats x 2)</td></tr>
+                <tr><td>Scalar</td><td>4x4</td><td>2 (1 FMA)</td></tr>
+            </tbody>
+        </table>
+
+        <h3>When GEMM is Not the Bottleneck</h3>
+        <p>For very small matrices (e.g., batch=1 inference with a small hidden layer), the pack overhead can dominate. In these cases:</p>
+        <ul>
+            <li>Consider reducing the thread count to 1 (<code>ax_set_num_threads(1)</code>)</li>
+            <li>The fused <code>matmul_bias_relu</code> eliminates post-gemm passes that would otherwise dominate</li>
+        </ul>
+
+        <h2>Memory Management</h2>
+
+        <h3>Arena Allocators</h3>
+        <p>Axiom uses arena allocators for temporary buffers during forward and backward passes. Arenas allocate via bump pointer (extremely fast) and free in bulk. You do not need to manage these manually; they are handled by the autograd system.</p>
+        <ul>
+            <li><strong>Forward arena:</strong> temporaries that must survive through backward (batchnorm saved tensors). Reset by <code>ax_graph_cleanup()</code>.</li>
+            <li><strong>Backward arena:</strong> temporaries used only during backward. Reset after <code>ax_backward()</code> completes.</li>
+        </ul>
+
+        <h3>Conv2D Scratch Caching</h3>
+        <p>Convolution layers cache their im2col buffers and GEMM scratch across batches. The <code>ax_conv_scratch</code> struct is lazily allocated on the first forward call and reused until the layer is destroyed. This avoids per-batch malloc/free for the (often large) im2col matrix.</p>
+
+        <h3>Pack Buffer Caching</h3>
+        <p>The GEMM backend caches packed B matrices (the weight matrix) keyed on the storage pointer and generation counter. When you run the same layer repeatedly (which is every training step), the packed B from the previous forward pass is reused if the weights have not changed. After an optimizer step, the generation counter increments and the cache invalidates.</p>
+
+        <h3>Allocation Counting</h3>
+        <p>Build with <code>-DAX_COUNT_ALLOCS</code> to track allocations:</p>
+<pre><code><span class="typ">uint64_t</span> before = <span class="fn">ax_get_alloc_count</span>();
+<span class="cmt">// ... run a training step ...</span>
+<span class="typ">uint64_t</span> after = <span class="fn">ax_get_alloc_count</span>();
+printf(<span class="str">"allocations: %lu\n"</span>, after - before);</code></pre>
+
+        <h2>CUDA Performance</h2>
+        <p>When using the CUDA backend:</p>
+        <ul>
+            <li><strong>Keep data on the GPU.</strong> Set <code>ax_set_default_device(AX_DEVICE_CUDA)</code> at the start so tensors are created on the GPU. Avoid unnecessary host-device transfers.</li>
+            <li><strong>Batch size matters more on GPU.</strong> Small batches underutilize the GPU. Use batch sizes of 128 or larger.</li>
+            <li><strong>Fused kernels</strong> (add_relu, gemm_relu, bias_add) avoid extra kernel launches and memory round-trips.</li>
+        </ul>
+
+        <h2>Profiling</h2>
+        <p>For detailed profiling, use your platform's tools:</p>
+        <ul>
+            <li><strong>Linux:</strong> <code>perf stat</code> and <code>perf record</code> for cycle-level profiling. <code>perf stat -e cache-misses,cache-references</code> to check cache behavior.</li>
+            <li><strong>Valgrind:</strong> <code>valgrind --tool=callgrind</code> for call-graph profiling (slow but detailed).</li>
+            <li><strong>CUDA:</strong> <code>nsys profile</code> for GPU timeline and kernel analysis.</li>
+        </ul>
+        <p>Common things to look for:</p>
+        <ul>
+            <li>L1/L2 cache miss rates during GEMM (should be very low if tiling is working)</li>
+            <li>Thread imbalance (one thread taking much longer than others at a barrier)</li>
+            <li>Unexpected allocations in the hot path (use <code>AX_COUNT_ALLOCS</code>)</li>
+        </ul>
+
+        <h2>Checklist</h2>
+        <ol>
+            <li>Build with <code>-DCMAKE_BUILD_TYPE=Release</code> (enables -O3)</li>
+            <li>Use <code>ax_matmul_bias_relu()</code> instead of separate matmul + add + relu</li>
+            <li>Call <code>ax_sequential_fuse()</code> for CNN models</li>
+            <li>Use in-place activations where possible</li>
+            <li>Set thread count appropriately for your batch size</li>
+            <li>On hybrid CPUs, call <code>ax_autotune_threads()</code> at startup</li>
+            <li>For inference, use <code>ax_no_grad()</code> or build with <code>AX_INFERENCE_ONLY</code></li>
+            <li>Use batched inference (batch > 1) to amortize fixed overhead</li>
+        </ol>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

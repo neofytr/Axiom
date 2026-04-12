@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en" data-page="api-autograd">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autograd API - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html" class="active">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link active">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Autograd API</h1>
+        <p>Reverse-mode automatic differentiation. Records operations during the forward pass, then walks backward through the computation graph to compute gradients.</p>
+
+        <h2>Core Functions</h2>
+
+        <div class="api-sig"><span class="typ">ax_status_t</span> <span class="fn">ax_backward</span>(<span class="typ">ax_tensor_t</span> *loss)</div>
+        <p class="api-desc">Run the backward pass starting from the loss tensor. The tensor should be a scalar (1 element). Computes gradients for all tensors in the graph that have <code>requires_grad = true</code>. <span class="badge">Training only</span></p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_zero_grad</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Zero out the gradient of a single tensor. Usually you will use <code>ax_optimizer_zero_grad()</code> instead, which zeros all parameter gradients at once. <span class="badge">Training only</span></p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_graph_cleanup</span>(<span class="typ">ax_tensor_t</span> *root)</div>
+        <p class="api-desc">Free the computation graph reachable from the root tensor. Destroys all intermediate (non-leaf) tensors created during the forward pass. Leaf tensors (parameters, user-created) are NOT destroyed. The root tensor itself is NOT destroyed. <span class="badge">Training only</span></p>
+
+        <blockquote><p>Always call <code>ax_graph_cleanup(loss)</code> after <code>ax_backward(loss)</code> and <code>ax_optimizer_step(opt)</code>. Without it, all intermediate forward-pass tensors will leak.</p></blockquote>
+
+        <h2>Gradient Context</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_no_grad</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Disable gradient tracking. Operations after this call will not record into the computation graph. Useful during inference for performance.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_enable_grad</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Re-enable gradient tracking after <code>ax_no_grad()</code>.</p>
+
+        <div class="api-sig"><span class="typ">bool</span> <span class="fn">ax_grad_enabled</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Check if gradient tracking is currently enabled.</p>
+
+        <h2>Arenas</h2>
+
+        <div class="api-sig"><span class="typ">ax_arena_t</span> *<span class="fn">ax_backward_arena</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Get the thread-local backward scratch arena. Backward functions use this for temporary buffers that are freed in bulk after <code>ax_backward()</code> completes. Do NOT store arena pointers in <code>grad_fn->saved[]</code>.</p>
+
+        <div class="api-sig"><span class="typ">ax_arena_t</span> *<span class="fn">ax_forward_arena</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Get the thread-local forward scratch arena. Used for tensors that must outlive the forward pass and stay alive through backward (e.g., batchnorm's saved x_hat). Reset by <code>ax_graph_cleanup()</code>, NOT by <code>ax_backward()</code>.</p>
+
+        <h2>Grad Fn Management</h2>
+
+        <div class="api-sig"><span class="typ">ax_grad_fn_t</span> *<span class="fn">ax_grad_fn_create</span>(<span class="typ">ax_backward_fn_t</span> fn)</div>
+        <p class="api-desc">Allocate a grad_fn from the thread-local slab free-list. Fast (pointer bump, no malloc).</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_grad_fn_destroy</span>(<span class="typ">ax_grad_fn_t</span> *gf)</div>
+        <p class="api-desc">Return a grad_fn to the thread-local slab free-list.</p>
+
+        <h2>Testing</h2>
+
+        <div class="api-sig"><span class="typ">double</span> <span class="fn">ax_grad_check</span>(<span class="typ">ax_tensor_t</span> *(*forward_fn)(<span class="typ">ax_tensor_t</span> *input), <span class="typ">ax_tensor_t</span> *input, <span class="typ">double</span> eps)</div>
+        <p class="api-desc">Numerical gradient check. Compares analytical gradient (from autograd) against finite-difference approximation. Returns the max absolute difference. Use this in tests to verify that your backward implementations are correct.</p>
+
+        <h2>Memory</h2>
+
+        <div class="api-sig"><span class="typ">ax_arena_t</span> *<span class="fn">ax_arena_create</span>(<span class="typ">size_t</span> block_size)</div>
+        <p class="api-desc">Create a new arena with the given default block size. Pass 0 for the default (1 MB).</p>
+
+        <div class="api-sig"><span class="typ">void</span> *<span class="fn">ax_arena_alloc</span>(<span class="typ">ax_arena_t</span> *arena, <span class="typ">size_t</span> size, <span class="typ">size_t</span> alignment)</div>
+        <p class="api-desc">Allocate bytes from the arena with the given alignment. Fast bump-pointer allocation.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_arena_reset</span>(<span class="typ">ax_arena_t</span> *arena)</div>
+        <p class="api-desc">Reset the arena, marking all memory as free without releasing it. Subsequent allocations reuse existing blocks.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_arena_destroy</span>(<span class="typ">ax_arena_t</span> *arena)</div>
+        <p class="api-desc">Destroy the arena and free all blocks.</p>
+
+        <h2>Typical Training Loop Pattern</h2>
+<pre><code><span class="kw">for</span> (<span class="typ">int</span> step = <span class="num">0</span>; step &lt; n_steps; step++) {
+    <span class="cmt">// 1. zero gradients</span>
+    <span class="fn">ax_optimizer_zero_grad</span>(opt);
+
+    <span class="cmt">// 2. forward pass (records computation graph)</span>
+    <span class="typ">ax_tensor_t</span> *pred = <span class="fn">ax_layer_forward</span>(net, input);
+    <span class="typ">ax_tensor_t</span> *loss = <span class="fn">ax_cross_entropy_loss</span>(pred, target);
+
+    <span class="cmt">// 3. backward pass (computes gradients)</span>
+    <span class="fn">ax_backward</span>(loss);
+
+    <span class="cmt">// 4. optional gradient clipping</span>
+    <span class="fn">ax_clip_grad_norm</span>(params, n_params, <span class="num">1.0f</span>);
+
+    <span class="cmt">// 5. update weights</span>
+    <span class="fn">ax_optimizer_step</span>(opt);
+
+    <span class="cmt">// 6. clean up computation graph (frees intermediates)</span>
+    <span class="fn">ax_graph_cleanup</span>(loss);
+    <span class="fn">ax_tensor_destroy</span>(loss);
+}</code></pre>
+
+        <h2>How requires_grad Works</h2>
+        <p>Set <code>t->requires_grad = true</code> on any tensor to track gradients for it. Layer creation functions do this automatically for weight and bias tensors. When an operation sees at least one input with <code>requires_grad = true</code> and gradient tracking is enabled, it creates a <code>grad_fn</code> and attaches it to the output tensor.</p>
+        <p>During <code>ax_backward()</code>, gradients flow back through the graph and accumulate in <code>t->grad</code> for every tensor with <code>requires_grad = true</code>.</p>
+
+        <h2>Inference Mode</h2>
+        <p>For pure inference, you have two options:</p>
+        <ul>
+            <li>Call <code>ax_no_grad()</code> before inference and <code>ax_enable_grad()</code> after. This skips all grad_fn allocation during forward passes.</li>
+            <li>Build with <code>-DAX_INFERENCE_ONLY=ON</code>. This compiles out all autograd code entirely. <code>ax_grad_enabled()</code> always returns false, and <code>ax_grad_fn_create()</code> always returns NULL.</li>
+        </ul>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en" data-page="api-tensor">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tensor API - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html" class="active">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link active">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Tensor API</h1>
+        <p>N-dimensional tensors with refcounted storage, views, and device placement.</p>
+
+        <h2>Types</h2>
+        <p>Supported data types (<code>ax_dtype_t</code>):</p>
+        <table>
+            <thead><tr><th>Enum</th><th>C Type</th><th>Bytes</th></tr></thead>
+            <tbody>
+                <tr><td><code>AX_FLOAT32</code></td><td><code>float</code></td><td>4</td></tr>
+                <tr><td><code>AX_FLOAT64</code></td><td><code>double</code></td><td>8</td></tr>
+                <tr><td><code>AX_INT32</code></td><td><code>int32_t</code></td><td>4</td></tr>
+                <tr><td><code>AX_INT64</code></td><td><code>int64_t</code></td><td>8</td></tr>
+                <tr><td><code>AX_UINT8</code></td><td><code>uint8_t</code></td><td>1</td></tr>
+                <tr><td><code>AX_BOOL</code></td><td><code>uint8_t</code></td><td>1</td></tr>
+            </tbody>
+        </table>
+
+        <h2>Creation</h2>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_create</span>(<span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">ax_dtype_t</span> dtype)</div>
+        <p class="api-desc">Create a tensor with the given shape and dtype. Memory is uninitialized.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_zeros</span>(<span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">ax_dtype_t</span> dtype)</div>
+        <p class="api-desc">Create a tensor filled with zeros.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_ones</span>(<span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">ax_dtype_t</span> dtype)</div>
+        <p class="api-desc">Create a tensor filled with ones.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_full</span>(<span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">ax_dtype_t</span> dtype, <span class="typ">double</span> value)</div>
+        <p class="api-desc">Create a tensor filled with a constant value.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_from_array</span>(<span class="kw">const</span> <span class="typ">void</span> *data, <span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">ax_dtype_t</span> dtype)</div>
+        <p class="api-desc">Create a tensor from existing data. Copies the data into a new storage buffer.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_arange</span>(<span class="typ">int64_t</span> start, <span class="typ">int64_t</span> end, <span class="typ">ax_dtype_t</span> dtype)</div>
+        <p class="api-desc">Create a 1D tensor with values from start to end (exclusive), step 1.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_rand</span>(<span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">float</span> low, <span class="typ">float</span> high)</div>
+        <p class="api-desc">Create a tensor filled with uniform random values in [low, high).</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_scalar</span>(<span class="typ">float</span> value)</div>
+        <p class="api-desc">Create a scalar tensor (shape [1], 1-dim).</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_set_seed</span>(<span class="typ">unsigned int</span> seed)</div>
+        <p class="api-desc">Seed the global RNG used by <code>ax_tensor_rand</code> and weight initializers.</p>
+
+        <h3>Arena Creation</h3>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_arena_zeros</span>(<span class="typ">ax_arena_t</span> *arena, <span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">ax_dtype_t</span> dtype)</div>
+        <p class="api-desc">Arena-allocated zero tensor. Metadata, storage, and data all come from the arena. Extremely fast (no malloc). Invalidated when the arena resets.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_arena_create</span>(<span class="typ">ax_arena_t</span> *arena, <span class="kw">const</span> <span class="typ">int64_t</span> *shape, <span class="typ">int</span> ndim, <span class="typ">ax_dtype_t</span> dtype)</div>
+        <p class="api-desc">Arena-allocated uninitialized tensor. Same lifecycle as <code>arena_zeros</code> but skips the memset.</p>
+
+        <h2>Destruction</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_tensor_destroy</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Release the tensor and its storage. Storage is freed only when refcount drops to 0.</p>
+
+        <h2>Shape Queries</h2>
+
+        <div class="api-sig"><span class="typ">int64_t</span> <span class="fn">ax_tensor_numel</span>(<span class="kw">const</span> <span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Total number of elements in the tensor.</p>
+
+        <div class="api-sig"><span class="typ">bool</span> <span class="fn">ax_tensor_is_contiguous</span>(<span class="kw">const</span> <span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Check if tensor data is contiguous in memory (row-major order).</p>
+
+        <h2>Shape Manipulation</h2>
+        <p>These operations are zero-copy where possible, returning views that share the same storage.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_reshape</span>(<span class="typ">ax_tensor_t</span> *t, <span class="kw">const</span> <span class="typ">int64_t</span> *new_shape, <span class="typ">int</span> new_ndim)</div>
+        <p class="api-desc">Reshape to new shape. Returns a view sharing storage if contiguous, otherwise copies.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_transpose</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int</span> dim0, <span class="typ">int</span> dim1)</div>
+        <p class="api-desc">Transpose two dimensions. Zero-copy (just swaps strides).</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_squeeze</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int</span> dim)</div>
+        <p class="api-desc">Remove a dimension of size 1.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_unsqueeze</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int</span> dim)</div>
+        <p class="api-desc">Insert a dimension of size 1 at the given position.</p>
+
+        <h2>Element Access</h2>
+
+        <div class="api-sig"><span class="typ">float</span> <span class="fn">ax_tensor_get_f32</span>(<span class="kw">const</span> <span class="typ">ax_tensor_t</span> *t, <span class="kw">const</span> <span class="typ">int64_t</span> *indices)</div>
+        <p class="api-desc">Get a single float32 element using ndim indices.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_tensor_set_f32</span>(<span class="typ">ax_tensor_t</span> *t, <span class="kw">const</span> <span class="typ">int64_t</span> *indices, <span class="typ">float</span> value)</div>
+        <p class="api-desc">Set a single float32 element using ndim indices.</p>
+
+        <h2>Views and Copies</h2>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_view</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Create a view that shares storage with a different shape/strides/offset.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_contiguous</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Make a contiguous copy of the tensor.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_ensure_contiguous</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Return the tensor if already contiguous, or a contiguous copy. Check if the return value differs from the input to know whether to free it.</p>
+
+        <h2>Device Management</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_set_default_device</span>(<span class="typ">ax_device_t</span> dev)</div>
+        <p class="api-desc">Set the default device for all new tensor allocations.</p>
+
+        <div class="api-sig"><span class="typ">ax_device_t</span> <span class="fn">ax_get_default_device</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Get the current default device.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_to_cuda</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Move a tensor to the CUDA device. No-op if already on GPU. Returns NULL if CUDA is not available.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_to_cpu</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Move a tensor to CPU. No-op if already on CPU.</p>
+
+        <h2>Operations</h2>
+
+        <h3>Binary Ops (with broadcasting)</h3>
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_add</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b)</div>
+        <p class="api-desc">Element-wise addition with broadcasting.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_sub</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b)</div>
+        <p class="api-desc">Element-wise subtraction with broadcasting.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_mul</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b)</div>
+        <p class="api-desc">Element-wise multiplication with broadcasting.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_div</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b)</div>
+        <p class="api-desc">Element-wise division with broadcasting.</p>
+
+        <h3>Unary Ops</h3>
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_neg</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Negate all elements.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_abs</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Absolute value of all elements.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_exp</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Element-wise exponential.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_log</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Element-wise natural logarithm.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_sqrt</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Element-wise square root.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_square</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Element-wise square.</p>
+
+        <h3>Scalar Ops</h3>
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_add_scalar</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">double</span> s)</div>
+        <p class="api-desc">Add a scalar to every element.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_mul_scalar</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">double</span> s)</div>
+        <p class="api-desc">Multiply every element by a scalar.</p>
+
+        <h3>Matrix Multiply</h3>
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_matmul</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b)</div>
+        <p class="api-desc">Matrix multiplication. Both inputs must be 2D.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_matmul_bias</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b, <span class="typ">ax_tensor_t</span> *bias)</div>
+        <p class="api-desc">Fused matmul + bias: <code>out = (a @ b) + bias</code>. Single output tensor and single grad_fn. Bias may be NULL.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_matmul_bias_relu</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b, <span class="typ">ax_tensor_t</span> *bias)</div>
+        <p class="api-desc">Fused matmul + bias + relu: <code>out = relu((a @ b) + bias)</code>. Applied during GEMM writeback when the backend supports it. Bias may be NULL.</p>
+
+        <h3>Reductions</h3>
+        <p>For all reductions, <code>axis = -1</code> reduces everything to a scalar.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_sum</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">int</span> axis)</div>
+        <p class="api-desc">Sum along the given axis.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_mean</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">int</span> axis)</div>
+        <p class="api-desc">Mean along the given axis.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_max</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">int</span> axis)</div>
+        <p class="api-desc">Maximum along the given axis.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_min</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">int</span> axis)</div>
+        <p class="api-desc">Minimum along the given axis.</p>
+
+        <h3>Comparison</h3>
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_equal</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b)</div>
+        <p class="api-desc">Element-wise equality. Returns float tensor with 0/1 values.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_greater</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">ax_tensor_t</span> *b)</div>
+        <p class="api-desc">Element-wise greater-than. Returns float tensor with 0/1 values.</p>
+
+        <h2>Printing</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_tensor_print</span>(<span class="kw">const</span> <span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Print tensor shape and a few elements for debugging.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_tensor_print_shape</span>(<span class="kw">const</span> <span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Print just the shape.</p>
+
+        <h2>Storage</h2>
+
+        <div class="api-sig"><span class="typ">ax_storage_t</span> *<span class="fn">ax_storage_create</span>(<span class="typ">size_t</span> size_bytes, <span class="typ">ax_device_t</span> device)</div>
+        <p class="api-desc">Create a new storage with the given byte count.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_storage_retain</span>(<span class="typ">ax_storage_t</span> *s)</div>
+        <p class="api-desc">Increment the storage reference count.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_storage_release</span>(<span class="typ">ax_storage_t</span> *s)</div>
+        <p class="api-desc">Decrement the reference count. Frees the storage if it hits 0.</p>
+
+        <div class="api-sig"><span class="kw">static inline</span> <span class="typ">void</span> <span class="fn">ax_storage_touch</span>(<span class="typ">ax_storage_t</span> *s)</div>
+        <p class="api-desc">Bump the generation counter to invalidate caches. Call on every in-place write.</p>
+
+        <h2>Serialization</h2>
+
+        <div class="api-sig"><span class="typ">ax_status_t</span> <span class="fn">ax_tensor_save</span>(<span class="typ">ax_tensor_t</span> *t, <span class="kw">const</span> <span class="typ">char</span> *path)</div>
+        <p class="api-desc">Save a single tensor to a file (raw binary with a small header).</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tensor_load</span>(<span class="kw">const</span> <span class="typ">char</span> *path)</div>
+        <p class="api-desc">Load a tensor from a file saved by <code>ax_tensor_save</code>.</p>
+
+        <h2>Example</h2>
+<pre><code><span class="cmt">// create a 3x4 matrix of random values</span>
+<span class="typ">ax_tensor_t</span> *a = <span class="fn">ax_tensor_rand</span>((<span class="typ">int64_t</span>[]){<span class="num">3</span>, <span class="num">4</span>}, <span class="num">2</span>, <span class="num">0.0f</span>, <span class="num">1.0f</span>);
+
+<span class="cmt">// create a 4x2 matrix of ones</span>
+<span class="typ">ax_tensor_t</span> *b = <span class="fn">ax_tensor_ones</span>((<span class="typ">int64_t</span>[]){<span class="num">4</span>, <span class="num">2</span>}, <span class="num">2</span>, AX_FLOAT32);
+
+<span class="cmt">// matrix multiply: result is 3x2</span>
+<span class="typ">ax_tensor_t</span> *c = <span class="fn">ax_matmul</span>(a, b);
+<span class="fn">ax_tensor_print</span>(c);
+
+<span class="cmt">// transpose: zero-copy, just swaps strides</span>
+<span class="typ">ax_tensor_t</span> *ct = <span class="fn">ax_tensor_transpose</span>(c, <span class="num">0</span>, <span class="num">1</span>);
+
+<span class="fn">ax_tensor_destroy</span>(ct);
+<span class="fn">ax_tensor_destroy</span>(c);
+<span class="fn">ax_tensor_destroy</span>(b);
+<span class="fn">ax_tensor_destroy</span>(a);</code></pre>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

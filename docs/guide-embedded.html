@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="en" data-page="guide-embedded">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Embedded Deployment - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html">API</a>
+            <a href="guide-training.html" class="active">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link active">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Embedded Deployment</h1>
+        <p>Deploying Axiom models on resource-constrained devices, from Raspberry Pi to bare-metal Cortex-M.</p>
+
+        <h2>The Idea</h2>
+        <p>Train on a big machine with the full Axiom library. Save the model. Deploy to the target with an inference-only build that strips everything training-related. The result is a tiny, self-contained binary that loads the model and runs forward passes.</p>
+
+        <h2>Inference-Only Build</h2>
+        <p>The <code>AX_INFERENCE_ONLY</code> flag strips autograd, optimizers, losses, backward passes, and all training-related code:</p>
+<pre><code>cmake -DCMAKE_BUILD_TYPE=MinSizeRel \
+      -DAX_INFERENCE_ONLY=ON ..</code></pre>
+        <p>This produces a library that supports:</p>
+        <ul>
+            <li>Tensor creation and manipulation</li>
+            <li><code>ax_layer_forward()</code> / <code>ax_model_predict()</code></li>
+            <li><code>ax_model_load()</code></li>
+            <li>All compute backends (naive, SIMD)</li>
+        </ul>
+        <p>It does NOT include:</p>
+        <ul>
+            <li><code>ax_backward()</code>, <code>ax_optimizer_step()</code>, any loss functions</li>
+            <li>Gradient tracking, grad_fn allocation, computation graph</li>
+            <li>Data loading (datasets, dataloaders)</li>
+        </ul>
+        <p><code>ax_grad_enabled()</code> always returns false. Any code that calls training-only functions will get a link error, which is the clearest signal that this build does not support training.</p>
+
+        <h2>Build Profiles</h2>
+
+        <h3>Embedded Linux</h3>
+        <p>For devices running Linux (Raspberry Pi, Jetson Nano, BeagleBone):</p>
+<pre><code>cmake -DCMAKE_BUILD_TYPE=Release \
+      -DAX_PROFILE=embedded-linux \
+      -DAX_INFERENCE_ONLY=ON ..</code></pre>
+        <p>This reduces internal buffer sizes and trims features not needed on edge devices, while still using the full standard library.</p>
+
+        <h3>Bare-Metal</h3>
+        <p>For microcontrollers with no OS (Cortex-M, RISC-V):</p>
+<pre><code>cmake -DCMAKE_BUILD_TYPE=MinSizeRel \
+      -DAX_PROFILE=embedded-baremetal \
+      -DAX_INFERENCE_ONLY=ON \
+      -DCMAKE_TOOLCHAIN_FILE=your-cortexm-toolchain.cmake ..</code></pre>
+        <p>This disables:</p>
+        <ul>
+            <li>stdio (no printf, no file I/O)</li>
+            <li>Dynamic allocation (no malloc/free)</li>
+            <li>Threads (no pthreads, no OpenMP)</li>
+        </ul>
+        <p>You provide memory through pre-allocated buffers. Tensor storage points into your static arrays.</p>
+
+        <h2>Workflow</h2>
+        <ol>
+            <li><strong>Train on a workstation</strong> using the full Axiom library. Save with <code>ax_model_save(m, "model.axm")</code>.</li>
+            <li><strong>Cross-compile</strong> the inference-only library for your target.</li>
+            <li><strong>Load and run</strong> on the target:</li>
+        </ol>
+
+<pre><code><span class="pp">#include</span> <span class="str">"axiom/axiom.h"</span>
+
+<span class="typ">int</span> <span class="fn">main</span>(<span class="typ">void</span>) {
+    <span class="fn">ax_init</span>();
+
+    <span class="cmt">// load the trained model</span>
+    <span class="typ">ax_model_t</span> *m = <span class="fn">ax_model_load</span>(<span class="str">"model.axm"</span>);
+    <span class="kw">if</span> (!m) {
+        <span class="cmt">// handle error</span>
+        <span class="kw">return</span> <span class="num">1</span>;
+    }
+
+    <span class="cmt">// prepare input (e.g., from sensor data)</span>
+    <span class="typ">float</span> sensor_data[<span class="num">784</span>];
+    <span class="cmt">// ... read from ADC, camera, etc.</span>
+
+    <span class="typ">ax_tensor_t</span> *input = <span class="fn">ax_tensor_from_array</span>(
+        sensor_data, (<span class="typ">int64_t</span>[]){<span class="num">1</span>, <span class="num">784</span>}, <span class="num">2</span>, AX_FLOAT32);
+
+    <span class="cmt">// run inference</span>
+    <span class="typ">ax_tensor_t</span> *output = <span class="fn">ax_model_predict</span>(m, input);
+
+    <span class="cmt">// read the result</span>
+    <span class="typ">float</span> prediction = <span class="fn">ax_tensor_get_f32</span>(output, (<span class="typ">int64_t</span>[]){<span class="num">0</span>, <span class="num">0</span>});
+
+    <span class="fn">ax_tensor_destroy</span>(output);
+    <span class="fn">ax_tensor_destroy</span>(input);
+    <span class="fn">ax_model_destroy</span>(m);
+    <span class="fn">ax_shutdown</span>();
+    <span class="kw">return</span> <span class="num">0</span>;
+}</code></pre>
+
+        <h2>Binary Size</h2>
+        <p>With <code>AX_INFERENCE_ONLY=ON</code> and <code>-Os</code> or <code>MinSizeRel</code>:</p>
+        <table>
+            <thead>
+                <tr><th>Target</th><th>Binary Size</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>ARM aarch64 (Linux)</td><td>&lt; 100KB</td></tr>
+                <tr><td>ARM Cortex-M (bare-metal)</td><td>~40-60KB (depends on layers used)</td></tr>
+                <tr><td>x86_64 (Linux)</td><td>~120KB</td></tr>
+            </tbody>
+        </table>
+        <p>The linker strips unused layer types. If your model only uses Dense and ReLU, Conv2D code is not linked in.</p>
+
+        <h2>Memory Considerations</h2>
+        <ul>
+            <li><strong>Model weights</strong> are the biggest consumer. A 1.46M parameter model needs ~5.6MB of float32 storage. Consider smaller architectures for very constrained targets.</li>
+            <li><strong>Activations</strong> (intermediate tensors during forward pass) need memory proportional to the largest layer's output. This is allocated and freed during inference.</li>
+            <li><strong>No gradient memory.</strong> Inference-only builds never allocate gradient tensors, saving roughly 2x the parameter memory compared to training.</li>
+            <li><strong>Arena allocator</strong> is used for temporary compute buffers. Its memory is reused across calls without repeated malloc/free.</li>
+        </ul>
+
+        <h2>NEON on ARM</h2>
+        <p>On aarch64, Axiom automatically uses NEON SIMD instructions for GEMM (8x12 micro-kernel) and element-wise ops. No special flags needed. The NEON backend is compiled in by default for ARM targets.</p>
+
+        <h2>Model Format</h2>
+        <p>The <code>.axm</code> binary format is designed for embedded:</p>
+        <ul>
+            <li>No external dependencies (no protobuf, no JSON)</li>
+            <li>Fixed-size header, simple structure</li>
+            <li>Little-endian throughout</li>
+            <li>Can be read incrementally (no need to load the entire file at once)</li>
+            <li>Magic bytes: <code>0x41584F4E</code> ("AXON")</li>
+        </ul>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

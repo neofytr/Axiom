@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en" data-page="api-layers">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Layers API - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html" class="active">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link active">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Layers API</h1>
+        <p>Building blocks for composing neural networks. Layers have forward functions, track parameters, and switch between train/eval mode.</p>
+
+        <h2>Dense (Fully Connected)</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_dense_create</span>(<span class="typ">int64_t</span> in_features, <span class="typ">int64_t</span> out_features, <span class="typ">bool</span> use_bias)</div>
+        <p class="api-desc">Create a dense layer: <code>out = input @ weight + bias</code>. Weights initialized with Kaiming uniform by default.</p>
+
+        <p>Weight shape: <code>[in_features, out_features]</code>. Bias shape: <code>[out_features]</code> (or NULL if <code>use_bias</code> is false).</p>
+
+        <h2>Conv2D</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_conv2d_create</span>(<span class="typ">int</span> in_channels, <span class="typ">int</span> out_channels, <span class="typ">int</span> kernel_size, <span class="typ">int</span> stride, <span class="typ">int</span> padding, <span class="typ">bool</span> use_bias)</div>
+        <p class="api-desc">Create a 2D convolution layer with square kernels. Data layout is NCHW throughout.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_conv2d_create_ex</span>(<span class="typ">int</span> in_channels, <span class="typ">int</span> out_channels, <span class="typ">int</span> kernel_h, <span class="typ">int</span> kernel_w, <span class="typ">int</span> stride_h, <span class="typ">int</span> stride_w, <span class="typ">int</span> pad_h, <span class="typ">int</span> pad_w, <span class="typ">bool</span> use_bias)</div>
+        <p class="api-desc">Create a Conv2D with non-square kernel, stride, and padding.</p>
+
+        <p>Input: <code>[N, C_in, H, W]</code>. Output: <code>[N, C_out, H_out, W_out]</code> where <code>H_out = (H + 2*padding - kernel_size) / stride + 1</code>.</p>
+
+        <h2>Pooling</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_maxpool2d_create</span>(<span class="typ">int</span> kernel_size, <span class="typ">int</span> stride, <span class="typ">int</span> padding)</div>
+        <p class="api-desc">Max pooling: takes the max value in each kernel-sized window. Saves argmax positions for backward pass.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_avgpool2d_create</span>(<span class="typ">int</span> kernel_size, <span class="typ">int</span> stride, <span class="typ">int</span> padding)</div>
+        <p class="api-desc">Average pooling: averages values in each window.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_global_avgpool2d_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Global average pooling: average each channel to a single value. Input <code>[N, C, H, W]</code> to output <code>[N, C]</code>.</p>
+
+        <h2>Normalization</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_batchnorm_create</span>(<span class="typ">int64_t</span> num_features, <span class="typ">float</span> eps, <span class="typ">float</span> momentum)</div>
+        <p class="api-desc">Batch normalization. Normalizes each feature across the batch, then applies learnable scale (gamma) and shift (beta). Maintains running stats for inference. Input: <code>[batch, features]</code>.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_layernorm_create</span>(<span class="typ">int64_t</span> num_features, <span class="typ">float</span> eps)</div>
+        <p class="api-desc">Layer normalization. Normalizes across features for each sample independently. No running stats needed. Input: <code>[batch, features]</code>.</p>
+
+        <h2>Dropout</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_dropout_create</span>(<span class="typ">float</span> p)</div>
+        <p class="api-desc">Dropout layer. Training: zeros elements with probability p, scales rest by 1/(1-p). Eval: identity pass-through.</p>
+
+        <h2>Utility Layers</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_flatten_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Flatten spatial dimensions: <code>[N, C, H, W]</code> to <code>[N, C*H*W]</code>. Needed to connect conv layers to dense layers.</p>
+
+        <h2>Activation Layers</h2>
+        <p>Stateless wrappers around the activation functions. These let you put activations in a sequential model.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_relu_layer_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">ReLU activation layer.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_sigmoid_layer_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Sigmoid activation layer.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_tanh_layer_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Tanh activation layer.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_leaky_relu_layer_create</span>(<span class="typ">float</span> alpha)</div>
+        <p class="api-desc">Leaky ReLU layer. Typical alpha: 0.01.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_elu_layer_create</span>(<span class="typ">float</span> alpha)</div>
+        <p class="api-desc">ELU activation layer.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_gelu_layer_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">GELU activation layer (approximate version).</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_swish_layer_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Swish (SiLU) activation layer.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_softmax_layer_create</span>(<span class="typ">int</span> axis)</div>
+        <p class="api-desc">Softmax layer along given axis.</p>
+
+        <h2>Sequential Model</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_sequential_create</span>(<span class="typ">void</span>)</div>
+        <p class="api-desc">Create an empty sequential model. Chains layers together; forward pass runs input through each layer in order.</p>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_sequential_add</span>(<span class="typ">ax_layer_t</span> *seq, <span class="typ">ax_layer_t</span> *layer)</div>
+        <p class="api-desc">Add a layer to the sequential model. Returns the model for chaining. Max 64 layers (<code>AX_SEQ_MAX_LAYERS</code>).</p>
+
+        <h2>Fusion</h2>
+
+        <div class="api-sig"><span class="typ">ax_layer_t</span> *<span class="fn">ax_sequential_fuse</span>(<span class="typ">ax_layer_t</span> *model)</div>
+        <p class="api-desc">Walk a sequential model and replace every Conv2D + BatchNorm + ReLU triple with a fused layer. Mutates in-place, returns the same pointer. Safe to call multiple times.</p>
+
+        <h2>Common Layer Operations</h2>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_layer_forward</span>(<span class="typ">ax_layer_t</span> *layer, <span class="typ">ax_tensor_t</span> *input)</div>
+        <p class="api-desc">Run the forward pass through the layer.</p>
+
+        <div class="api-sig"><span class="typ">int</span> <span class="fn">ax_layer_get_params</span>(<span class="typ">ax_layer_t</span> *layer, <span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> max_params)</div>
+        <p class="api-desc">Collect all trainable parameters (recursive for sequential). Fills params array, returns count.</p>
+
+        <div class="api-sig"><span class="typ">int</span> <span class="fn">ax_layer_get_buffers</span>(<span class="typ">ax_layer_t</span> *layer, <span class="typ">ax_tensor_t</span> **buffers, <span class="typ">int</span> max_buffers)</div>
+        <p class="api-desc">Collect all non-trainable buffers (e.g., batchnorm running stats). Recursive for sequential.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_layer_train</span>(<span class="typ">ax_layer_t</span> *layer)</div>
+        <p class="api-desc">Set train mode (recursive for sequential). Affects dropout and batchnorm behavior.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_layer_eval</span>(<span class="typ">ax_layer_t</span> *layer)</div>
+        <p class="api-desc">Set eval mode (recursive for sequential). Dropout becomes identity, batchnorm uses running stats.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_layer_summary</span>(<span class="typ">ax_layer_t</span> *layer)</div>
+        <p class="api-desc">Print model summary: layer types, shapes, and parameter counts.</p>
+
+        <div class="api-sig"><span class="typ">int64_t</span> <span class="fn">ax_layer_param_count</span>(<span class="typ">ax_layer_t</span> *layer)</div>
+        <p class="api-desc">Count total trainable parameters.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_layer_destroy</span>(<span class="typ">ax_layer_t</span> *layer)</div>
+        <p class="api-desc">Free a layer and all its owned tensors.</p>
+
+        <h2>Gradient Clipping</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_clip_grad_value</span>(<span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> n_params, <span class="typ">float</span> max_val)</div>
+        <p class="api-desc">Clip gradient values to [-max_val, max_val].</p>
+
+        <div class="api-sig"><span class="typ">float</span> <span class="fn">ax_clip_grad_norm</span>(<span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> n_params, <span class="typ">float</span> max_norm)</div>
+        <p class="api-desc">Clip gradient norm. Returns the original norm before clipping.</p>
+
+        <h2>Weight Initialization</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_xavier_uniform</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int64_t</span> fan_in, <span class="typ">int64_t</span> fan_out)</div>
+        <p class="api-desc">Xavier/Glorot uniform: U[-limit, limit] where limit = sqrt(6 / (fan_in + fan_out)). Good for sigmoid/tanh.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_xavier_normal</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int64_t</span> fan_in, <span class="typ">int64_t</span> fan_out)</div>
+        <p class="api-desc">Xavier/Glorot normal: N(0, std) where std = sqrt(2 / (fan_in + fan_out)).</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_kaiming_uniform</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int64_t</span> fan_in)</div>
+        <p class="api-desc">He/Kaiming uniform: U[-limit, limit] where limit = sqrt(6 / fan_in). Designed for ReLU.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_kaiming_normal</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int64_t</span> fan_in)</div>
+        <p class="api-desc">He/Kaiming normal: N(0, std) where std = sqrt(2 / fan_in).</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_lecun_normal</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">int64_t</span> fan_in)</div>
+        <p class="api-desc">LeCun normal: N(0, 1/sqrt(fan_in)). For SELU activations.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_uniform</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">float</span> low, <span class="typ">float</span> high)</div>
+        <p class="api-desc">Uniform random in [low, high).</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_normal</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">float</span> mean, <span class="typ">float</span> std)</div>
+        <p class="api-desc">Normal/Gaussian with given mean and std.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_zeros</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Fill with zeros.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_ones</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Fill with ones.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_init_constant</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">float</span> value)</div>
+        <p class="api-desc">Fill with a constant value.</p>
+
+        <h2>Example: CNN</h2>
+<pre><code><span class="typ">ax_layer_t</span> *net = <span class="fn">ax_sequential_create</span>();
+
+<span class="cmt">// conv block 1</span>
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_conv2d_create</span>(<span class="num">1</span>, <span class="num">32</span>, <span class="num">3</span>, <span class="num">1</span>, <span class="num">1</span>, <span class="num">true</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_batchnorm_create</span>(<span class="num">32</span>, <span class="num">1e-5f</span>, <span class="num">0.1f</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_maxpool2d_create</span>(<span class="num">2</span>, <span class="num">2</span>, <span class="num">0</span>));
+
+<span class="cmt">// conv block 2</span>
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_conv2d_create</span>(<span class="num">32</span>, <span class="num">64</span>, <span class="num">3</span>, <span class="num">1</span>, <span class="num">1</span>, <span class="num">true</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_batchnorm_create</span>(<span class="num">64</span>, <span class="num">1e-5f</span>, <span class="num">0.1f</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_maxpool2d_create</span>(<span class="num">2</span>, <span class="num">2</span>, <span class="num">0</span>));
+
+<span class="cmt">// classifier head</span>
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_flatten_create</span>());
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">64</span> * <span class="num">7</span> * <span class="num">7</span>, <span class="num">128</span>, <span class="num">true</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dropout_create</span>(<span class="num">0.5f</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">128</span>, <span class="num">10</span>, <span class="num">true</span>));
+
+<span class="cmt">// optionally fuse conv+bn+relu triples</span>
+<span class="fn">ax_sequential_fuse</span>(net);</code></pre>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

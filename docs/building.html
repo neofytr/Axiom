@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en" data-page="building">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Building - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link active">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Building</h1>
+        <p>CMake flags, build profiles, and cross-compilation.</p>
+
+        <h2>Default Build</h2>
+<pre><code>mkdir build && <span class="kw">cd</span> build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+ctest --output-on-failure</code></pre>
+        <p>This produces <code>libaxiom.a</code> (or <code>.so</code>) and all test binaries. The build auto-detects your CPU features and enables the best available GEMM backend.</p>
+
+        <h2>CMake Flags</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Flag</th>
+                    <th>Default</th>
+                    <th>Description</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><code>AX_CPU_ISA_DISPATCH</code></td>
+                    <td>ON</td>
+                    <td>Builds AVX-512 + AVX2 + scalar paths. Picks fastest at runtime via CPUID.</td>
+                </tr>
+                <tr>
+                    <td><code>AX_CUDA</code></td>
+                    <td>OFF</td>
+                    <td>Enables the CUDA backend. Requires the CUDA toolkit (nvcc on PATH).</td>
+                </tr>
+                <tr>
+                    <td><code>AX_INFERENCE_ONLY</code></td>
+                    <td>OFF</td>
+                    <td>Strips all training code (autograd, optimizers, losses). Binary under 100KB on ARM.</td>
+                </tr>
+                <tr>
+                    <td><code>AX_PROFILE</code></td>
+                    <td>(none)</td>
+                    <td>Build profile for target environment. See profiles below.</td>
+                </tr>
+                <tr>
+                    <td><code>AX_COUNT_ALLOCS</code></td>
+                    <td>OFF</td>
+                    <td>Enables allocation counting for memory profiling.</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h2>Build Profiles</h2>
+
+        <h3><code>embedded-linux</code></h3>
+        <p>Reduced buffer sizes, trimmed for embedded Linux targets (Raspberry Pi, Jetson Nano, etc.).</p>
+<pre><code>cmake -DCMAKE_BUILD_TYPE=Release -DAX_PROFILE=embedded-linux ..</code></pre>
+
+        <h3><code>embedded-baremetal</code></h3>
+        <p>No stdio, no heap, no threads. Designed for Cortex-M class microcontrollers. Must be combined with <code>AX_INFERENCE_ONLY=ON</code>.</p>
+<pre><code>cmake -DCMAKE_BUILD_TYPE=MinSizeRel \
+      -DAX_PROFILE=embedded-baremetal \
+      -DAX_INFERENCE_ONLY=ON \
+      -DCMAKE_TOOLCHAIN_FILE=your-cortexm-toolchain.cmake ..</code></pre>
+
+        <h2>CUDA Build</h2>
+<pre><code>cmake -DCMAKE_BUILD_TYPE=Release -DAX_CUDA=ON ..
+make -j$(nproc)</code></pre>
+        <p>The CUDA backend registers itself at <code>ax_compute_init()</code> time. To route all ops to the GPU:</p>
+<pre><code><span class="fn">ax_set_default_device</span>(AX_DEVICE_CUDA);
+<span class="fn">ax_compute_set_backend</span>(AX_BACKEND_CUDA);</code></pre>
+
+        <h2>Cross-Compilation</h2>
+        <p>For ARM cross-compilation from x86:</p>
+<pre><code>cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+      -DCMAKE_SYSTEM_NAME=Linux \
+      -DCMAKE_SYSTEM_PROCESSOR=aarch64 ..</code></pre>
+        <p>The build system detects the target architecture and selects the right GEMM micro-kernel (NEON 8x12 for aarch64, AVX-512/AVX2 for x86).</p>
+
+        <h2>Debug Builds</h2>
+<pre><code><span class="cmt"># with address sanitizer</span>
+cmake -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_FLAGS="-fsanitize=address -fno-omit-frame-pointer" ..
+
+<span class="cmt"># with thread sanitizer</span>
+cmake -DCMAKE_BUILD_TYPE=Debug \
+      -DCMAKE_C_FLAGS="-fsanitize=thread" ..</code></pre>
+        <p>All 22 tests pass under both ASan and TSan.</p>
+
+        <h2>Linking</h2>
+        <p>After building, link against the static library:</p>
+<pre><code>gcc -O2 -I/path/to/include your_code.c -L/path/to/build -laxiom -lm -lpthread -o your_binary</code></pre>
+        <p>If OpenMP is enabled (it is by default when available), add <code>-fopenmp</code> to both compile and link flags.</p>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

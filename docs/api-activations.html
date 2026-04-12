@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en" data-page="api-activations">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Activations API - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html" class="active">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link active">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Activations API</h1>
+        <p>Activation functions with autograd support. All return new tensors with gradients tracked.</p>
+
+        <h2>Basic Activations</h2>
+        <p>These live in <code>ops.h</code> and are the most commonly used.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_relu</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">ReLU: <code>max(0, x)</code>. The workhorse activation for hidden layers.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_sigmoid</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Sigmoid: <code>1 / (1 + exp(-x))</code>. Squashes output to (0, 1).</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tanh_op</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Tanh: <code>(exp(x) - exp(-x)) / (exp(x) + exp(-x))</code>. Output in (-1, 1).</p>
+
+        <h2>In-Place Variants</h2>
+        <p>These mutate the input buffer directly when the storage refcount is 1 (no shared views), halving memory traffic. If refcount > 1, they fall back to the non-inplace variant for safety. Autograd-compatible: backward works with the post-activation values.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_relu_inplace</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">In-place ReLU. Returns the same tensor pointer.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_sigmoid_inplace</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">In-place sigmoid.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_tanh_inplace</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">In-place tanh.</p>
+
+        <h2>Extended Activations</h2>
+        <p>These live in <code>activations.h</code>.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_leaky_relu</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">float</span> alpha)</div>
+        <p class="api-desc">Leaky ReLU: <code>max(alpha * x, x)</code>. Typical alpha is 0.01. Prevents dead neurons by allowing a small gradient for negative inputs.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_elu</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">float</span> alpha)</div>
+        <p class="api-desc">ELU: <code>x if x > 0, alpha * (exp(x) - 1) otherwise</code>. Smooth approximation to ReLU with negative values.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_selu</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">SELU: <code>scale * elu(x, alpha)</code> with specific constants for self-normalizing networks. Use with <code>ax_init_lecun_normal</code>.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_gelu</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">GELU (approximate): <code>x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))</code>. Used in transformers.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_swish</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Swish (SiLU): <code>x * sigmoid(x)</code>. Self-gated activation.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_softplus</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Softplus: <code>log(1 + exp(x))</code>. Smooth approximation to ReLU.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_mish</span>(<span class="typ">ax_tensor_t</span> *a)</div>
+        <p class="api-desc">Mish: <code>x * tanh(softplus(x))</code>. Self-regularizing, non-monotonic.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_softmax</span>(<span class="typ">ax_tensor_t</span> *a, <span class="typ">int</span> axis)</div>
+        <p class="api-desc">Softmax along a given axis. Numerically stable (subtracts max first). <code>axis = -1</code> means last dimension.</p>
+
+        <h2>Which Activation to Use</h2>
+        <table>
+            <thead>
+                <tr><th>Use Case</th><th>Recommendation</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>Default hidden layers</td><td><code>ax_relu</code> (fast, well-understood)</td></tr>
+                <tr><td>Dead neuron problems</td><td><code>ax_leaky_relu</code> or <code>ax_elu</code></td></tr>
+                <tr><td>Transformer models</td><td><code>ax_gelu</code></td></tr>
+                <tr><td>Self-normalizing nets</td><td><code>ax_selu</code> with LeCun init</td></tr>
+                <tr><td>Modern architectures</td><td><code>ax_swish</code> or <code>ax_mish</code></td></tr>
+                <tr><td>Output (classification)</td><td><code>ax_softmax</code> (or use cross-entropy loss which applies it internally)</td></tr>
+                <tr><td>Output (binary)</td><td><code>ax_sigmoid</code> (or use BCE with logits loss)</td></tr>
+            </tbody>
+        </table>
+
+        <h2>Example</h2>
+<pre><code><span class="cmt">// functional style (direct tensor ops)</span>
+<span class="typ">ax_tensor_t</span> *h1 = <span class="fn">ax_matmul</span>(input, w1);
+<span class="typ">ax_tensor_t</span> *a1 = <span class="fn">ax_gelu</span>(h1);
+
+<span class="cmt">// or use the fused variant for performance</span>
+<span class="typ">ax_tensor_t</span> *a2 = <span class="fn">ax_matmul_bias_relu</span>(input, w1, b1);
+
+<span class="cmt">// or use in-place when you know the tensor is unique</span>
+<span class="typ">ax_tensor_t</span> *h = <span class="fn">ax_matmul_bias</span>(input, w1, b1);
+<span class="fn">ax_relu_inplace</span>(h);  <span class="cmt">// modifies h, returns same pointer</span></code></pre>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

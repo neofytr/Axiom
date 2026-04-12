@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en" data-page="api-optimizers">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Optimizers API - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html" class="active">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link active">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Optimizers API</h1>
+        <p>Optimizers update model parameters using their gradients. Each holds per-parameter state (momentum, Adam moments, etc.).</p>
+
+        <h2>Creating Optimizers</h2>
+        <p>All creation functions take an array of tensor pointers (the weights to optimize) and hyperparameters. The optimizer does NOT own the tensors, just references them. Per-parameter state is allocated lazily on the first step.</p>
+
+        <div class="api-sig"><span class="typ">ax_optimizer_t</span> *<span class="fn">ax_sgd_create</span>(<span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> n_params, <span class="typ">float</span> lr, <span class="typ">float</span> momentum, <span class="typ">float</span> weight_decay, <span class="typ">bool</span> nesterov)</div>
+        <p class="api-desc">Stochastic Gradient Descent with optional momentum and Nesterov acceleration. Set momentum to 0 for vanilla SGD.</p>
+
+        <div class="api-sig"><span class="typ">ax_optimizer_t</span> *<span class="fn">ax_adam_create</span>(<span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> n_params, <span class="typ">float</span> lr, <span class="typ">float</span> beta1, <span class="typ">float</span> beta2, <span class="typ">float</span> eps, <span class="typ">float</span> weight_decay)</div>
+        <p class="api-desc">Adam optimizer. Good defaults: lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0. The most popular optimizer for general use.</p>
+
+        <div class="api-sig"><span class="typ">ax_optimizer_t</span> *<span class="fn">ax_adamw_create</span>(<span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> n_params, <span class="typ">float</span> lr, <span class="typ">float</span> beta1, <span class="typ">float</span> beta2, <span class="typ">float</span> eps, <span class="typ">float</span> weight_decay)</div>
+        <p class="api-desc">AdamW: Adam with decoupled weight decay. Better regularization than Adam's L2 penalty. Preferred for transformer training.</p>
+
+        <div class="api-sig"><span class="typ">ax_optimizer_t</span> *<span class="fn">ax_rmsprop_create</span>(<span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> n_params, <span class="typ">float</span> lr, <span class="typ">float</span> rho, <span class="typ">float</span> eps, <span class="typ">float</span> weight_decay)</div>
+        <p class="api-desc">RMSprop: adapts learning rate per parameter using a moving average of squared gradients. Good defaults: lr=1e-3, rho=0.99, eps=1e-8.</p>
+
+        <div class="api-sig"><span class="typ">ax_optimizer_t</span> *<span class="fn">ax_adagrad_create</span>(<span class="typ">ax_tensor_t</span> **params, <span class="typ">int</span> n_params, <span class="typ">float</span> lr, <span class="typ">float</span> eps, <span class="typ">float</span> weight_decay)</div>
+        <p class="api-desc">Adagrad: adapts learning rate based on cumulative squared gradients. Learning rate decays over time. Good for sparse gradients.</p>
+
+        <h2>Optimizer Operations</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_optimizer_step</span>(<span class="typ">ax_optimizer_t</span> *opt)</div>
+        <p class="api-desc">Update all parameters using their current gradients. Increments the global step counter.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_optimizer_zero_grad</span>(<span class="typ">ax_optimizer_t</span> *opt)</div>
+        <p class="api-desc">Zero out gradients of all parameters. Call before each forward pass in a training loop.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_optimizer_set_lr</span>(<span class="typ">ax_optimizer_t</span> *opt, <span class="typ">float</span> lr)</div>
+        <p class="api-desc">Set the learning rate. Useful for manual scheduling.</p>
+
+        <div class="api-sig"><span class="typ">float</span> <span class="fn">ax_optimizer_get_lr</span>(<span class="typ">ax_optimizer_t</span> *opt)</div>
+        <p class="api-desc">Get the current learning rate.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_optimizer_destroy</span>(<span class="typ">ax_optimizer_t</span> *opt)</div>
+        <p class="api-desc">Free the optimizer and its internal state. Does NOT free the parameter tensors.</p>
+
+        <h2>Learning Rate Schedulers</h2>
+        <p>Schedulers modify the optimizer's learning rate over the course of training. Starting high and decaying is almost always better than a constant LR.</p>
+
+        <div class="api-sig"><span class="typ">ax_lr_scheduler_t</span> *<span class="fn">ax_sched_step_decay</span>(<span class="typ">ax_optimizer_t</span> *opt, <span class="typ">int</span> step_size, <span class="typ">float</span> gamma)</div>
+        <p class="api-desc">Step decay: <code>lr = initial_lr * gamma^(epoch / step_size)</code>. E.g., step_size=30, gamma=0.1 drops LR by 10x every 30 epochs.</p>
+
+        <div class="api-sig"><span class="typ">ax_lr_scheduler_t</span> *<span class="fn">ax_sched_exponential</span>(<span class="typ">ax_optimizer_t</span> *opt, <span class="typ">float</span> gamma)</div>
+        <p class="api-desc">Exponential decay: <code>lr = initial_lr * gamma^epoch</code>.</p>
+
+        <div class="api-sig"><span class="typ">ax_lr_scheduler_t</span> *<span class="fn">ax_sched_cosine</span>(<span class="typ">ax_optimizer_t</span> *opt, <span class="typ">int</span> total_steps, <span class="typ">float</span> min_lr)</div>
+        <p class="api-desc">Cosine annealing: <code>lr = min_lr + 0.5 * (initial_lr - min_lr) * (1 + cos(pi * step / total))</code>. Smooth decay following a cosine curve.</p>
+
+        <div class="api-sig"><span class="typ">ax_lr_scheduler_t</span> *<span class="fn">ax_sched_warmup_cosine</span>(<span class="typ">ax_optimizer_t</span> *opt, <span class="typ">int</span> warmup_steps, <span class="typ">int</span> total_steps, <span class="typ">float</span> min_lr)</div>
+        <p class="api-desc">Warmup + cosine: linear warmup from 0 to initial_lr, then cosine decay to min_lr. The standard schedule for transformer training.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_sched_step</span>(<span class="typ">ax_lr_scheduler_t</span> *sched)</div>
+        <p class="api-desc">Advance the scheduler by one step and update the optimizer's learning rate. Call after each epoch (or step, depending on convention).</p>
+
+        <div class="api-sig"><span class="typ">float</span> <span class="fn">ax_sched_get_lr</span>(<span class="typ">ax_lr_scheduler_t</span> *sched)</div>
+        <p class="api-desc">Get the current scheduled learning rate (for logging).</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_sched_destroy</span>(<span class="typ">ax_lr_scheduler_t</span> *sched)</div>
+        <p class="api-desc">Free the scheduler. Does NOT free the optimizer.</p>
+
+        <h2>Which Optimizer to Use</h2>
+        <table>
+            <thead>
+                <tr><th>Use Case</th><th>Recommendation</th></tr>
+            </thead>
+            <tbody>
+                <tr><td>General purpose</td><td><code>ax_adam_create</code> with lr=1e-3</td></tr>
+                <tr><td>With weight decay</td><td><code>ax_adamw_create</code> (decoupled is better than L2)</td></tr>
+                <tr><td>Fine-tuning / final training</td><td><code>ax_sgd_create</code> with momentum=0.9</td></tr>
+                <tr><td>Sparse gradients</td><td><code>ax_adagrad_create</code></td></tr>
+                <tr><td>RNNs / unstable training</td><td><code>ax_rmsprop_create</code></td></tr>
+            </tbody>
+        </table>
+
+        <h2>Example</h2>
+<pre><code><span class="cmt">// create optimizer</span>
+<span class="typ">ax_optimizer_t</span> *opt = <span class="fn">ax_adam_create</span>(
+    model->params, model->n_params,
+    <span class="num">1e-3f</span>, <span class="num">0.9f</span>, <span class="num">0.999f</span>, <span class="num">1e-8f</span>, <span class="num">0.0f</span>);
+
+<span class="cmt">// cosine schedule: decay to 1e-5 over 100 epochs</span>
+<span class="typ">ax_lr_scheduler_t</span> *sched = <span class="fn">ax_sched_cosine</span>(opt, <span class="num">100</span>, <span class="num">1e-5f</span>);
+
+<span class="kw">for</span> (<span class="typ">int</span> epoch = <span class="num">0</span>; epoch &lt; <span class="num">100</span>; epoch++) {
+    <span class="cmt">// ... training loop ...</span>
+    <span class="fn">ax_sched_step</span>(sched);
+    printf(<span class="str">"epoch %d lr=%.6f\n"</span>, epoch, <span class="fn">ax_sched_get_lr</span>(sched));
+}
+
+<span class="fn">ax_sched_destroy</span>(sched);
+<span class="fn">ax_optimizer_destroy</span>(opt);</code></pre>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

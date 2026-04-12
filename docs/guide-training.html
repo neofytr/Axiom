@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en" data-page="guide-training">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Training Guide - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html">API</a>
+            <a href="guide-training.html" class="active">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link active">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Training Loop Guide</h1>
+        <p>A step-by-step walkthrough of writing a complete training loop in Axiom, from data loading through evaluation.</p>
+
+        <h2>Overview</h2>
+        <p>Training a neural network consists of repeating these steps:</p>
+        <ol>
+            <li>Load a batch of data</li>
+            <li>Run the forward pass to get predictions</li>
+            <li>Compute the loss</li>
+            <li>Run the backward pass to compute gradients</li>
+            <li>Update the weights</li>
+            <li>Clean up the computation graph</li>
+        </ol>
+        <p>The sections below build up a complete example piece by piece.</p>
+
+        <h2>Step 1: Initialize and Prepare Data</h2>
+<pre><code><span class="pp">#include</span> <span class="str">"axiom/axiom.h"</span>
+<span class="pp">#include</span> <span class="str">&lt;stdio.h&gt;</span>
+
+<span class="typ">int</span> <span class="fn">main</span>(<span class="typ">void</span>) {
+    <span class="fn">ax_init</span>();
+    <span class="fn">ax_set_seed</span>(<span class="num">42</span>);
+
+    <span class="cmt">// load your data. here we assume train_x is [N, 784] and</span>
+    <span class="cmt">// train_y is [N, 10] (one-hot encoded labels)</span>
+    <span class="typ">ax_tensor_t</span> *train_x = ...;  <span class="cmt">// your input data</span>
+    <span class="typ">ax_tensor_t</span> *train_y = ...;  <span class="cmt">// your labels</span>
+
+    <span class="cmt">// normalize inputs to zero mean, unit variance</span>
+    <span class="typ">ax_tensor_t</span> *norm_x = <span class="fn">ax_transform_normalize</span>(train_x);
+
+    <span class="cmt">// wrap as a dataset and create a dataloader</span>
+    <span class="typ">ax_dataset_t</span> *ds = <span class="fn">ax_tensor_dataset_create</span>(norm_x, train_y);
+    <span class="typ">ax_dataloader_t</span> *dl = <span class="fn">ax_dataloader_create</span>(ds, <span class="num">256</span>, <span class="num">true</span>);</code></pre>
+
+        <h2>Step 2: Build the Network</h2>
+<pre><code>    <span class="cmt">// 784 -> 256 -> 128 -> 10 with batchnorm and dropout</span>
+    <span class="typ">ax_layer_t</span> *net = <span class="fn">ax_sequential_create</span>();
+
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">784</span>, <span class="num">256</span>, <span class="num">true</span>));
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_batchnorm_create</span>(<span class="num">256</span>, <span class="num">1e-5f</span>, <span class="num">0.1f</span>));
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dropout_create</span>(<span class="num">0.3f</span>));
+
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">256</span>, <span class="num">128</span>, <span class="num">true</span>));
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_batchnorm_create</span>(<span class="num">128</span>, <span class="num">1e-5f</span>, <span class="num">0.1f</span>));
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dropout_create</span>(<span class="num">0.2f</span>));
+
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">128</span>, <span class="num">10</span>, <span class="num">true</span>));
+
+    <span class="fn">ax_layer_summary</span>(net);</code></pre>
+
+        <h2>Step 3: Create Model, Optimizer, and Scheduler</h2>
+<pre><code>    <span class="typ">ax_model_t</span> *model = <span class="fn">ax_model_create</span>(net);
+
+    <span class="typ">ax_optimizer_t</span> *opt = <span class="fn">ax_adam_create</span>(
+        model->params, model->n_params,
+        <span class="num">1e-3f</span>,    <span class="cmt">// lr</span>
+        <span class="num">0.9f</span>,    <span class="cmt">// beta1</span>
+        <span class="num">0.999f</span>,  <span class="cmt">// beta2</span>
+        <span class="num">1e-8f</span>,   <span class="cmt">// eps</span>
+        <span class="num">1e-4f</span>); <span class="cmt">// weight decay</span>
+
+    <span class="fn">ax_model_compile</span>(model, opt, ax_cross_entropy_loss);
+
+    <span class="cmt">// cosine LR schedule: decay from 1e-3 to 1e-5 over 50 epochs</span>
+    <span class="typ">int</span> n_epochs = <span class="num">50</span>;
+    <span class="typ">ax_lr_scheduler_t</span> *sched = <span class="fn">ax_sched_cosine</span>(opt, n_epochs, <span class="num">1e-5f</span>);</code></pre>
+
+        <h2>Step 4: The Training Loop</h2>
+<pre><code>    <span class="kw">for</span> (<span class="typ">int</span> epoch = <span class="num">0</span>; epoch &lt; n_epochs; epoch++) {
+        <span class="fn">ax_layer_train</span>(net);        <span class="cmt">// enable dropout, batchnorm training mode</span>
+        <span class="fn">ax_dataloader_reset</span>(dl);    <span class="cmt">// reshuffle the data</span>
+
+        <span class="typ">float</span> epoch_loss = <span class="num">0</span>;
+        <span class="typ">int</span> n_batches = <span class="num">0</span>;
+        <span class="typ">ax_batch_t</span> batch;
+
+        <span class="kw">while</span> (<span class="fn">ax_dataloader_next</span>(dl, &amp;batch)) {
+            <span class="cmt">// single train step: forward -> loss -> backward -> step -> cleanup</span>
+            <span class="typ">float</span> loss = <span class="fn">ax_model_train_step</span>(model, batch.input, batch.target);
+            epoch_loss += loss;
+            n_batches++;
+
+            <span class="cmt">// dataloader allocates batch tensors; we must free them</span>
+            <span class="fn">ax_tensor_destroy</span>(batch.input);
+            <span class="fn">ax_tensor_destroy</span>(batch.target);
+        }
+
+        <span class="cmt">// step the LR scheduler</span>
+        <span class="fn">ax_sched_step</span>(sched);
+
+        printf(<span class="str">"epoch %3d  loss %.4f  lr %.6f\n"</span>,
+               epoch, epoch_loss / n_batches, <span class="fn">ax_sched_get_lr</span>(sched));
+    }</code></pre>
+
+        <h2>Step 5: Evaluation</h2>
+<pre><code>    <span class="cmt">// switch to eval mode: dropout disabled, batchnorm uses running stats</span>
+    <span class="fn">ax_layer_eval</span>(net);
+    <span class="fn">ax_no_grad</span>();  <span class="cmt">// skip gradient tracking for speed</span>
+
+    <span class="typ">ax_tensor_t</span> *pred = <span class="fn">ax_model_predict</span>(model, test_x);
+    <span class="cmt">// ... compute accuracy, print results ...</span>
+
+    <span class="fn">ax_enable_grad</span>();
+    <span class="fn">ax_tensor_destroy</span>(pred);</code></pre>
+
+        <h2>Step 6: Save and Clean Up</h2>
+<pre><code>    <span class="cmt">// save the trained model</span>
+    <span class="fn">ax_model_save</span>(model, <span class="str">"trained.axm"</span>);
+
+    <span class="cmt">// clean up</span>
+    <span class="fn">ax_sched_destroy</span>(sched);
+    <span class="fn">ax_dataloader_destroy</span>(dl);
+    <span class="fn">ax_dataset_destroy</span>(ds);
+    <span class="fn">ax_tensor_destroy</span>(norm_x);
+    <span class="fn">ax_tensor_destroy</span>(train_x);
+    <span class="fn">ax_tensor_destroy</span>(train_y);
+    <span class="fn">ax_model_destroy</span>(model);  <span class="cmt">// frees net, opt, and all params</span>
+    <span class="fn">ax_shutdown</span>();
+    <span class="kw">return</span> <span class="num">0</span>;
+}</code></pre>
+
+        <h2>The Manual Training Loop</h2>
+        <p>If you need more control than <code>ax_model_train_step()</code> provides (e.g., for gradient clipping or custom loss combinations), here is the full manual loop:</p>
+
+<pre><code><span class="kw">while</span> (<span class="fn">ax_dataloader_next</span>(dl, &amp;batch)) {
+    <span class="cmt">// 1. zero gradients</span>
+    <span class="fn">ax_optimizer_zero_grad</span>(opt);
+
+    <span class="cmt">// 2. forward</span>
+    <span class="typ">ax_tensor_t</span> *pred = <span class="fn">ax_layer_forward</span>(net, batch.input);
+
+    <span class="cmt">// 3. loss</span>
+    <span class="typ">ax_tensor_t</span> *loss = <span class="fn">ax_cross_entropy_loss</span>(pred, batch.target);
+    <span class="typ">float</span> loss_val = <span class="fn">ax_tensor_get_f32</span>(loss, (<span class="typ">int64_t</span>[]){<span class="num">0</span>});
+
+    <span class="cmt">// 4. backward</span>
+    <span class="fn">ax_backward</span>(loss);
+
+    <span class="cmt">// 5. gradient clipping (optional)</span>
+    <span class="fn">ax_clip_grad_norm</span>(model->params, model->n_params, <span class="num">1.0f</span>);
+
+    <span class="cmt">// 6. update weights</span>
+    <span class="fn">ax_optimizer_step</span>(opt);
+
+    <span class="cmt">// 7. clean up computation graph (frees all intermediate tensors)</span>
+    <span class="fn">ax_graph_cleanup</span>(loss);
+    <span class="fn">ax_tensor_destroy</span>(loss);
+
+    <span class="cmt">// 8. clean up batch</span>
+    <span class="fn">ax_tensor_destroy</span>(batch.input);
+    <span class="fn">ax_tensor_destroy</span>(batch.target);
+}</code></pre>
+
+        <h2>Tips</h2>
+        <ul>
+            <li><strong>Always call <code>ax_graph_cleanup()</code></strong> after backward. Without it, every intermediate tensor from the forward pass leaks.</li>
+            <li><strong>Destroy batch tensors.</strong> <code>ax_dataloader_next()</code> allocates new tensors for each batch. You own them and must destroy them.</li>
+            <li><strong>BatchNorm needs train/eval mode.</strong> In training mode it computes batch statistics and updates running stats. In eval mode it uses the running stats. Forgetting to switch causes accuracy drops at test time.</li>
+            <li><strong>Gradient clipping helps deep networks.</strong> Use <code>ax_clip_grad_norm()</code> with a max norm of 1.0 for stability.</li>
+            <li><strong>LR scheduling matters.</strong> Cosine annealing or warmup+cosine almost always beats a constant learning rate.</li>
+            <li><strong>Weight decay in AdamW</strong> is better than L2 regularization in Adam. Use <code>ax_adamw_create()</code> if you want regularization.</li>
+        </ul>
+
+        <h2>Loading from CSV</h2>
+<pre><code><span class="cmt">// load a CSV with 4 feature columns and 1 target column</span>
+<span class="typ">ax_dataset_t</span> *ds = <span class="fn">ax_csv_dataset_load</span>(
+    <span class="str">"data.csv"</span>,
+    (<span class="typ">int</span>[]){<span class="num">0</span>, <span class="num">1</span>, <span class="num">2</span>, <span class="num">3</span>}, <span class="num">4</span>,  <span class="cmt">// feature columns</span>
+    (<span class="typ">int</span>[]){<span class="num">4</span>}, <span class="num">1</span>,              <span class="cmt">// target column</span>
+    <span class="num">true</span>);                      <span class="cmt">// has header row</span>
+
+<span class="typ">ax_dataloader_t</span> *dl = <span class="fn">ax_dataloader_create</span>(ds, <span class="num">32</span>, <span class="num">true</span>);</code></pre>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

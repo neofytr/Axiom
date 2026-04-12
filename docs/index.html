@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Axiom - Deep Learning Framework in C</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<main class="landing-page">
+
+    <!-- hero -->
+    <section class="hero">
+        <h1>Axiom</h1>
+        <p class="tagline">Deep learning framework in C. No dependencies. No compromises.</p>
+        <div class="hero-buttons">
+            <a href="quickstart.html" class="btn btn-primary">Get Started</a>
+            <a href="https://github.com/neofytr/neoNN" class="btn btn-secondary" target="_blank">GitHub</a>
+        </div>
+    </section>
+
+    <!-- stats -->
+    <section class="stats-bar">
+        <div class="stat-item">
+            <span class="stat-value">2.3x</span>
+            <span class="stat-label">Faster inference vs TensorFlow</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-value">19K</span>
+            <span class="stat-label">Lines of C</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-value">Zero</span>
+            <span class="stat-label">External dependencies</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-value">&lt; 100KB</span>
+            <span class="stat-label">Inference binary on ARM</span>
+        </div>
+    </section>
+
+    <!-- benchmarks -->
+    <section class="section">
+        <h2 class="section-title">Benchmarks</h2>
+        <p class="section-subtitle">Same model, same dataset, same thread count, same CI machine. No cherry-picking.</p>
+
+        <h3 style="margin-bottom: 12px;">Training (MNIST, 60K samples, Adam, batch 256)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Model Size</th>
+                    <th>x86 (EPYC, 4 threads)</th>
+                    <th>ARM (Graviton3, 4 threads)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>12.6M params</td>
+                    <td><strong>Axiom 69s</strong> / TF 87s</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>4.2M params</td>
+                    <td><strong>Axiom 34s</strong> / TF 36s</td>
+                    <td><strong>Axiom 26s</strong> / TF 30s</td>
+                </tr>
+                <tr>
+                    <td>1.46M params</td>
+                    <td><strong>Axiom 16s</strong> / TF 17s</td>
+                    <td><strong>Axiom 16s</strong> / TF 20s</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3 style="margin-top: 32px; margin-bottom: 12px;">Inference (1.46M params, batch 256, 1000 forward passes)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Metric</th>
+                    <th>Axiom</th>
+                    <th>TensorFlow</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Throughput</td>
+                    <td><strong>51,226 img/s</strong></td>
+                    <td>22,185 img/s</td>
+                </tr>
+                <tr>
+                    <td>Per batch latency</td>
+                    <td><strong>4.99ms</strong></td>
+                    <td>11.54ms</td>
+                </tr>
+            </tbody>
+        </table>
+    </section>
+
+    <!-- features -->
+    <section class="section">
+        <h2 class="section-title">What you get</h2>
+        <p class="section-subtitle">Everything needed to train and deploy neural networks. Nothing you don't need.</p>
+        <div class="feature-grid">
+            <div class="feature-card">
+                <span class="feature-icon">0</span>
+                <h3>Zero Dependencies</h3>
+                <p>No BLAS, no Python, no package manager. The C compiler is the only tool you need. Builds in seconds on any platform.</p>
+            </div>
+            <div class="feature-card">
+                <span class="feature-icon">d</span>
+                <h3>Reverse-Mode Autograd</h3>
+                <p>Automatic differentiation that records a computation graph and backpropagates through it. Slab-allocated grad nodes, arena temporaries, zero malloc overhead per op.</p>
+            </div>
+            <div class="feature-card">
+                <span class="feature-icon">*</span>
+                <h3>BLIS-Style GEMM</h3>
+                <p>Tiled matrix multiply with micro-kernels sized to the register file. 14x32 on AVX-512, 6x16 on AVX2, 8x12 on NEON. Cache-tuned at startup.</p>
+            </div>
+            <div class="feature-card">
+                <span class="feature-icon">+</span>
+                <h3>Op Fusion</h3>
+                <p>Dense+ReLU fused into a single kernel. Cross-entropy backward in one SIMD pass. MatMul+Bias+ReLU without materializing intermediates.</p>
+            </div>
+            <div class="feature-card">
+                <span class="feature-icon">e</span>
+                <h3>Embedded Ready</h3>
+                <p>Inference binary under 100KB on ARM. Baremetal profile with no stdio, no heap, no threads. Runs on Cortex-M class hardware.</p>
+            </div>
+            <div class="feature-card">
+                <span class="feature-icon">G</span>
+                <h3>CUDA Backend</h3>
+                <p>GPU support via cuBLAS GEMM, fused element-wise kernels, and explicit device memory management. Same training code, just flip a flag.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- code example -->
+    <section class="section">
+        <h2 class="section-title">What it looks like</h2>
+        <p class="section-subtitle">A complete training loop in a few lines of C.</p>
+        <div class="code-section">
+<pre><code><span class="pp">#include</span> <span class="str">"axiom/axiom.h"</span>
+
+<span class="typ">int</span> <span class="fn">main</span>(<span class="typ">void</span>) {
+    <span class="fn">ax_init</span>();
+
+    <span class="cmt">// build a 784 -> 128 -> 10 classifier</span>
+    <span class="typ">ax_layer_t</span> *net = <span class="fn">ax_sequential_create</span>();
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">784</span>, <span class="num">128</span>, <span class="num">true</span>));
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+    <span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">128</span>, <span class="num">10</span>, <span class="num">true</span>));
+
+    <span class="typ">ax_model_t</span> *m = <span class="fn">ax_model_create</span>(net);
+    <span class="typ">ax_optimizer_t</span> *opt = <span class="fn">ax_adam_create</span>(
+        m->params, m->n_params,
+        <span class="num">1e-3f</span>, <span class="num">0.9f</span>, <span class="num">0.999f</span>, <span class="num">1e-8f</span>, <span class="num">0</span>);
+    <span class="fn">ax_model_compile</span>(m, opt, ax_cross_entropy_loss);
+
+    <span class="cmt">// train</span>
+    <span class="kw">for</span> (<span class="typ">int</span> i = <span class="num">0</span>; i &lt; <span class="num">1000</span>; i++) {
+        <span class="typ">float</span> loss = <span class="fn">ax_model_train_step</span>(m, train_x, train_y);
+        <span class="kw">if</span> (i % <span class="num">100</span> == <span class="num">0</span>) printf(<span class="str">"epoch %d loss %.4f\n"</span>, i, loss);
+    }
+
+    <span class="fn">ax_model_save</span>(m, <span class="str">"model.axm"</span>);
+    <span class="fn">ax_model_destroy</span>(m);
+    <span class="fn">ax_shutdown</span>();
+}</code></pre>
+        </div>
+    </section>
+
+</main>
+
+<footer class="site-footer">
+    <div class="footer-links">
+        <a href="quickstart.html">Quickstart</a>
+        <a href="architecture.html">Architecture</a>
+        <a href="api-tensor.html">API Reference</a>
+        <a href="guide-training.html">Guides</a>
+        <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+    </div>
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>

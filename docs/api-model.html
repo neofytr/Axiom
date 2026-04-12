@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en" data-page="api-model">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Model API - Axiom</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+    <div class="header-inner">
+        <a href="index.html" class="header-logo">Axiom<span>.</span></a>
+        <button class="mobile-menu-btn" onclick="document.querySelector('.sidebar').classList.toggle('open')">&#9776;</button>
+        <nav class="header-nav">
+            <a href="quickstart.html">Quickstart</a>
+            <a href="architecture.html">Architecture</a>
+            <a href="api-tensor.html" class="active">API</a>
+            <a href="guide-training.html">Guides</a>
+            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        </nav>
+    </div>
+</header>
+
+<div class="doc-layout">
+    <nav class="sidebar">
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Getting Started</div>
+            <a href="quickstart.html" class="sidebar-link">Quickstart</a>
+            <a href="building.html" class="sidebar-link">Building</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Architecture</div>
+            <a href="architecture.html" class="sidebar-link">Overview</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">API Reference</div>
+            <a href="api-tensor.html" class="sidebar-link">Tensors</a>
+            <a href="api-layers.html" class="sidebar-link">Layers</a>
+            <a href="api-activations.html" class="sidebar-link">Activations</a>
+            <a href="api-losses.html" class="sidebar-link">Losses</a>
+            <a href="api-optimizers.html" class="sidebar-link">Optimizers</a>
+            <a href="api-model.html" class="sidebar-link active">Model</a>
+            <a href="api-autograd.html" class="sidebar-link">Autograd</a>
+        </div>
+        <div class="sidebar-section">
+            <div class="sidebar-heading">Guides</div>
+            <a href="guide-training.html" class="sidebar-link">Training Loop</a>
+            <a href="guide-embedded.html" class="sidebar-link">Embedded Deployment</a>
+            <a href="guide-performance.html" class="sidebar-link">Performance</a>
+        </div>
+    </nav>
+
+    <main class="doc-content">
+        <h1>Model API</h1>
+        <p>High-level model container. Wraps a network, optimizer, and loss function to provide a simple train/predict interface.</p>
+
+        <h2>The Model Struct</h2>
+<pre><code><span class="kw">typedef struct</span> {
+    <span class="typ">ax_layer_t</span> *net;                          <span class="cmt">// the network (usually sequential)</span>
+    <span class="typ">ax_optimizer_t</span> *opt;                      <span class="cmt">// optimizer (owned by model)</span>
+    <span class="typ">ax_loss_fn_t</span> loss_fn;                     <span class="cmt">// loss function pointer</span>
+    <span class="typ">ax_tensor_t</span> *params[AX_MODEL_MAX_PARAMS]; <span class="cmt">// collected parameter pointers</span>
+    <span class="typ">int</span> n_params;
+} <span class="typ">ax_model_t</span>;</code></pre>
+        <p>The model collects all trainable parameters from the layer tree at creation time and stores them in a flat array (max <code>AX_MODEL_MAX_PARAMS</code> = 256). This array is what you pass to the optimizer.</p>
+
+        <h2>Creation and Compilation</h2>
+
+        <div class="api-sig"><span class="typ">ax_model_t</span> *<span class="fn">ax_model_create</span>(<span class="typ">ax_layer_t</span> *net)</div>
+        <p class="api-desc">Create a model from a network layer. Collects all trainable parameters from the layer tree.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_model_compile</span>(<span class="typ">ax_model_t</span> *model, <span class="typ">ax_optimizer_t</span> *opt, <span class="typ">ax_loss_fn_t</span> loss_fn)</div>
+        <p class="api-desc">Attach an optimizer and loss function. Call before training. The model takes ownership of the optimizer. <span class="badge">Training only</span></p>
+
+        <p>The loss function type is a function pointer: <code>ax_tensor_t *(*ax_loss_fn_t)(ax_tensor_t *pred, ax_tensor_t *target)</code>. Pass any of the loss functions directly: <code>ax_mse_loss</code>, <code>ax_cross_entropy_loss</code>, etc.</p>
+
+        <h2>Training</h2>
+
+        <div class="api-sig"><span class="typ">float</span> <span class="fn">ax_model_train_step</span>(<span class="typ">ax_model_t</span> *model, <span class="typ">ax_tensor_t</span> *input, <span class="typ">ax_tensor_t</span> *target)</div>
+        <p class="api-desc">Single training step: forward, loss, backward, optimizer step. Returns the loss value as a float. Handles graph cleanup internally. <span class="badge">Training only</span></p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_model_fit</span>(<span class="typ">ax_model_t</span> *model, <span class="typ">ax_tensor_t</span> *train_x, <span class="typ">ax_tensor_t</span> *train_y, <span class="typ">int</span> epochs, <span class="typ">int</span> print_every)</div>
+        <p class="api-desc">Train for multiple epochs on the full dataset. Prints loss every <code>print_every</code> epochs. Simple but gets the job done for small datasets that fit in memory. <span class="badge">Training only</span></p>
+
+        <h2>Inference</h2>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_model_predict</span>(<span class="typ">ax_model_t</span> *model, <span class="typ">ax_tensor_t</span> *input)</div>
+        <p class="api-desc">Forward pass only (inference). Switches to eval mode, runs forward, switches back. Does not track gradients.</p>
+
+        <h2>Serialization</h2>
+
+        <div class="api-sig"><span class="typ">ax_status_t</span> <span class="fn">ax_model_save</span>(<span class="typ">ax_model_t</span> *model, <span class="kw">const</span> <span class="typ">char</span> *path)</div>
+        <p class="api-desc">Save a sequential model to a binary file. Writes architecture and all parameter data. Format: little-endian, fixed-size header, compact.</p>
+
+        <div class="api-sig"><span class="typ">ax_model_t</span> *<span class="fn">ax_model_load</span>(<span class="kw">const</span> <span class="typ">char</span> *path)</div>
+        <p class="api-desc">Load a model from a binary file. Reconstructs the layer tree and loads all weights. Returns NULL on failure.</p>
+
+        <h2>Utilities</h2>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_model_summary</span>(<span class="typ">ax_model_t</span> *model)</div>
+        <p class="api-desc">Print model summary (delegates to <code>ax_layer_summary</code>).</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_model_destroy</span>(<span class="typ">ax_model_t</span> *model)</div>
+        <p class="api-desc">Destroy the model, its optimizer, its network, and all owned tensors.</p>
+
+        <h2>Data Loading</h2>
+        <p>Axiom provides a data pipeline for batching and shuffling training data.</p>
+
+        <h3>Datasets</h3>
+
+        <div class="api-sig"><span class="typ">ax_dataset_t</span> *<span class="fn">ax_tensor_dataset_create</span>(<span class="typ">ax_tensor_t</span> *inputs, <span class="typ">ax_tensor_t</span> *targets)</div>
+        <p class="api-desc">Wrap a pair of tensors as a dataset. First dimension is the sample dimension.</p>
+
+        <div class="api-sig"><span class="typ">ax_dataset_t</span> *<span class="fn">ax_csv_dataset_load</span>(<span class="kw">const</span> <span class="typ">char</span> *path, <span class="kw">const</span> <span class="typ">int</span> *feature_cols, <span class="typ">int</span> n_features, <span class="kw">const</span> <span class="typ">int</span> *target_cols, <span class="typ">int</span> n_targets, <span class="typ">bool</span> has_header)</div>
+        <p class="api-desc">Load a CSV file as a dataset. Specify which columns are features and which are targets. All values parsed as float32.</p>
+
+        <h3>DataLoader</h3>
+
+        <div class="api-sig"><span class="typ">ax_dataloader_t</span> *<span class="fn">ax_dataloader_create</span>(<span class="typ">ax_dataset_t</span> *dataset, <span class="typ">int64_t</span> batch_size, <span class="typ">bool</span> shuffle)</div>
+        <p class="api-desc">Create a dataloader for batched iteration over a dataset.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_dataloader_reset</span>(<span class="typ">ax_dataloader_t</span> *dl)</div>
+        <p class="api-desc">Reset to the start of the dataset. Reshuffles if shuffle=true.</p>
+
+        <div class="api-sig"><span class="typ">bool</span> <span class="fn">ax_dataloader_next</span>(<span class="typ">ax_dataloader_t</span> *dl, <span class="typ">ax_batch_t</span> *batch)</div>
+        <p class="api-desc">Get the next batch. Returns false when the epoch is done. Batch tensors are freshly allocated; caller must destroy them.</p>
+
+        <div class="api-sig"><span class="typ">int64_t</span> <span class="fn">ax_dataloader_num_batches</span>(<span class="typ">ax_dataloader_t</span> *dl)</div>
+        <p class="api-desc">Number of batches in one epoch.</p>
+
+        <div class="api-sig"><span class="typ">void</span> <span class="fn">ax_dataloader_destroy</span>(<span class="typ">ax_dataloader_t</span> *dl)</div>
+        <p class="api-desc">Free the dataloader. Does NOT free the dataset.</p>
+
+        <h3>Transforms</h3>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_transform_normalize</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Normalize to zero mean, unit variance along axis 0 (per-feature).</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_transform_normalize_with</span>(<span class="typ">ax_tensor_t</span> *t, <span class="typ">ax_tensor_t</span> *mean, <span class="typ">ax_tensor_t</span> *std)</div>
+        <p class="api-desc">Normalize with known mean and std (for applying training stats to test data).</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_transform_one_hot</span>(<span class="typ">ax_tensor_t</span> *labels, <span class="typ">int</span> num_classes)</div>
+        <p class="api-desc">One-hot encode integer labels. Input: [n] of ints in [0, num_classes). Output: [n, num_classes] of float 0/1.</p>
+
+        <div class="api-sig"><span class="typ">ax_tensor_t</span> *<span class="fn">ax_transform_minmax_scale</span>(<span class="typ">ax_tensor_t</span> *t)</div>
+        <p class="api-desc">Min-max scaling to [0, 1] range along axis 0.</p>
+
+        <h2>Example: Full Pipeline</h2>
+<pre><code><span class="fn">ax_init</span>();
+
+<span class="cmt">// build network</span>
+<span class="typ">ax_layer_t</span> *net = <span class="fn">ax_sequential_create</span>();
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">784</span>, <span class="num">256</span>, <span class="num">true</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_relu_layer_create</span>());
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dropout_create</span>(<span class="num">0.3f</span>));
+<span class="fn">ax_sequential_add</span>(net, <span class="fn">ax_dense_create</span>(<span class="num">256</span>, <span class="num">10</span>, <span class="num">true</span>));
+
+<span class="cmt">// create model and compile</span>
+<span class="typ">ax_model_t</span> *m = <span class="fn">ax_model_create</span>(net);
+<span class="fn">ax_model_summary</span>(m);
+
+<span class="typ">ax_optimizer_t</span> *opt = <span class="fn">ax_adam_create</span>(
+    m->params, m->n_params,
+    <span class="num">1e-3f</span>, <span class="num">0.9f</span>, <span class="num">0.999f</span>, <span class="num">1e-8f</span>, <span class="num">0</span>);
+<span class="fn">ax_model_compile</span>(m, opt, ax_cross_entropy_loss);
+
+<span class="cmt">// train</span>
+<span class="fn">ax_model_fit</span>(m, train_x, train_y, <span class="num">50</span>, <span class="num">5</span>);
+
+<span class="cmt">// save and load</span>
+<span class="fn">ax_model_save</span>(m, <span class="str">"model.axm"</span>);
+<span class="fn">ax_model_destroy</span>(m);
+
+<span class="typ">ax_model_t</span> *loaded = <span class="fn">ax_model_load</span>(<span class="str">"model.axm"</span>);
+<span class="typ">ax_tensor_t</span> *pred = <span class="fn">ax_model_predict</span>(loaded, test_x);
+
+<span class="fn">ax_tensor_destroy</span>(pred);
+<span class="fn">ax_model_destroy</span>(loaded);
+<span class="fn">ax_shutdown</span>();</code></pre>
+    </main>
+</div>
+
+<footer class="site-footer">
+    <p>Axiom is MIT licensed.</p>
+</footer>
+
+</body>
+</html>
