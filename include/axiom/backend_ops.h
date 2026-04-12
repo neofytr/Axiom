@@ -132,6 +132,21 @@ typedef struct {
     ax_status_t (*sigmoid)(const ax_tensor_t *in, ax_tensor_t *out);
     ax_status_t (*tanh_op)(const ax_tensor_t *in, ax_tensor_t *out);
 
+    /* optional: fused optimizer update kernels. the optimizer iterates
+       per-parameter and calls these with each param's weight, grad, and
+       state tensors. avoids reading all 4 tensors back to the host for
+       a scalar update loop. NULL when unimplemented — optim.c falls
+       back to the existing cpu simd path. */
+    ax_status_t (*adam_update)(ax_tensor_t *weight, ax_tensor_t *grad,
+                                ax_tensor_t *m, ax_tensor_t *v,
+                                float lr, float beta1, float beta2, float eps,
+                                float weight_decay, float bc1, float bc2,
+                                bool decoupled);
+    ax_status_t (*sgd_update)(ax_tensor_t *weight, ax_tensor_t *grad,
+                               ax_tensor_t *momentum_buf,
+                               float lr, float momentum, float weight_decay,
+                               bool nesterov);
+
     /* ---- device-owner hooks (phase 0 backend module extension) ----
        a backend that owns a non-cpu device (e.g. cuda) fills these in so
        core code can manage memory without knowing the device specifics.

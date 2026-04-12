@@ -157,6 +157,8 @@ extern const ax_backend_ops_t ax_cuda_ops = {
     .relu       = cuda_relu,
     .sigmoid    = cuda_sigmoid,
     .tanh_op    = cuda_tanh_op,
+    .adam_update = cuda_adam_update,
+    .sgd_update  = cuda_sgd_update,
 
     /* device-owner hooks */
     .device        = AX_DEVICE_CUDA,

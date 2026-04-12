@@ -163,6 +163,17 @@ ax_status_t cuda_add_relu(const ax_tensor_t *a, const ax_tensor_t *b,
 ax_status_t cuda_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y);
 ax_status_t cuda_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out);
 
+/* optimizer update kernels (ops_optim.cu) */
+ax_status_t cuda_adam_update(ax_tensor_t *weight, ax_tensor_t *grad,
+                              ax_tensor_t *m, ax_tensor_t *v,
+                              float lr, float beta1, float beta2, float eps,
+                              float weight_decay, float bc1, float bc2,
+                              bool decoupled);
+ax_status_t cuda_sgd_update(ax_tensor_t *weight, ax_tensor_t *grad,
+                              ax_tensor_t *momentum_buf,
+                              float lr, float momentum, float weight_decay,
+                              bool nesterov);
+
 /* memory + transfer hooks (memory.cu) */
 void       *cuda_storage_alloc_hook(size_t size_bytes);
 void        cuda_storage_free_hook(void *ptr);

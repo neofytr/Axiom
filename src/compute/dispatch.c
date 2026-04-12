@@ -471,6 +471,35 @@ ax_status_t ax_compute_relu(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_
 ax_status_t ax_compute_sigmoid(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(sigmoid, in, out); }
 ax_status_t ax_compute_tanh(const ax_tensor_t *in, ax_tensor_t *out) { DISPATCH_UNOP(tanh_op, in, out); }
 
+/* fused optimizer updates */
+ax_status_t ax_compute_adam_update(ax_tensor_t *weight, ax_tensor_t *grad,
+                                    ax_tensor_t *m, ax_tensor_t *v,
+                                    float lr, float beta1, float beta2, float eps,
+                                    float weight_decay, float bc1, float bc2,
+                                    bool decoupled)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->adam_update)
+        return AX_ERR_NOT_IMPLEMENTED;
+    return active_ops->adam_update(weight, grad, m, v, lr, beta1, beta2, eps,
+                                   weight_decay, bc1, bc2, decoupled);
+}
+
+ax_status_t ax_compute_sgd_update(ax_tensor_t *weight, ax_tensor_t *grad,
+                                    ax_tensor_t *momentum_buf,
+                                    float lr, float momentum, float weight_decay,
+                                    bool nesterov)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->sgd_update)
+        return AX_ERR_NOT_IMPLEMENTED;
+    return active_ops->sgd_update(weight, grad, momentum_buf, lr, momentum,
+                                   weight_decay, nesterov);
+}
+
+int ax_compute_has_adam_update(void) { ensure_compute_init(); return (active_ops && active_ops->adam_update) ? 1 : 0; }
+int ax_compute_has_sgd_update(void) { ensure_compute_init(); return (active_ops && active_ops->sgd_update) ? 1 : 0; }
+
 /* thread control */
 void ax_set_num_threads(int n)
 {
