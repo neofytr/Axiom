@@ -9,7 +9,6 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './routes/__root'
-import { Route as IndexRouteImport } from './routes/index'
 import { Route as DocsQuickstartRouteImport } from './routes/docs/quickstart'
 import { Route as DocsBuildingRouteImport } from './routes/docs/building'
 import { Route as DocsGuidesTrainingRouteImport } from './routes/docs/guides/training'
@@ -30,11 +29,6 @@ import { Route as DocsApiDataRouteImport } from './routes/docs/api/data'
 import { Route as DocsApiAutogradRouteImport } from './routes/docs/api/autograd'
 import { Route as DocsApiActivationsRouteImport } from './routes/docs/api/activations'
 
-const IndexRoute = IndexRouteImport.update({
-  id: '/',
-  path: '/',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const DocsQuickstartRoute = DocsQuickstartRouteImport.update({
   id: '/docs/quickstart',
   path: '/docs/quickstart',
@@ -134,7 +128,6 @@ const DocsApiActivationsRoute = DocsApiActivationsRouteImport.update({
 } as any)
 
 export interface FileRoutesByFullPath {
-  '/': typeof IndexRoute
   '/docs/building': typeof DocsBuildingRoute
   '/docs/quickstart': typeof DocsQuickstartRoute
   '/docs/api/activations': typeof DocsApiActivationsRoute
@@ -156,7 +149,6 @@ export interface FileRoutesByFullPath {
   '/docs/guides/training': typeof DocsGuidesTrainingRoute
 }
 export interface FileRoutesByTo {
-  '/': typeof IndexRoute
   '/docs/building': typeof DocsBuildingRoute
   '/docs/quickstart': typeof DocsQuickstartRoute
   '/docs/api/activations': typeof DocsApiActivationsRoute
@@ -179,7 +171,6 @@ export interface FileRoutesByTo {
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
-  '/': typeof IndexRoute
   '/docs/building': typeof DocsBuildingRoute
   '/docs/quickstart': typeof DocsQuickstartRoute
   '/docs/api/activations': typeof DocsApiActivationsRoute
@@ -203,7 +194,6 @@ export interface FileRoutesById {
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    | '/'
     | '/docs/building'
     | '/docs/quickstart'
     | '/docs/api/activations'
@@ -225,7 +215,6 @@ export interface FileRouteTypes {
     | '/docs/guides/training'
   fileRoutesByTo: FileRoutesByTo
   to:
-    | '/'
     | '/docs/building'
     | '/docs/quickstart'
     | '/docs/api/activations'
@@ -247,7 +236,6 @@ export interface FileRouteTypes {
     | '/docs/guides/training'
   id:
     | '__root__'
-    | '/'
     | '/docs/building'
     | '/docs/quickstart'
     | '/docs/api/activations'
@@ -270,7 +258,6 @@ export interface FileRouteTypes {
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
-  IndexRoute: typeof IndexRoute
   DocsBuildingRoute: typeof DocsBuildingRoute
   DocsQuickstartRoute: typeof DocsQuickstartRoute
   DocsApiActivationsRoute: typeof DocsApiActivationsRoute
@@ -294,13 +281,6 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/': {
-      id: '/'
-      path: '/'
-      fullPath: '/'
-      preLoaderRoute: typeof IndexRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/docs/quickstart': {
       id: '/docs/quickstart'
       path: '/docs/quickstart'
@@ -438,7 +418,6 @@ declare module '@tanstack/react-router' {
 }
 
 const rootRouteChildren: RootRouteChildren = {
-  IndexRoute: IndexRoute,
   DocsBuildingRoute: DocsBuildingRoute,
   DocsQuickstartRoute: DocsQuickstartRoute,
   DocsApiActivationsRoute: DocsApiActivationsRoute,
