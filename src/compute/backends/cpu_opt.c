@@ -647,10 +647,10 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
     }
 
     int64_t p = 0;
-    int64_t kc2 = kc - (kc & 1);  /* round down to even */
+    int64_t kc2 = kc - (kc & 1);
     for (; p < kc2; p += 2) {
-        __builtin_prefetch(ap + 4 * GEMM_MR, 0, 3);
-        __builtin_prefetch(bp + 4 * GEMM_NR, 0, 3);
+        __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
+        __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
         KERNEL_BODY(ap, bp);
         KERNEL_BODY(ap + GEMM_MR, bp + GEMM_NR);
         ap += 2 * GEMM_MR;
