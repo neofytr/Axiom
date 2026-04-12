@@ -157,6 +157,14 @@ ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
                             const ax_conv_params_t *params,
                             ax_tensor_t *out);
 
+/* col2im for conv backward (ops_conv.cu). scatter col matrix back into
+   input_grad using atomicAdd for overlapping receptive fields. */
+ax_status_t cuda_col2im(const float *col,
+                         int64_t C_in, int64_t H, int64_t W,
+                         int kh, int kw, int sh, int sw, int ph, int pw,
+                         int64_t out_h, int64_t out_w,
+                         float *input_grad);
+
 /* fused primitives (ops_fused.cu) */
 ax_status_t cuda_add_relu(const ax_tensor_t *a, const ax_tensor_t *b,
                            ax_tensor_t *out);
@@ -164,6 +172,12 @@ ax_status_t cuda_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y);
 ax_status_t cuda_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out);
 ax_status_t cuda_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
                            int axis, ax_tensor_t *out);
+
+/* extended activations (ops_activations.cu) */
+ax_status_t cuda_leaky_relu(const ax_tensor_t *in, float alpha, ax_tensor_t *out);
+ax_status_t cuda_elu_op(const ax_tensor_t *in, float alpha, ax_tensor_t *out);
+ax_status_t cuda_gelu_op(const ax_tensor_t *in, ax_tensor_t *out);
+ax_status_t cuda_swish_op(const ax_tensor_t *in, ax_tensor_t *out);
 
 /* optimizer update kernels (ops_optim.cu) */
 ax_status_t cuda_adam_update(ax_tensor_t *weight, ax_tensor_t *grad,

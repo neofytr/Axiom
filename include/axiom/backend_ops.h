@@ -140,6 +140,14 @@ typedef struct {
     ax_status_t (*sigmoid)(const ax_tensor_t *in, ax_tensor_t *out);
     ax_status_t (*tanh_op)(const ax_tensor_t *in, ax_tensor_t *out);
 
+    /* extended activations. leaky_relu and elu take a float alpha
+       parameter. gelu uses the tanh approximation. swish is x*sigmoid(x).
+       all optional — NULL when unimplemented. */
+    ax_status_t (*leaky_relu)(const ax_tensor_t *in, float alpha, ax_tensor_t *out);
+    ax_status_t (*elu_op)(const ax_tensor_t *in, float alpha, ax_tensor_t *out);
+    ax_status_t (*gelu_op)(const ax_tensor_t *in, ax_tensor_t *out);
+    ax_status_t (*swish_op)(const ax_tensor_t *in, ax_tensor_t *out);
+
     /* optional: fused optimizer update kernels. the optimizer iterates
        per-parameter and calls these with each param's weight, grad, and
        state tensors. avoids reading all 4 tensors back to the host for

@@ -133,8 +133,37 @@ UNOP_KERNEL(k_relu,    v > 0.0f ? v : 0.0f)
 UNOP_KERNEL(k_sigmoid, 1.0f / (1.0f + expf(-v)))
 UNOP_KERNEL(k_tanh,    tanhf(v))
 
+/* ── float4 vectorized unary kernels ─────────────────────────────
+   process 4 elements per thread via float4 load/store. dispatched
+   when n is divisible by 4 and both offsets are 0 (guaranteeing
+   16-byte alignment on the base pointer). */
+
+#define UNOP_KERNEL_VEC4(kname, expr)                                           \
+__global__ static void kname(const float *in, float *out, int64_t n4) {         \
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;                 \
+    if (i >= n4) return;                                                         \
+    float4 ld = ((const float4 *)in)[i];                                         \
+    float4 st;                                                                   \
+    { float v = ld.x; st.x = (expr); }                                          \
+    { float v = ld.y; st.y = (expr); }                                          \
+    { float v = ld.z; st.z = (expr); }                                          \
+    { float v = ld.w; st.w = (expr); }                                          \
+    ((float4 *)out)[i] = st;                                                     \
+}
+
+UNOP_KERNEL_VEC4(k_neg_v4,     -v)
+UNOP_KERNEL_VEC4(k_abs_v4,     fabsf(v))
+UNOP_KERNEL_VEC4(k_exp_v4,     expf(v))
+UNOP_KERNEL_VEC4(k_log_v4,     v > 0.0f ? logf(v) : -FLT_MAX)
+UNOP_KERNEL_VEC4(k_sqrt_v4,    v >= 0.0f ? sqrtf(v) : 0.0f)
+UNOP_KERNEL_VEC4(k_square_v4,  v * v)
+UNOP_KERNEL_VEC4(k_relu_v4,    v > 0.0f ? v : 0.0f)
+UNOP_KERNEL_VEC4(k_sigmoid_v4, 1.0f / (1.0f + expf(-v)))
+UNOP_KERNEL_VEC4(k_tanh_v4,    tanhf(v))
+
 static ax_status_t run_unop(
     void(*kernel)(const float *, float *, int64_t, int64_t, int64_t),
+    void(*kernel_v4)(const float *, float *, int64_t),
     const ax_tensor_t *in, ax_tensor_t *out)
 {
     if (in->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32) {
@@ -143,6 +172,18 @@ static ax_status_t run_unop(
     }
     int64_t n = 1;
     for (int d = 0; d < out->ndim; d++) n *= out->shape[d];
+
+    /* dispatch to float4 path when aligned and evenly divisible */
+    if (kernel_v4 && in->offset == 0 && out->offset == 0 && (n % 4) == 0) {
+        int64_t n4 = n / 4;
+        int blocks = (int)((n4 + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
+        kernel_v4<<<blocks, AX_CUDA_BLOCK>>>(
+            (const float *)in->storage->data,
+            (float *)out->storage->data, n4);
+        AX_CUDA_CHECK_LAUNCH("unop_v4");
+        return AX_OK;
+    }
+
     int blocks = (int)((n + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
     kernel<<<blocks, AX_CUDA_BLOCK>>>(
         (const float *)in->storage->data, (float *)out->storage->data,
@@ -192,15 +233,15 @@ ax_status_t cuda_equal(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *
 ax_status_t cuda_greater(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
     return run_binop(k_greater, a, b, out); }
 
-ax_status_t cuda_neg(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_neg,     in, out); }
-ax_status_t cuda_abs(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_abs,     in, out); }
-ax_status_t cuda_exp(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_exp,     in, out); }
-ax_status_t cuda_log(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_log,     in, out); }
-ax_status_t cuda_sqrt(const ax_tensor_t *in, ax_tensor_t *out)    { return run_unop(k_sqrt,    in, out); }
-ax_status_t cuda_square(const ax_tensor_t *in, ax_tensor_t *out)  { return run_unop(k_square,  in, out); }
-ax_status_t cuda_relu(const ax_tensor_t *in, ax_tensor_t *out)    { return run_unop(k_relu,    in, out); }
-ax_status_t cuda_sigmoid(const ax_tensor_t *in, ax_tensor_t *out) { return run_unop(k_sigmoid, in, out); }
-ax_status_t cuda_tanh_op(const ax_tensor_t *in, ax_tensor_t *out) { return run_unop(k_tanh,    in, out); }
+ax_status_t cuda_neg(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_neg,     k_neg_v4,     in, out); }
+ax_status_t cuda_abs(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_abs,     k_abs_v4,     in, out); }
+ax_status_t cuda_exp(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_exp,     k_exp_v4,     in, out); }
+ax_status_t cuda_log(const ax_tensor_t *in, ax_tensor_t *out)     { return run_unop(k_log,     k_log_v4,     in, out); }
+ax_status_t cuda_sqrt(const ax_tensor_t *in, ax_tensor_t *out)    { return run_unop(k_sqrt,    k_sqrt_v4,    in, out); }
+ax_status_t cuda_square(const ax_tensor_t *in, ax_tensor_t *out)  { return run_unop(k_square,  k_square_v4,  in, out); }
+ax_status_t cuda_relu(const ax_tensor_t *in, ax_tensor_t *out)    { return run_unop(k_relu,    k_relu_v4,    in, out); }
+ax_status_t cuda_sigmoid(const ax_tensor_t *in, ax_tensor_t *out) { return run_unop(k_sigmoid, k_sigmoid_v4, in, out); }
+ax_status_t cuda_tanh_op(const ax_tensor_t *in, ax_tensor_t *out) { return run_unop(k_tanh,    k_tanh_v4,    in, out); }
 
 ax_status_t cuda_add_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out) {
     if (in->dtype != AX_FLOAT32) {

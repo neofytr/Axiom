@@ -112,6 +112,73 @@ __global__ static void k_reduce_min_axis(const float *in, float *out,
     out[idx] = m;
 }
 
+/* ── block-parallel axis reductions ──────────────────────────────
+   one block per output element. threads cooperate to reduce the axis
+   dimension using shared memory + warp shuffle. dispatched when
+   axis_len >= 64; otherwise the serial-per-thread path above suffices. */
+
+__global__ static void k_reduce_sum_axis_block(const float *in, float *out,
+        int64_t outer, int64_t axis_len, int64_t inner) {
+    __shared__ float smem[AX_CUDA_BLOCK / 32];
+    int64_t idx = blockIdx.x;  /* one block per output element */
+    int64_t o = idx / inner, j = idx % inner;
+    float s = 0.0f;
+    for (int64_t a = threadIdx.x; a < axis_len; a += blockDim.x)
+        s += in[o * axis_len * inner + a * inner + j];
+    s = warp_reduce_sum(s);
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x / 32] = s;
+    __syncthreads();
+    if (threadIdx.x < (AX_CUDA_BLOCK / 32)) {
+        s = smem[threadIdx.x];
+        s = warp_reduce_sum(s);
+    }
+    if (threadIdx.x == 0) out[idx] = s;
+}
+
+__global__ static void k_reduce_max_axis_block(const float *in, float *out,
+        int64_t outer, int64_t axis_len, int64_t inner) {
+    __shared__ float smem[AX_CUDA_BLOCK / 32];
+    int64_t idx = blockIdx.x;
+    int64_t o = idx / inner, j = idx % inner;
+    float m = -FLT_MAX;
+    for (int64_t a = threadIdx.x; a < axis_len; a += blockDim.x) {
+        float v = in[o * axis_len * inner + a * inner + j];
+        if (v > m) m = v;
+    }
+    m = warp_reduce_max(m);
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x / 32] = m;
+    __syncthreads();
+    if (threadIdx.x < (AX_CUDA_BLOCK / 32)) {
+        m = smem[threadIdx.x];
+        m = warp_reduce_max(m);
+    }
+    if (threadIdx.x == 0) out[idx] = m;
+}
+
+__global__ static void k_reduce_min_axis_block(const float *in, float *out,
+        int64_t outer, int64_t axis_len, int64_t inner) {
+    __shared__ float smem[AX_CUDA_BLOCK / 32];
+    int64_t idx = blockIdx.x;
+    int64_t o = idx / inner, j = idx % inner;
+    float m = FLT_MAX;
+    for (int64_t a = threadIdx.x; a < axis_len; a += blockDim.x) {
+        float v = in[o * axis_len * inner + a * inner + j];
+        if (v < m) m = v;
+    }
+    m = warp_reduce_min(m);
+    if ((threadIdx.x & 31) == 0) smem[threadIdx.x / 32] = m;
+    __syncthreads();
+    if (threadIdx.x < (AX_CUDA_BLOCK / 32)) {
+        m = smem[threadIdx.x];
+        m = warp_reduce_min(m);
+    }
+    if (threadIdx.x == 0) out[idx] = m;
+}
+
+/* threshold: axis lengths below this use the simple one-thread-per-output
+   serial loop; above it threads cooperate via shared mem + warp shuffle. */
+#define AX_AXIS_BLOCK_THRESH 64
+
 /* ── two-level full-reduce helpers returning a host float ─────────
    temp buffers (d_tmp, d2) come from the persistent scratch arena
    instead of per-call cudaMalloc/cudaFree. the caller is responsible
@@ -213,10 +280,17 @@ ax_status_t cuda_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     int64_t outer, axis_len, inner;
     reduction_dims(in, axis, &outer, &axis_len, &inner);
     int64_t n_out = outer * inner;
-    k_reduce_sum_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
-        d + in->offset, (float *)out->storage->data + out->offset,
-        outer, axis_len, inner);
-    AX_CUDA_CHECK_LAUNCH("sum_axis");
+    if (axis_len >= AX_AXIS_BLOCK_THRESH) {
+        k_reduce_sum_axis_block<<<(int)n_out, AX_CUDA_BLOCK>>>(
+            d + in->offset, (float *)out->storage->data + out->offset,
+            outer, axis_len, inner);
+        AX_CUDA_CHECK_LAUNCH("sum_axis_block");
+    } else {
+        k_reduce_sum_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
+            d + in->offset, (float *)out->storage->data + out->offset,
+            outer, axis_len, inner);
+        AX_CUDA_CHECK_LAUNCH("sum_axis");
+    }
     return AX_OK;
 }
 
@@ -252,10 +326,17 @@ ax_status_t cuda_max(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     int64_t outer, axis_len, inner;
     reduction_dims(in, axis, &outer, &axis_len, &inner);
     int64_t n_out = outer * inner;
-    k_reduce_max_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
-        d + in->offset, (float *)out->storage->data + out->offset,
-        outer, axis_len, inner);
-    AX_CUDA_CHECK_LAUNCH("max_axis");
+    if (axis_len >= AX_AXIS_BLOCK_THRESH) {
+        k_reduce_max_axis_block<<<(int)n_out, AX_CUDA_BLOCK>>>(
+            d + in->offset, (float *)out->storage->data + out->offset,
+            outer, axis_len, inner);
+        AX_CUDA_CHECK_LAUNCH("max_axis_block");
+    } else {
+        k_reduce_max_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
+            d + in->offset, (float *)out->storage->data + out->offset,
+            outer, axis_len, inner);
+        AX_CUDA_CHECK_LAUNCH("max_axis");
+    }
     return AX_OK;
 }
 
@@ -280,10 +361,17 @@ ax_status_t cuda_min(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
     int64_t outer, axis_len, inner;
     reduction_dims(in, axis, &outer, &axis_len, &inner);
     int64_t n_out = outer * inner;
-    k_reduce_min_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
-        d + in->offset, (float *)out->storage->data + out->offset,
-        outer, axis_len, inner);
-    AX_CUDA_CHECK_LAUNCH("min_axis");
+    if (axis_len >= AX_AXIS_BLOCK_THRESH) {
+        k_reduce_min_axis_block<<<(int)n_out, AX_CUDA_BLOCK>>>(
+            d + in->offset, (float *)out->storage->data + out->offset,
+            outer, axis_len, inner);
+        AX_CUDA_CHECK_LAUNCH("min_axis_block");
+    } else {
+        k_reduce_min_axis<<<(int)((n_out+AX_CUDA_BLOCK-1)/AX_CUDA_BLOCK), AX_CUDA_BLOCK>>>(
+            d + in->offset, (float *)out->storage->data + out->offset,
+            outer, axis_len, inner);
+        AX_CUDA_CHECK_LAUNCH("min_axis");
+    }
     return AX_OK;
 }
 

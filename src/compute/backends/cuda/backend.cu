@@ -158,6 +158,10 @@ extern const ax_backend_ops_t ax_cuda_ops = {
     .relu       = cuda_relu,
     .sigmoid    = cuda_sigmoid,
     .tanh_op    = cuda_tanh_op,
+    .leaky_relu = cuda_leaky_relu,
+    .elu_op     = cuda_elu_op,
+    .gelu_op    = cuda_gelu_op,
+    .swish_op   = cuda_swish_op,
     .adam_update = cuda_adam_update,
     .sgd_update  = cuda_sgd_update,
 

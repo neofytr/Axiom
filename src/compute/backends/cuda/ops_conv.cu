@@ -57,7 +57,58 @@ __global__ static void k_im2col_sample(
     col[r * cols + c] = v;
 }
 
+/* ── col2im kernel (conv backward) ───────────────────────────────
+   inverse of im2col: scatter columns back into input_grad space.
+   overlapping receptive fields require atomicAdd. one thread per
+   element of the col matrix [C_in*kh*kw, out_h*out_w]. */
+
+__global__ static void k_col2im_sample(
+        const float *col, int64_t C_in, int64_t H, int64_t W,
+        int kh, int kw, int sh, int sw, int ph, int pw,
+        int64_t out_h, int64_t out_w,
+        float *input_grad)
+{
+    int64_t rows = C_in * kh * kw;
+    int64_t cols = out_h * out_w;
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= rows * cols) return;
+
+    int64_t r = idx / cols;
+    int64_t c = idx % cols;
+
+    /* unpack r -> (channel, ky, kx) */
+    int64_t kx = r % kw;
+    int64_t ky = (r / kw) % kh;
+    int64_t ch = r / (kh * kw);
+
+    /* unpack c -> (out_y, out_x) */
+    int64_t out_y = c / out_w;
+    int64_t out_x = c % out_w;
+
+    int64_t in_y = out_y * sh - ph + ky;
+    int64_t in_x = out_x * sw - pw + kx;
+
+    if (in_y >= 0 && in_y < H && in_x >= 0 && in_x < W) {
+        atomicAdd(&input_grad[ch * H * W + in_y * W + in_x],
+                  col[r * cols + c]);
+    }
+}
+
 extern "C" {
+
+ax_status_t cuda_col2im(const float *col,
+                         int64_t C_in, int64_t H, int64_t W,
+                         int kh, int kw, int sh, int sw, int ph, int pw,
+                         int64_t out_h, int64_t out_w,
+                         float *input_grad)
+{
+    int64_t total = C_in * kh * kw * out_h * out_w;
+    int blocks = (int)((total + AX_CUDA_BLOCK - 1) / AX_CUDA_BLOCK);
+    k_col2im_sample<<<blocks, AX_CUDA_BLOCK>>>(
+        col, C_in, H, W, kh, kw, sh, sw, ph, pw, out_h, out_w, input_grad);
+    AX_CUDA_CHECK_LAUNCH("col2im");
+    return AX_OK;
+}
 
 ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
                             const ax_conv_params_t *params,

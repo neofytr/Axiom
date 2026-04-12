@@ -35,15 +35,15 @@ __global__ static void k_axpy(
 }
 
 /* ── softmax_rowwise ──────────────────────────────────────────────
-   numerically stable row-wise softmax. one block per row; block
-   cooperates to find the row max, compute exp(x - max), sum, and
-   normalise. row must fit in shared memory for the current impl —
-   128-column rows at block size 256 is comfortable for mnist-class
-   classifier heads. for wider rows we'd need a multi-pass reduction;
-   deferred until a caller actually needs it. */
+   numerically stable row-wise softmax. for cols <= AX_CUDA_BLOCK we
+   use the fast single-block path (one block per row, shared mem reduce).
+   for wider rows a 3-pass multi-block approach: (1) row max, (2) exp +
+   sum, (3) normalize. the multi-block path uses scratch arena for
+   per-row temporaries. */
 
-#define AX_SOFTMAX_ROW_MAX_COLS 1024
-
+/* single-block fast path: one block per row, threads cooperate via
+   shared memory tree reduction. handles cols up to any size but is
+   most efficient when cols <= AX_CUDA_BLOCK (no thread-loop needed). */
 __global__ static void k_softmax_row(
         const float *in, float *out, int rows, int cols)
 {
@@ -92,6 +92,74 @@ __global__ static void k_softmax_row(
     for (int c = threadIdx.x; c < cols; c += blockDim.x) {
         orow[c] *= inv;
     }
+}
+
+/* multi-block softmax: 3 separate kernel launches per batch.
+   each kernel uses one block per row with shared mem tree reduction.
+   pass 1 writes per-row max to scratch, pass 2 writes exp to out and
+   per-row sum to scratch, pass 3 normalizes. */
+
+__global__ static void k_softmax_mb_max(
+        const float *in, float *row_max_buf, int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float *irow = in + (int64_t)row * cols;
+
+    __shared__ float smem[AX_CUDA_BLOCK];
+    float local_max = -FLT_MAX;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        float v = irow[c];
+        if (v > local_max) local_max = v;
+    }
+    smem[threadIdx.x] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            float r = smem[threadIdx.x + s];
+            if (r > smem[threadIdx.x]) smem[threadIdx.x] = r;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) row_max_buf[row] = smem[0];
+}
+
+__global__ static void k_softmax_mb_exp_sum(
+        const float *in, float *out, const float *row_max_buf,
+        float *row_sum_buf, int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    const float *irow = in  + (int64_t)row * cols;
+    float       *orow = out + (int64_t)row * cols;
+    float row_max = row_max_buf[row];
+
+    __shared__ float smem[AX_CUDA_BLOCK];
+    float local_sum = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        float e = expf(irow[c] - row_max);
+        orow[c] = e;
+        local_sum += e;
+    }
+    smem[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            smem[threadIdx.x] += smem[threadIdx.x + s];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) row_sum_buf[row] = smem[0];
+}
+
+__global__ static void k_softmax_mb_norm(
+        float *out, const float *row_sum_buf, int rows, int cols)
+{
+    int row = blockIdx.x;
+    if (row >= rows) return;
+    float *orow = out + (int64_t)row * cols;
+    float inv = 1.0f / row_sum_buf[row];
+    for (int c = threadIdx.x; c < cols; c += blockDim.x)
+        orow[c] *= inv;
 }
 
 /* ── op wrappers ──────────────────────────────────────────────── */
@@ -153,17 +221,36 @@ ax_status_t cuda_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
     }
     int rows = (int)in->shape[0];
     int cols = (int)in->shape[1];
-    if (cols > AX_SOFTMAX_ROW_MAX_COLS) {
-        ax_err_set(AX_ERR_NOT_IMPLEMENTED,
-                   "cuda softmax_rowwise: cols=%d exceeds single-block limit %d",
-                   cols, AX_SOFTMAX_ROW_MAX_COLS);
-        return AX_ERR_NOT_IMPLEMENTED;
+    const float *inp = (const float *)in->storage->data  + in->offset;
+    float       *outp = (float *)     out->storage->data + out->offset;
+
+    if (cols <= AX_CUDA_BLOCK) {
+        /* fast path: single block per row, all 3 passes in one kernel */
+        k_softmax_row<<<rows, AX_CUDA_BLOCK>>>(inp, outp, rows, cols);
+        AX_CUDA_CHECK_LAUNCH("softmax_rowwise");
+        return AX_OK;
     }
-    k_softmax_row<<<rows, AX_CUDA_BLOCK>>>(
-        (const float *)in->storage->data  + in->offset,
-        (float *)      out->storage->data + out->offset,
-        rows, cols);
-    AX_CUDA_CHECK_LAUNCH("softmax_rowwise");
+
+    /* multi-block path for wide rows: 3 separate kernel launches.
+       scratch holds per-row max and per-row sum (2 * rows floats). */
+    ax_cuda_scratch_reset();
+    float *d_row_max = (float *)ax_cuda_scratch_alloc((size_t)rows * sizeof(float));
+    float *d_row_sum = (float *)ax_cuda_scratch_alloc((size_t)rows * sizeof(float));
+    if (!d_row_max || !d_row_sum) {
+        ax_err_set(AX_ERR_BACKEND,
+                   "cuda softmax_rowwise: scratch arena too small for %d rows", rows);
+        return AX_ERR_BACKEND;
+    }
+
+    k_softmax_mb_max<<<rows, AX_CUDA_BLOCK>>>(inp, d_row_max, rows, cols);
+    AX_CUDA_CHECK_LAUNCH("softmax_mb_max");
+
+    k_softmax_mb_exp_sum<<<rows, AX_CUDA_BLOCK>>>(
+        inp, outp, d_row_max, d_row_sum, rows, cols);
+    AX_CUDA_CHECK_LAUNCH("softmax_mb_exp_sum");
+
+    k_softmax_mb_norm<<<rows, AX_CUDA_BLOCK>>>(outp, d_row_sum, rows, cols);
+    AX_CUDA_CHECK_LAUNCH("softmax_mb_norm");
     return AX_OK;
 }
 
