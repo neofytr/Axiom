@@ -148,6 +148,11 @@ ax_status_t cuda_min(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 /* matrix multiply (ops_gemm.cu) */
 ax_status_t cuda_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+/* implicit im2col conv forward (ops_conv.cu). per-sample. */
+ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
+                            const ax_conv_params_t *params,
+                            ax_tensor_t *out);
+
 /* memory + transfer hooks (memory.cu) */
 void       *cuda_storage_alloc_hook(size_t size_bytes);
 void        cuda_storage_free_hook(void *ptr);

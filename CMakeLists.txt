@@ -100,6 +100,7 @@ if(AX_CUDA)
         src/compute/backends/cuda/ops_elementwise.cu
         src/compute/backends/cuda/ops_reduce.cu
         src/compute/backends/cuda/ops_gemm.cu
+        src/compute/backends/cuda/ops_conv.cu
     )
     list(APPEND AXIOM_SOURCES ${AX_CUDA_SOURCES})
 endif()

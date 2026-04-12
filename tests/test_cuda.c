@@ -242,6 +242,91 @@ static void test_gpu_larger_gemm(void) {
     ax_set_default_device(AX_DEVICE_CPU);
     ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
 }
+
+/* conv_gemm parity: run cuda_conv_gemm on a small sample and compare
+   against the cpu reference computed via the current active cpu backend's
+   im2col + gemm. */
+static void test_gpu_conv_gemm(void) {
+    /* tiny 3-channel 4x4 input, 2 output channels, 3x3 kernel, stride 1,
+       pad 1 -> out 4x4. sizes chosen to keep the reference fast. */
+    const int C_in = 3, C_out = 2, H = 4, W = 4;
+    const int kh = 3, kw = 3, sh = 1, sw = 1, ph = 1, pw = 1;
+    const int out_h = (H + 2*ph - kh) / sh + 1;
+    const int out_w = (W + 2*pw - kw) / sw + 1;
+    const int K = C_in * kh * kw, M = out_h * out_w;
+
+    /* cpu reference: build input and weight on cpu, run cpu gemm via the
+       explicit im2col path using the existing ax_compute_conv_gemm. the
+       cpu backend implements conv_gemm too, so we can reuse the same api. */
+    int64_t in_shape[]  = {C_in, H, W};
+    int64_t w_shape[]   = {C_out, K};
+    int64_t out_shape[] = {C_out, M};
+
+    float *in_data = (float *)malloc((size_t)C_in * H * W * sizeof(float));
+    float *w_data  = (float *)malloc((size_t)C_out * K * sizeof(float));
+    for (int i = 0; i < C_in * H * W; i++) in_data[i] = 0.01f * (float)(i + 1);
+    for (int i = 0; i < C_out * K;    i++) w_data[i]  = 0.02f * (float)(i + 1) - 0.1f;
+
+    /* cpu leg */
+    ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
+    ax_set_default_device(AX_DEVICE_CPU);
+    ax_tensor_t *cpu_in  = ax_tensor_from_array(in_data, in_shape, 3, AX_FLOAT32);
+    ax_tensor_t *cpu_w   = ax_tensor_from_array(w_data,  w_shape,  2, AX_FLOAT32);
+    ax_tensor_t *cpu_out = ax_tensor_zeros(out_shape, 2, AX_FLOAT32);
+
+    AX_TEST_ASSERT(ax_compute_has_conv_gemm() != 0,
+                   "cpu backend should implement conv_gemm for reference");
+    ax_conv_params_t cp_cpu = {
+        .input = (const float *)cpu_in->storage->data,
+        .C_in = C_in, .H = H, .W = W,
+        .kh = kh, .kw = kw,
+        .sh = sh, .sw = sw,
+        .ph = ph, .pw = pw,
+        .out_h = out_h, .out_w = out_w,
+    };
+    AX_TEST_ASSERT(ax_compute_conv_gemm(cpu_w, &cp_cpu, cpu_out) == AX_OK,
+                   "cpu conv_gemm should succeed");
+
+    /* gpu leg */
+    ax_compute_set_backend(AX_BACKEND_CUDA);
+    ax_tensor_t *gpu_in  = ax_tensor_to_cuda(cpu_in);
+    ax_tensor_t *gpu_w   = ax_tensor_to_cuda(cpu_w);
+    ax_set_default_device(AX_DEVICE_CUDA);
+    ax_tensor_t *gpu_out = ax_tensor_zeros(out_shape, 2, AX_FLOAT32);
+
+    AX_TEST_ASSERT(ax_compute_has_conv_gemm() != 0,
+                   "cuda backend should implement conv_gemm");
+    ax_conv_params_t cp_gpu = {
+        .input = (const float *)gpu_in->storage->data,
+        .C_in = C_in, .H = H, .W = W,
+        .kh = kh, .kw = kw,
+        .sh = sh, .sw = sw,
+        .ph = ph, .pw = pw,
+        .out_h = out_h, .out_w = out_w,
+    };
+    AX_TEST_ASSERT(ax_compute_conv_gemm(gpu_w, &cp_gpu, gpu_out) == AX_OK,
+                   "gpu conv_gemm should succeed");
+    ax_cuda_synchronize();
+
+    /* compare via bulk d2h */
+    ax_tensor_t *check = ax_tensor_to_cpu(gpu_out);
+    int mismatches = 0;
+    for (int i = 0; i < C_out * M; i++) {
+        float a = cpu_f32(cpu_out, i);
+        float b = cpu_f32(check,   i);
+        if (fabsf(a - b) > 1e-3f) mismatches++;
+    }
+    AX_TEST_ASSERT(mismatches == 0, "gpu vs cpu conv_gemm mismatch");
+    printf("  (%dx%d @ %d,%d kernel: %d mismatches vs cpu)\n",
+           C_in, H*W, kh, kw, mismatches);
+
+    ax_tensor_destroy(cpu_in); ax_tensor_destroy(cpu_w); ax_tensor_destroy(cpu_out);
+    ax_tensor_destroy(gpu_in); ax_tensor_destroy(gpu_w); ax_tensor_destroy(gpu_out);
+    ax_tensor_destroy(check);
+    free(in_data); free(w_data);
+    ax_set_default_device(AX_DEVICE_CPU);
+    ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
+}
 #endif /* AX_HAVE_CUDA */
 
 /* ── main ─────────────────────────────────────────────────────────────────── */
@@ -272,6 +357,7 @@ int main(void) {
         AX_RUN_TEST(test_gpu_gemm);
         AX_RUN_TEST(test_gpu_sum_reduction);
         AX_RUN_TEST(test_gpu_larger_gemm);
+        AX_RUN_TEST(test_gpu_conv_gemm);
     } else {
         printf("--- no GPU found, skipping GPU tests ---\n");
     }
