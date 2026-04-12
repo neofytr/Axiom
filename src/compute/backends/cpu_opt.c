@@ -615,11 +615,19 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
     __m256 c40 = _mm256_setzero_ps(), c41 = _mm256_setzero_ps();
     __m256 c50 = _mm256_setzero_ps(), c51 = _mm256_setzero_ps();
 
-    /* prefetch distance of 8 iterations keeps the l1 warm without evicting
-       the currently-used lines. tuned for the 6x16 inner loop. */
+    /* prefetch output C into L1 before the compute loop so the writeback
+       step doesn't stall on L2 latency. use read hint (0) not write
+       hint (1) because prefetchw can segfault on some os/memory configs. */
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 8) __builtin_prefetch(c + row * ldc + 8, 0, 3);
+    }
+
+    /* prefetch distance 4 iterations ahead (~96 B for A, ~256 B for B).
+       tighter than 8 to avoid evicting hot data from L1 on small kc. */
     for (int64_t p = 0; p < kc; p++) {
-        __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
-        __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
+        __builtin_prefetch(ap + 4 * GEMM_MR, 0, 3);
+        __builtin_prefetch(bp + 4 * GEMM_NR, 0, 3);
 
         __m256 b0 = _mm256_load_ps(bp);
         __m256 b1 = _mm256_load_ps(bp + 8);
@@ -730,6 +738,17 @@ static inline int64_t ax_adaptive_nc(int64_t n, int max_threads) {
         if (nc > GEMM_NC) nc = GEMM_NC;
     }
     return nc;
+}
+
+/* adaptive KC: when K is small enough to fit in a single tile, use K
+   directly as KC to avoid the overhead of multiple K-tile iterations
+   (each tile re-packs A and B). for large K, cap at the L2 budget.
+   the L2 budget constraint: pack_a (MC×KC) + pack_b (NC×KC) must fit.
+   for MC=72, NC=256: (72+256)×KC×4 ≤ ~768 KB → KC ≤ ~600.
+   use 512 as a safe maximum that fits comfortably in any L2 ≥ 1 MB. */
+static inline int64_t ax_adaptive_kc(int64_t k) {
+    if (k <= 512) return k;  /* single tile: no re-packing */
+    return GEMM_KC;          /* default tiled path */
 }
 
 static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
