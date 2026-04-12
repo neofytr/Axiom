@@ -625,29 +625,56 @@ int ax_autotune_threads(void)
 
     /* fast cores: within 25% of best (i.e. time <= 1.25 * best) */
     double threshold = best * 1.25;
-    int fast_count = 0;
+    int fast_cpus_all[CPU_SETSIZE];
+    int fast_all = 0;
     for (int i = 0; i < n_cpus; i++) {
-        if (times[i] <= threshold) fast_count++;
+        if (times[i] <= threshold)
+            fast_cpus_all[fast_all++] = cpu_ids[i];
     }
-    if (fast_count <= 0) fast_count = 1;
-    if (fast_count > n_cpus) fast_count = n_cpus;
+    if (fast_all <= 0) { fast_cpus_all[fast_all++] = cpu_ids[0]; }
+
+    /* smt/ht deduplication: on hyperthreaded cpus, two logical cores
+       share the same physical core and its fma units. running one
+       thread per PHYSICAL core avoids fma contention and gives each
+       thread full throughput. two ht siblings typically score within
+       5% of each other in the calibration (they are equally "fast"),
+       so both make it past the threshold — but using both costs ~40%
+       gemm throughput on alder lake due to fma port sharing.
+
+       detect siblings via /sys thread_siblings_list: if cpu A lists
+       cpu B as a sibling and B is already in the deduped set, skip A. */
+    int fast_cpus[CPU_SETSIZE];
+    int fc = 0;
+    int used_physical[CPU_SETSIZE];
+    memset(used_physical, 0, sizeof(used_physical));
+
+    for (int i = 0; i < fast_all; i++) {
+        int cpu = fast_cpus_all[i];
+        /* read the thread_siblings_list to find the physical core id.
+           format: "a-b" or "a,b" or just "a" (no ht). we use the
+           LOWEST numbered sibling as the physical core identifier. */
+        int phys_id = cpu;
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", cpu);
+        FILE *f = fopen(path, "r");
+        if (f) {
+            int lo = cpu;
+            if (fscanf(f, "%d", &lo) == 1 && lo < cpu) phys_id = lo;
+            fclose(f);
+        }
+        /* skip if we already have a thread on this physical core */
+        if (phys_id < CPU_SETSIZE && used_physical[phys_id]) continue;
+        if (phys_id < CPU_SETSIZE) used_physical[phys_id] = 1;
+        fast_cpus[fc++] = cpu;
+    }
+    if (fc == 0) { fast_cpus[fc++] = fast_cpus_all[0]; }
+
+    int fast_count = fc;
 
     double total_ms = ax_autotune_now_ms() - t_start;
 
     omp_set_num_threads(fast_count);
-
-    /* collect the fast cpu ids in the same order cpu_ids[] was scanned */
-    int fast_cpus[CPU_SETSIZE];
-    int fc = 0;
-    for (int i = 0; i < n_cpus && fc < fast_count; i++) {
-        if (times[i] <= threshold) {
-            fast_cpus[fc++] = cpu_ids[i];
-        }
-    }
-    /* fc should equal fast_count unless fast_count was clamped to 1 above */
-    if (fc == 0) {
-        fast_cpus[fc++] = cpu_ids[0];
-    }
 
     /* pin each omp worker to one fast core. without this step
        omp_set_num_threads alone lets the scheduler drop workers onto
