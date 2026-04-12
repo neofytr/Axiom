@@ -562,9 +562,69 @@ static double ax_autotune_now_ms(void)
 }
 
 #ifdef __linux__
+/* read a single long from a sysfs file. returns -1 on failure. */
+static long read_sysfs_long(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    long v = -1;
+    if (fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f);
+    return v;
+}
+
+/* classify cores by sysfs frequency: read base_frequency (or
+   cpuinfo_max_freq) for each online cpu, find the fastest tier, and
+   mark cpus within 85% of max as "fast". this replaces the 200ms
+   per-core probe loop on systems with frequency info (all modern
+   linux kernels with cpufreq). returns the number of fast cpus
+   written to out_fast[], or -1 if frequency data is unavailable
+   (caller should fall back to the probe). */
+static int classify_cores_by_freq(const int *cpu_ids, int n_cpus,
+                                   int *out_fast, int max_out)
+{
+    long freqs[CPU_SETSIZE];
+    long max_freq = 0;
+    int have_freq = 0;
+
+    for (int i = 0; i < n_cpus; i++) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu%d/cpufreq/base_frequency",
+                 cpu_ids[i]);
+        freqs[i] = read_sysfs_long(path);
+        if (freqs[i] <= 0) {
+            /* try cpuinfo_max_freq as fallback (always present if cpufreq is) */
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",
+                     cpu_ids[i]);
+            freqs[i] = read_sysfs_long(path);
+        }
+        if (freqs[i] > 0) {
+            have_freq = 1;
+            if (freqs[i] > max_freq) max_freq = freqs[i];
+        }
+    }
+
+    if (!have_freq || max_freq <= 0) return -1;
+
+    /* cpus within 85% of the fastest are "fast". on alder lake P-cores
+       run at 2.5 GHz base vs E-cores at 1.8 GHz → ratio 0.72 → E-cores
+       fail the 85% test. on non-hybrid systems all cores have the same
+       freq → all pass. */
+    long threshold = (long)((double)max_freq * 0.85);
+    int fc = 0;
+    for (int i = 0; i < n_cpus && fc < max_out; i++) {
+        if (freqs[i] >= threshold) {
+            out_fast[fc++] = cpu_ids[i];
+        }
+    }
+    return fc > 0 ? fc : -1;
+}
+
 /* tiny serial workload. volatile sink prevents the optimizer from
    collapsing the loop. ~1m fma-ish iterations is plenty for relative
-   speed measurement on modern x86. */
+   speed measurement on modern x86. only used as a FALLBACK when
+   sysfs frequency data is unavailable. */
 static double ax_autotune_run_kernel(void)
 {
     const int iters = 1000000;
@@ -632,60 +692,55 @@ int ax_autotune_threads(void)
         return omp_get_max_threads();
     }
 
-    /* save current affinity so we can restore it after probing */
-    cpu_set_t saved = allowed;
-
-    double times[CPU_SETSIZE];
     double t_start = ax_autotune_now_ms();
-    double budget_ms = 200.0;
 
-    for (int i = 0; i < n_cpus; i++) {
-        /* abort calibration cleanly if we're about to blow the budget */
-        if (ax_autotune_now_ms() - t_start > budget_ms - 5.0) {
-            /* not enough samples to cluster; bail out */
-            sched_setaffinity(0, sizeof(saved), &saved);
-            return omp_get_max_threads();
-        }
-
-        cpu_set_t one;
-        CPU_ZERO(&one);
-        CPU_SET((size_t)cpu_ids[i], &one);
-        if (sched_setaffinity(0, sizeof(one), &one) != 0) {
-            /* couldn't pin; treat as worst-case */
-            times[i] = 1e9;
-            continue;
-        }
-        /* short yield so the kernel actually migrates us */
-        sched_yield();
-        times[i] = ax_autotune_run_kernel();
-    }
-
-    /* restore affinity */
-    sched_setaffinity(0, sizeof(saved), &saved);
-
-    /* find the fastest (smallest time) */
-    double best = times[0];
-    for (int i = 1; i < n_cpus; i++) {
-        if (times[i] < best) best = times[i];
-    }
-    if (best <= 0.0) {
-        return omp_get_max_threads();
-    }
-
-    /* classify cores by speed. for small-to-medium matrix workloads
-       (typical nn training: batch 64-512, hidden 128-1024), using only
-       the fast P-cores beats using all cores because fork-join overhead
-       + L2 contention from slow E-cores hurts more than the extra
-       compute helps. the threshold is 25% — E-cores on alder lake are
-       ~40% slower and get excluded. this matches the empirical optimum
-       measured on i5-12500H (4 P-cores = 6.75s vs 12 all = 8.9s for
-       mnist mlp training). */
-    double threshold = best * 1.25;
+    /* primary path: classify cores by sysfs frequency. reads
+       base_frequency for each cpu — instant (<1ms), no probing.
+       on hybrid cpus (alder lake etc.) this cleanly separates P-cores
+       from E-cores by their base clock without any magic threshold
+       on measured runtime. on non-hybrid cpus all cores have the same
+       freq and all pass — the ht dedup below then picks physical
+       cores. */
     int fast_cpus_all[CPU_SETSIZE];
-    int fast_all = 0;
-    for (int i = 0; i < n_cpus; i++) {
-        if (times[i] <= threshold)
-            fast_cpus_all[fast_all++] = cpu_ids[i];
+    int fast_all = classify_cores_by_freq(cpu_ids, n_cpus,
+                                           fast_cpus_all, CPU_SETSIZE);
+
+    /* fallback: if sysfs frequency data is unavailable (containers,
+       old kernels, non-linux-like environments), probe per-core speed
+       with a scalar fma microbench. this is the old path — ~1ms per
+       core, 200ms budget. */
+    if (fast_all < 0) {
+        cpu_set_t saved = allowed;
+        double times[CPU_SETSIZE];
+        double budget_ms = 200.0;
+
+        for (int i = 0; i < n_cpus; i++) {
+            if (ax_autotune_now_ms() - t_start > budget_ms - 5.0) {
+                sched_setaffinity(0, sizeof(saved), &saved);
+                return omp_get_max_threads();
+            }
+            cpu_set_t one;
+            CPU_ZERO(&one);
+            CPU_SET((size_t)cpu_ids[i], &one);
+            if (sched_setaffinity(0, sizeof(one), &one) != 0) {
+                times[i] = 1e9;
+                continue;
+            }
+            sched_yield();
+            times[i] = ax_autotune_run_kernel();
+        }
+        sched_setaffinity(0, sizeof(saved), &saved);
+
+        double best = times[0];
+        for (int i = 1; i < n_cpus; i++)
+            if (times[i] < best) best = times[i];
+        if (best <= 0.0) return omp_get_max_threads();
+
+        double thr = best * 1.25;
+        fast_all = 0;
+        for (int i = 0; i < n_cpus; i++)
+            if (times[i] <= thr)
+                fast_cpus_all[fast_all++] = cpu_ids[i];
     }
     if (fast_all <= 0) { fast_cpus_all[fast_all++] = cpu_ids[0]; }
 
