@@ -166,6 +166,7 @@ ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device) {
         atomic_init(&s->refcount, 1);
         s->device = device;
         s->is_arena_temp = false;
+        s->generation = 1;
         return s;
     }
 
@@ -176,6 +177,10 @@ ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device) {
         atomic_init(&pooled->refcount, 1);
         pooled->device = device;
         pooled->is_arena_temp = false;
+        /* pooled buffers are recycled — bump generation so any stale cache
+           entry keyed on this storage pointer from a previous owner is
+           invalidated on first use. */
+        pooled->generation++;
         return pooled;
     }
 #endif
@@ -193,6 +198,7 @@ ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device) {
     atomic_init(&s->refcount, 1);
     s->device = device;
     s->is_arena_temp = false;
+    s->generation = 1;
     return s;
 }
 
@@ -355,8 +361,10 @@ static ax_status_t tensor_fill_value(ax_tensor_t *t, double value) {
         /* fast path: in-process memset for zero, kernel loop otherwise */
         if (value == 0.0) {
             memset(t->storage->data, 0, t->storage->size_bytes);
+            ax_storage_touch(t->storage);
             return AX_OK;
         }
+        /* ax_compute_fill bumps generation via dispatch_touch_on_ok */
         return ax_compute_fill(t, value);
     }
     const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
@@ -365,7 +373,9 @@ static ax_status_t tensor_fill_value(ax_tensor_t *t, double value) {
                    "device %d has no fill hook", (int)t->storage->device);
         return AX_ERR_BACKEND;
     }
-    return ops->fill(t, value);
+    ax_status_t s = ops->fill(t, value);
+    if (s == AX_OK) ax_storage_touch(t->storage);
+    return s;
 }
 
 /* copy `bytes` from host buffer `data` into tensor storage at t->offset.
@@ -374,6 +384,7 @@ static ax_status_t tensor_write_from_host(ax_tensor_t *t, const void *data, size
     void *dst = (char *)t->storage->data + t->offset * ax_dtype_size(t->dtype);
     if (t->storage->device == AX_DEVICE_CPU) {
         memcpy(dst, data, bytes);
+        ax_storage_touch(t->storage);
         return AX_OK;
     }
     const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
@@ -382,7 +393,9 @@ static ax_status_t tensor_write_from_host(ax_tensor_t *t, const void *data, size
                    "device %d has no h2d hook", (int)t->storage->device);
         return AX_ERR_BACKEND;
     }
-    return ops->memcpy_h2d(dst, data, bytes);
+    ax_status_t s = ops->memcpy_h2d(dst, data, bytes);
+    if (s == AX_OK) ax_storage_touch(t->storage);
+    return s;
 }
 
 ax_tensor_t *ax_tensor_zeros(const int64_t *shape, int ndim, ax_dtype_t dtype) {
@@ -525,6 +538,7 @@ ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape,
     atomic_init(&s->refcount, 1);
     s->device = AX_DEVICE_CPU;
     s->is_arena_temp = true;
+    s->generation = 1;
     memset(data, 0, bytes);
 
     t->storage = s;

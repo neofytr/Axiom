@@ -16,7 +16,21 @@ typedef struct {
     atomic_int refcount;   /* atomic reference count; freed when it hits 0 */
     ax_device_t device;    /* where this memory lives */
     bool is_arena_temp;    /* true if allocated from a bump arena (release is no-op) */
+    /* generation counter — bumped on every write to the buffer contents.
+       read-only caches (pack_b in cpu_opt.c, ...) that key on a raw
+       pointer use this to detect when the buffer has mutated in place
+       (e.g. optimizer step rewrote weights without changing the pointer)
+       and invalidate stale entries. starts at 1. mutate via
+       ax_storage_touch(); direct manipulation is allowed but discouraged. */
+    uint64_t generation;
 } ax_storage_t;
+
+/* mark storage as modified — bump its generation counter so any stale
+   cache keyed on the previous value invalidates on next lookup. cheap
+   (single increment); call at every in-place write site. safe on NULL. */
+static inline void ax_storage_touch(ax_storage_t *s) {
+    if (s) s->generation++;
+}
 
 /* the tensor: metadata wrapper around a storage buffer */
 typedef struct ax_tensor {

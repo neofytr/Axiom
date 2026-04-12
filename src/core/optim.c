@@ -169,6 +169,9 @@ static void sgd_step(ax_optimizer_t *opt)
         }
 
         opt->state[i].step_count++;
+        /* in-place weight update → bump generation so any cache keyed
+           on this storage (cpu_opt pack_b in particular) invalidates. */
+        ax_storage_touch(p->storage);
     }
 }
 
@@ -285,6 +288,7 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
             float v_hat = vd[j] / bc2;
             wd[wo + j] = w - opt->lr * m_hat / (sqrtf(v_hat) + opt->eps);
         }
+        ax_storage_touch(p->storage);
     }
 }
 
@@ -370,6 +374,7 @@ static void rmsprop_step(ax_optimizer_t *opt)
             wd[wo + j] -= opt->lr * g / (sqrtf(vd[j]) + opt->eps);
         }
         opt->state[i].step_count++;
+        ax_storage_touch(p->storage);
     }
 }
 
@@ -436,6 +441,7 @@ static void adagrad_step(ax_optimizer_t *opt)
             wd[wo + j] -= opt->lr * g / (sqrtf(vd[j]) + opt->eps);
         }
         opt->state[i].step_count++;
+        ax_storage_touch(p->storage);
     }
 }
 

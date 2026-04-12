@@ -76,6 +76,9 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
                 for (int64_t i = 0; i < n; i++)
                     gd[goff + i] += ad[aoff + i];
             }
+            /* grad buffer mutated in place — bump generation so any
+               cache keyed on it (cpu_opt pack_b) invalidates. */
+            ax_storage_touch(t->grad->storage);
             return;
         }
     }
@@ -114,6 +117,7 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
 
         gd[t->grad->offset + param_flat] += ad[grad_to_add->offset + i];
     }
+    ax_storage_touch(t->grad->storage);
 }
 
 

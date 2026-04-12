@@ -187,9 +187,20 @@ int ax_device_is_available(ax_device_t device) {
     return ax_backend_for_device(device) != NULL;
 }
 
-/* dispatch helpers */
-/* macro to reduce boilerplate: check that backend is initialized,
-   check that the op is implemented, then call it */
+/* bump out's generation counter on successful op completion. used as
+   a return-value adapter by every ax_compute_* wrapper so cpu_opt's
+   pack_b cache (keyed on the raw b->storage pointer + generation) can
+   detect in-place mutations and invalidate stale entries. one-line
+   atomic-free increment; perf impact is in the noise. */
+static inline ax_status_t dispatch_touch_on_ok(ax_tensor_t *out, ax_status_t s) {
+    if (s == AX_OK && out) ax_storage_touch(out->storage);
+    return s;
+}
+
+/* dispatch helpers.
+   every wrapper bumps out->storage->generation on successful completion
+   via dispatch_touch_on_ok so read-only caches (pack_b in cpu_opt, ...)
+   keyed on the raw storage pointer can detect in-place mutations. */
 #define DISPATCH_BINOP(op, a, b, out) \
     do { \
         ensure_compute_init(); \
@@ -201,7 +212,7 @@ int ax_device_is_available(ax_device_t device) {
             ax_err_set(AX_ERR_NOT_IMPLEMENTED, #op " not implemented in %s", active_ops->name); \
             return AX_ERR_NOT_IMPLEMENTED; \
         } \
-        return active_ops->op(a, b, out); \
+        return dispatch_touch_on_ok((out), active_ops->op(a, b, out)); \
     } while (0)
 
 #define DISPATCH_UNOP(op, in, out) \
@@ -215,7 +226,7 @@ int ax_device_is_available(ax_device_t device) {
             ax_err_set(AX_ERR_NOT_IMPLEMENTED, #op " not implemented in %s", active_ops->name); \
             return AX_ERR_NOT_IMPLEMENTED; \
         } \
-        return active_ops->op(in, out); \
+        return dispatch_touch_on_ok((out), active_ops->op(in, out)); \
     } while (0)
 
 /* binary ops */
@@ -237,14 +248,14 @@ ax_status_t ax_compute_add_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->add_scalar) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "add_scalar not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
-    return active_ops->add_scalar(in, scalar, out);
+    return dispatch_touch_on_ok(out, active_ops->add_scalar(in, scalar, out));
 }
 
 ax_status_t ax_compute_mul_scalar(const ax_tensor_t *in, double scalar, ax_tensor_t *out) {
     ensure_compute_init();
     if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
     if (!active_ops->mul_scalar) { ax_err_set(AX_ERR_NOT_IMPLEMENTED, "mul_scalar not implemented"); return AX_ERR_NOT_IMPLEMENTED; }
-    return active_ops->mul_scalar(in, scalar, out);
+    return dispatch_touch_on_ok(out, active_ops->mul_scalar(in, scalar, out));
 }
 
 /* matrix ops */
@@ -261,7 +272,7 @@ ax_status_t ax_compute_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
         ax_err_set(AX_ERR_NOT_IMPLEMENTED, "gemm_nt not implemented in %s", active_ops->name);
         return AX_ERR_NOT_IMPLEMENTED;
     }
-    return active_ops->gemm_nt(a, b, out);
+    return dispatch_touch_on_ok(out, active_ops->gemm_nt(a, b, out));
 }
 
 /* optional transposed-a gemm: out = a^T @ b. */
@@ -273,7 +284,7 @@ ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
         ax_err_set(AX_ERR_NOT_IMPLEMENTED, "gemm_tn not implemented in %s", active_ops->name);
         return AX_ERR_NOT_IMPLEMENTED;
     }
-    return active_ops->gemm_tn(a, b, out);
+    return dispatch_touch_on_ok(out, active_ops->gemm_tn(a, b, out));
 }
 
 int ax_compute_has_gemm_nt(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_nt) ? 1 : 0; }
@@ -289,7 +300,7 @@ ax_status_t ax_compute_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
         ax_err_set(AX_ERR_NOT_IMPLEMENTED, "bias_add not implemented in %s", active_ops->name);
         return AX_ERR_NOT_IMPLEMENTED;
     }
-    return active_ops->bias_add(in, bias, axis, out);
+    return dispatch_touch_on_ok(out, active_ops->bias_add(in, bias, axis, out));
 }
 
 int ax_compute_has_bias_add(void) { ensure_compute_init(); return (active_ops && active_ops->bias_add) ? 1 : 0; }
@@ -303,7 +314,7 @@ ax_status_t ax_compute_argmax(const ax_tensor_t *in, int axis, ax_tensor_t *out)
         ax_err_set(AX_ERR_NOT_IMPLEMENTED, "argmax not implemented in %s", active_ops->name);
         return AX_ERR_NOT_IMPLEMENTED;
     }
-    return active_ops->argmax(in, axis, out);
+    return dispatch_touch_on_ok(out, active_ops->argmax(in, axis, out));
 }
 
 /* implicit im2col conv gemm — optional backend op */
@@ -317,7 +328,7 @@ ax_status_t ax_compute_conv_gemm(const ax_tensor_t *weight,
         ax_err_set(AX_ERR_NOT_IMPLEMENTED, "conv_gemm not implemented in %s", active_ops->name);
         return AX_ERR_NOT_IMPLEMENTED;
     }
-    return active_ops->conv_gemm(weight, params, out);
+    return dispatch_touch_on_ok(out, active_ops->conv_gemm(weight, params, out));
 }
 
 int ax_compute_has_conv_gemm(void)
