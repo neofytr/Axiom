@@ -186,6 +186,87 @@ static ax_status_t cpu_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     return AX_OK;
 }
 
+/* fused primitives — naive reference implementations.
+   correctness first; cpu_opt supplies SIMD variants. */
+
+static ax_status_t cpu_add_relu(const ax_tensor_t *a, const ax_tensor_t *b,
+                                 ax_tensor_t *out)
+{
+    if (a->dtype != AX_FLOAT32 || b->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    int64_t n = 1;
+    for (int d = 0; d < out->ndim; d++) n *= out->shape[d];
+    /* require same-shape for the fused path; broadcast callers go
+       through plain add + relu. */
+    int64_t na = 1, nb = 1;
+    for (int d = 0; d < a->ndim; d++) na *= a->shape[d];
+    for (int d = 0; d < b->ndim; d++) nb *= b->shape[d];
+    if (na != n || nb != n) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "add_relu requires matching shapes");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+    const float *ad = (const float *)a->storage->data + a->offset;
+    const float *bd = (const float *)b->storage->data + b->offset;
+    float *od = (float *)out->storage->data + out->offset;
+    for (int64_t i = 0; i < n; i++) {
+        float v = ad[i] + bd[i];
+        od[i] = v > 0.0f ? v : 0.0f;
+    }
+    return AX_OK;
+}
+
+static ax_status_t cpu_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y)
+{
+    if (x->dtype != AX_FLOAT32 || y->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    int64_t nx = 1, ny = 1;
+    for (int d = 0; d < x->ndim; d++) nx *= x->shape[d];
+    for (int d = 0; d < y->ndim; d++) ny *= y->shape[d];
+    if (nx != ny) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "axpy requires matching numel");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+    const float *xd = (const float *)x->storage->data + x->offset;
+    float *yd = (float *)y->storage->data + y->offset;
+    for (int64_t i = 0; i < nx; i++) yd[i] += alpha * xd[i];
+    return AX_OK;
+}
+
+static ax_status_t cpu_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
+{
+    if (in->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (in->ndim != 2 || out->ndim != 2 ||
+        in->shape[0] != out->shape[0] || in->shape[1] != out->shape[1]) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "softmax_rowwise requires matching 2d shapes");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+    int64_t rows = in->shape[0], cols = in->shape[1];
+    const float *id = (const float *)in->storage->data + in->offset;
+    float *od = (float *)out->storage->data + out->offset;
+    int64_t id_rs = in->strides[0], id_cs = in->strides[1];
+    int64_t od_rs = out->strides[0], od_cs = out->strides[1];
+    for (int64_t r = 0; r < rows; r++) {
+        /* max-subtract for numerical stability */
+        float mx = id[r * id_rs];
+        for (int64_t c = 1; c < cols; c++) {
+            float v = id[r * id_rs + c * id_cs];
+            if (v > mx) mx = v;
+        }
+        float sum = 0.0f;
+        for (int64_t c = 0; c < cols; c++) {
+            float e = expf(id[r * id_rs + c * id_cs] - mx);
+            od[r * od_rs + c * od_cs] = e;
+            sum += e;
+        }
+        float inv = 1.0f / sum;
+        for (int64_t c = 0; c < cols; c++) {
+            od[r * od_rs + c * od_cs] *= inv;
+        }
+    }
+    return AX_OK;
+}
+
 /* fused-scaling gemm: out = alpha * (a @ b) + beta * out.
    naive reference implementation — correct for arbitrary alpha/beta. */
 static ax_status_t cpu_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
@@ -512,6 +593,9 @@ const ax_backend_ops_t ax_cpu_naive_ops = {
     .mul_scalar = cpu_mul_scalar,
     .gemm       = cpu_gemm,
     .gemm_ex    = cpu_gemm_ex,
+    .add_relu   = cpu_add_relu,
+    .axpy       = cpu_axpy,
+    .softmax_rowwise = cpu_softmax_rowwise,
     .sum        = cpu_sum,
     .mean       = cpu_mean,
     .max_op     = cpu_max,

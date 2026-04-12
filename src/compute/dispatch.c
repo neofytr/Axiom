@@ -305,6 +305,45 @@ ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
 
 int ax_compute_has_gemm_ex(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_ex) ? 1 : 0; }
 
+/* fused relu(a + b) */
+ax_status_t ax_compute_add_relu(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->add_relu) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "add_relu not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return dispatch_touch_on_ok(out, active_ops->add_relu(a, b, out));
+}
+int ax_compute_has_add_relu(void) { ensure_compute_init(); return (active_ops && active_ops->add_relu) ? 1 : 0; }
+
+/* y += alpha * x, in-place on y */
+ax_status_t ax_compute_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->axpy) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "axpy not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return dispatch_touch_on_ok(y, active_ops->axpy(x, alpha, y));
+}
+int ax_compute_has_axpy(void) { ensure_compute_init(); return (active_ops && active_ops->axpy) ? 1 : 0; }
+
+/* row-wise stable softmax */
+ax_status_t ax_compute_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->softmax_rowwise) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "softmax_rowwise not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return dispatch_touch_on_ok(out, active_ops->softmax_rowwise(in, out));
+}
+int ax_compute_has_softmax_rowwise(void) { ensure_compute_init(); return (active_ops && active_ops->softmax_rowwise) ? 1 : 0; }
+
 /* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias. */
 ax_status_t ax_compute_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
                                  int axis, ax_tensor_t *out)

@@ -1716,6 +1716,126 @@ static ax_status_t opt_argmax(const ax_tensor_t *in, int axis, ax_tensor_t *out)
 }
 
 
+/* ── fused primitives ──────────────────────────────────────────────
+   add_relu / axpy / softmax_rowwise — single-pass fused ops whose
+   win over the equivalent dispatch chain is memory traffic. all
+   three require contiguous, same-shape tensors; anything else
+   falls back to cpu_naive. */
+
+static ax_status_t opt_add_relu(const ax_tensor_t *a, const ax_tensor_t *b,
+                                 ax_tensor_t *out)
+{
+    int64_t na = validate_contig_f32(a);
+    int64_t nb = validate_contig_f32(b);
+    int64_t no_v = validate_contig_f32(out);
+    if (na < 0 || nb < 0 || no_v < 0 || na != nb || na != no_v) {
+        return ax_cpu_naive_ops.add_relu(a, b, out);
+    }
+    const float *ad = raw_f32(a);
+    const float *bd = raw_f32(b);
+    float *od = raw_f32(out);
+
+    int64_t i = 0, ve = na - (na % AX_VF32_WIDTH);
+    for (; i < ve; i += AX_VF32_WIDTH) {
+        ax_vf32 va = ax_vf32_load(ad + i);
+        ax_vf32 vb = ax_vf32_load(bd + i);
+        ax_vf32_store(od + i, ax_vf32_relu(ax_vf32_add(va, vb)));
+    }
+    for (; i < na; i++) {
+        float v = ad[i] + bd[i];
+        od[i] = v > 0.0f ? v : 0.0f;
+    }
+    return AX_OK;
+}
+
+static ax_status_t opt_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y)
+{
+    int64_t nx = validate_contig_f32(x);
+    int64_t ny = validate_contig_f32(y);
+    if (nx < 0 || ny < 0 || nx != ny) {
+        return ax_cpu_naive_ops.axpy(x, alpha, y);
+    }
+    const float *xd = raw_f32(x);
+    float *yd = raw_f32(y);
+    ax_vf32 v_alpha = ax_vf32_set1(alpha);
+    int64_t i = 0, ve = nx - (nx % AX_VF32_WIDTH);
+    for (; i < ve; i += AX_VF32_WIDTH) {
+        ax_vf32 vy = ax_vf32_load(yd + i);
+        ax_vf32 vx = ax_vf32_load(xd + i);
+        ax_vf32_store(yd + i, ax_vf32_fmadd(v_alpha, vx, vy));
+    }
+    for (; i < nx; i++) yd[i] += alpha * xd[i];
+    return AX_OK;
+}
+
+static ax_status_t opt_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
+{
+    if (in->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (in->ndim != 2 || out->ndim != 2)
+        return ax_cpu_naive_ops.softmax_rowwise(in, out);
+    /* stricter: require contiguous, offset 0 */
+    if (validate_contig_f32(in) < 0 || validate_contig_f32(out) < 0)
+        return ax_cpu_naive_ops.softmax_rowwise(in, out);
+    if (in->shape[0] != out->shape[0] || in->shape[1] != out->shape[1])
+        return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t rows = in->shape[0];
+    int64_t cols = in->shape[1];
+    const float *id = raw_f32(in);
+    float *od = raw_f32(out);
+
+    /* parallel over rows — each row is an independent softmax. threshold
+       avoids omp fork-join overhead for tiny batches. */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(rows * cols > ax_par_threshold() / 2)
+    #endif
+    for (int64_t r = 0; r < rows; r++) {
+        const float *irow = id + r * cols;
+        float *orow = od + r * cols;
+
+        /* pass 1: row-max with simd. */
+        int64_t c = 0, ve = cols - (cols % AX_VF32_WIDTH);
+        float mx;
+        if (ve > 0) {
+            ax_vf32 vmx = ax_vf32_load(irow);
+            for (c = AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+                vmx = ax_vf32_max(vmx, ax_vf32_load(irow + c));
+            mx = ax_vf32_hmax(vmx);
+        } else {
+            mx = irow[0];
+            c = 1;
+        }
+        for (; c < cols; c++) if (irow[c] > mx) mx = irow[c];
+
+        /* pass 2: exp(x - max) + row sum. */
+        ax_vf32 vmx_b = ax_vf32_set1(mx);
+        ax_vf32 vsum = ax_vf32_zero();
+        c = 0;
+        for (; c < ve; c += AX_VF32_WIDTH) {
+            ax_vf32 ve_vals = ax_vf32_exp(ax_vf32_sub(ax_vf32_load(irow + c), vmx_b));
+            ax_vf32_store(orow + c, ve_vals);
+            vsum = ax_vf32_add(vsum, ve_vals);
+        }
+        float sum = ax_vf32_hsum(vsum);
+        for (; c < cols; c++) {
+            float e = expf(irow[c] - mx);
+            orow[c] = e;
+            sum += e;
+        }
+
+        /* pass 3: divide by row sum. */
+        float inv = 1.0f / sum;
+        ax_vf32 vinv = ax_vf32_set1(inv);
+        c = 0;
+        for (; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_store(orow + c, ax_vf32_mul(ax_vf32_load(orow + c), vinv));
+        for (; c < cols; c++) orow[c] *= inv;
+    }
+    return AX_OK;
+}
+
+
 /* fused-scaling gemm: out = alpha * (a @ b) + beta * out.
 
    dispatch strategy:
@@ -1809,6 +1929,9 @@ const ax_backend_ops_t ax_cpu_opt_ops = {
     .gemm_ex    = opt_gemm_ex,
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
+    .add_relu   = opt_add_relu,
+    .axpy       = opt_axpy,
+    .softmax_rowwise = opt_softmax_rowwise,
     .bias_add   = opt_bias_add,
     .conv_gemm  = opt_conv_gemm,
     .sum        = opt_sum,

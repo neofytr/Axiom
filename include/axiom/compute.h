@@ -103,6 +103,19 @@ ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
                                 float alpha, float beta, ax_tensor_t *out);
 int ax_compute_has_gemm_ex(void);
 
+/* fused relu(a + b). returns AX_ERR_NOT_IMPLEMENTED when absent. */
+ax_status_t ax_compute_add_relu(const ax_tensor_t *a, const ax_tensor_t *b,
+                                 ax_tensor_t *out);
+int ax_compute_has_add_relu(void);
+
+/* y += alpha * x, in-place. same shape required, no broadcast. */
+ax_status_t ax_compute_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y);
+int ax_compute_has_axpy(void);
+
+/* row-wise stable softmax on a 2d [rows, cols] input. */
+ax_status_t ax_compute_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out);
+int ax_compute_has_softmax_rowwise(void);
+
 /* fused bias add. returns AX_ERR_NOT_IMPLEMENTED when the backend
    doesn't provide a fused path; callers can either fall back to a
    broadcast add or accept the error. */

@@ -327,6 +327,88 @@ static void test_gpu_conv_gemm(void) {
     ax_set_default_device(AX_DEVICE_CPU);
     ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
 }
+
+/* fused-op parity: add_relu, axpy, softmax_rowwise vs cpu reference. */
+static void test_gpu_fused_ops(void) {
+    /* add_relu */
+    {
+        float a_data[] = {-1.f,  2.f, -3.f, 4.f,  5.f, -6.f};
+        float b_data[] = { 0.5f, 0.5f, 0.5f, 0.5f, 0.5f, 0.5f};
+        int64_t shape[] = {2, 3};
+        ax_compute_set_backend(AX_BACKEND_CUDA);
+        ax_tensor_t *ga = gpu_from_array(a_data, shape, 2);
+        ax_tensor_t *gb = gpu_from_array(b_data, shape, 2);
+        ax_set_default_device(AX_DEVICE_CUDA);
+        ax_tensor_t *gout = ax_tensor_zeros(shape, 2, AX_FLOAT32);
+
+        AX_TEST_ASSERT(ax_compute_has_add_relu(), "cuda backend should have add_relu");
+        AX_TEST_ASSERT(ax_compute_add_relu(ga, gb, gout) == AX_OK, "add_relu should succeed");
+        ax_cuda_synchronize();
+
+        /* expected: relu(a + b) */
+        float expected[] = {0.f, 2.5f, 0.f, 4.5f, 5.5f, 0.f};
+        for (int i = 0; i < 6; i++)
+            AX_TEST_ASSERT_NEAR(gpu_read(gout, i), expected[i], 1e-5f, "add_relu element");
+
+        ax_tensor_destroy(ga); ax_tensor_destroy(gb); ax_tensor_destroy(gout);
+        ax_set_default_device(AX_DEVICE_CPU);
+    }
+
+    /* axpy: y += 0.5 * x */
+    {
+        float x_data[] = {1.f, 2.f, 3.f, 4.f};
+        float y_data[] = {10.f, 20.f, 30.f, 40.f};
+        int64_t shape[] = {4};
+        ax_compute_set_backend(AX_BACKEND_CUDA);
+        ax_tensor_t *gx = gpu_from_array(x_data, shape, 1);
+        ax_tensor_t *gy = gpu_from_array(y_data, shape, 1);
+
+        AX_TEST_ASSERT(ax_compute_has_axpy(), "cuda backend should have axpy");
+        AX_TEST_ASSERT(ax_compute_axpy(gx, 0.5f, gy) == AX_OK, "axpy should succeed");
+        ax_cuda_synchronize();
+
+        float expected[] = {10.5f, 21.f, 31.5f, 42.f};
+        for (int i = 0; i < 4; i++)
+            AX_TEST_ASSERT_NEAR(gpu_read(gy, i), expected[i], 1e-5f, "axpy result");
+
+        ax_tensor_destroy(gx); ax_tensor_destroy(gy);
+    }
+
+    /* softmax_rowwise: stable row-wise softmax */
+    {
+        float in_data[] = {1.f, 2.f, 3.f,
+                           -1.f, -2.f, -3.f};
+        int64_t shape[] = {2, 3};
+        ax_compute_set_backend(AX_BACKEND_CUDA);
+        ax_tensor_t *gin = gpu_from_array(in_data, shape, 2);
+        ax_set_default_device(AX_DEVICE_CUDA);
+        ax_tensor_t *gout = ax_tensor_zeros(shape, 2, AX_FLOAT32);
+
+        AX_TEST_ASSERT(ax_compute_has_softmax_rowwise(), "cuda backend should have softmax_rowwise");
+        AX_TEST_ASSERT(ax_compute_softmax_rowwise(gin, gout) == AX_OK, "softmax_rowwise should succeed");
+        ax_cuda_synchronize();
+
+        /* expected: softmax([1,2,3]) = [0.0900, 0.2447, 0.6652] */
+        AX_TEST_ASSERT_NEAR(gpu_read(gout, 0), 0.09003f, 1e-4f, "softmax row0 [0]");
+        AX_TEST_ASSERT_NEAR(gpu_read(gout, 1), 0.24473f, 1e-4f, "softmax row0 [1]");
+        AX_TEST_ASSERT_NEAR(gpu_read(gout, 2), 0.66524f, 1e-4f, "softmax row0 [2]");
+        /* row 1 is the same but reversed because of the negative sign */
+        AX_TEST_ASSERT_NEAR(gpu_read(gout, 3), 0.66524f, 1e-4f, "softmax row1 [0]");
+        AX_TEST_ASSERT_NEAR(gpu_read(gout, 4), 0.24473f, 1e-4f, "softmax row1 [1]");
+        AX_TEST_ASSERT_NEAR(gpu_read(gout, 5), 0.09003f, 1e-4f, "softmax row1 [2]");
+
+        /* verify each row sums to 1 */
+        float r0 = gpu_read(gout, 0) + gpu_read(gout, 1) + gpu_read(gout, 2);
+        float r1 = gpu_read(gout, 3) + gpu_read(gout, 4) + gpu_read(gout, 5);
+        AX_TEST_ASSERT_NEAR(r0, 1.0f, 1e-4f, "softmax row0 sums to 1");
+        AX_TEST_ASSERT_NEAR(r1, 1.0f, 1e-4f, "softmax row1 sums to 1");
+
+        ax_tensor_destroy(gin); ax_tensor_destroy(gout);
+        ax_set_default_device(AX_DEVICE_CPU);
+    }
+
+    ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
+}
 #endif /* AX_HAVE_CUDA */
 
 /* ── main ─────────────────────────────────────────────────────────────────── */
@@ -358,6 +440,7 @@ int main(void) {
         AX_RUN_TEST(test_gpu_sum_reduction);
         AX_RUN_TEST(test_gpu_larger_gemm);
         AX_RUN_TEST(test_gpu_conv_gemm);
+        AX_RUN_TEST(test_gpu_fused_ops);
     } else {
         printf("--- no GPU found, skipping GPU tests ---\n");
     }

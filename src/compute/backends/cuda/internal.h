@@ -155,6 +155,12 @@ ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
                             const ax_conv_params_t *params,
                             ax_tensor_t *out);
 
+/* fused primitives (ops_fused.cu) */
+ax_status_t cuda_add_relu(const ax_tensor_t *a, const ax_tensor_t *b,
+                           ax_tensor_t *out);
+ax_status_t cuda_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y);
+ax_status_t cuda_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out);
+
 /* memory + transfer hooks (memory.cu) */
 void       *cuda_storage_alloc_hook(size_t size_bytes);
 void        cuda_storage_free_hook(void *ptr);

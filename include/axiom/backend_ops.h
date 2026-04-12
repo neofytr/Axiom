@@ -70,6 +70,25 @@ typedef struct {
     ax_status_t (*gemm_ex)(const ax_tensor_t *a, const ax_tensor_t *b,
                             float alpha, float beta, ax_tensor_t *out);
 
+    /* optional fused primitives for bandwidth-bound workloads.
+       same shape rules as their elementwise analogues (same ndim,
+       matching shape; no broadcast). NULL when unimplemented. */
+
+    /* fused relu(a + b). single pass, half the memory traffic of
+       the separate add then relu sequence. */
+    ax_status_t (*add_relu)(const ax_tensor_t *a, const ax_tensor_t *b,
+                             ax_tensor_t *out);
+
+    /* y += alpha * x, in-place on y. the classic blas axpy. used in
+       optimiser updates and gradient accumulation. y and x must have
+       the same numel and be contiguous. */
+    ax_status_t (*axpy)(const ax_tensor_t *x, float alpha, ax_tensor_t *y);
+
+    /* row-wise softmax on a 2d input [rows, cols]. numerically stable
+       via the max-subtract trick: for each row, out = exp(in - max)
+       then divide by row sum. out has the same shape as in. */
+    ax_status_t (*softmax_rowwise)(const ax_tensor_t *in, ax_tensor_t *out);
+
     /* optional: fused bias add. out = in + broadcast(bias) along `axis`.
        bias is rank-1 with numel matching in->shape[axis]. saves a separate
        pass over out after linear/conv. NULL when unimplemented. */
