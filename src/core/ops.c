@@ -26,14 +26,16 @@ static ax_tensor_t *alloc_binop_result(ax_tensor_t *a, ax_tensor_t *b)
         out_shape, &out_ndim);
     if (s != AX_OK) return NULL;
 
-    return ax_tensor_zeros(out_shape, out_ndim, a->dtype);
+    /* uninit: every binop (add/mul/relu/etc.) fully overwrites the output.
+       the old zeros call wasted one full memset pass per allocation. */
+    return ax_tensor_create(out_shape, out_ndim, a->dtype);
 }
 
 /* allocate an output tensor with same shape as input */
 static ax_tensor_t *alloc_like(ax_tensor_t *t)
 {
     if (!t) return NULL;
-    return ax_tensor_zeros(t->shape, t->ndim, t->dtype);
+    return ax_tensor_create(t->shape, t->ndim, t->dtype);
 }
 
 /* compute the shape that results from reducing along an axis */
@@ -311,7 +313,10 @@ ax_tensor_t *ax_matmul_bias(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias)
     }
 
     int64_t out_shape[] = {a->shape[0], b->shape[1]};
-    ax_tensor_t *out = ax_tensor_zeros(out_shape, 2, a->dtype);
+    /* use create (uninit) instead of zeros — the gemm's internal memset(0)
+       will zero the output before the tiled computation starts. saves one
+       redundant 1 MB memset per dense layer. */
+    ax_tensor_t *out = ax_tensor_create(out_shape, 2, a->dtype);
     if (!out) return NULL;
 
     ax_compute_gemm(a, b, out);

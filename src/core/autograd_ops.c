@@ -612,14 +612,29 @@ ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
     gf->inputs[0] = a;
     gf->inputs[1] = b;
     gf->n_inputs = 2;
-    /* save a (contiguous) for dW computation via gemm_tn */
-    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
-    gf->saved[0] = a_safe;
-    gf->saved_owned[0] = (a_safe != a);
-    /* save b contiguous for dX via gemm_nt */
-    ax_tensor_t *b_safe = ax_ensure_contiguous(b);
-    gf->saved[1] = b_safe;
-    gf->saved_owned[1] = (b_safe != b);
+    /* save a for dW (gemm_tn) and b for dX (gemm_nt).
+       skip the ensure_contiguous view creation when the tensor is already
+       contiguous at offset 0 — just retain the storage directly. this
+       avoids one slab alloc + atomic retain per save for the common case
+       (layer weights and activations are always contiguous). */
+    if (ax_tensor_is_contiguous(a) && a->offset == 0) {
+        ax_storage_retain(a->storage);
+        gf->saved[0] = a;
+        gf->saved_owned[0] = false;
+    } else {
+        ax_tensor_t *a_safe = ax_tensor_contiguous(a);
+        gf->saved[0] = a_safe;
+        gf->saved_owned[0] = true;
+    }
+    if (ax_tensor_is_contiguous(b) && b->offset == 0) {
+        ax_storage_retain(b->storage);
+        gf->saved[1] = b;
+        gf->saved_owned[1] = false;
+    } else {
+        ax_tensor_t *b_safe = ax_tensor_contiguous(b);
+        gf->saved[1] = b_safe;
+        gf->saved_owned[1] = true;
+    }
     gf->saved[2] = bias;
     gf->saved_owned[2] = false;
     gf->n_saved = 3;
