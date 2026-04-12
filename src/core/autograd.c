@@ -21,6 +21,13 @@ static _Thread_local ax_arena_t *backward_arena = NULL;
 
 ax_arena_t *ax_backward_arena(void)
 {
+    /* when the default device is non-cpu (e.g. cuda), return NULL so
+       arena callers fall back to the device-aware heap path (tensor.c's
+       ax_tensor_zeros / ax_tensor_create route through the owning
+       backend's storage_alloc). the cpu arena only holds host memory
+       and can't be used for device tensors. */
+    if (ax_get_default_device() != AX_DEVICE_CPU)
+        return NULL;
     if (!backward_arena)
         backward_arena = ax_arena_create(16 * 1024 * 1024); /* 16 MB — deep_mlp backward temps can exceed 1 MB per tensor */
     return backward_arena;
@@ -34,6 +41,8 @@ static _Thread_local ax_arena_t *forward_arena = NULL;
 
 ax_arena_t *ax_forward_arena(void)
 {
+    if (ax_get_default_device() != AX_DEVICE_CPU)
+        return NULL;
     if (!forward_arena)
         forward_arena = ax_arena_create(16 * 1024 * 1024); /* 16 MB — matches backward */
     return forward_arena;

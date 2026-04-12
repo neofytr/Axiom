@@ -54,7 +54,17 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
         }
         if (same)
         {
-            /* straightforward accumulation — SIMD when both are contiguous */
+            /* device-aware path: for non-cpu tensors, dispatch through
+               the compute backend (axpy for same-shape accumulation).
+               this makes backward work on cuda tensors without any
+               host-side raw-pointer access. */
+            if (t->grad->storage->device != AX_DEVICE_CPU) {
+                ax_compute_axpy(grad_to_add, 1.0f, t->grad);
+                ax_storage_touch(t->grad->storage);
+                return;
+            }
+
+            /* cpu fast path: simd accumulation when both are contiguous */
             int64_t n = ax_tensor_numel(t->grad);
             float *gd = (float *)t->grad->storage->data;
             float *ad = (float *)grad_to_add->storage->data;
@@ -76,8 +86,6 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
                 for (int64_t i = 0; i < n; i++)
                     gd[goff + i] += ad[aoff + i];
             }
-            /* grad buffer mutated in place — bump generation so any
-               cache keyed on it (cpu_opt pack_b) invalidates. */
             ax_storage_touch(t->grad->storage);
             return;
         }
@@ -86,6 +94,17 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
     /* shapes differ due to broadcasting — need to sum out the broadcast dims.
        gradient flows backwards: if a was broadcast from [3] to [2,3],
        we need to sum the [2,3] gradient along axis 0 to get [3]. */
+
+    /* non-cpu broadcast accumulation is not yet supported. mlp training
+       doesn't hit this path (all dense layers produce matching shapes).
+       conv/batchnorm backward may need this for bias gradients; when it
+       does, dispatch through ax_compute_sum + ax_compute_axpy. */
+    if (t->grad->storage->device != AX_DEVICE_CPU) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED,
+                   "broadcast accumulate_grad on non-cpu tensor not yet supported");
+        return;
+    }
+
     int64_t n_grad = ax_tensor_numel(grad_to_add);
     float *gd = (float *)t->grad->storage->data;
     float *ad = (float *)grad_to_add->storage->data;
@@ -679,11 +698,29 @@ static void relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t n = ax_tensor_numel(grad_out);
     if (!ensure_grad(input)) return;
 
+    /* device-aware path: for non-cpu tensors, compute relu'(a) * grad_out
+       via dispatch and accumulate with axpy. no raw pointer access. */
+    if (a->storage->device != AX_DEVICE_CPU) {
+        ax_tensor_t *zeros = ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+        ax_tensor_t *mask  = ax_tensor_create(a->shape, a->ndim, a->dtype);
+        ax_tensor_t *temp  = ax_tensor_create(grad_out->shape, grad_out->ndim, grad_out->dtype);
+        if (!zeros || !mask || !temp) goto cuda_relu_cleanup;
+        ax_compute_greater(a, zeros, mask);       /* mask = (a > 0) ? 1 : 0 */
+        ax_compute_mul(grad_out, mask, temp);     /* temp = grad_out * mask */
+        ax_compute_axpy(temp, 1.0f, input->grad); /* input.grad += temp */
+cuda_relu_cleanup:
+        if (zeros) ax_tensor_destroy(zeros);
+        if (mask)  ax_tensor_destroy(mask);
+        if (temp)  ax_tensor_destroy(temp);
+        ax_storage_touch(input->grad->storage);
+        return;
+    }
+
     float *god = (float *)grad_out->storage->data;
     float *ad  = (float *)a->storage->data;
     float *ig  = (float *)input->grad->storage->data;
 
-    /* fast path: all contiguous — directly accumulate masked gradient, no temp alloc */
+    /* cpu fast path: all contiguous — directly accumulate masked gradient, no temp alloc */
     if (a->offset == 0 && grad_out->offset == 0 && input->grad->offset == 0
         && ax_tensor_is_contiguous(grad_out) && ax_tensor_is_contiguous(input->grad))
     {
