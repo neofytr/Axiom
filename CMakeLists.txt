@@ -354,6 +354,12 @@ if(NOT AX_INFERENCE_ONLY)
 
     add_executable(bench_optimizations examples/bench_optimizations.c)
     target_link_libraries(bench_optimizations PRIVATE axiom_static)
+
+    # large MLP benchmark for CI perf validation
+    if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_large.c")
+        add_executable(bench_large benchmarks/bench_large.c)
+        target_link_libraries(bench_large PRIVATE axiom_static)
+    endif()
 endif()
 
 # convenience target: run all tests
