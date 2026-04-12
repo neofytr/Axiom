@@ -8,15 +8,6 @@
   </head>
   <body>
     <div id="app"></div>
-    <script>
-      // Restore SPA route from 404.html redirect query string
-      (function () {
-        var q = location.search.slice(1);
-        if (q && !q.includes('=')) {
-          history.replaceState(null, '', '/Axiom/' + q + location.hash);
-        }
-      })();
-    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
