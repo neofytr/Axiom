@@ -39,6 +39,7 @@ static float *init_host_acquire(ax_tensor_t *t, int64_t n, bool *is_scratch_out)
         return (float *)t->storage->data + t->offset;
     }
     *is_scratch_out = true;
+    if (n <= 0 || (size_t)n > SIZE_MAX / sizeof(float)) return NULL;
     return (float *)malloc((size_t)n * sizeof(float));
 }
 

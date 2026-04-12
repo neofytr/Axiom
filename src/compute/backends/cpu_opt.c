@@ -116,7 +116,12 @@ extern const ax_backend_ops_t ax_cpu_naive_ops;
 
 static inline int64_t fast_numel(const ax_tensor_t *t) {
     int64_t n = 1;
-    for (int d = 0; d < t->ndim; d++) n *= t->shape[d];
+    for (int d = 0; d < t->ndim; d++) {
+        if (t->shape[d] <= 0) return -1;
+        /* overflow check: if n * shape[d] would exceed INT64_MAX, bail */
+        if (n > INT64_MAX / t->shape[d]) return -1;
+        n *= t->shape[d];
+    }
     return n;
 }
 
@@ -427,15 +432,22 @@ static __attribute__((constructor)) void ax_cpu_opt_ctor(void) {
 
 /* lazily allocate this thread's pack_a and pack_b buffers (once per thread) */
 static bool ensure_tl_pack_bufs(void) {
-    if (!tl_pack_a_buf)
-        tl_pack_a_buf = (float *)ax_aligned_alloc((size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float), 64);
+    if (!tl_pack_a_buf) {
+        size_t pa = (size_t)GEMM_MC * (size_t)GEMM_KC;
+        if (pa / (size_t)GEMM_MC != (size_t)GEMM_KC) return false; /* overflow */
+        if (pa > SIZE_MAX / sizeof(float)) return false;
+        tl_pack_a_buf = (float *)ax_aligned_alloc(pa * sizeof(float), 64);
+    }
     if (!tl_pack_b_buf) {
         /* round NC up to a multiple of NR for the pack buffer. when NR
            doesn't evenly divide NC (e.g. NR=12, NC=128 → nc_pack=132),
            pack_b writes ceil(NC/NR)*NR floats per KC row. without the
            round-up the buffer overflows. */
         size_t nc_rounded = (size_t)((GEMM_NC + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-        tl_pack_b_buf = (float *)ax_aligned_alloc(nc_rounded * (size_t)GEMM_KC * sizeof(float), 64);
+        size_t pb = nc_rounded * (size_t)GEMM_KC;
+        if (pb / nc_rounded != (size_t)GEMM_KC) return false;
+        if (pb > SIZE_MAX / sizeof(float)) return false;
+        tl_pack_b_buf = (float *)ax_aligned_alloc(pb * sizeof(float), 64);
     }
     return tl_pack_a_buf && tl_pack_b_buf;
 }

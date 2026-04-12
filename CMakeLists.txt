@@ -312,6 +312,7 @@ if(NOT AX_INFERENCE_ONLY)
         tests/test_lr_sched.c
         tests/test_inplace.c
         tests/test_stress.c
+        tests/test_fuzz_serialize.c
     )
 endif()
 
