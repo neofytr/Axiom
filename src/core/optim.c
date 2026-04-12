@@ -76,8 +76,40 @@ ax_optimizer_t *ax_sgd_create(ax_tensor_t **params, int n_params,
     return opt;
 }
 
+/* gpu fast path: dispatch per-param fused sgd kernel.
+   only fires when the active backend provides sgd_update AND the first
+   param with a gradient lives on a non-cpu device. */
+static void sgd_step_device(ax_optimizer_t *opt)
+{
+    if (opt->momentum > 0.0f) {
+        for (int i = 0; i < opt->n_params; i++)
+            if (opt->params[i]->grad) ensure_state_m(&opt->state[i], opt->params[i]);
+    }
+    for (int i = 0; i < opt->n_params; i++) {
+        ax_tensor_t *p = opt->params[i];
+        if (!p->grad) continue;
+        ax_compute_sgd_update(p, p->grad,
+                               (opt->momentum > 0.0f) ? opt->state[i].m : NULL,
+                               opt->lr, opt->momentum, opt->weight_decay, opt->nesterov);
+        opt->state[i].step_count++;
+        ax_storage_touch(p->storage);
+    }
+}
+
 static void sgd_step(ax_optimizer_t *opt)
 {
+    /* gpu early-exit: if the backend has a fused sgd kernel AND the first
+       grad-bearing param is on a non-cpu device, dispatch the whole step
+       to the device. the cpu simd path below is untouched. */
+    if (ax_compute_has_sgd_update()) {
+        for (int i = 0; i < opt->n_params; i++) {
+            if (opt->params[i]->grad && opt->params[i]->storage->device != AX_DEVICE_CPU) {
+                sgd_step_device(opt);
+                return;
+            }
+        }
+    }
+
     ax_vf32 v_lr   = ax_vf32_set1(opt->lr);
     ax_vf32 v_wd   = ax_vf32_set1(opt->weight_decay);
     ax_vf32 v_mom  = ax_vf32_set1(opt->momentum);
@@ -198,8 +230,42 @@ ax_optimizer_t *ax_adam_create(ax_tensor_t **params, int n_params,
     return opt;
 }
 
+/* gpu fast path: dispatch per-param fused adam kernel. */
+static void adam_step_device(ax_optimizer_t *opt, bool decoupled_decay)
+{
+    opt->global_step++;
+    float bc1 = 1.0f - powf(opt->beta1, (float)opt->global_step);
+    float bc2 = 1.0f - powf(opt->beta2, (float)opt->global_step);
+
+    for (int i = 0; i < opt->n_params; i++) {
+        if (opt->params[i]->grad) {
+            ensure_state_m(&opt->state[i], opt->params[i]);
+            ensure_state_v(&opt->state[i], opt->params[i]);
+        }
+    }
+    for (int i = 0; i < opt->n_params; i++) {
+        ax_tensor_t *p = opt->params[i];
+        if (!p->grad) continue;
+        ax_compute_adam_update(p, p->grad,
+                                opt->state[i].m, opt->state[i].v,
+                                opt->lr, opt->beta1, opt->beta2, opt->eps,
+                                opt->weight_decay, bc1, bc2, decoupled_decay);
+        ax_storage_touch(p->storage);
+    }
+}
+
 static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
 {
+    /* gpu early-exit */
+    if (ax_compute_has_adam_update()) {
+        for (int i = 0; i < opt->n_params; i++) {
+            if (opt->params[i]->grad && opt->params[i]->storage->device != AX_DEVICE_CPU) {
+                adam_step_device(opt, decoupled_decay);
+                return;
+            }
+        }
+    }
+
     /* increment global step once per call — all parameters share the same t.
        per-parameter step counts would give different bias corrections to different
        params (e.g. if some have no grad for a batch), which is incorrect. */
