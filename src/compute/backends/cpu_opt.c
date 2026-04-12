@@ -659,23 +659,25 @@ static void micro_kernel(int64_t kc, const float *restrict ap, const float *rest
 
     /* 2× unrolled K loop with prefetch */
     #define AVX512_BODY(a_ptr, b_ptr) { \
-        __m512 b0 = _mm512_load_ps(b_ptr); \
-        __m512 b1 = _mm512_load_ps(b_ptr + 16); \
+        const float *_ap = (const float *)(a_ptr); \
+        const float *_bp = (const float *)(b_ptr); \
+        __m512 b0 = _mm512_load_ps(_bp); \
+        __m512 b1 = _mm512_load_ps(_bp + 16); \
         __m512 a; \
-        a=_mm512_set1_ps(a_ptr[ 0]); c00=_mm512_fmadd_ps(a,b0,c00); c01=_mm512_fmadd_ps(a,b1,c01); \
-        a=_mm512_set1_ps(a_ptr[ 1]); c10=_mm512_fmadd_ps(a,b0,c10); c11=_mm512_fmadd_ps(a,b1,c11); \
-        a=_mm512_set1_ps(a_ptr[ 2]); c20=_mm512_fmadd_ps(a,b0,c20); c21=_mm512_fmadd_ps(a,b1,c21); \
-        a=_mm512_set1_ps(a_ptr[ 3]); c30=_mm512_fmadd_ps(a,b0,c30); c31=_mm512_fmadd_ps(a,b1,c31); \
-        a=_mm512_set1_ps(a_ptr[ 4]); c40=_mm512_fmadd_ps(a,b0,c40); c41=_mm512_fmadd_ps(a,b1,c41); \
-        a=_mm512_set1_ps(a_ptr[ 5]); c50=_mm512_fmadd_ps(a,b0,c50); c51=_mm512_fmadd_ps(a,b1,c51); \
-        a=_mm512_set1_ps(a_ptr[ 6]); c60=_mm512_fmadd_ps(a,b0,c60); c61=_mm512_fmadd_ps(a,b1,c61); \
-        a=_mm512_set1_ps(a_ptr[ 7]); c70=_mm512_fmadd_ps(a,b0,c70); c71=_mm512_fmadd_ps(a,b1,c71); \
-        a=_mm512_set1_ps(a_ptr[ 8]); c80=_mm512_fmadd_ps(a,b0,c80); c81=_mm512_fmadd_ps(a,b1,c81); \
-        a=_mm512_set1_ps(a_ptr[ 9]); c90=_mm512_fmadd_ps(a,b0,c90); c91=_mm512_fmadd_ps(a,b1,c91); \
-        a=_mm512_set1_ps(a_ptr[10]); cA0=_mm512_fmadd_ps(a,b0,cA0); cA1=_mm512_fmadd_ps(a,b1,cA1); \
-        a=_mm512_set1_ps(a_ptr[11]); cB0=_mm512_fmadd_ps(a,b0,cB0); cB1=_mm512_fmadd_ps(a,b1,cB1); \
-        a=_mm512_set1_ps(a_ptr[12]); cC0=_mm512_fmadd_ps(a,b0,cC0); cC1=_mm512_fmadd_ps(a,b1,cC1); \
-        a=_mm512_set1_ps(a_ptr[13]); cD0=_mm512_fmadd_ps(a,b0,cD0); cD1=_mm512_fmadd_ps(a,b1,cD1); \
+        a=_mm512_set1_ps(_ap[ 0]); c00=_mm512_fmadd_ps(a,b0,c00); c01=_mm512_fmadd_ps(a,b1,c01); \
+        a=_mm512_set1_ps(_ap[ 1]); c10=_mm512_fmadd_ps(a,b0,c10); c11=_mm512_fmadd_ps(a,b1,c11); \
+        a=_mm512_set1_ps(_ap[ 2]); c20=_mm512_fmadd_ps(a,b0,c20); c21=_mm512_fmadd_ps(a,b1,c21); \
+        a=_mm512_set1_ps(_ap[ 3]); c30=_mm512_fmadd_ps(a,b0,c30); c31=_mm512_fmadd_ps(a,b1,c31); \
+        a=_mm512_set1_ps(_ap[ 4]); c40=_mm512_fmadd_ps(a,b0,c40); c41=_mm512_fmadd_ps(a,b1,c41); \
+        a=_mm512_set1_ps(_ap[ 5]); c50=_mm512_fmadd_ps(a,b0,c50); c51=_mm512_fmadd_ps(a,b1,c51); \
+        a=_mm512_set1_ps(_ap[ 6]); c60=_mm512_fmadd_ps(a,b0,c60); c61=_mm512_fmadd_ps(a,b1,c61); \
+        a=_mm512_set1_ps(_ap[ 7]); c70=_mm512_fmadd_ps(a,b0,c70); c71=_mm512_fmadd_ps(a,b1,c71); \
+        a=_mm512_set1_ps(_ap[ 8]); c80=_mm512_fmadd_ps(a,b0,c80); c81=_mm512_fmadd_ps(a,b1,c81); \
+        a=_mm512_set1_ps(_ap[ 9]); c90=_mm512_fmadd_ps(a,b0,c90); c91=_mm512_fmadd_ps(a,b1,c91); \
+        a=_mm512_set1_ps(_ap[10]); cA0=_mm512_fmadd_ps(a,b0,cA0); cA1=_mm512_fmadd_ps(a,b1,cA1); \
+        a=_mm512_set1_ps(_ap[11]); cB0=_mm512_fmadd_ps(a,b0,cB0); cB1=_mm512_fmadd_ps(a,b1,cB1); \
+        a=_mm512_set1_ps(_ap[12]); cC0=_mm512_fmadd_ps(a,b0,cC0); cC1=_mm512_fmadd_ps(a,b1,cC1); \
+        a=_mm512_set1_ps(_ap[13]); cD0=_mm512_fmadd_ps(a,b0,cD0); cD1=_mm512_fmadd_ps(a,b1,cD1); \
     }
 
     int64_t p = 0;
@@ -842,11 +844,13 @@ static void micro_kernel(int64_t kc, const float *restrict ap, const float *rest
 
     /* 2× unrolled K loop with prefetch */
     #define NEON_BODY(a_ptr, b_ptr) { \
-        float32x4_t b0 = vld1q_f32(b_ptr); \
-        float32x4_t b1 = vld1q_f32(b_ptr + 4); \
-        float32x4_t b2 = vld1q_f32(b_ptr + 8); \
-        float32x4_t a_lo = vld1q_f32(a_ptr); \
-        float32x4_t a_hi = vld1q_f32(a_ptr + 4); \
+        const float *_ap = (const float *)(a_ptr); \
+        const float *_bp = (const float *)(b_ptr); \
+        float32x4_t b0 = vld1q_f32(_bp); \
+        float32x4_t b1 = vld1q_f32(_bp + 4); \
+        float32x4_t b2 = vld1q_f32(_bp + 8); \
+        float32x4_t a_lo = vld1q_f32(_ap); \
+        float32x4_t a_hi = vld1q_f32(_ap + 4); \
         c00=vfmaq_laneq_f32(c00,b0,a_lo,0); c01=vfmaq_laneq_f32(c01,b1,a_lo,0); c02=vfmaq_laneq_f32(c02,b2,a_lo,0); \
         c10=vfmaq_laneq_f32(c10,b0,a_lo,1); c11=vfmaq_laneq_f32(c11,b1,a_lo,1); c12=vfmaq_laneq_f32(c12,b2,a_lo,1); \
         c20=vfmaq_laneq_f32(c20,b0,a_lo,2); c21=vfmaq_laneq_f32(c21,b1,a_lo,2); c22=vfmaq_laneq_f32(c22,b2,a_lo,2); \

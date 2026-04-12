@@ -61,6 +61,14 @@ typedef struct {
        NULL when unimplemented. */
     ax_status_t (*gemm_tn)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+    /* optional: fused matmul + relu. out = relu(a @ b + bias).
+       bias may be NULL for matmul+relu without bias.
+       applies max(0, x) during the gemm writeback step, saving a full
+       read+write pass over the output tensor vs separate gemm then relu.
+       NULL when unimplemented — callers fall back to gemm + compute_relu. */
+    ax_status_t (*gemm_relu)(const ax_tensor_t *a, const ax_tensor_t *b,
+                              const ax_tensor_t *bias, ax_tensor_t *out);
+
     /* optional: fused-scaling gemm. out = alpha * (a @ b) + beta * out.
        matches the standard blas sgemm signature so callers can fuse
        an accumulate (beta=1), a scale (alpha!=1), or a bias-add
