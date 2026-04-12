@@ -24,7 +24,7 @@ typedef struct ax_arena_block {
 } ax_arena_block_t;
 
 /* arena: a chain of blocks with bump allocation */
-typedef struct {
+typedef struct ax_arena {
     ax_arena_block_t *head;       /* current block (allocations come from here) */
     ax_arena_block_t *first;      /* first block in chain (for iteration/reset) */
     size_t block_size;            /* default size for new blocks */

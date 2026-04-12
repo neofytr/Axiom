@@ -39,7 +39,7 @@ typedef struct ax_tensor {
     int64_t strides[AX_MAX_DIMS];      /* element stride per dimension */
     int ndim;                          /* number of dimensions */
     ax_dtype_t dtype;                  /* element type */
-    size_t offset;                     /* element offset into storage */
+    int64_t offset;                    /* element offset into storage */
 
     /* autograd fields — used in phase 2, reserved now */
     bool requires_grad;

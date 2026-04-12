@@ -679,7 +679,7 @@ ax_tensor_t *ax_tensor_transpose(ax_tensor_t *t, int dim0, int dim1) {
     r->offset = t->offset;
 
     /* copy strides from original, then swap */
-    memcpy(r->strides, t->strides, sizeof(int64_t) * t->ndim);
+    memcpy(r->strides, t->strides, sizeof(int64_t) * (size_t)t->ndim);
 
     int64_t tmp_shape = r->shape[dim0];
     r->shape[dim0] = r->shape[dim1];
@@ -720,7 +720,7 @@ ax_tensor_t *ax_tensor_squeeze(ax_tensor_t *t, int dim) {
     r->storage = t->storage;
     ax_storage_retain(r->storage);
     r->offset = t->offset;
-    memcpy(r->strides, new_strides, sizeof(int64_t) * new_ndim);
+    memcpy(r->strides, new_strides, sizeof(int64_t) * (size_t)new_ndim);
     return r;
 }
 
@@ -760,7 +760,7 @@ ax_tensor_t *ax_tensor_unsqueeze(ax_tensor_t *t, int dim) {
     r->storage = t->storage;
     ax_storage_retain(r->storage);
     r->offset = t->offset;
-    memcpy(r->strides, new_strides, sizeof(int64_t) * new_ndim);
+    memcpy(r->strides, new_strides, sizeof(int64_t) * (size_t)new_ndim);
     return r;
 }
 
@@ -828,7 +828,7 @@ ax_tensor_t *ax_tensor_view(ax_tensor_t *t) {
     v->storage = t->storage;
     ax_storage_retain(v->storage);
     v->offset = t->offset;
-    memcpy(v->strides, t->strides, sizeof(int64_t) * t->ndim);
+    memcpy(v->strides, t->strides, sizeof(int64_t) * (size_t)t->ndim);
     return v;
 }
 

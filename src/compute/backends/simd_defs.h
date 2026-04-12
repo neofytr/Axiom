@@ -83,7 +83,8 @@ static inline ax_vf32 ax_vf32_exp(ax_vf32 x) {
     x = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
     __m512 ln2_inv = _mm512_set1_ps(1.4426950408889634f);
     __m512 t = _mm512_mul_ps(x, ln2_inv);
-    __m512 tn = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT);
+    /* imm=0x08: scale=0 (integer), round=nearest-even, suppress exceptions */
+    __m512 tn = _mm512_roundscale_ps(t, 0x08);
     __m512 f = _mm512_sub_ps(t, tn);
     __m512i ni = _mm512_cvtps_epi32(tn);
     __m512i exp_bits = _mm512_slli_epi32(_mm512_add_epi32(ni, _mm512_set1_epi32(127)), 23);
@@ -118,7 +119,7 @@ static inline ax_vf32 ax_vf32_log(ax_vf32 x) {
     r = _mm512_fmadd_ps(r, s2, _mm512_set1_ps(0.4000006f));
     r = _mm512_fmadd_ps(r, s2, _mm512_set1_ps(0.6666667f));
     r = _mm512_fmadd_ps(r, s2, _mm512_set1_ps(2.0f));
-    r = _mm512_fmadd_ps(r, s, _mm512_setzero_ps());
+    r = _mm512_mul_ps(r, s);
     return _mm512_fmadd_ps(e, _mm512_set1_ps(0.6931472f), r);
 }
 
