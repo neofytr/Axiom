@@ -393,11 +393,19 @@ void ax_graph_cleanup(ax_tensor_t *root)
 
     topo_sort_dfs(root, &tl_visited, &tl_order);
 
-    /* for every non-leaf node: run ctx_cleanup (if backward never ran),
-       free saved_owned tensors (most backward fns leave these alive),
-       free the grad_fn struct, then destroy the intermediate tensor.
-       leaf nodes (no grad_fn) are parameters — leave them alone.
-       the root is skipped here and handled below (caller destroys it). */
+    /* two-pass cleanup. the topo order is leaf-first, so a tensor A may
+       be destroyed (pass 1, old code) before a later node B's saved[j]
+       reference to A has its retained refcount released. that leaves A's
+       storage at refcount 1 (the retained ref) which is never freed.
+
+       fix: pass 1 releases all saved refs + frees grad_fns but does NOT
+       destroy tensor structs. pass 2 destroys the now-fully-released
+       intermediates. a tombstone sentinel distinguishes cleaned-up
+       intermediates (grad_fn set to tombstone in pass 1) from leaf
+       params (grad_fn was always NULL). */
+#define AX_GRAD_FN_TOMBSTONE ((void *)(uintptr_t)1)
+
+    /* pass 1: release saved refs, free grad_fn structs, mark for pass 2 */
     for (int i = 0; i < tl_order.count; i++)
     {
         ax_tensor_t *node = tl_order.nodes[i];
@@ -418,17 +426,23 @@ void ax_graph_cleanup(ax_tensor_t *root)
             }
             else if (gf->saved_retained[j] && gf->saved[j] && gf->saved[j]->storage)
             {
-                /* release the extra refcount taken at save time. the tensor
-                   itself is not owned (it's a graph node or leaf param);
-                   this just drops the defensive retain so the storage can
-                   be freed when the tensor itself is destroyed. */
                 ax_storage_release(gf->saved[j]->storage);
                 gf->saved_retained[j] = false;
             }
         }
         slab_grad_fn_free(gf);
-        node->grad_fn = NULL;
-        ax_tensor_destroy(node);
+        node->grad_fn = AX_GRAD_FN_TOMBSTONE;
+    }
+
+    /* pass 2: destroy tombstoned intermediates (retained refs already released) */
+    for (int i = 0; i < tl_order.count; i++)
+    {
+        ax_tensor_t *node = tl_order.nodes[i];
+        if (node->grad_fn == AX_GRAD_FN_TOMBSTONE)
+        {
+            node->grad_fn = NULL;
+            ax_tensor_destroy(node);
+        }
     }
 
     /* detach root from the graph without destroying it — caller owns it */

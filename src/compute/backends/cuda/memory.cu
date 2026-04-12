@@ -5,8 +5,28 @@
    dispatch.c. no cuda api ever leaks into src/core/ anymore. */
 
 #include "internal.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+/* alloc/free counters for leak diagnosis. query from test code via
+   ax_cuda_alloc_stats. compiled unconditionally; zero cost when not read. */
+static int64_t g_cuda_allocs = 0;
+static int64_t g_cuda_frees  = 0;
+static int64_t g_cuda_bytes_alloc = 0;
+static int64_t g_cuda_bytes_free  = 0;
 
 extern "C" {
+
+void ax_cuda_alloc_stats(int64_t *allocs, int64_t *frees,
+                          int64_t *bytes_alloc, int64_t *bytes_free) {
+    if (allocs) *allocs = g_cuda_allocs;
+    if (frees) *frees = g_cuda_frees;
+    if (bytes_alloc) *bytes_alloc = g_cuda_bytes_alloc;
+    if (bytes_free) *bytes_free = g_cuda_bytes_free;
+}
+void ax_cuda_reset_alloc_stats(void) {
+    g_cuda_allocs = g_cuda_frees = g_cuda_bytes_alloc = g_cuda_bytes_free = 0;
+}
 
 /* explicit device memory model.
 
@@ -27,18 +47,24 @@ extern "C" {
 void *cuda_storage_alloc_hook(size_t size_bytes) {
     void *p = NULL;
     if (cudaMalloc(&p, size_bytes) != cudaSuccess) return NULL;
-    /* zero by default so ax_tensor_zeros semantics hold even if the
-       caller never touches the tensor through fill. cudaMalloc does
-       not guarantee zero-initialised memory. */
     if (cudaMemset(p, 0, size_bytes) != cudaSuccess) {
         cudaFree(p);
         return NULL;
     }
+    g_cuda_allocs++;
+    g_cuda_bytes_alloc += (int64_t)size_bytes;
+    if (getenv("AX_TRACE_CUDA_ALLOC"))
+        fprintf(stderr, "  CUDA_ALLOC %p size=%zu\n", p, size_bytes);
     return p;
 }
 
 void cuda_storage_free_hook(void *ptr) {
-    if (ptr) cudaFree(ptr);
+    if (ptr) {
+        g_cuda_frees++;
+        if (getenv("AX_TRACE_CUDA_ALLOC"))
+            fprintf(stderr, "  CUDA_FREE  %p\n", ptr);
+        cudaFree(ptr);
+    }
 }
 
 ax_status_t cuda_memcpy_h2d_hook(void *dst, const void *src, size_t bytes) {
