@@ -40,6 +40,7 @@ struct ax_grad_fn
        also graph nodes or user-owned). */
     ax_tensor_t *saved[AX_GRAD_MAX_SAVED];
     bool saved_owned[AX_GRAD_MAX_SAVED];
+    bool saved_retained[AX_GRAD_MAX_SAVED]; /* extra storage refcount taken at save time */
     int n_saved;
 
     /* extra scalar context some ops need (e.g., mul_scalar stores the scalar) */

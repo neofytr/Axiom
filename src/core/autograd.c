@@ -407,6 +407,15 @@ void ax_graph_cleanup(ax_tensor_t *root)
                 ax_tensor_destroy(gf->saved[j]);
                 gf->saved[j] = NULL;
             }
+            else if (gf->saved_retained[j] && gf->saved[j] && gf->saved[j]->storage)
+            {
+                /* release the extra refcount taken at save time. the tensor
+                   itself is not owned (it's a graph node or leaf param);
+                   this just drops the defensive retain so the storage can
+                   be freed when the tensor itself is destroyed. */
+                ax_storage_release(gf->saved[j]->storage);
+                gf->saved_retained[j] = false;
+            }
         }
         slab_grad_fn_free(gf);
         node->grad_fn = NULL;
@@ -428,6 +437,11 @@ void ax_graph_cleanup(ax_tensor_t *root)
             {
                 ax_tensor_destroy(gf->saved[i]);
                 gf->saved[i] = NULL;
+            }
+            else if (gf->saved_retained[i] && gf->saved[i] && gf->saved[i]->storage)
+            {
+                ax_storage_release(gf->saved[i]->storage);
+                gf->saved_retained[i] = false;
             }
         }
         slab_grad_fn_free(gf);

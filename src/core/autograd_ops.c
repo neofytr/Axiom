@@ -548,6 +548,7 @@ ax_grad_fn_t *ax_make_matmul_bias_relu_backward(ax_tensor_t *a, ax_tensor_t *b,
         ax_storage_retain(a->storage);
         gf->saved[0] = a;
         gf->saved_owned[0] = false;
+        gf->saved_retained[0] = true;
     } else {
         gf->saved[0] = ax_tensor_contiguous(a);
         gf->saved_owned[0] = true;
@@ -556,6 +557,7 @@ ax_grad_fn_t *ax_make_matmul_bias_relu_backward(ax_tensor_t *a, ax_tensor_t *b,
         ax_storage_retain(b->storage);
         gf->saved[1] = b;
         gf->saved_owned[1] = false;
+        gf->saved_retained[1] = true;
     } else {
         gf->saved[1] = ax_tensor_contiguous(b);
         gf->saved_owned[1] = true;
@@ -566,6 +568,7 @@ ax_grad_fn_t *ax_make_matmul_bias_relu_backward(ax_tensor_t *a, ax_tensor_t *b,
     ax_storage_retain(out->storage);
     gf->saved[3] = out;
     gf->saved_owned[3] = false;
+    gf->saved_retained[3] = true;
     gf->n_saved = 4;
     gf->int_ctx = 0;
     return gf;
@@ -732,6 +735,7 @@ ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
         ax_storage_retain(a->storage);
         gf->saved[0] = a;
         gf->saved_owned[0] = false;
+        gf->saved_retained[0] = true;
     } else {
         ax_tensor_t *a_safe = ax_tensor_contiguous(a);
         gf->saved[0] = a_safe;
@@ -741,6 +745,7 @@ ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
         ax_storage_retain(b->storage);
         gf->saved[1] = b;
         gf->saved_owned[1] = false;
+        gf->saved_retained[1] = true;
     } else {
         ax_tensor_t *b_safe = ax_tensor_contiguous(b);
         gf->saved[1] = b_safe;
