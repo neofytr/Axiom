@@ -216,6 +216,17 @@ static void im2col_into(const float *id, int64_t C, int64_t H, int64_t W,
     const int64_t M = out_h * out_w;
     int64_t col_idx = 0;
 
+    /* 1x1 stride-1 pad-0 conv: im2col is the identity layout. col_buf
+       [C, M] matches the input [C, H, W] flattened exactly. one big
+       memcpy instead of C*H separate row-memcpys. */
+    if (kh == 1 && kw == 1 && stride_h == 1 && stride_w == 1
+        && pad_h == 0 && pad_w == 0
+        && H == out_h && W == out_w)
+    {
+        memcpy(cd, id, (size_t)(C * H * W) * sizeof(float));
+        return;
+    }
+
     /* fast path: stride_w == 1 lets each oh row be a contiguous memcpy
        of the input row, with memset zeroing the pad regions. */
     if (stride_w == 1)
