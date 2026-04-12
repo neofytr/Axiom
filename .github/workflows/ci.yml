@@ -328,8 +328,7 @@ jobs:
                    test_conv test_norm test_autograd test_losses test_optim \
                    test_layer test_activations test_fuzz_serialize; do
             echo "--- valgrind $t ---"
-            valgrind --leak-check=full --errors-for-context=yes \
-                     --error-exitcode=1 ./$t 2>&1 | tail -5
+            valgrind --leak-check=full --error-exitcode=1 ./$t 2>&1 | tail -5
           done
 
   # x86_64 inference-only build: verifies embedded profile compiles
