@@ -26,13 +26,21 @@
 
 /* declared in cpu_naive.c and cpu_opt.c */
 extern const ax_backend_ops_t ax_cpu_naive_ops;
-extern const ax_backend_ops_t ax_cpu_opt_ops;
 
-/* declared in cpu_opt.c — idempotent init that reads AX_GEMM_* env
-   overrides and applies the l2 size warning. called both from the
-   ctor (hosted builds) and explicitly from ax_compute_init below as
-   a fallback for baremetal crt0 that doesn't walk .init_array. */
+/* cpu_opt vtable(s). under AX_CPU_ISA_DISPATCH the cpu_opt source is
+   compiled twice — once with avx2/fma and once without — producing
+   two distinct vtable symbols. ax_compute_init picks between them at
+   runtime via __builtin_cpu_supports. single-build mode (default)
+   exports the plain ax_cpu_opt_ops symbol. */
+#ifdef AX_CPU_ISA_DISPATCH
+extern const ax_backend_ops_t ax_cpu_opt_ops_avx2;
+extern const ax_backend_ops_t ax_cpu_opt_ops_scalar;
+extern void ax_cpu_opt_tune_init_avx2(void);
+extern void ax_cpu_opt_tune_init_scalar(void);
+#else
+extern const ax_backend_ops_t ax_cpu_opt_ops;
 extern void ax_cpu_opt_tune_init(void);
+#endif
 
 #ifdef AX_HAVE_CUDA
 extern const ax_backend_ops_t ax_cuda_ops;
@@ -83,9 +91,19 @@ static void ensure_compute_init(void) {
 }
 
 ax_status_t ax_compute_init(void) {
-    /* register all built-in backends */
+    /* register cpu backends. under AX_CPU_ISA_DISPATCH we probe for
+       avx2+fma and pick the corresponding cpu_opt variant at runtime;
+       otherwise the single-build vtable wins unconditionally. */
     backends[AX_BACKEND_CPU_NAIVE] = &ax_cpu_naive_ops;
-    backends[AX_BACKEND_CPU_SIMD]  = &ax_cpu_opt_ops;
+#ifdef AX_CPU_ISA_DISPATCH
+    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        backends[AX_BACKEND_CPU_SIMD] = &ax_cpu_opt_ops_avx2;
+    } else {
+        backends[AX_BACKEND_CPU_SIMD] = &ax_cpu_opt_ops_scalar;
+    }
+#else
+    backends[AX_BACKEND_CPU_SIMD] = &ax_cpu_opt_ops;
+#endif
 #ifdef AX_HAVE_CUDA
     backends[AX_BACKEND_CUDA]      = &ax_cuda_ops;
 #endif
@@ -98,14 +116,23 @@ ax_status_t ax_compute_init(void) {
 
     /* select the optimized backend by default (falls back to naive internally) */
     active_id = AX_BACKEND_CPU_SIMD;
-    active_ops = &ax_cpu_opt_ops;
+    active_ops = backends[AX_BACKEND_CPU_SIMD];
     compute_initialized = 1;
 
     /* explicit fallback for baremetal: the cpu_opt tile-size init is
        normally driven by an __attribute__((constructor)), but some
        embedded crt0 scripts don't walk .init_array, so we also call it
-       here. idempotent — a second call is a no-op on hosted builds. */
+       here. idempotent — a second call is a no-op on hosted builds.
+       under AX_CPU_ISA_DISPATCH we call the variant that got selected. */
+#ifdef AX_CPU_ISA_DISPATCH
+    if (active_ops == &ax_cpu_opt_ops_avx2) {
+        ax_cpu_opt_tune_init_avx2();
+    } else {
+        ax_cpu_opt_tune_init_scalar();
+    }
+#else
     ax_cpu_opt_tune_init();
+#endif
 
     /* runtime hybrid-cpu autotune. only emits a stderr line when it
        actually calibrates (i.e. user did not pin threads explicitly).

@@ -100,6 +100,15 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O3 -fno-math-errno -funroll-loops -fno-trapping-math -D_FORTIFY_SOURCE=2)
 endif()
 
+# runtime isa dispatch for cpu_opt. when on, cpu_opt.c is compiled
+# twice: once with -mavx2 -mfma (AX_CPU_OPT_SUFFIX=_avx2) and once
+# with vector extensions disabled (AX_CPU_OPT_SUFFIX=_scalar). the
+# two object files produce distinct vtable symbols and dispatch.c
+# picks one at ax_compute_init time via __builtin_cpu_supports.
+# single binary that gracefully degrades on pre-avx2 x86_64.
+# default off — costs nothing on a fixed-target deployment.
+option(AX_CPU_ISA_DISPATCH "build cpu_opt twice (avx2 + scalar) and select at runtime" OFF)
+
 # library sources
 set(AXIOM_SOURCES
     src/core/error.c
@@ -123,8 +132,13 @@ set(AXIOM_SOURCES
     src/core/rng.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
-    src/compute/backends/cpu_opt.c
 )
+# cpu_opt goes in directly under single-build, or via dual object
+# libraries under AX_CPU_ISA_DISPATCH. see the isa-dispatch block
+# below.
+if(NOT AX_CPU_ISA_DISPATCH)
+    list(APPEND AXIOM_SOURCES src/compute/backends/cpu_opt.c)
+endif()
 
 if(AX_CUDA)
     # cuda backend is a self-contained module under backends/cuda/
@@ -140,10 +154,51 @@ if(AX_CUDA)
     list(APPEND AXIOM_SOURCES ${AX_CUDA_SOURCES})
 endif()
 
-# enable SIMD for the optimized backend on x86
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
+# enable SIMD for the optimized backend on x86. single-build path:
+# use the detected target ISA (-mavx2 -mfma on x86_64). the runtime-
+# isa-dispatch path below overrides this by compiling two object
+# libraries with their own flags.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86" AND NOT AX_CPU_ISA_DISPATCH)
     set_source_files_properties(src/compute/backends/cpu_opt.c
         PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+endif()
+
+# runtime isa dispatch: build two cpu_opt object libraries with
+# distinct symbol suffixes and different compile flags, then link
+# both into axiom_static/axiom_shared. dispatch.c selects the
+# active vtable at ax_compute_init via __builtin_cpu_supports.
+if(AX_CPU_ISA_DISPATCH)
+    message(STATUS "cpu_opt runtime isa dispatch enabled (avx2 + scalar variants)")
+
+    # avx2+fma variant — the fast one on modern x86.
+    add_library(axiom_cpu_opt_avx2 OBJECT src/compute/backends/cpu_opt.c)
+    target_include_directories(axiom_cpu_opt_avx2 PUBLIC include
+        PRIVATE src/compute/backends)
+    target_compile_definitions(axiom_cpu_opt_avx2 PRIVATE AX_CPU_OPT_SUFFIX=_avx2)
+    target_compile_options(axiom_cpu_opt_avx2 PRIVATE -mavx2 -mfma)
+    # pic required because the object files are linked into both the
+    # static and the shared axiom libraries.
+    set_property(TARGET axiom_cpu_opt_avx2 PROPERTY POSITION_INDEPENDENT_CODE ON)
+    if(AX_OPENMP AND OpenMP_C_FOUND)
+        target_link_libraries(axiom_cpu_opt_avx2 PUBLIC OpenMP::OpenMP_C)
+    endif()
+
+    # scalar variant — no vector extensions beyond sse2 baseline.
+    # runs on any x86_64 cpu including very old ones; simd_defs.h
+    # falls through to its scalar branch when __AVX2__ isn't set.
+    add_library(axiom_cpu_opt_scalar OBJECT src/compute/backends/cpu_opt.c)
+    target_include_directories(axiom_cpu_opt_scalar PUBLIC include
+        PRIVATE src/compute/backends)
+    target_compile_definitions(axiom_cpu_opt_scalar PRIVATE AX_CPU_OPT_SUFFIX=_scalar)
+    target_compile_options(axiom_cpu_opt_scalar PRIVATE -mno-avx2 -mno-fma -mno-avx)
+    set_property(TARGET axiom_cpu_opt_scalar PROPERTY POSITION_INDEPENDENT_CODE ON)
+    if(AX_OPENMP AND OpenMP_C_FOUND)
+        target_link_libraries(axiom_cpu_opt_scalar PUBLIC OpenMP::OpenMP_C)
+    endif()
+
+    # core compiled units get the dispatch flag so dispatch.c swaps
+    # the extern decls + runtime selection in.
+    add_compile_definitions(AX_CPU_ISA_DISPATCH=1)
 endif()
 
 # static library
@@ -152,6 +207,10 @@ target_include_directories(axiom_static PUBLIC include)
 target_link_libraries(axiom_static PUBLIC m)
 if(AX_OPENMP AND OpenMP_C_FOUND)
     target_link_libraries(axiom_static PUBLIC OpenMP::OpenMP_C)
+endif()
+if(AX_CPU_ISA_DISPATCH)
+    target_link_libraries(axiom_static PUBLIC
+        axiom_cpu_opt_avx2 axiom_cpu_opt_scalar)
 endif()
 if(AX_CUDA)
     target_link_libraries(axiom_static PUBLIC CUDA::cudart CUDA::cublas)
@@ -167,6 +226,10 @@ target_include_directories(axiom_shared PUBLIC include)
 target_link_libraries(axiom_shared PUBLIC m)
 if(AX_OPENMP AND OpenMP_C_FOUND)
     target_link_libraries(axiom_shared PUBLIC OpenMP::OpenMP_C)
+endif()
+if(AX_CPU_ISA_DISPATCH)
+    target_link_libraries(axiom_shared PUBLIC
+        axiom_cpu_opt_avx2 axiom_cpu_opt_scalar)
 endif()
 if(AX_CUDA)
     target_link_libraries(axiom_shared PUBLIC CUDA::cudart CUDA::cublas)

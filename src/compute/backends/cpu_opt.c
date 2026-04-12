@@ -1,6 +1,23 @@
 /* cpu_opt.c — optimized cpu backend with contiguous fast paths.
    falls back to cpu_naive for strided/broadcast cases.
-   every op validates storage bounds before pointer access. */
+   every op validates storage bounds before pointer access.
+
+   runtime isa dispatch: this file can be compiled twice under the
+   AX_CPU_ISA_DISPATCH build flag, once with -mavx2 -mfma and once
+   without. the externally-visible symbols (the vtable and the tune
+   init) get suffixed by AX_CPU_OPT_SUFFIX so the two object files
+   don't collide when linked together. dispatch.c then picks between
+   ax_cpu_opt_ops_avx2 and ax_cpu_opt_ops_scalar at ax_compute_init
+   time via __builtin_cpu_supports. single-build users (the default)
+   see the unchanged symbol names. */
+
+#ifdef AX_CPU_OPT_SUFFIX
+#define AX_PASTE2(a, b) a ## b
+#define AX_PASTE(a, b)  AX_PASTE2(a, b)
+#define AX_SYM(name)    AX_PASTE(name, AX_CPU_OPT_SUFFIX)
+#else
+#define AX_SYM(name)    name
+#endif
 
 #include "axiom/backend_ops.h"
 #include "axiom/tensor.h"
@@ -332,12 +349,20 @@ static void ax_cpu_opt_init_impl(void) {
 
 /* public entry point — called from ax_compute_init() in dispatch.c so
    baremetal targets without .init_array support still apply the env
-   overrides. idempotent: second call is a no-op. */
-void ax_cpu_opt_tune_init(void) {
+   overrides. idempotent: second call is a no-op. suffixed variant
+   under AX_CPU_ISA_DISPATCH so both isa variants coexist. */
+void AX_SYM(ax_cpu_opt_tune_init)(void) {
     ax_cpu_opt_init_impl();
 }
 
-#if !defined(AX_NO_CONSTRUCTORS) && (defined(__GNUC__) || defined(__clang__))
+/* constructor: only emit under the single-build path. under
+   AX_CPU_ISA_DISPATCH we drive init explicitly from dispatch.c
+   (because only one of the two variants ends up being the active
+   backend — registering both constructors is redundant and the
+   scalar variant would overwrite the autotuned tile sizes the
+   avx2 variant picked). */
+#if !defined(AX_NO_CONSTRUCTORS) && !defined(AX_CPU_OPT_SUFFIX) \
+    && (defined(__GNUC__) || defined(__clang__))
 static __attribute__((constructor)) void ax_cpu_opt_ctor(void) {
     ax_cpu_opt_init_impl();
 }
@@ -1911,7 +1936,7 @@ static ax_status_t opt_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
 
 /* vtable registration */
 
-const ax_backend_ops_t ax_cpu_opt_ops = {
+const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .name       = "cpu_opt",
     .add        = opt_add,
     .sub        = opt_sub,
