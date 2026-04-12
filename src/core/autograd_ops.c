@@ -503,7 +503,7 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
        when the grad already existed (residual connections, shared params),
        we fall back to the temp + accumulate path so += semantics are
        preserved. */
-    /* dA = grad_out @ b^T. direct-write when fresh. */
+    /* dA = grad_out @ b^T via gemm_nt. direct-write when fresh. */
     if (self->inputs[0]->requires_grad)
     {
         bool fresh_a;
@@ -616,12 +616,11 @@ ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
     ax_tensor_t *a_safe = ax_ensure_contiguous(a);
     gf->saved[0] = a_safe;
     gf->saved_owned[0] = (a_safe != a);
-    /* save b contiguous for dX computation via gemm_nt */
+    /* save b contiguous for dX via gemm_nt */
     ax_tensor_t *b_safe = ax_ensure_contiguous(b);
     gf->saved[1] = b_safe;
     gf->saved_owned[1] = (b_safe != b);
-    /* save bias reference (not owned) for dBias */
-    gf->saved[2] = bias;  /* NULL if no bias */
+    gf->saved[2] = bias;
     gf->saved_owned[2] = false;
     gf->n_saved = 3;
     gf->int_ctx = 0;

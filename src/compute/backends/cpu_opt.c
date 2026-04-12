@@ -464,23 +464,96 @@ static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc
 static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc,
                       int64_t n_remain, float *packed)
 {
-    /* b_src is [N, K] (row-major), we want to pack as if transposed:
-       packed[p * NR + jj] = b_src[(j + jj) * ldb + p]. the naive code
-       accesses b with stride=ldb between jj values → one L1 miss per
-       element for large ldb.
+    /* b_src is [N, K] (row-major). pack as if transposed:
+       packed[p * NR + jj] = b_src[(j + jj) * ldb + p].
 
-       optimisation: prefetch the next k-iteration's elements from each
-       row so the cache line is already in L1 by the time we read it.
-       with NR=16 rows and 1 prefetch per row, that's 16 prefetches
-       per K iteration — cheap versus the 16 cache misses they avoid. */
+       the naive approach reads column-by-column with stride=ldb between
+       consecutive elements — one L1 miss per element for large ldb.
+
+       avx2 optimisation: process 8×8 sub-blocks where we load 8
+       consecutive floats from 8 different rows (8 sequential reads),
+       transpose in-register using vpunpcklps/vunpckhps/vperm2f128, and
+       write 8 transposed rows sequentially. this converts the NR strided
+       reads into NR/8 groups of 8 sequential reads, dramatically
+       improving cache utilisation. */
+
+#if defined(AX_SIMD_AVX2)
     for (int64_t j = 0; j < nc; j += GEMM_NR) {
         int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
-        for (int64_t p = 0; p < kc; p++) {
-            /* prefetch next K position for each row */
-            if (p + 8 < kc) {
-                for (int64_t jj = 0; jj < nr; jj++)
-                    __builtin_prefetch(b_src + (j + jj) * ldb_src + p + 8, 0, 1);
+
+        /* fast path: full NR-wide strip with K >= 8, use 8×8 block transpose.
+           NR=16 means two groups of 8 rows, each processed in 8-column chunks. */
+        if (nr == GEMM_NR) {
+            int64_t p = 0;
+            for (; p + 8 <= kc; p += 8) {
+                /* process rows j..j+7 and j+8..j+15 */
+                for (int g = 0; g < 2; g++) {
+                    int64_t base_row = j + g * 8;
+                    /* load 8 floats from each of 8 rows (sequential within each row) */
+                    __m256 r0 = _mm256_loadu_ps(b_src + (base_row + 0) * ldb_src + p);
+                    __m256 r1 = _mm256_loadu_ps(b_src + (base_row + 1) * ldb_src + p);
+                    __m256 r2 = _mm256_loadu_ps(b_src + (base_row + 2) * ldb_src + p);
+                    __m256 r3 = _mm256_loadu_ps(b_src + (base_row + 3) * ldb_src + p);
+                    __m256 r4 = _mm256_loadu_ps(b_src + (base_row + 4) * ldb_src + p);
+                    __m256 r5 = _mm256_loadu_ps(b_src + (base_row + 5) * ldb_src + p);
+                    __m256 r6 = _mm256_loadu_ps(b_src + (base_row + 6) * ldb_src + p);
+                    __m256 r7 = _mm256_loadu_ps(b_src + (base_row + 7) * ldb_src + p);
+
+                    /* 8×8 in-register transpose.
+                       step 1: interleave pairs of 32-bit floats */
+                    __m256 t0 = _mm256_unpacklo_ps(r0, r1);
+                    __m256 t1 = _mm256_unpackhi_ps(r0, r1);
+                    __m256 t2 = _mm256_unpacklo_ps(r2, r3);
+                    __m256 t3 = _mm256_unpackhi_ps(r2, r3);
+                    __m256 t4 = _mm256_unpacklo_ps(r4, r5);
+                    __m256 t5 = _mm256_unpackhi_ps(r4, r5);
+                    __m256 t6 = _mm256_unpacklo_ps(r6, r7);
+                    __m256 t7 = _mm256_unpackhi_ps(r6, r7);
+
+                    /* step 2: interleave pairs of 64-bit groups */
+                    r0 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t0), _mm256_castps_pd(t2)));
+                    r1 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t0), _mm256_castps_pd(t2)));
+                    r2 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t1), _mm256_castps_pd(t3)));
+                    r3 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t1), _mm256_castps_pd(t3)));
+                    r4 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t4), _mm256_castps_pd(t6)));
+                    r5 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t4), _mm256_castps_pd(t6)));
+                    r6 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t5), _mm256_castps_pd(t7)));
+                    r7 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t5), _mm256_castps_pd(t7)));
+
+                    /* step 3: swap 128-bit lanes */
+                    t0 = _mm256_permute2f128_ps(r0, r4, 0x20);
+                    t1 = _mm256_permute2f128_ps(r1, r5, 0x20);
+                    t2 = _mm256_permute2f128_ps(r2, r6, 0x20);
+                    t3 = _mm256_permute2f128_ps(r3, r7, 0x20);
+                    t4 = _mm256_permute2f128_ps(r0, r4, 0x31);
+                    t5 = _mm256_permute2f128_ps(r1, r5, 0x31);
+                    t6 = _mm256_permute2f128_ps(r2, r6, 0x31);
+                    t7 = _mm256_permute2f128_ps(r3, r7, 0x31);
+
+                    /* store: each t[i] holds 8 values from column (p+i) of the
+                       original B, across 8 rows. write them into the packed layout
+                       where the NR=16 slot for this group starts at packed[(p+i)*NR + g*8]. */
+                    _mm256_storeu_ps(packed + (p + 0) * GEMM_NR + g * 8, t0);
+                    _mm256_storeu_ps(packed + (p + 1) * GEMM_NR + g * 8, t1);
+                    _mm256_storeu_ps(packed + (p + 2) * GEMM_NR + g * 8, t2);
+                    _mm256_storeu_ps(packed + (p + 3) * GEMM_NR + g * 8, t3);
+                    _mm256_storeu_ps(packed + (p + 4) * GEMM_NR + g * 8, t4);
+                    _mm256_storeu_ps(packed + (p + 5) * GEMM_NR + g * 8, t5);
+                    _mm256_storeu_ps(packed + (p + 6) * GEMM_NR + g * 8, t6);
+                    _mm256_storeu_ps(packed + (p + 7) * GEMM_NR + g * 8, t7);
+                }
             }
+            /* scalar tail for remaining K columns */
+            for (; p < kc; p++) {
+                for (int64_t jj = 0; jj < GEMM_NR; jj++)
+                    packed[p * GEMM_NR + jj] = b_src[(j + jj) * ldb_src + p];
+            }
+            packed += kc * GEMM_NR;
+            continue;
+        }
+
+        /* edge strip: NR not full — scalar fallback with zero padding */
+        for (int64_t p = 0; p < kc; p++) {
             for (int64_t jj = 0; jj < GEMM_NR; jj++) {
                 if (jj < nr)
                     packed[jj] = b_src[(j + jj) * ldb_src + p];
@@ -490,6 +563,21 @@ static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc
             packed += GEMM_NR;
         }
     }
+#else
+    /* generic scalar fallback */
+    for (int64_t j = 0; j < nc; j += GEMM_NR) {
+        int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
+        for (int64_t p = 0; p < kc; p++) {
+            for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                if (jj < nr)
+                    packed[jj] = b_src[(j + jj) * ldb_src + p];
+                else
+                    packed[jj] = 0.0f;
+            }
+            packed += GEMM_NR;
+        }
+    }
+#endif
 }
 
 /* pack a KC x NC panel of B (row-major) into contiguous NR-col strips */
