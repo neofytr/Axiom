@@ -657,30 +657,43 @@ static void micro_kernel(int64_t kc, const float *restrict ap, const float *rest
         if (nr > 16) __builtin_prefetch(c + row * ldc + 16, 0, 3);
     }
 
-    for (int64_t p = 0; p < kc; p++) {
+    /* 2× unrolled K loop with prefetch */
+    #define AVX512_BODY(a_ptr, b_ptr) { \
+        __m512 b0 = _mm512_load_ps(b_ptr); \
+        __m512 b1 = _mm512_load_ps(b_ptr + 16); \
+        __m512 a; \
+        a=_mm512_set1_ps(a_ptr[ 0]); c00=_mm512_fmadd_ps(a,b0,c00); c01=_mm512_fmadd_ps(a,b1,c01); \
+        a=_mm512_set1_ps(a_ptr[ 1]); c10=_mm512_fmadd_ps(a,b0,c10); c11=_mm512_fmadd_ps(a,b1,c11); \
+        a=_mm512_set1_ps(a_ptr[ 2]); c20=_mm512_fmadd_ps(a,b0,c20); c21=_mm512_fmadd_ps(a,b1,c21); \
+        a=_mm512_set1_ps(a_ptr[ 3]); c30=_mm512_fmadd_ps(a,b0,c30); c31=_mm512_fmadd_ps(a,b1,c31); \
+        a=_mm512_set1_ps(a_ptr[ 4]); c40=_mm512_fmadd_ps(a,b0,c40); c41=_mm512_fmadd_ps(a,b1,c41); \
+        a=_mm512_set1_ps(a_ptr[ 5]); c50=_mm512_fmadd_ps(a,b0,c50); c51=_mm512_fmadd_ps(a,b1,c51); \
+        a=_mm512_set1_ps(a_ptr[ 6]); c60=_mm512_fmadd_ps(a,b0,c60); c61=_mm512_fmadd_ps(a,b1,c61); \
+        a=_mm512_set1_ps(a_ptr[ 7]); c70=_mm512_fmadd_ps(a,b0,c70); c71=_mm512_fmadd_ps(a,b1,c71); \
+        a=_mm512_set1_ps(a_ptr[ 8]); c80=_mm512_fmadd_ps(a,b0,c80); c81=_mm512_fmadd_ps(a,b1,c81); \
+        a=_mm512_set1_ps(a_ptr[ 9]); c90=_mm512_fmadd_ps(a,b0,c90); c91=_mm512_fmadd_ps(a,b1,c91); \
+        a=_mm512_set1_ps(a_ptr[10]); cA0=_mm512_fmadd_ps(a,b0,cA0); cA1=_mm512_fmadd_ps(a,b1,cA1); \
+        a=_mm512_set1_ps(a_ptr[11]); cB0=_mm512_fmadd_ps(a,b0,cB0); cB1=_mm512_fmadd_ps(a,b1,cB1); \
+        a=_mm512_set1_ps(a_ptr[12]); cC0=_mm512_fmadd_ps(a,b0,cC0); cC1=_mm512_fmadd_ps(a,b1,cC1); \
+        a=_mm512_set1_ps(a_ptr[13]); cD0=_mm512_fmadd_ps(a,b0,cD0); cD1=_mm512_fmadd_ps(a,b1,cD1); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
         __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
         __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
-
-        __m512 b0 = _mm512_load_ps(bp);
-        __m512 b1 = _mm512_load_ps(bp + 16);
-
-        #define FMA_ROW(row, lo, hi) { \
-            __m512 a = _mm512_set1_ps(ap[row]); \
-            lo = _mm512_fmadd_ps(a, b0, lo); \
-            hi = _mm512_fmadd_ps(a, b1, hi); \
-        }
-        FMA_ROW( 0, c00, c01); FMA_ROW( 1, c10, c11);
-        FMA_ROW( 2, c20, c21); FMA_ROW( 3, c30, c31);
-        FMA_ROW( 4, c40, c41); FMA_ROW( 5, c50, c51);
-        FMA_ROW( 6, c60, c61); FMA_ROW( 7, c70, c71);
-        FMA_ROW( 8, c80, c81); FMA_ROW( 9, c90, c91);
-        FMA_ROW(10, cA0, cA1); FMA_ROW(11, cB0, cB1);
-        FMA_ROW(12, cC0, cC1); FMA_ROW(13, cD0, cD1);
-        #undef FMA_ROW
-
+        AVX512_BODY(ap, bp);
+        AVX512_BODY(ap + GEMM_MR, bp + GEMM_NR);
+        ap += 2 * GEMM_MR;
+        bp += 2 * GEMM_NR;
+    }
+    if (p < kc) {
+        AVX512_BODY(ap, bp);
         ap += GEMM_MR;
         bp += GEMM_NR;
     }
+    #undef AVX512_BODY
 
     /* writeback */
     if (mr == GEMM_MR && nr == GEMM_NR) {
@@ -820,51 +833,46 @@ static void micro_kernel(int64_t kc, const float *restrict ap, const float *rest
     float32x4_t c60=vdupq_n_f32(0), c61=vdupq_n_f32(0), c62=vdupq_n_f32(0);
     float32x4_t c70=vdupq_n_f32(0), c71=vdupq_n_f32(0), c72=vdupq_n_f32(0);
 
-    for (int64_t p = 0; p < kc; p++) {
-        float32x4_t b0 = vld1q_f32(bp);
-        float32x4_t b1 = vld1q_f32(bp + 4);
-        float32x4_t b2 = vld1q_f32(bp + 8);
+    /* prefetch output C into L1 */
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 4) __builtin_prefetch(c + row * ldc + 4, 0, 3);
+        if (nr > 8) __builtin_prefetch(c + row * ldc + 8, 0, 3);
+    }
 
-        /* load 8 A values as 2 Q registers, broadcast via lane index */
-        float32x4_t a_lo = vld1q_f32(ap);       /* ap[0..3] */
-        float32x4_t a_hi = vld1q_f32(ap + 4);   /* ap[4..7] */
+    /* 2× unrolled K loop with prefetch */
+    #define NEON_BODY(a_ptr, b_ptr) { \
+        float32x4_t b0 = vld1q_f32(b_ptr); \
+        float32x4_t b1 = vld1q_f32(b_ptr + 4); \
+        float32x4_t b2 = vld1q_f32(b_ptr + 8); \
+        float32x4_t a_lo = vld1q_f32(a_ptr); \
+        float32x4_t a_hi = vld1q_f32(a_ptr + 4); \
+        c00=vfmaq_laneq_f32(c00,b0,a_lo,0); c01=vfmaq_laneq_f32(c01,b1,a_lo,0); c02=vfmaq_laneq_f32(c02,b2,a_lo,0); \
+        c10=vfmaq_laneq_f32(c10,b0,a_lo,1); c11=vfmaq_laneq_f32(c11,b1,a_lo,1); c12=vfmaq_laneq_f32(c12,b2,a_lo,1); \
+        c20=vfmaq_laneq_f32(c20,b0,a_lo,2); c21=vfmaq_laneq_f32(c21,b1,a_lo,2); c22=vfmaq_laneq_f32(c22,b2,a_lo,2); \
+        c30=vfmaq_laneq_f32(c30,b0,a_lo,3); c31=vfmaq_laneq_f32(c31,b1,a_lo,3); c32=vfmaq_laneq_f32(c32,b2,a_lo,3); \
+        c40=vfmaq_laneq_f32(c40,b0,a_hi,0); c41=vfmaq_laneq_f32(c41,b1,a_hi,0); c42=vfmaq_laneq_f32(c42,b2,a_hi,0); \
+        c50=vfmaq_laneq_f32(c50,b0,a_hi,1); c51=vfmaq_laneq_f32(c51,b1,a_hi,1); c52=vfmaq_laneq_f32(c52,b2,a_hi,1); \
+        c60=vfmaq_laneq_f32(c60,b0,a_hi,2); c61=vfmaq_laneq_f32(c61,b1,a_hi,2); c62=vfmaq_laneq_f32(c62,b2,a_hi,2); \
+        c70=vfmaq_laneq_f32(c70,b0,a_hi,3); c71=vfmaq_laneq_f32(c71,b1,a_hi,3); c72=vfmaq_laneq_f32(c72,b2,a_hi,3); \
+    }
 
-        /* row 0: a_lo[0] */
-        c00 = vfmaq_laneq_f32(c00, b0, a_lo, 0);
-        c01 = vfmaq_laneq_f32(c01, b1, a_lo, 0);
-        c02 = vfmaq_laneq_f32(c02, b2, a_lo, 0);
-        /* row 1: a_lo[1] */
-        c10 = vfmaq_laneq_f32(c10, b0, a_lo, 1);
-        c11 = vfmaq_laneq_f32(c11, b1, a_lo, 1);
-        c12 = vfmaq_laneq_f32(c12, b2, a_lo, 1);
-        /* row 2: a_lo[2] */
-        c20 = vfmaq_laneq_f32(c20, b0, a_lo, 2);
-        c21 = vfmaq_laneq_f32(c21, b1, a_lo, 2);
-        c22 = vfmaq_laneq_f32(c22, b2, a_lo, 2);
-        /* row 3: a_lo[3] */
-        c30 = vfmaq_laneq_f32(c30, b0, a_lo, 3);
-        c31 = vfmaq_laneq_f32(c31, b1, a_lo, 3);
-        c32 = vfmaq_laneq_f32(c32, b2, a_lo, 3);
-        /* row 4: a_hi[0] */
-        c40 = vfmaq_laneq_f32(c40, b0, a_hi, 0);
-        c41 = vfmaq_laneq_f32(c41, b1, a_hi, 0);
-        c42 = vfmaq_laneq_f32(c42, b2, a_hi, 0);
-        /* row 5: a_hi[1] */
-        c50 = vfmaq_laneq_f32(c50, b0, a_hi, 1);
-        c51 = vfmaq_laneq_f32(c51, b1, a_hi, 1);
-        c52 = vfmaq_laneq_f32(c52, b2, a_hi, 1);
-        /* row 6: a_hi[2] */
-        c60 = vfmaq_laneq_f32(c60, b0, a_hi, 2);
-        c61 = vfmaq_laneq_f32(c61, b1, a_hi, 2);
-        c62 = vfmaq_laneq_f32(c62, b2, a_hi, 2);
-        /* row 7: a_hi[3] */
-        c70 = vfmaq_laneq_f32(c70, b0, a_hi, 3);
-        c71 = vfmaq_laneq_f32(c71, b1, a_hi, 3);
-        c72 = vfmaq_laneq_f32(c72, b2, a_hi, 3);
-
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
+        __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
+        __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
+        NEON_BODY(ap, bp);
+        NEON_BODY(ap + GEMM_MR, bp + GEMM_NR);
+        ap += 2 * GEMM_MR;
+        bp += 2 * GEMM_NR;
+    }
+    if (p < kc) {
+        NEON_BODY(ap, bp);
         ap += GEMM_MR;
         bp += GEMM_NR;
     }
+    #undef NEON_BODY
 
     /* writeback */
     if (mr == GEMM_MR && nr == GEMM_NR) {
