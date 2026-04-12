@@ -489,6 +489,88 @@ ax_grad_fn_t *ax_make_add_scalar_backward(ax_tensor_t *a, ax_tensor_t *out)
 }
 
 
+/* forward declaration — matmul_bias_backward is defined below */
+static void matmul_bias_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out);
+
+/* matmul_bias_relu backward: apply relu mask to grad_out, then
+   forward to matmul_bias_backward for dA/dB/dBias.
+   saved[0] = a (contiguous), saved[1] = b (contiguous),
+   saved[2] = bias (or NULL), saved[3] = relu output (for mask). */
+static void matmul_bias_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *relu_out = self->saved[3]; /* the relu'd forward output */
+
+    /* apply relu mask: masked_grad = grad_out * (relu_out > 0) */
+    int64_t n = ax_tensor_numel(grad_out);
+    ax_arena_t *ar = ax_backward_arena();
+    ax_tensor_t *masked = ax_tensor_arena_create(ar, grad_out->shape, grad_out->ndim, grad_out->dtype);
+    if (!masked) return;
+
+    if (grad_out->storage->device == AX_DEVICE_CPU) {
+        const float *gd = (const float *)grad_out->storage->data + grad_out->offset;
+        const float *rd = (const float *)relu_out->storage->data + relu_out->offset;
+        float *md = (float *)masked->storage->data + masked->offset;
+        int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+        ax_vf32 vzero = ax_vf32_zero();
+        for (; i < ve; i += AX_VF32_WIDTH) {
+            ax_vf32 mask = ax_vf32_cmpgt(ax_vf32_loadu(rd + i), vzero);
+            ax_vf32_storeu(md + i, ax_vf32_mul(ax_vf32_loadu(gd + i), mask));
+        }
+        for (; i < n; i++)
+            md[i] = (rd[i] > 0.0f) ? gd[i] : 0.0f;
+    } else {
+        /* device path */
+        ax_tensor_t *zeros = ax_tensor_zeros(relu_out->shape, relu_out->ndim, relu_out->dtype);
+        ax_tensor_t *mask = ax_tensor_create(relu_out->shape, relu_out->ndim, relu_out->dtype);
+        if (zeros && mask) {
+            ax_compute_greater(relu_out, zeros, mask);
+            ax_compute_mul(grad_out, mask, masked);
+        }
+        if (zeros) ax_tensor_destroy(zeros);
+        if (mask) ax_tensor_destroy(mask);
+    }
+
+    /* now forward the masked gradient to the standard matmul_bias backward */
+    matmul_bias_backward(self, masked);
+
+    ax_tensor_destroy(masked);
+}
+
+ax_grad_fn_t *ax_make_matmul_bias_relu_backward(ax_tensor_t *a, ax_tensor_t *b,
+                                                  ax_tensor_t *bias, ax_tensor_t *out)
+{
+    ax_grad_fn_t *gf = ax_grad_fn_create(matmul_bias_relu_backward);
+    gf->inputs[0] = a;
+    gf->inputs[1] = b;
+    gf->n_inputs = 2;
+    /* save a, b for dA/dB (same as matmul_bias_backward) */
+    if (ax_tensor_is_contiguous(a) && a->offset == 0) {
+        ax_storage_retain(a->storage);
+        gf->saved[0] = a;
+        gf->saved_owned[0] = false;
+    } else {
+        gf->saved[0] = ax_tensor_contiguous(a);
+        gf->saved_owned[0] = true;
+    }
+    if (ax_tensor_is_contiguous(b) && b->offset == 0) {
+        ax_storage_retain(b->storage);
+        gf->saved[1] = b;
+        gf->saved_owned[1] = false;
+    } else {
+        gf->saved[1] = ax_tensor_contiguous(b);
+        gf->saved_owned[1] = true;
+    }
+    gf->saved[2] = bias;
+    gf->saved_owned[2] = false;
+    /* save the relu'd output for the backward relu mask */
+    ax_storage_retain(out->storage);
+    gf->saved[3] = out;
+    gf->saved_owned[3] = false;
+    gf->n_saved = 4;
+    gf->int_ctx = 0;
+    return gf;
+}
+
 /* mul_scalar: d/da(a * c) = c */
 static void mul_scalar_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {

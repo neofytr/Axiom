@@ -320,6 +320,20 @@ ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     return dispatch_touch_on_ok(out, active_ops->gemm_tn(a, b, out));
 }
 
+/* fused matmul+relu */
+ax_status_t ax_compute_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,
+                                  const ax_tensor_t *bias, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->gemm_relu) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "gemm_relu not implemented in %s",
+                   active_ops ? active_ops->name : "none");
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return dispatch_touch_on_ok(out, active_ops->gemm_relu(a, b, bias, out));
+}
+int ax_compute_has_gemm_relu(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_relu) ? 1 : 0; }
+
 int ax_compute_has_gemm_nt(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_nt) ? 1 : 0; }
 int ax_compute_has_gemm_tn(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_tn) ? 1 : 0; }
 

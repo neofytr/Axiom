@@ -92,6 +92,12 @@ ax_status_t ax_compute_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 /* out = a^T @ b. same fallback contract as gemm_nt. */
 ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+/* fused matmul+relu: out = relu(a @ b + bias). bias may be NULL.
+   returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
+ax_status_t ax_compute_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,
+                                  const ax_tensor_t *bias, ax_tensor_t *out);
+int ax_compute_has_gemm_relu(void);
+
 int ax_compute_has_gemm_nt(void);
 int ax_compute_has_gemm_tn(void);
 

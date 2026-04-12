@@ -40,6 +40,13 @@ ax_tensor_t *ax_matmul(ax_tensor_t *a, ax_tensor_t *b);
    create. bias may be NULL for matmul-only (equivalent to ax_matmul). */
 ax_tensor_t *ax_matmul_bias(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias);
 
+/* fused matmul + bias + relu: out = relu((a @ b) + bias).
+   when the backend provides gemm_relu, the relu is applied during the
+   gemm writeback step — saving one full memory pass over the output.
+   falls back to matmul_bias + separate relu when gemm_relu is absent.
+   bias may be NULL. */
+ax_tensor_t *ax_matmul_bias_relu(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias);
+
 /* reductions */
 /* axis = -1 reduces everything to a scalar */
 

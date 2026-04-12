@@ -347,6 +347,55 @@ ax_tensor_t *ax_matmul_bias(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias)
     return out;
 }
 
+/* fused backward for matmul+bias+relu: same as matmul_bias_backward but
+   the dX and dW computations must account for the relu mask. the relu was
+   applied to the forward output, so the backward needs to zero the gradient
+   where the output was <= 0. we save the relu'd output for this purpose. */
+extern ax_grad_fn_t *ax_make_matmul_bias_relu_backward(ax_tensor_t *a, ax_tensor_t *b,
+                                                         ax_tensor_t *bias, ax_tensor_t *out);
+
+ax_tensor_t *ax_matmul_bias_relu(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias)
+{
+    if (!a || !b) {
+        ax_err_set(AX_ERR_NULL_ARG, "matmul_bias_relu: NULL tensor");
+        return NULL;
+    }
+    if (a->ndim != 2 || b->ndim != 2) return NULL;
+    if (a->shape[1] != b->shape[0]) return NULL;
+
+    int64_t out_shape[] = {a->shape[0], b->shape[1]};
+    ax_tensor_t *out = ax_tensor_create(out_shape, 2, a->dtype);
+    if (!out) return NULL;
+
+    if (ax_compute_has_gemm_relu()) {
+        /* fused path: gemm + bias + relu in one call (output stays cache-hot) */
+        ax_compute_gemm_relu(a, b, bias, out);
+    } else {
+        /* fallback: gemm → bias → relu as separate passes */
+        ax_compute_gemm(a, b, out);
+        if (bias) {
+            if (ax_compute_has_bias_add())
+                ax_compute_bias_add(out, bias, 0, out);
+            else {
+                float *od = (float *)out->storage->data + out->offset;
+                const float *bd = (const float *)bias->storage->data + bias->offset;
+                int64_t m = out->shape[0], n = out->shape[1];
+                for (int64_t i = 0; i < m; i++)
+                    for (int64_t j = 0; j < n; j++)
+                        od[i * n + j] += bd[j];
+            }
+        }
+        ax_compute_relu(out, out);
+    }
+
+    if (needs_grad(a, b) || (bias && bias->requires_grad))
+    {
+        out->requires_grad = true;
+        out->grad_fn = ax_make_matmul_bias_relu_backward(a, b, bias, out);
+    }
+    return out;
+}
+
 /* reductions */
 
 ax_tensor_t *ax_sum(ax_tensor_t *a, int axis)

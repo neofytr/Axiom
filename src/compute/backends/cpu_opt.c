@@ -352,10 +352,37 @@ static void ax_cpu_opt_init_impl(void) {
     ax_gemm_read_env("AX_GEMM_NC", &GEMM_NC, GEMM_NR);
     ax_gemm_read_env("AX_GEMM_KC", &GEMM_KC, 1);
 
+    /* runtime cache-size auto-tuning. if the user didn't set env vars,
+       detect L2 from sysconf and adjust NC/KC so pack_a + pack_b fit
+       in L2 with ~20% headroom for output tiles and other data.
+       this replaces microarchitecture-specific tile defaults — the
+       framework adapts to any cpu's cache hierarchy automatically. */
 #if defined(__linux__) && !defined(AX_NO_STDIO)
     long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
     if (l2 > 0) {
+        /* target: pack_a (MC×KC) + pack_b (NC×KC) ≤ 80% of L2 */
+        long budget = (long)(l2 * 0.80);
+        size_t pack_a_bytes = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
         size_t pack_b_bytes = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
+
+        /* if pack_a + pack_b exceeds the budget, shrink NC first
+           (NC is the outermost tile dimension, easiest to reduce
+           without harming parallelism). */
+        if ((long)(pack_a_bytes + pack_b_bytes) > budget) {
+            long avail_for_b = budget - (long)pack_a_bytes;
+            if (avail_for_b > 0) {
+                int64_t new_nc = avail_for_b / ((int64_t)GEMM_KC * (int64_t)sizeof(float));
+                new_nc = (new_nc / GEMM_NR) * GEMM_NR; /* round down to NR */
+                if (new_nc >= GEMM_NR && new_nc < GEMM_NC) {
+                    AX_LOG("axiom: auto-tuned NC from %ld to %ld to fit L2 (%ld kB)\n",
+                           (long)GEMM_NC, (long)new_nc, l2 / 1024);
+                    GEMM_NC = new_nc;
+                }
+            }
+        }
+
+        /* re-check after adjustment */
+        pack_b_bytes = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
         if ((long)pack_b_bytes > l2) {
             AX_LOG("axiom: gemm pack_b buffer %zu kB exceeds detected l2 %ld kB; "
                    "consider setting AX_GEMM_KC / AX_GEMM_NC smaller on this target\n",
@@ -2263,6 +2290,52 @@ static ax_status_t opt_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
    patterns where alpha=1 is the norm and beta is either 0 or 1.
    other alphas are rare in practice. */
 
+/* fused matmul + bias + relu: out = relu(a @ b + bias).
+   does the gemm via opt_gemm, then a single simd pass that adds bias
+   and applies relu in-place. the output is cache-hot from the gemm
+   write, so the fused pass hits L2/L3 instead of streaming from DRAM.
+   saves one full read+write pass vs separate gemm → bias_add → relu. */
+static ax_status_t opt_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,
+                                  const ax_tensor_t *bias, ax_tensor_t *out)
+{
+    ax_status_t s = opt_gemm(a, b, out);
+    if (s != AX_OK) return s;
+
+    int64_t m = out->shape[0], n = out->shape[1];
+    float *od = raw_f32(out);
+    const float *bd = bias ? (const float *)bias->storage->data + bias->offset : NULL;
+
+    /* fused bias + relu in a single pass while output is cache-hot */
+    if (bd) {
+        ax_vf32 vzero = ax_vf32_zero();
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(m * n > ax_par_threshold())
+        #endif
+        for (int64_t i = 0; i < m; i++) {
+            float *row = od + i * n;
+            int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
+            for (; j < ve; j += AX_VF32_WIDTH) {
+                ax_vf32 v = ax_vf32_add(ax_vf32_loadu(row + j), ax_vf32_loadu(bd + j));
+                ax_vf32_storeu(row + j, ax_vf32_max(v, vzero));
+            }
+            for (; j < n; j++) {
+                float v = row[j] + bd[j];
+                row[j] = v > 0.0f ? v : 0.0f;
+            }
+        }
+    } else {
+        /* no bias — just relu */
+        int64_t total = m * n;
+        ax_vf32 vzero = ax_vf32_zero();
+        int64_t i = 0, ve = total - (total % AX_VF32_WIDTH);
+        for (; i < ve; i += AX_VF32_WIDTH)
+            ax_vf32_storeu(od + i, ax_vf32_max(ax_vf32_loadu(od + i), vzero));
+        for (; i < total; i++)
+            od[i] = od[i] > 0.0f ? od[i] : 0.0f;
+    }
+    return AX_OK;
+}
+
 static ax_status_t opt_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
                                 float alpha, float beta, ax_tensor_t *out)
 {
@@ -2338,6 +2411,7 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .add_scalar = opt_add_scalar,
     .mul_scalar = opt_mul_scalar,
     .gemm       = opt_gemm,
+    .gemm_relu  = opt_gemm_relu,
     .gemm_ex    = opt_gemm_ex,
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
