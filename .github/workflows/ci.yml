@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  # x86_64: tests AVX2 (always) + AVX-512 (on Ice Lake runners)
+  # x86_64: full test suite + multi-model benchmarks vs TF
   test-x86:
     runs-on: ubuntu-latest
     steps:
@@ -25,7 +25,6 @@ jobs:
       - name: check ISA selection
         run: |
           cd build
-          # the runner's xeon should select avx512
           ./test_compute 2>&1 | head -5
 
       - name: download mnist data
@@ -39,72 +38,27 @@ jobs:
             gunzip "${f}.gz"
           done
 
-      - name: build ISA-specific benchmarks
-        run: |
-          cd build
-          # link against static lib (has all ISA variants bundled)
-          # the benchmark binary itself doesn't need ISA flags — the library
-          # dispatch selects the kernel at runtime via __builtin_cpu_supports.
-          # bench_large is already built by cmake; just use it directly.
-          echo "bench_large already built by cmake"
+      - name: install tensorflow
+        continue-on-error: true
+        run: pip install -q tensorflow 2>/dev/null || pip install -q tensorflow-cpu 2>/dev/null
 
-      - name: benchmark all ISA tiers + tensorflow
+      - name: benchmark axiom vs tensorflow (1.46M params)
         continue-on-error: true
         run: |
           echo "CPU: $(lscpu | grep 'Model name' | sed 's/.*: *//')"
-          echo "Cores: $(nproc) logical, $(lscpu | grep 'Core(s) per socket' | sed 's/.*: *//')"
+          echo "Cores: $(nproc) logical"
           echo ""
-
-          echo "=== AXIOM (ISA dispatch, default threads) ==="
-          timeout 120 build/bench_large train-cpu 2>&1 | grep -E "epoch|median|threads"
+          echo "=== MODEL: 784->1024->512->256->10 (1.46M params, 5 epochs) ==="
           echo ""
+          echo "--- Axiom ---"
+          timeout 120 build/bench_large train-cpu 2>&1
+          echo ""
+          echo "--- TensorFlow ---"
+          timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1 | grep -v WARNING | grep -v "I0000"
 
-          echo "=== TENSORFLOW oneDNN (default threads) ==="
-          pip install -q tensorflow 2>/dev/null || pip install -q tensorflow-cpu 2>/dev/null
-          timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1 | grep -E "epoch|median|threads"
-
-      - name: large-scale benchmark (cloud has more RAM)
+      - name: benchmark (4.2M params, 3 epochs)
         continue-on-error: true
         run: |
-          # write a quick large-model benchmark inline
-          cat > /tmp/bench_xlarge.py << 'PYEOF'
-          import os, struct, time, numpy as np
-          os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-          os.environ["CUDA_VISIBLE_DEVICES"] = ""
-          import tensorflow as tf
-          # let tf use its default thread count
-          tf.random.set_seed(42); np.random.seed(42)
-          dd = "examples/data"
-          def ri(p,n):
-              with open(p,"rb") as f: struct.unpack(">IIII",f.read(16)); return np.frombuffer(f.read(n*784),dtype=np.uint8).astype(np.float32).reshape(n,784)/255.0
-          def rl(p,n):
-              with open(p,"rb") as f: f.read(8); return np.frombuffer(f.read(n),dtype=np.uint8).astype(np.int32)
-          tx=ri(f"{dd}/train-images-idx3-ubyte",60000); ty=rl(f"{dd}/train-labels-idx1-ubyte",60000)
-          ex=ri(f"{dd}/t10k-images-idx3-ubyte",10000); ey=rl(f"{dd}/t10k-labels-idx1-ubyte",10000)
-          model = tf.keras.Sequential([
-              tf.keras.Input(shape=(784,)),
-              tf.keras.layers.Dense(2048, activation="relu"),
-              tf.keras.layers.Dense(1024, activation="relu"),
-              tf.keras.layers.Dense(512, activation="relu"),
-              tf.keras.layers.Dense(10),
-          ])
-          np_ = sum(v.numpy().size for v in model.trainable_variables)
-          model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
-          model.train_on_batch(tx[:256], ty[:256])
-          pe=[]
-          t0=time.perf_counter()
-          for e in range(3):
-              te=time.perf_counter()
-              p=np.random.permutation(len(tx)); sx,sy=tx[p],ty[p]
-              for i in range(0,len(sx),256): model.train_on_batch(sx[i:i+256],sy[i:i+256])
-              pe.append(time.perf_counter()-te)
-          tt=time.perf_counter()-t0
-          _,acc=model.evaluate(ex,ey,verbose=0,batch_size=512)
-          med=sorted(pe)[len(pe)//2]
-          print(f"TF XLARGE: {np_} params, median={med:.3f}s/epoch, total={tt:.3f}s, acc={acc*100:.2f}%")
-          PYEOF
-
-          # axiom xlarge: 784->2048->1024->512->10 (4.2M params)
           cat > /tmp/bench_xlarge.c << 'CEOF'
           #include "axiom/axiom.h"
           #include <stdio.h>
@@ -116,19 +70,13 @@ jobs:
           static uint32_t rbe(FILE*f){uint8_t b[4];if(fread(b,1,4,f)!=4)return 0;return((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];}
           int main(void){
             ax_init();ax_set_seed(42);
-            FILE*f;uint8_t*r;float*tx,*ty,*ex;uint8_t*el;
+            FILE*f;uint8_t*r;float*tx,*ty;
             f=fopen("examples/data/train-images-idx3-ubyte","rb");rbe(f);rbe(f);rbe(f);rbe(f);
             r=malloc(60000*784);fread(r,1,60000*784,f);fclose(f);
             tx=malloc(60000*784*4);for(int i=0;i<60000*784;i++)tx[i]=(float)r[i]/255.0f;free(r);
             f=fopen("examples/data/train-labels-idx1-ubyte","rb");rbe(f);rbe(f);
             uint8_t*l=malloc(60000);fread(l,1,60000,f);fclose(f);
             ty=calloc(60000*10,4);for(int i=0;i<60000;i++)ty[i*10+l[i]]=1.0f;free(l);
-            f=fopen("examples/data/t10k-images-idx3-ubyte","rb");rbe(f);rbe(f);rbe(f);rbe(f);
-            r=malloc(10000*784);fread(r,1,10000*784,f);fclose(f);
-            ex=malloc(10000*784*4);for(int i=0;i<10000*784;i++)ex[i]=(float)r[i]/255.0f;free(r);
-            f=fopen("examples/data/t10k-labels-idx1-ubyte","rb");rbe(f);rbe(f);
-            el=malloc(10000);fread(el,1,10000,f);fclose(f);
-
             ax_layer_t*fc1=ax_dense_create(784,2048,true);
             ax_layer_t*fc2=ax_dense_create(2048,1024,true);
             ax_layer_t*fc3=ax_dense_create(1024,512,true);
@@ -140,7 +88,6 @@ jobs:
             np+=ax_layer_get_params(fc4,ps+np,16-np);
             int64_t npar=0;for(int i=0;i<np;i++)npar+=ax_tensor_numel(ps[i]);
             ax_optimizer_t*opt=ax_adam_create(ps,np,1e-3f,.9f,.999f,1e-8f,0);
-
             {int64_t xs[]={256,784},ys[]={256,10};
             ax_tensor_t*wx=ax_tensor_zeros(xs,2,AX_FLOAT32),*wy=ax_tensor_zeros(ys,2,AX_FLOAT32);
             ax_tensor_t*h=ax_layer_forward(fc1,wx);h=ax_relu(h);
@@ -150,7 +97,6 @@ jobs:
             ax_tensor_t*loss=ax_cross_entropy_loss(h,wy);
             ax_optimizer_zero_grad(opt);ax_backward(loss);
             ax_graph_cleanup(loss);ax_tensor_destroy(loss);}
-
             double pe[3];double t0=now_s();
             for(int e=0;e<3;e++){
               double te=now_s();
@@ -172,19 +118,60 @@ jobs:
             double sorted[3]; memcpy(sorted,pe,sizeof(pe));
             for(int i=0;i<3;i++)for(int j=i+1;j<3;j++)if(sorted[j]<sorted[i]){double t=sorted[i];sorted[i]=sorted[j];sorted[j]=t;}
             printf("AXIOM XLARGE: %ld params, median=%.3fs/epoch, total=%.3fs\n",(long)npar,sorted[1],tt);
-            ax_shutdown();free(tx);free(ty);free(ex);free(el);return 0;
+            ax_shutdown();free(tx);free(ty);return 0;
           }
           CEOF
 
-          echo ""
-          echo "=== XLARGE MODEL: 784->2048->1024->512->10 (4.2M params, 60K train, 3 epochs) ==="
-          echo ""
+          cat > /tmp/bench_xlarge.py << 'PYEOF'
+          import os, struct, time, numpy as np
+          os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+          os.environ["CUDA_VISIBLE_DEVICES"] = ""
+          import tensorflow as tf
+          tf.random.set_seed(42); np.random.seed(42)
+          dd = "examples/data"
+          def ri(p,n):
+              with open(p,"rb") as f: struct.unpack(">IIII",f.read(16)); return np.frombuffer(f.read(n*784),dtype=np.uint8).astype(np.float32).reshape(n,784)/255.0
+          def rl(p,n):
+              with open(p,"rb") as f: f.read(8); return np.frombuffer(f.read(n),dtype=np.uint8).astype(np.int32)
+          tx=ri(f"{dd}/train-images-idx3-ubyte",60000); ty=rl(f"{dd}/train-labels-idx1-ubyte",60000)
+          model = tf.keras.Sequential([
+              tf.keras.Input(shape=(784,)),
+              tf.keras.layers.Dense(2048, activation="relu"),
+              tf.keras.layers.Dense(1024, activation="relu"),
+              tf.keras.layers.Dense(512, activation="relu"),
+              tf.keras.layers.Dense(10),
+          ])
+          np_ = sum(v.numpy().size for v in model.trainable_variables)
+          model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
+          model.train_on_batch(tx[:256], ty[:256])
+          pe=[]
+          t0=time.perf_counter()
+          for e in range(3):
+              te=time.perf_counter()
+              p=np.random.permutation(len(tx)); sx,sy=tx[p],ty[p]
+              for i in range(0,len(sx),256): model.train_on_batch(sx[i:i+256],sy[i:i+256])
+              pe.append(time.perf_counter()-te)
+          tt=time.perf_counter()-t0
+          med=sorted(pe)[len(pe)//2]
+          print(f"TF XLARGE: {np_} params, median={med:.3f}s/epoch, total={tt:.3f}s")
+          PYEOF
 
-          # also write 10M param model
-          sed 's/2048, activation="relu"/4096, activation="relu"/' /tmp/bench_xlarge.py > /tmp/bench_10m_tf.py
-          sed -i 's/Dense(1024/Dense(2048/' /tmp/bench_10m_tf.py
+          echo ""
+          echo "=== MODEL: 784->2048->1024->512->10 (4.2M params, 3 epochs) ==="
+          echo ""
+          cd build
+          gcc -O3 -mavx512f -mavx2 -mfma -fopenmp -o bench_xlarge /tmp/bench_xlarge.c \
+            -I../include libaxiom.a -lm -lgomp
+          cd ..
+          echo "--- Axiom ---"
+          timeout 300 build/bench_xlarge 2>&1
+          echo "--- TensorFlow ---"
+          timeout 300 python3 /tmp/bench_xlarge.py 2>&1 | grep -v WARNING | grep -v "I0000"
 
-          cat > /tmp/bench_10m.c << '10MCEOF'
+      - name: benchmark (12.6M params, 2 epochs)
+        continue-on-error: true
+        run: |
+          cat > /tmp/bench_10m.c << 'CEOF'
           #include "axiom/axiom.h"
           #include <stdio.h>
           #include <stdlib.h>
@@ -243,35 +230,98 @@ jobs:
             printf("AXIOM 10M: %ld params, ep1=%.3fs, ep2=%.3fs, total=%.3fs\n",(long)npar,pe[0],pe[1],tt);
             ax_shutdown();free(tx);free(ty);return 0;
           }
-          10MCEOF
+          CEOF
 
-          cd build
-          gcc -O3 -mavx512f -mavx2 -mfma -fopenmp -o bench_xlarge /tmp/bench_xlarge.c \
-            -I../include libaxiom.a -lm -lgomp
-          cd ..
-
-          echo "--- Axiom (4.2M) ---"
-          timeout 300 build/bench_xlarge 2>&1
-
-          echo "--- TensorFlow (4.2M) ---"
-          timeout 300 python3 /tmp/bench_xlarge.py 2>&1 | grep -v WARNING | grep -v "I0000"
+          cat > /tmp/bench_10m_tf.py << 'PYEOF'
+          import os, struct, time, numpy as np
+          os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+          os.environ["CUDA_VISIBLE_DEVICES"] = ""
+          import tensorflow as tf
+          tf.random.set_seed(42); np.random.seed(42)
+          dd = "examples/data"
+          def ri(p,n):
+              with open(p,"rb") as f: struct.unpack(">IIII",f.read(16)); return np.frombuffer(f.read(n*784),dtype=np.uint8).astype(np.float32).reshape(n,784)/255.0
+          def rl(p,n):
+              with open(p,"rb") as f: f.read(8); return np.frombuffer(f.read(n),dtype=np.uint8).astype(np.int32)
+          tx=ri(f"{dd}/train-images-idx3-ubyte",60000); ty=rl(f"{dd}/train-labels-idx1-ubyte",60000)
+          model = tf.keras.Sequential([
+              tf.keras.Input(shape=(784,)),
+              tf.keras.layers.Dense(4096, activation="relu"),
+              tf.keras.layers.Dense(2048, activation="relu"),
+              tf.keras.layers.Dense(512, activation="relu"),
+              tf.keras.layers.Dense(10),
+          ])
+          np_ = sum(v.numpy().size for v in model.trainable_variables)
+          model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
+          model.train_on_batch(tx[:256], ty[:256])
+          pe=[]
+          t0=time.perf_counter()
+          for e in range(2):
+              te=time.perf_counter()
+              p=np.random.permutation(len(tx)); sx,sy=tx[p],ty[p]
+              for i in range(0,len(sx),256): model.train_on_batch(sx[i:i+256],sy[i:i+256])
+              pe.append(time.perf_counter()-te)
+          tt=time.perf_counter()-t0
+          print(f"TF 10M: {np_} params, ep1={pe[0]:.3f}s, ep2={pe[1]:.3f}s, total={tt:.3f}s")
+          PYEOF
 
           echo ""
-          echo "=== 10M MODEL: 784->4096->2048->512->10 (10.5M params, 60K train, 2 epochs) ==="
+          echo "=== MODEL: 784->4096->2048->512->10 (12.6M params, 2 epochs) ==="
           echo ""
-
           cd build
           gcc -O3 -mavx512f -mavx2 -mfma -fopenmp -o bench_10m /tmp/bench_10m.c \
             -I../include libaxiom.a -lm -lgomp
           cd ..
-
-          echo "--- Axiom (10M) ---"
+          echo "--- Axiom ---"
           timeout 600 build/bench_10m 2>&1
-
-          echo "--- TensorFlow (10M) ---"
+          echo "--- TensorFlow ---"
           timeout 600 python3 /tmp/bench_10m_tf.py 2>&1 | grep -v WARNING | grep -v "I0000"
 
-  # aarch64: try native graviton runner, fall back to qemu
+      - name: inference throughput benchmark
+        continue-on-error: true
+        run: |
+          echo ""
+          echo "=== INFERENCE THROUGHPUT (batch=256, 1000 iters) ==="
+          echo ""
+          echo "--- Axiom ---"
+          timeout 60 build/bench_large infer-cpu 2>&1
+          echo ""
+          echo "--- TensorFlow ---"
+          timeout 60 python3 benchmarks/bench_large_tf.py infer 2>&1 | grep -v WARNING | grep -v "I0000"
+
+  # x86_64 address sanitizer: catches memory bugs
+  test-x86-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build (ASan + UBSan)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Debug -DAX_SANITIZE=ON ..
+          cmake --build . -j$(nproc)
+
+      - name: test under sanitizers
+        run: |
+          cd build
+          ASAN_OPTIONS=detect_leaks=0 ctest --output-on-failure
+
+  # x86_64 inference-only build: verifies embedded profile compiles
+  test-x86-inference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build (inference only)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_INFERENCE_ONLY=ON ..
+          cmake --build . -j$(nproc)
+
+      - name: test (forward-path only)
+        run: cd build && ctest --output-on-failure
+
+  # aarch64: native NEON kernel testing + benchmark
   test-arm:
     runs-on: ubuntu-24.04-arm
     continue-on-error: true
@@ -302,8 +352,10 @@ jobs:
         continue-on-error: true
         run: |
           echo "CPU: $(lscpu | grep 'Model name' | sed 's/.*: *//')"
+          echo "Cores: $(nproc) logical"
+          echo ""
           if [ -f build/bench_large ] && [ -f examples/data/train-images-idx3-ubyte ]; then
-            echo "=== AXIOM NEON (8x12 kernel) ==="
+            echo "=== AXIOM NEON (1.46M params, 5 epochs) ==="
             timeout 120 build/bench_large train-cpu 2>&1
           fi
 
@@ -312,9 +364,123 @@ jobs:
         run: |
           pip install -q tensorflow 2>/dev/null || pip install -q tensorflow-cpu 2>/dev/null || true
           if [ -f benchmarks/bench_large_tf.py ] && [ -f examples/data/train-images-idx3-ubyte ]; then
-            echo "=== TENSORFLOW (ARM, default threads) ==="
+            echo "=== TENSORFLOW (ARM, 1.46M params, 5 epochs) ==="
             timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1 | grep -v WARNING | grep -v "I0000"
           fi
+
+      - name: benchmark large model (ARM, 4.2M params)
+        continue-on-error: true
+        run: |
+          if [ ! -f examples/data/train-images-idx3-ubyte ]; then exit 0; fi
+
+          cat > /tmp/bench_xlarge_arm.c << 'CEOF'
+          #include "axiom/axiom.h"
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <stdint.h>
+          #include <time.h>
+          static double now_s(void){struct timespec ts;clock_gettime(CLOCK_MONOTONIC,&ts);return(double)ts.tv_sec+(double)ts.tv_nsec/1e9;}
+          static uint32_t rbe(FILE*f){uint8_t b[4];if(fread(b,1,4,f)!=4)return 0;return((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];}
+          int main(void){
+            ax_init();ax_set_seed(42);
+            FILE*f;uint8_t*r;float*tx,*ty;
+            f=fopen("examples/data/train-images-idx3-ubyte","rb");rbe(f);rbe(f);rbe(f);rbe(f);
+            r=malloc(60000*784);fread(r,1,60000*784,f);fclose(f);
+            tx=malloc(60000*784*4);for(int i=0;i<60000*784;i++)tx[i]=(float)r[i]/255.0f;free(r);
+            f=fopen("examples/data/train-labels-idx1-ubyte","rb");rbe(f);rbe(f);
+            uint8_t*l=malloc(60000);fread(l,1,60000,f);fclose(f);
+            ty=calloc(60000*10,4);for(int i=0;i<60000;i++)ty[i*10+l[i]]=1.0f;free(l);
+            ax_layer_t*fc1=ax_dense_create(784,2048,true);
+            ax_layer_t*fc2=ax_dense_create(2048,1024,true);
+            ax_layer_t*fc3=ax_dense_create(1024,512,true);
+            ax_layer_t*fc4=ax_dense_create(512,10,true);
+            ax_tensor_t*ps[16];int np=0;
+            np+=ax_layer_get_params(fc1,ps+np,16-np);
+            np+=ax_layer_get_params(fc2,ps+np,16-np);
+            np+=ax_layer_get_params(fc3,ps+np,16-np);
+            np+=ax_layer_get_params(fc4,ps+np,16-np);
+            int64_t npar=0;for(int i=0;i<np;i++)npar+=ax_tensor_numel(ps[i]);
+            ax_optimizer_t*opt=ax_adam_create(ps,np,1e-3f,.9f,.999f,1e-8f,0);
+            {int64_t xs[]={256,784},ys[]={256,10};
+            ax_tensor_t*wx=ax_tensor_zeros(xs,2,AX_FLOAT32),*wy=ax_tensor_zeros(ys,2,AX_FLOAT32);
+            ax_tensor_t*h=ax_layer_forward(fc1,wx);h=ax_relu(h);
+            h=ax_layer_forward(fc2,h);h=ax_relu(h);
+            h=ax_layer_forward(fc3,h);h=ax_relu(h);
+            h=ax_layer_forward(fc4,h);
+            ax_tensor_t*loss=ax_cross_entropy_loss(h,wy);
+            ax_optimizer_zero_grad(opt);ax_backward(loss);
+            ax_graph_cleanup(loss);ax_tensor_destroy(loss);}
+            double pe[3];double t0=now_s();
+            for(int e=0;e<3;e++){
+              double te=now_s();
+              for(int64_t i=0;i+256<=60000;i+=256){
+                int64_t xs[]={256,784},ys[]={256,10};
+                ax_tensor_t*xb=ax_tensor_from_array(tx+i*784,xs,2,AX_FLOAT32);
+                ax_tensor_t*yb=ax_tensor_from_array(ty+i*10,ys,2,AX_FLOAT32);
+                ax_tensor_t*h=ax_layer_forward(fc1,xb);h=ax_relu(h);
+                h=ax_layer_forward(fc2,h);h=ax_relu(h);
+                h=ax_layer_forward(fc3,h);h=ax_relu(h);
+                h=ax_layer_forward(fc4,h);
+                ax_tensor_t*loss=ax_cross_entropy_loss(h,yb);
+                ax_optimizer_zero_grad(opt);ax_backward(loss);ax_optimizer_step(opt);
+                ax_graph_cleanup(loss);ax_tensor_destroy(loss);
+              }
+              pe[e]=now_s()-te;
+            }
+            double tt=now_s()-t0;
+            double sorted[3]; memcpy(sorted,pe,sizeof(pe));
+            for(int i=0;i<3;i++)for(int j=i+1;j<3;j++)if(sorted[j]<sorted[i]){double t=sorted[i];sorted[i]=sorted[j];sorted[j]=t;}
+            printf("AXIOM ARM XLARGE: %ld params, median=%.3fs/epoch, total=%.3fs\n",(long)npar,sorted[1],tt);
+            ax_shutdown();free(tx);free(ty);return 0;
+          }
+          CEOF
+
+          cat > /tmp/bench_xlarge_arm_tf.py << 'PYEOF'
+          import os, struct, time, numpy as np
+          os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+          os.environ["CUDA_VISIBLE_DEVICES"] = ""
+          import tensorflow as tf
+          tf.random.set_seed(42); np.random.seed(42)
+          dd = "examples/data"
+          def ri(p,n):
+              with open(p,"rb") as f: struct.unpack(">IIII",f.read(16)); return np.frombuffer(f.read(n*784),dtype=np.uint8).astype(np.float32).reshape(n,784)/255.0
+          def rl(p,n):
+              with open(p,"rb") as f: f.read(8); return np.frombuffer(f.read(n),dtype=np.uint8).astype(np.int32)
+          tx=ri(f"{dd}/train-images-idx3-ubyte",60000); ty=rl(f"{dd}/train-labels-idx1-ubyte",60000)
+          model = tf.keras.Sequential([
+              tf.keras.Input(shape=(784,)),
+              tf.keras.layers.Dense(2048, activation="relu"),
+              tf.keras.layers.Dense(1024, activation="relu"),
+              tf.keras.layers.Dense(512, activation="relu"),
+              tf.keras.layers.Dense(10),
+          ])
+          np_ = sum(v.numpy().size for v in model.trainable_variables)
+          model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True), metrics=["accuracy"])
+          model.train_on_batch(tx[:256], ty[:256])
+          pe=[]
+          t0=time.perf_counter()
+          for e in range(3):
+              te=time.perf_counter()
+              p=np.random.permutation(len(tx)); sx,sy=tx[p],ty[p]
+              for i in range(0,len(sx),256): model.train_on_batch(sx[i:i+256],sy[i:i+256])
+              pe.append(time.perf_counter()-te)
+          tt=time.perf_counter()-t0
+          med=sorted(pe)[len(pe)//2]
+          print(f"TF ARM XLARGE: {np_} params, median={med:.3f}s/epoch, total={tt:.3f}s")
+          PYEOF
+
+          echo ""
+          echo "=== ARM MODEL: 784->2048->1024->512->10 (4.2M params, 3 epochs) ==="
+          echo ""
+          cd build
+          gcc -O3 -fopenmp -o bench_xlarge_arm /tmp/bench_xlarge_arm.c \
+            -I../include libaxiom.a -lm -lgomp
+          cd ..
+          echo "--- Axiom (ARM) ---"
+          timeout 300 build/bench_xlarge_arm 2>&1
+          echo "--- TensorFlow (ARM) ---"
+          timeout 300 python3 /tmp/bench_xlarge_arm_tf.py 2>&1 | grep -v WARNING | grep -v "I0000" || true
 
   # x86_64 + CUDA: tests GPU backend (if runner has nvidia GPU)
   test-cuda:

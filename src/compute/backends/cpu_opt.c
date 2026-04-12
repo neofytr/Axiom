@@ -368,7 +368,12 @@ static void ax_cpu_opt_init_impl(void) {
         if ((long)pack_a_bytes > l1_budget) {
             int64_t new_mc = l1_budget / ((int64_t)GEMM_KC * (int64_t)sizeof(float));
             new_mc = (new_mc / GEMM_MR) * GEMM_MR;
-            if (new_mc >= GEMM_MR && new_mc < GEMM_MC) {
+            /* floor: keep at least 8 MR-tiles so IC parallelism stays useful.
+               on 32KB L1d (zen3/4) this means MC=max(24,48)=48 — pack_a
+               spills ~25% past L1d but trades that for better IC occupancy. */
+            int64_t mc_floor = GEMM_MR * 8;
+            if (new_mc < mc_floor) new_mc = mc_floor;
+            if (new_mc < GEMM_MC) {
                 AX_LOG("axiom: auto-tuned MC from %ld to %ld to fit L1d (%ld kB)\n",
                        (long)GEMM_MC, (long)new_mc, l1d / 1024);
                 GEMM_MC = new_mc;

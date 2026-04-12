@@ -362,21 +362,83 @@ static inline ax_vf32 ax_vf32_fmadd(ax_vf32 a, ax_vf32 b, ax_vf32 c) { return vf
 static inline ax_vf32 ax_vf32_sqrt(ax_vf32 a)          { return vsqrtq_f32(a); }
 static inline ax_vf32 ax_vf32_relu(ax_vf32 a)          { return vmaxq_f32(a, vdupq_n_f32(0.0f)); }
 
-/* scalar fallbacks for transcendentals on NEON */
-static inline ax_vf32 ax_vf32_exp(ax_vf32 a) {
-    float tmp[4]; vst1q_f32(tmp, a);
-    for (int i = 0; i < 4; i++) {
-        if (tmp[i] > 88.0f) tmp[i] = 88.0f;
-        if (tmp[i] < -88.0f) tmp[i] = -88.0f;
-        tmp[i] = expf(tmp[i]);
-    }
-    return vld1q_f32(tmp);
+/* vectorized exp: same polynomial as avx2 ported to neon intrinsics.
+   exp(x) = 2^n * poly(f) where n = round(x/ln2), f = x/ln2 - n */
+static inline ax_vf32 ax_vf32_exp(ax_vf32 x) {
+    x = vmaxq_f32(x, vdupq_n_f32(-88.0f));
+    x = vminq_f32(x, vdupq_n_f32(88.0f));
+
+    float32x4_t ln2_inv = vdupq_n_f32(1.4426950408889634f);
+    float32x4_t t = vmulq_f32(x, ln2_inv);
+    float32x4_t tn = vrndnq_f32(t);
+    float32x4_t f = vsubq_f32(t, tn);
+
+    /* 2^n via integer exponent bit shift */
+    int32x4_t ni = vcvtq_s32_f32(tn);
+    int32x4_t exp_bits = vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23);
+    float32x4_t pow2n = vreinterpretq_f32_s32(exp_bits);
+
+    /* degree-5 poly for 2^f, f in [-0.5, 0.5] */
+    float32x4_t p = vdupq_n_f32(0.0013376f);
+    p = vfmaq_f32(vdupq_n_f32(0.0096813f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(0.0554953f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(0.2402265f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(0.6931472f), p, f);
+    p = vfmaq_f32(vdupq_n_f32(1.0f),       p, f);
+
+    return vmulq_f32(p, pow2n);
 }
-/* TODO: port AVX2 poly log to NEON */
-static inline ax_vf32 ax_vf32_log(ax_vf32 a) {
-    float tmp[4]; vst1q_f32(tmp, a);
-    for (int i = 0; i < 4; i++) tmp[i] = logf(tmp[i]);
-    return vld1q_f32(tmp);
+
+/* vectorized log: cephes-style frexp decomposition with degree-8 poly.
+   same algorithm as avx2 log ported to neon. */
+static inline ax_vf32 ax_vf32_log(ax_vf32 x) {
+    float32x4_t min_norm = vdupq_n_f32(1.17549435e-38f);
+    x = vmaxq_f32(x, min_norm);
+
+    int32x4_t xi = vreinterpretq_s32_f32(x);
+
+    /* extract exponent, unbias */
+    int32x4_t ei = vsubq_s32(vshrq_n_s32(xi, 23), vdupq_n_s32(0x7f));
+
+    /* mantissa in [0.5, 1) */
+    int32x4_t mi = vorrq_s32(vandq_s32(xi, vdupq_n_s32(0x007FFFFF)),
+                              vdupq_n_s32(0x3F000000));
+    float32x4_t m = vreinterpretq_f32_s32(mi);
+    float32x4_t e = vcvtq_f32_s32(ei);
+    e = vaddq_f32(e, vdupq_n_f32(1.0f));
+
+    /* if m < sqrt(0.5), double m and decrement e */
+    float32x4_t sqrt_half = vdupq_n_f32(0.707106781f);
+    uint32x4_t lt_mask = vcltq_f32(m, sqrt_half);
+    float32x4_t m_masked = vreinterpretq_f32_u32(
+        vandq_u32(lt_mask, vreinterpretq_u32_f32(m)));
+    m = vsubq_f32(m, vdupq_n_f32(1.0f));
+    e = vsubq_f32(e, vreinterpretq_f32_u32(
+        vandq_u32(lt_mask, vreinterpretq_u32_f32(vdupq_n_f32(1.0f)))));
+    m = vaddq_f32(m, m_masked);
+
+    float32x4_t z = m;
+    float32x4_t z2 = vmulq_f32(z, z);
+
+    /* degree-8 horner poly, cephes coefficients */
+    float32x4_t p = vdupq_n_f32(7.0376836292e-2f);
+    p = vfmaq_f32(vdupq_n_f32(-1.1514610310e-1f), p, z);
+    p = vfmaq_f32(vdupq_n_f32( 1.1676998740e-1f), p, z);
+    p = vfmaq_f32(vdupq_n_f32(-1.2420140846e-1f), p, z);
+    p = vfmaq_f32(vdupq_n_f32( 1.4249322787e-1f), p, z);
+    p = vfmaq_f32(vdupq_n_f32(-1.6668057665e-1f), p, z);
+    p = vfmaq_f32(vdupq_n_f32( 2.0000714765e-1f), p, z);
+    p = vfmaq_f32(vdupq_n_f32(-2.4999993993e-1f), p, z);
+    p = vfmaq_f32(vdupq_n_f32( 3.3333331174e-1f), p, z);
+    p = vmulq_f32(p, z);
+    p = vmulq_f32(p, z2);
+
+    /* log(1+z) = z - 0.5*z^2 + z^3 * P(z) */
+    float32x4_t half_z2 = vmulq_f32(z2, vdupq_n_f32(-0.5f));
+    float32x4_t log1pz = vaddq_f32(vaddq_f32(z, half_z2), p);
+
+    /* combine: log(x) = e * ln2 + log(1+z) */
+    return vfmaq_f32(log1pz, e, vdupq_n_f32(0.6931471805f));
 }
 static inline ax_vf32 ax_vf32_sigmoid(ax_vf32 x) {
     ax_vf32 neg_x = vnegq_f32(x);

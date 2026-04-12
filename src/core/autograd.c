@@ -48,8 +48,17 @@ ax_arena_t *ax_forward_arena(void)
     return forward_arena;
 }
 
-void ax_no_grad(void)    { grad_tracking = false; }
-void ax_enable_grad(void){ grad_tracking = true; }
+/* nestable no-grad: ax_no_grad increments a depth counter,
+   ax_enable_grad decrements. grad is enabled only at depth 0.
+   this lets library code safely disable grad without clobbering
+   the caller's no-grad scope. */
+static _Thread_local int no_grad_depth = 0;
+
+void ax_no_grad(void)    { no_grad_depth++; grad_tracking = false; }
+void ax_enable_grad(void){
+    if (no_grad_depth > 0) no_grad_depth--;
+    if (no_grad_depth == 0) grad_tracking = true;
+}
 bool ax_grad_enabled(void){ return grad_tracking; }
 
 /* thread-local slab allocator for ax_grad_fn_t — eliminates per-op calloc.

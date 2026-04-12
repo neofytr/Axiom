@@ -308,6 +308,7 @@ if(NOT AX_INFERENCE_ONLY)
         tests/test_serialize_all.c
         tests/test_lr_sched.c
         tests/test_inplace.c
+        tests/test_stress.c
     )
 endif()
 

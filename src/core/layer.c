@@ -174,6 +174,15 @@ ax_layer_t *ax_softmax_layer_create(int axis)
 
 /* sequential model */
 
+/* fused dense+relu: called when sequential detects Dense followed by ReLU.
+   uses the gemm_relu kernel that keeps the output cache-hot through both ops. */
+static ax_tensor_t *dense_relu_forward(ax_layer_t *dense_layer, ax_tensor_t *input)
+{
+    ax_dense_t *d = (ax_dense_t *)dense_layer;
+    return ax_matmul_bias_relu(input, d->weight,
+                               (d->use_bias && d->bias) ? d->bias : NULL);
+}
+
 static ax_tensor_t *sequential_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_sequential_t *seq = (ax_sequential_t *)self;
@@ -182,7 +191,21 @@ static ax_tensor_t *sequential_forward(ax_layer_t *self, ax_tensor_t *input)
 
     for (int i = 0; i < seq->n_layers; i++)
     {
-        ax_tensor_t *next = ax_layer_forward(seq->layers[i], x);
+        ax_tensor_t *next;
+
+        /* fuse Dense + ReLU into one op when possible */
+        if (seq->layers[i]->type == AX_LAYER_DENSE &&
+            i + 1 < seq->n_layers &&
+            seq->layers[i + 1]->type == AX_LAYER_RELU)
+        {
+            next = dense_relu_forward(seq->layers[i], x);
+            i++; /* skip the relu layer */
+        }
+        else
+        {
+            next = ax_layer_forward(seq->layers[i], x);
+        }
+
         if (!next)
         {
             /* clean up previous intermediate on failure */

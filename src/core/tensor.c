@@ -812,9 +812,11 @@ void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
         if (!ops || !ops->memcpy_h2d) return;
         void *dst = (char *)t->storage->data + offset * sizeof(float);
         ops->memcpy_h2d(dst, &value, sizeof(float));
+        ax_storage_touch(t->storage);
         return;
     }
     ((float *)t->storage->data)[(size_t)offset] = value;
+    ax_storage_touch(t->storage);
 }
 
 /* view / copy */

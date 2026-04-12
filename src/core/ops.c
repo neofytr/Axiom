@@ -329,17 +329,19 @@ ax_tensor_t *ax_matmul_bias(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias)
         if (ax_compute_has_bias_add()) {
             ax_compute_bias_add(out, bias, 0, out);
         } else {
-            /* scalar fallback: bias is [N], out is [M, N] */
+            /* scalar fallback: bias is [N], out is [M, N].
+               respects bias strides for non-contiguous views. */
             float *od = (float *)out->storage->data + out->offset;
             const float *bd = (const float *)bias->storage->data + bias->offset;
             int64_t m = out->shape[0], n = out->shape[1];
+            int64_t b_stride = (bias->ndim >= 1) ? bias->strides[bias->ndim - 1] : 1;
             for (int64_t i = 0; i < m; i++)
                 for (int64_t j = 0; j < n; j++)
-                    od[i * n + j] += bd[j];
+                    od[i * n + j] += bd[j * b_stride];
         }
     }
 
-    if (needs_grad(a, b) || (bias && bias->requires_grad))
+    if (ax_grad_enabled() && (needs_grad(a, b) || (bias && bias->requires_grad)))
     {
         out->requires_grad = true;
         out->grad_fn = ax_make_matmul_bias_backward(a, b, bias, out);
@@ -380,15 +382,16 @@ ax_tensor_t *ax_matmul_bias_relu(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bi
                 float *od = (float *)out->storage->data + out->offset;
                 const float *bd = (const float *)bias->storage->data + bias->offset;
                 int64_t m = out->shape[0], n = out->shape[1];
+                int64_t b_stride = (bias->ndim >= 1) ? bias->strides[bias->ndim - 1] : 1;
                 for (int64_t i = 0; i < m; i++)
                     for (int64_t j = 0; j < n; j++)
-                        od[i * n + j] += bd[j];
+                        od[i * n + j] += bd[j * b_stride];
             }
         }
         ax_compute_relu(out, out);
     }
 
-    if (needs_grad(a, b) || (bias && bias->requires_grad))
+    if (ax_grad_enabled() && (needs_grad(a, b) || (bias && bias->requires_grad)))
     {
         out->requires_grad = true;
         out->grad_fn = ax_make_matmul_bias_relu_backward(a, b, bias, out);
