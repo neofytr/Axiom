@@ -335,6 +335,46 @@ static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
     }
 }
 
+/* pack an MC x KC panel of A^T, where the physical source a_src is
+   stored [K, M] row-major with lda == M. A^T[i,p] = a_src[p*lda + i].
+   produces the same layout as pack_a so the shared micro_kernel works. */
+static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc,
+                      int64_t m_remain, float *packed)
+{
+    for (int64_t i = 0; i < mc; i += GEMM_MR) {
+        int64_t mr = (i + GEMM_MR <= m_remain) ? GEMM_MR : (m_remain > i ? m_remain - i : 0);
+        for (int64_t p = 0; p < kc; p++) {
+            for (int64_t ii = 0; ii < GEMM_MR; ii++) {
+                if (ii < mr)
+                    packed[ii] = a_src[p * lda_src + (i + ii)];
+                else
+                    packed[ii] = 0.0f;
+            }
+            packed += GEMM_MR;
+        }
+    }
+}
+
+/* pack a KC x NC panel of B^T, where the physical source b_src is
+   stored [N, K] row-major with ldb == K. B^T[p,j] = b_src[j*ldb + p].
+   produces the same layout as pack_b. */
+static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc,
+                      int64_t n_remain, float *packed)
+{
+    for (int64_t j = 0; j < nc; j += GEMM_NR) {
+        int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
+        for (int64_t p = 0; p < kc; p++) {
+            for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                if (jj < nr)
+                    packed[jj] = b_src[(j + jj) * ldb_src + p];
+                else
+                    packed[jj] = 0.0f;
+            }
+            packed += GEMM_NR;
+        }
+    }
+}
+
 /* pack a KC x NC panel of B (row-major) into contiguous NR-col strips */
 static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
                     int64_t n_remain, float *packed)
@@ -1329,6 +1369,274 @@ static ax_status_t opt_copy(const ax_tensor_t *src, ax_tensor_t *dst) {
 }
 
 
+/* transposed-b gemm: out = a @ b^T.
+   shape contract: a is [m, k], b is [n, k], out is [m, n].
+   reuses the packed BLIS tile loop with pack_b_t in place of pack_b.
+   for simplicity this path skips the small-matrix fast-path and the
+   pack_b cache — backward-pass gemms are called once per layer per
+   step with unique shapes, so the cache would miss anyway. */
+static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
+    if (!a || !b || !out) { ax_err_set(AX_ERR_NULL_ARG, "gemm_nt: NULL"); return AX_ERR_NULL_ARG; }
+    if (a->dtype != AX_FLOAT32 || b->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (a->ndim != 2 || b->ndim != 2 || out->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t m = a->shape[0], k = a->shape[1];
+    int64_t n = b->shape[0];
+    if (b->shape[1] != k || out->shape[0] != m || out->shape[1] != n) return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(a) < 0 || validate_contig_f32(b) < 0 || validate_contig_f32(out) < 0)
+        return AX_ERR_BACKEND;
+
+    const float *ad = raw_f32(a);
+    const float *bd = raw_f32(b);  /* [n, k] — walked as if transposed */
+    float *od = raw_f32(out);
+
+    /* plain b cache would give stale/incorrect hits here — different packer */
+    pack_b_cache_invalidate();
+
+    /* small-path: straight vectorized inner loop. b[j, p] is accessed
+       column-wise by j for each p — strided. scalar fallback is simplest. */
+    if (m * n * k < 100000) {
+        memset(od, 0, (size_t)(m * n) * sizeof(float));
+        for (int64_t i = 0; i < m; i++) {
+            const float *ai = ad + i * k;
+            float *oi = od + i * n;
+            for (int64_t j = 0; j < n; j++) {
+                const float *bj = bd + j * k;
+                ax_vf32 acc = ax_vf32_zero();
+                int64_t p = 0;
+                int64_t vec_end = k - (k % AX_VF32_WIDTH);
+                for (; p < vec_end; p += AX_VF32_WIDTH)
+                    acc = ax_vf32_fmadd(ax_vf32_loadu(ai + p), ax_vf32_loadu(bj + p), acc);
+                float s = ax_vf32_hsum(acc);
+                for (; p < k; p++) s += ai[p] * bj[p];
+                oi[j] = s;
+            }
+        }
+        return AX_OK;
+    }
+
+    if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
+    float *pack_a_buf = tl_pack_a_buf;
+    float *pack_b_buf = tl_pack_b_buf;
+    memset(od, 0, (size_t)(m * n) * sizeof(float));
+
+    for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+        int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+        for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+            int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            /* pack B^T: source b[j*k + p], we want packed[p*NR + jj] = b[(jc+j+jj)*k + pc + p] */
+            pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, pack_b_buf);
+            for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                    int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                    for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                        int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                        micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                     od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                    }
+                }
+            }
+        }
+    }
+    pack_b_cache_invalidate();
+    return AX_OK;
+}
+
+/* transposed-a gemm: out = a^T @ b.
+   shape contract: a is [k, m], b is [k, n], out is [m, n].
+   reuses the tile loop with pack_a_t in place of pack_a. */
+static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
+    if (!a || !b || !out) { ax_err_set(AX_ERR_NULL_ARG, "gemm_tn: NULL"); return AX_ERR_NULL_ARG; }
+    if (a->dtype != AX_FLOAT32 || b->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (a->ndim != 2 || b->ndim != 2 || out->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t k = a->shape[0], m = a->shape[1];
+    int64_t n = b->shape[1];
+    if (b->shape[0] != k || out->shape[0] != m || out->shape[1] != n) return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(a) < 0 || validate_contig_f32(b) < 0 || validate_contig_f32(out) < 0)
+        return AX_ERR_BACKEND;
+
+    const float *ad = raw_f32(a);  /* [k, m] — walked as if transposed */
+    const float *bd = raw_f32(b);
+    float *od = raw_f32(out);
+
+    pack_b_cache_invalidate();
+
+    if (m * n * k < 100000) {
+        memset(od, 0, (size_t)(m * n) * sizeof(float));
+        /* scalar-simd inner: out[i,j] = sum_p a[p,i] * b[p,j].
+           iterate p outer, (i,j) inner to keep b[p,:] contiguous. */
+        for (int64_t p = 0; p < k; p++) {
+            const float *bp = bd + p * n;
+            const float *ap = ad + p * m;
+            for (int64_t i = 0; i < m; i++) {
+                float ai = ap[i];
+                float *oi = od + i * n;
+                ax_vf32 va = ax_vf32_set1(ai);
+                int64_t j = 0;
+                int64_t vec_end = n - (n % AX_VF32_WIDTH);
+                if (p == 0) {
+                    /* first pass: initialize oi to ai * bp */
+                    for (; j < vec_end; j += AX_VF32_WIDTH)
+                        ax_vf32_storeu(oi + j, ax_vf32_mul(va, ax_vf32_loadu(bp + j)));
+                    for (; j < n; j++) oi[j] = ai * bp[j];
+                } else {
+                    for (; j < vec_end; j += AX_VF32_WIDTH)
+                        ax_vf32_storeu(oi + j, ax_vf32_fmadd(va, ax_vf32_loadu(bp + j), ax_vf32_loadu(oi + j)));
+                    for (; j < n; j++) oi[j] += ai * bp[j];
+                }
+            }
+        }
+        return AX_OK;
+    }
+
+    if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
+    float *pack_a_buf = tl_pack_a_buf;
+    float *pack_b_buf = tl_pack_b_buf;
+    memset(od, 0, (size_t)(m * n) * sizeof(float));
+
+    for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+        int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
+        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+        for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
+            int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
+            for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                /* pack A^T: source a[k, m], slice is [pc:pc+kc, ic:ic+mc] in A^T space,
+                   i.e. we want packed[ii,p] = a[pc+p, ic+ii] = a_src[(pc+p)*m + ic+ii]. */
+                pack_a_t(ad + pc * m + ic, m, mc_pack, kc, mc, pack_a_buf);
+                for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                    int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                    for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                        int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                        micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                     od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                    }
+                }
+            }
+        }
+    }
+    pack_b_cache_invalidate();
+    return AX_OK;
+}
+
+/* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias.
+   bias is rank-1, numel == in->shape[axis]. single-pass fused write
+   to out. broadcast is along `axis` — the stride of the bias lookup
+   is 1 per AX_VF32_WIDTH elements ONLY when axis == ndim-1 (innermost).
+   for axis != innermost, use a per-group scalar fill + simd add. */
+static ax_status_t opt_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
+                                 int axis, ax_tensor_t *out) {
+    if (!in || !bias || !out) return AX_ERR_NULL_ARG;
+    if (validate_contig_f32(in) < 0 || validate_contig_f32(bias) < 0 || validate_contig_f32(out) < 0)
+        return ax_cpu_naive_ops.add ? ax_cpu_naive_ops.add(in, bias, out) : AX_ERR_BACKEND;
+    if (bias->ndim != 1) return AX_ERR_SHAPE_MISMATCH;
+    if (axis < 0 || axis >= in->ndim) return AX_ERR_INVALID_AXIS;
+    if (bias->shape[0] != in->shape[axis]) return AX_ERR_SHAPE_MISMATCH;
+    if (in->ndim != out->ndim) return AX_ERR_SHAPE_MISMATCH;
+    for (int d = 0; d < in->ndim; d++)
+        if (in->shape[d] != out->shape[d]) return AX_ERR_SHAPE_MISMATCH;
+
+    const float *id = raw_f32(in);
+    const float *bd = raw_f32(bias);
+    float *od = raw_f32(out);
+    int64_t n = fast_numel(in);
+
+    /* compute outer, axis_len, inner:
+       outer = product of shape[0..axis)
+       axis_len = shape[axis]
+       inner = product of shape[axis+1..ndim) */
+    int64_t outer = 1, inner = 1;
+    for (int d = 0; d < axis; d++) outer *= in->shape[d];
+    int64_t axis_len = in->shape[axis];
+    for (int d = axis + 1; d < in->ndim; d++) inner *= in->shape[d];
+
+    /* for every (outer, axis, inner) group, broadcast bias[axis] over inner elements */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) collapse(2) if(n > ax_par_threshold())
+#else
+    (void)n;
+#endif
+    for (int64_t o = 0; o < outer; o++) {
+        for (int64_t a = 0; a < axis_len; a++) {
+            const float *ip = id + (o * axis_len + a) * inner;
+            float *op = od + (o * axis_len + a) * inner;
+            float bv = bd[a];
+            ax_vf32 vb = ax_vf32_set1(bv);
+            int64_t i = 0;
+            int64_t vec_end = inner - (inner % AX_VF32_WIDTH);
+            for (; i < vec_end; i += AX_VF32_WIDTH)
+                ax_vf32_storeu(op + i, ax_vf32_add(ax_vf32_loadu(ip + i), vb));
+            for (; i < inner; i++) op[i] = ip[i] + bv;
+        }
+    }
+    return AX_OK;
+}
+
+/* argmax along an axis. output is contig int64 with rank in->ndim-1
+   (reduced dim removed). axis=-1 reduces everything to one scalar.
+   fast path: full reduction via one linear scan over the flat buffer.
+   general axis=k: outer x axis_len x inner layout with scalar scan along
+   axis — simd is not straightforward because we'd need to track indices
+   alongside values. scalar is fine for an accuracy-counting hot path. */
+static ax_status_t opt_argmax(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
+    if (!in || !out) return AX_ERR_NULL_ARG;
+    if (in->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
+    if (out->dtype != AX_INT64) return AX_ERR_DTYPE_MISMATCH;
+    if (validate_contig_f32(in) < 0) return AX_ERR_BACKEND;
+    if (!out->storage || !out->storage->data) return AX_ERR_BACKEND;
+
+    const float *id = raw_f32(in);
+    int64_t *od = (int64_t *)out->storage->data;
+    int64_t n = fast_numel(in);
+
+    if (axis == -1) {
+        if (fast_numel(out) != 1) return AX_ERR_SHAPE_MISMATCH;
+        int64_t best = 0;
+        float bestv = id[0];
+        for (int64_t i = 1; i < n; i++) {
+            if (id[i] > bestv) { bestv = id[i]; best = i; }
+        }
+        od[0] = best;
+        return AX_OK;
+    }
+
+    if (axis < 0 || axis >= in->ndim) return AX_ERR_INVALID_AXIS;
+
+    int64_t outer = 1, inner = 1;
+    for (int d = 0; d < axis; d++) outer *= in->shape[d];
+    int64_t axis_len = in->shape[axis];
+    for (int d = axis + 1; d < in->ndim; d++) inner *= in->shape[d];
+
+    if (fast_numel(out) != outer * inner) return AX_ERR_SHAPE_MISMATCH;
+
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if(outer * inner > ax_par_threshold() / 4)
+#endif
+    for (int64_t oi = 0; oi < outer * inner; oi++) {
+        int64_t o = oi / inner;
+        int64_t i = oi - o * inner;
+        const float *base = id + o * axis_len * inner + i;
+        int64_t best = 0;
+        float bestv = base[0];
+        for (int64_t a = 1; a < axis_len; a++) {
+            float v = base[a * inner];
+            if (v > bestv) { bestv = v; best = a; }
+        }
+        od[oi] = best;
+    }
+    return AX_OK;
+}
+
+
 /* vtable registration */
 
 const ax_backend_ops_t ax_cpu_opt_ops = {
@@ -1346,11 +1654,15 @@ const ax_backend_ops_t ax_cpu_opt_ops = {
     .add_scalar = opt_add_scalar,
     .mul_scalar = opt_mul_scalar,
     .gemm       = opt_gemm,
+    .gemm_nt    = opt_gemm_nt,
+    .gemm_tn    = opt_gemm_tn,
+    .bias_add   = opt_bias_add,
     .conv_gemm  = opt_conv_gemm,
     .sum        = opt_sum,
     .mean       = opt_mean,
     .max_op     = opt_max,
     .min_op     = opt_min,
+    .argmax     = opt_argmax,
     .equal      = opt_equal,
     .greater    = opt_greater,
     .fill       = opt_fill,
