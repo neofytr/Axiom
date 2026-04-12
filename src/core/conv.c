@@ -34,6 +34,14 @@
 #include <inttypes.h>
 #include <float.h>
 
+/* overflow-checked multiply. returns -1 on overflow. */
+static inline int64_t safe_mul(int64_t a, int64_t b)
+{
+    if (a <= 0 || b <= 0) return (a == 0 || b == 0) ? 0 : -1;
+    if (a > INT64_MAX / b) return -1;
+    return a * b;
+}
+
 /* compute output spatial dimension.
    returns -1 if the result would be non-positive (invalid configuration). */
 static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int pad)

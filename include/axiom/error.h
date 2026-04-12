@@ -44,6 +44,27 @@ void ax_err_set_callback(ax_err_callback_t cb, void *userdata);
         } \
     } while (0)
 
+/* debug bounds assertion. active only in debug builds (NDEBUG not defined).
+   use this when indexing into storage->data to catch out-of-bounds access
+   during development. compiles to nothing in release builds. */
+#ifndef NDEBUG
+#include <stdio.h>
+#include <stdlib.h>
+#define AX_BOUNDS_CHECK(tensor, byte_offset) \
+    do { \
+        if ((tensor) && (tensor)->storage && \
+            (size_t)(byte_offset) >= (tensor)->storage->size_bytes) { \
+            fprintf(stderr, "axiom: bounds violation at %s:%d " \
+                    "(offset %zu >= %zu bytes)\n", \
+                    __FILE__, __LINE__, \
+                    (size_t)(byte_offset), (tensor)->storage->size_bytes); \
+            abort(); \
+        } \
+    } while (0)
+#else
+#define AX_BOUNDS_CHECK(tensor, byte_offset) ((void)0)
+#endif
+
 #ifdef __cplusplus
 }
 #endif

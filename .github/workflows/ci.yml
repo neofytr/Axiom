@@ -306,6 +306,32 @@ jobs:
           cd build
           ASAN_OPTIONS=detect_leaks=0 ctest --output-on-failure
 
+  # x86_64 valgrind: zero memory leaks
+  test-x86-valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install valgrind
+        run: sudo apt-get install -y valgrind
+
+      - name: build (debug, no sanitizers)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Debug ..
+          cmake --build . -j$(nproc)
+
+      - name: valgrind core tests
+        run: |
+          cd build
+          for t in test_error test_memory test_tensor test_compute test_ops \
+                   test_conv test_norm test_autograd test_losses test_optim \
+                   test_layer test_activations test_fuzz_serialize; do
+            echo "--- valgrind $t ---"
+            valgrind --leak-check=full --errors-for-context=yes \
+                     --error-exitcode=1 ./$t 2>&1 | tail -5
+          done
+
   # x86_64 inference-only build: verifies embedded profile compiles
   test-x86-inference:
     runs-on: ubuntu-latest
