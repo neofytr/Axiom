@@ -83,8 +83,9 @@ static inline ax_vf32 ax_vf32_exp(ax_vf32 x) {
     x = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
     __m512 ln2_inv = _mm512_set1_ps(1.4426950408889634f);
     __m512 t = _mm512_mul_ps(x, ln2_inv);
-    /* imm=0x08: scale=0 (integer), round=nearest-even, suppress exceptions */
-    __m512 tn = _mm512_roundscale_ps(t, 0x08);
+    /* round to nearest integer. _MM_FROUND_TO_NEAREST_INT = 0x00:
+       bits[3:0]=0 (M=0, integer precision), bits[5:4]=0 (nearest-even). */
+    __m512 tn = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT);
     __m512 f = _mm512_sub_ps(t, tn);
     __m512i ni = _mm512_cvtps_epi32(tn);
     __m512i exp_bits = _mm512_slli_epi32(_mm512_add_epi32(ni, _mm512_set1_epi32(127)), 23);
