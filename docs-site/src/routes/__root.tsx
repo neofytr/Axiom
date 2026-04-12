@@ -1,4 +1,4 @@
-import { Outlet, createRootRoute, Link, useMatches } from '@tanstack/react-router'
+import { Outlet, createRootRoute, Link, useRouterState } from '@tanstack/react-router'
 import '../styles.css'
 
 const navSections = [
@@ -49,32 +49,21 @@ export const Route = createRootRoute({
 })
 
 function RootComponent() {
-  const matches = useMatches()
-  const currentPath = matches[matches.length - 1]?.fullPath || '/'
-  const isHome = currentPath === '/'
+  const location = useRouterState({ select: (s) => s.location })
+  const isHome = location.pathname === '/'
 
   return (
-    <div className="min-h-screen bg-white text-gray-900">
-      <header className="sticky top-0 z-50 border-b border-gray-200 bg-white/80 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-3">
-          <Link to="/" className="flex items-center gap-2 text-xl font-bold tracking-tight text-gray-900">
+    <>
+      {/* header */}
+      <header className="sticky top-0 z-50 border-b border-[var(--line)] backdrop-blur" style={{ background: 'var(--header-bg)' }}>
+        <div className="page-wrap flex items-center justify-between py-3">
+          <Link to="/" className="text-xl font-bold tracking-tight no-underline" style={{ color: 'var(--lagoon)' }}>
             Axiom
           </Link>
-          <nav className="hidden items-center gap-6 text-sm font-medium md:flex">
-            <Link to="/docs/quickstart" className="text-gray-600 hover:text-gray-900 [&.active]:text-blue-600">
-              Docs
-            </Link>
-            <Link to="/docs/api/tensor" className="text-gray-600 hover:text-gray-900 [&.active]:text-blue-600">
-              API
-            </Link>
-            <a
-              href="https://github.com/neofytr/Axiom"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-gray-600 hover:text-gray-900"
-            >
-              GitHub
-            </a>
+          <nav className="flex items-center gap-5 text-sm font-medium">
+            <Link to="/docs/quickstart" className="nav-link">Docs</Link>
+            <Link to="/docs/api/tensor" className="nav-link">API</Link>
+            <a href="https://github.com/neofytr/Axiom" target="_blank" rel="noopener noreferrer" className="nav-link">GitHub</a>
           </nav>
         </div>
       </header>
@@ -82,35 +71,44 @@ function RootComponent() {
       {isHome ? (
         <Outlet />
       ) : (
-        <div className="mx-auto flex max-w-7xl">
-          <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-64 shrink-0 overflow-y-auto border-r border-gray-200 px-4 py-6 lg:block">
-            {navSections.map((section) => (
-              <div key={section.title} className="mb-6">
-                <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-gray-400">
-                  {section.title}
-                </h3>
-                <ul className="space-y-1">
-                  {section.links.map((link) => (
-                    <li key={link.to}>
-                      <Link
-                        to={link.to}
-                        className="block rounded px-2 py-1 text-sm text-gray-600 hover:bg-gray-100 hover:text-gray-900 [&.active]:bg-blue-50 [&.active]:font-medium [&.active]:text-blue-700"
-                      >
-                        {link.label}
-                      </Link>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            ))}
-          </aside>
-          <main className="min-w-0 flex-1 px-8 py-8">
-            <div className="prose prose-gray max-w-3xl prose-headings:scroll-mt-20 prose-code:before:content-none prose-code:after:content-none">
-              <Outlet />
-            </div>
-          </main>
+        <div className="page-wrap" style={{ width: 'min(1280px, calc(100% - 2rem))' }}>
+          <div className="flex gap-8 pt-6 pb-16">
+            {/* sidebar */}
+            <aside className="hidden w-56 shrink-0 lg:block">
+              <nav className="sticky top-16 max-h-[calc(100vh-5rem)] overflow-y-auto pr-4">
+                {navSections.map((section) => (
+                  <div key={section.title} className="mb-5">
+                    <h4 className="island-kicker mb-2" style={{ fontSize: '0.65rem' }}>{section.title}</h4>
+                    <ul className="space-y-0.5">
+                      {section.links.map((link) => (
+                        <li key={link.to}>
+                          <Link
+                            to={link.to}
+                            className="nav-link block rounded-md px-2.5 py-1.5 text-[0.82rem] no-underline"
+                            activeProps={{ className: 'nav-link is-active block rounded-md px-2.5 py-1.5 text-[0.82rem] no-underline' }}
+                            style={{ textDecoration: 'none' }}
+                          >
+                            {link.label}
+                          </Link>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </nav>
+            </aside>
+
+            {/* content */}
+            <main className="min-w-0 flex-1">
+              <article className="island-shell rounded-2xl px-8 py-8 sm:px-10 sm:py-10">
+                <div className="docs-prose">
+                  <Outlet />
+                </div>
+              </article>
+            </main>
+          </div>
         </div>
       )}
-    </div>
+    </>
   )
 }

@@ -154,6 +154,33 @@ pre code {
   color: inherit;
 }
 
+pre {
+  background: var(--foam) !important;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 1rem 1.25rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.7;
+}
+
+/* docs prose styles */
+.docs-prose h1 { font-family: "Fraunces", Georgia, serif; font-size: 1.85rem; font-weight: 700; margin-bottom: 0.5rem; color: var(--sea-ink); }
+.docs-prose h2 { font-size: 1.3rem; font-weight: 700; margin-top: 2.5rem; margin-bottom: 0.6rem; color: var(--sea-ink); padding-bottom: 0.35rem; border-bottom: 1px solid var(--line); }
+.docs-prose h3 { font-size: 1.05rem; font-weight: 700; margin-top: 1.8rem; margin-bottom: 0.4rem; color: var(--sea-ink); }
+.docs-prose p { line-height: 1.75; margin-bottom: 1rem; color: var(--sea-ink-soft); }
+.docs-prose ul, .docs-prose ol { margin-bottom: 1rem; padding-left: 1.5rem; color: var(--sea-ink-soft); }
+.docs-prose li { margin-bottom: 0.35rem; line-height: 1.65; }
+.docs-prose strong { color: var(--sea-ink); }
+.docs-prose table { width: 100%; border-collapse: collapse; margin: 1rem 0; font-size: 0.88rem; }
+.docs-prose th { text-align: left; padding: 0.5rem 0.75rem; border-bottom: 2px solid var(--line); color: var(--sea-ink); font-weight: 600; text-transform: uppercase; font-size: 0.72rem; letter-spacing: 0.08em; }
+.docs-prose td { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--line); color: var(--sea-ink-soft); }
+.docs-prose tr:hover td { background: color-mix(in oklab, var(--surface) 50%, transparent); }
+.docs-prose blockquote { border-left: 3px solid var(--lagoon); padding: 0.5rem 1rem; margin: 1.25rem 0; background: color-mix(in oklab, var(--surface) 50%, transparent); border-radius: 0 8px 8px 0; }
+.docs-prose blockquote p { margin: 0; color: var(--sea-ink-soft); }
+.docs-prose a { color: var(--lagoon-deep); }
+.docs-prose a:hover { color: var(--lagoon); }
+
 .page-wrap {
   width: min(1080px, calc(100% - 2rem));
   margin-inline: auto;

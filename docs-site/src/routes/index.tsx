@@ -129,7 +129,7 @@ function LandingPage() {
 int main(void) {
     ax_init();
 
-    // 784 &gt; 128 &gt; 10 classifier
+    // 784 -> 128 -> 10 classifier
     ax_layer_t *net = ax_sequential_create();
     ax_sequential_add(net, ax_dense_create(784, 128, true));
     ax_sequential_add(net, ax_relu_layer_create());
@@ -137,7 +137,7 @@ int main(void) {
 
     ax_model_t *m = ax_model_create(net);
     ax_optimizer_t *opt = ax_adam_create(
-        m&gt;params, m&gt;n_params, 1e-3f, 0.9f, 0.999f, 1e-8f, 0);
+        m->params, m->n_params, 1e-3f, 0.9f, 0.999f, 1e-8f, 0);
     ax_model_compile(m, opt, ax_cross_entropy_loss);
 
     for (int i = 0; i < 1000; i++)
