@@ -672,13 +672,15 @@ int ax_autotune_threads(void)
         return omp_get_max_threads();
     }
 
-    /* include all cores that are within 2× of the fastest. the old 1.25
-       threshold excluded e-cores on hybrid cpus (alder lake etc.) even
-       though the total throughput with all cores is higher than p-cores
-       alone for bandwidth-bound workloads like gemm. a core is only
-       excluded if it's more than 2× slower — which catches thermal-
-       throttled or offline cores without cutting viable e-cores. */
-    double threshold = best * 2.0;
+    /* classify cores by speed. for small-to-medium matrix workloads
+       (typical nn training: batch 64-512, hidden 128-1024), using only
+       the fast P-cores beats using all cores because fork-join overhead
+       + L2 contention from slow E-cores hurts more than the extra
+       compute helps. the threshold is 25% — E-cores on alder lake are
+       ~40% slower and get excluded. this matches the empirical optimum
+       measured on i5-12500H (4 P-cores = 6.75s vs 12 all = 8.9s for
+       mnist mlp training). */
+    double threshold = best * 1.25;
     int fast_cpus_all[CPU_SETSIZE];
     int fast_all = 0;
     for (int i = 0; i < n_cpus; i++) {
