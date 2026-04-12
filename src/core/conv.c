@@ -530,12 +530,24 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     int T = s->T;
     ax_tensor_t *wt_contig = s->wt_contig;
-    /* refresh wt_contig with current weights (they change every step) */
-    if (input_orig->requires_grad && wt_contig) {
+    /* when gemm_tn is available we skip the physical weight transpose —
+       gemm_tn walks w2d as if transposed. keep the legacy refresh only
+       for the fallback path so backends without gemm_tn still work. */
+    bool have_gemm_tn = ax_compute_has_gemm_tn();
+    bool have_gemm_nt = ax_compute_has_gemm_nt();
+    if (input_orig->requires_grad && wt_contig && !have_gemm_tn) {
         float *wtd = (float *)wt_contig->storage->data;
         for (int64_t r = 0; r < C_out; r++)
             for (int64_t c = 0; c < K; c++)
                 wtd[c * C_out + r] = wdata[r * K + c];
+    }
+    /* w2d for gemm_tn fast path: fresh copy of current weights in
+       [C_out, K] shape. s->w2d is refreshed by forward, but forward
+       may have been called long enough ago that weights changed; do
+       it here too for safety. */
+    ax_tensor_t *w2d = s->w2d;
+    if (input_orig->requires_grad && have_gemm_tn && w2d) {
+        memcpy(w2d->storage->data, wdata, (size_t)(C_out * K) * sizeof(float));
     }
 
     /* zero per-thread dW buffers (we accumulate into them across samples) */
@@ -557,6 +569,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         int tid = AX_OMP_THREAD_NUM();
         if (tid >= T) tid = 0;
         float *cbd = (float *)s->col_bufs[tid]->storage->data;
+        ax_tensor_t *col_buf = s->col_bufs[tid];
         ax_tensor_t *go_mat = s->go_bufs[tid];
 
         /* im2col into per-thread buffer */
@@ -570,41 +583,39 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         /* weight gradient: per-thread dW accumulates across this thread's samples */
         if (weight->requires_grad)
         {
-            ax_tensor_t *colt_buf = s->colt_bufs[tid];
             ax_tensor_t *dw_local = s->dw_bufs[tid];
             ax_tensor_t *dw_sample = s->dws_bufs[tid];
-
-            /* transpose col [K,M] -> colt [M,K] with cache-blocked tiles.
-               naive scatter thrashes cache (dest stride K per step).
-               32x32 tiles fit 4KB in L1 keeping both src and dst hot.
-               inner row copy is unit-stride in src, easy to auto-vectorize. */
-            float *ctd = (float *)colt_buf->storage->data;
-            const int64_t BT = 32;
-            for (int64_t r0 = 0; r0 < K; r0 += BT) {
-                int64_t r_end = (r0 + BT < K) ? r0 + BT : K;
-                for (int64_t c0 = 0; c0 < M; c0 += BT) {
-                    int64_t c_end = (c0 + BT < M) ? c0 + BT : M;
-                    for (int64_t r = r0; r < r_end; r++) {
-                        const float *src_row = cbd + r * M;
-                        int64_t c = c0;
-                        /* 4-way unrolled inner loop — compiler auto-vectorizes load,
-                           stores are strided so they stay scalar either way */
-                        for (; c + 4 <= c_end; c += 4) {
-                            ctd[(c + 0) * K + r] = src_row[c + 0];
-                            ctd[(c + 1) * K + r] = src_row[c + 1];
-                            ctd[(c + 2) * K + r] = src_row[c + 2];
-                            ctd[(c + 3) * K + r] = src_row[c + 3];
-                        }
-                        for (; c < c_end; c++)
-                            ctd[c * K + r] = src_row[c];
-                    }
-                }
-            }
-
-            /* gemm into pre-allocated per-thread sample buffer, then accumulate */
             float *dws = (float *)dw_sample->storage->data;
             memset(dws, 0, (size_t)(C_out * K) * sizeof(float));
-            ax_compute_gemm(go_mat, colt_buf, dw_sample);
+
+            if (have_gemm_nt) {
+                /* dw = go @ col^T via gemm_nt — skips the 60-line block
+                   cache-blocked transpose of col that the legacy path did. */
+                ax_compute_gemm_nt(go_mat, col_buf, dw_sample);
+            } else {
+                ax_tensor_t *colt_buf = s->colt_bufs[tid];
+                float *ctd = (float *)colt_buf->storage->data;
+                const int64_t BT = 32;
+                for (int64_t r0 = 0; r0 < K; r0 += BT) {
+                    int64_t r_end = (r0 + BT < K) ? r0 + BT : K;
+                    for (int64_t c0 = 0; c0 < M; c0 += BT) {
+                        int64_t c_end = (c0 + BT < M) ? c0 + BT : M;
+                        for (int64_t r = r0; r < r_end; r++) {
+                            const float *src_row = cbd + r * M;
+                            int64_t c = c0;
+                            for (; c + 4 <= c_end; c += 4) {
+                                ctd[(c + 0) * K + r] = src_row[c + 0];
+                                ctd[(c + 1) * K + r] = src_row[c + 1];
+                                ctd[(c + 2) * K + r] = src_row[c + 2];
+                                ctd[(c + 3) * K + r] = src_row[c + 3];
+                            }
+                            for (; c < c_end; c++)
+                                ctd[c * K + r] = src_row[c];
+                        }
+                    }
+                }
+                ax_compute_gemm(go_mat, colt_buf, dw_sample);
+            }
 
             float *dwl = (float *)dw_local->storage->data;
             int64_t wn = C_out * K;
@@ -615,13 +626,19 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         }
 
         /* input gradient — disjoint per-sample writes, no reduction needed */
-        if (input_orig->requires_grad && wt_contig)
+        if (input_orig->requires_grad && (wt_contig || have_gemm_tn))
         {
             ax_tensor_t *dcol_buf = s->dcol_bufs[tid];
             ax_tensor_t *dimg_buf = s->dimg_bufs[tid];
 
             memset(dcol_buf->storage->data, 0, (size_t)(K * M) * sizeof(float));
-            ax_compute_gemm(wt_contig, go_mat, dcol_buf);
+            if (have_gemm_tn) {
+                /* dcol = w^T @ go via gemm_tn — skips the wt_contig scalar
+                   transpose refresh done above in the legacy path. */
+                ax_compute_gemm_tn(w2d, go_mat, dcol_buf);
+            } else {
+                ax_compute_gemm(wt_contig, go_mat, dcol_buf);
+            }
 
             float *dimg_d = (float *)dimg_buf->storage->data;
             memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));
@@ -1098,7 +1115,10 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
     int T = s->T;
 
-    if (input_orig->requires_grad) {
+    bool have_gemm_nt_b = ax_compute_has_gemm_nt();
+    bool have_gemm_tn_b = ax_compute_has_gemm_tn();
+
+    if (input_orig->requires_grad && !have_gemm_tn_b) {
         if (!s->wt_contig) {
             int64_t wt_shape[] = {K, C_out};
             s->wt_contig = ax_tensor_create(wt_shape, 2, AX_FLOAT32);
@@ -1109,6 +1129,10 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 for (int64_t col = 0; col < K; col++)
                     wtd[col * C_out + r] = wdata[r * K + col];
         }
+    }
+    ax_tensor_t *w2d_bn = s->w2d;
+    if (input_orig->requires_grad && have_gemm_tn_b && w2d_bn) {
+        memcpy(w2d_bn->storage->data, wdata, (size_t)(C_out * K) * sizeof(float));
     }
 
     if (weight->requires_grad) {
@@ -1126,6 +1150,7 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         int tid = AX_OMP_THREAD_NUM();
         if (tid >= T) tid = 0;
         float *cbd = (float *)s->col_bufs[tid]->storage->data;
+        ax_tensor_t *col_buf = s->col_bufs[tid];
         ax_tensor_t *go_mat = s->go_bufs[tid];
 
         im2col_into(ind + n * C_in * H * W, C_in, H, W,
@@ -1135,18 +1160,21 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                (size_t)(C_out * M) * sizeof(float));
 
         if (weight->requires_grad) {
-            ax_tensor_t *colt_buf = s->colt_bufs[tid];
             ax_tensor_t *dw_local = s->dw_bufs[tid];
             ax_tensor_t *dw_sample = s->dws_bufs[tid];
-
-            float *ctd = (float *)colt_buf->storage->data;
-            for (int64_t r = 0; r < K; r++)
-                for (int64_t col = 0; col < M; col++)
-                    ctd[col * K + r] = cbd[r * M + col];
-
             float *dws = (float *)dw_sample->storage->data;
             memset(dws, 0, (size_t)(C_out * K) * sizeof(float));
-            ax_compute_gemm(go_mat, colt_buf, dw_sample);
+
+            if (have_gemm_nt_b) {
+                ax_compute_gemm_nt(go_mat, col_buf, dw_sample);
+            } else {
+                ax_tensor_t *colt_buf = s->colt_bufs[tid];
+                float *ctd = (float *)colt_buf->storage->data;
+                for (int64_t r = 0; r < K; r++)
+                    for (int64_t col = 0; col < M; col++)
+                        ctd[col * K + r] = cbd[r * M + col];
+                ax_compute_gemm(go_mat, colt_buf, dw_sample);
+            }
 
             float *dwl = (float *)dw_local->storage->data;
             int64_t wn = C_out * K;
@@ -1156,12 +1184,16 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             for (; wi < wn; wi++) dwl[wi] += dws[wi];
         }
 
-        if (input_orig->requires_grad && wt_contig) {
+        if (input_orig->requires_grad && (wt_contig || have_gemm_tn_b)) {
             ax_tensor_t *dcol_buf = s->dcol_bufs[tid];
             ax_tensor_t *dimg_buf = s->dimg_bufs[tid];
 
             memset(dcol_buf->storage->data, 0, (size_t)(K * M) * sizeof(float));
-            ax_compute_gemm(wt_contig, go_mat, dcol_buf);
+            if (have_gemm_tn_b) {
+                ax_compute_gemm_tn(w2d_bn, go_mat, dcol_buf);
+            } else {
+                ax_compute_gemm(wt_contig, go_mat, dcol_buf);
+            }
 
             float *dimg_d = (float *)dimg_buf->storage->data;
             memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));

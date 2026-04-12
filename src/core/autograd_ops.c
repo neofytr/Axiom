@@ -430,44 +430,50 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_tensor_t *b = self->saved[1];
     ax_arena_t *ar = ax_backward_arena();
 
-    /* d/da = grad_out @ b^T */
+    /* d/da = grad_out @ b^T.
+       when the backend provides gemm_nt we can skip the physical b^T
+       copy entirely. fallback to transpose+copy+gemm when not available. */
     if (self->inputs[0]->requires_grad)
     {
-        ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
-        if (!bt) return;
-        /* arena copy — avoids heap malloc for the transposed contiguous buffer */
-        ax_tensor_t *bt_contig = ax_tensor_arena_zeros(ar, bt->shape, bt->ndim, bt->dtype);
-        if (!bt_contig) { ax_tensor_destroy(bt); return; }
-        ax_compute_copy(bt, bt_contig);
-
-        int64_t ga_shape[] = {grad_out->shape[0], bt_contig->shape[1]};
+        int64_t ga_shape[] = {grad_out->shape[0], b->shape[0]};
         ax_tensor_t *grad_a = ax_tensor_arena_zeros(ar, ga_shape, 2, grad_out->dtype);
-        if (!grad_a) { ax_tensor_destroy(bt); return; }
-        ax_compute_gemm(grad_out, bt_contig, grad_a);
+        if (!grad_a) return;
+
+        if (ax_compute_has_gemm_nt()) {
+            ax_compute_gemm_nt(grad_out, b, grad_a);
+        } else {
+            ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
+            if (!bt) return;
+            ax_tensor_t *bt_contig = ax_tensor_arena_zeros(ar, bt->shape, bt->ndim, bt->dtype);
+            if (!bt_contig) { ax_tensor_destroy(bt); return; }
+            ax_compute_copy(bt, bt_contig);
+            ax_compute_gemm(grad_out, bt_contig, grad_a);
+            ax_tensor_destroy(bt);
+        }
 
         accumulate_grad(self->inputs[0], grad_a);
-        ax_tensor_destroy(bt);
-        /* bt_contig and grad_a are arena-allocated — freed in bulk by ax_backward */
     }
 
-    /* d/db = a^T @ grad_out */
+    /* d/db = a^T @ grad_out. same deal with gemm_tn. */
     if (self->inputs[1]->requires_grad)
     {
-        ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
-        if (!at) return;
-        /* arena copy — avoids heap malloc for the transposed contiguous buffer */
-        ax_tensor_t *at_contig = ax_tensor_arena_zeros(ar, at->shape, at->ndim, at->dtype);
-        if (!at_contig) { ax_tensor_destroy(at); return; }
-        ax_compute_copy(at, at_contig);
-
-        int64_t gb_shape[] = {at_contig->shape[0], grad_out->shape[1]};
+        int64_t gb_shape[] = {a->shape[1], grad_out->shape[1]};
         ax_tensor_t *grad_b = ax_tensor_arena_zeros(ar, gb_shape, 2, grad_out->dtype);
-        if (!grad_b) { ax_tensor_destroy(at); return; }
-        ax_compute_gemm(at_contig, grad_out, grad_b);
+        if (!grad_b) return;
+
+        if (ax_compute_has_gemm_tn()) {
+            ax_compute_gemm_tn(a, grad_out, grad_b);
+        } else {
+            ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
+            if (!at) return;
+            ax_tensor_t *at_contig = ax_tensor_arena_zeros(ar, at->shape, at->ndim, at->dtype);
+            if (!at_contig) { ax_tensor_destroy(at); return; }
+            ax_compute_copy(at, at_contig);
+            ax_compute_gemm(at_contig, grad_out, grad_b);
+            ax_tensor_destroy(at);
+        }
 
         accumulate_grad(self->inputs[1], grad_b);
-        ax_tensor_destroy(at);
-        /* at_contig and grad_b are arena-allocated — freed in bulk by ax_backward */
     }
 }
 
