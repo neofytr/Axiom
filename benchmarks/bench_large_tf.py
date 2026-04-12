@@ -14,17 +14,18 @@ import struct
 import time
 import sys
 
-NUM_THREADS = int(os.environ.get("AX_BENCH_THREADS", "8"))
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "1")
-# force cpu for fair comparison with axiom cpu_opt
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
 import tensorflow as tf
 
-tf.config.threading.set_intra_op_parallelism_threads(NUM_THREADS)
-tf.config.threading.set_inter_op_parallelism_threads(1)
+# let tf pick its own thread count unless explicitly overridden
+_threads = os.environ.get("AX_BENCH_THREADS")
+if _threads:
+    tf.config.threading.set_intra_op_parallelism_threads(int(_threads))
+    tf.config.threading.set_inter_op_parallelism_threads(1)
 tf.random.set_seed(42)
 np.random.seed(42)
 
@@ -49,7 +50,7 @@ def main():
     data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "..", "examples", "data")
     print(f"=== tensorflow {mode} ===")
-    print(f"threads (intra_op): {NUM_THREADS}")
+    print(f"threads (intra_op): {tf.config.threading.get_intra_op_parallelism_threads() or 'auto'}")
     print(f"model: 784 -> 1024 -> 512 -> 256 -> 10")
 
     model = tf.keras.Sequential([

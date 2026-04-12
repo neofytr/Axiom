@@ -55,13 +55,13 @@ jobs:
           echo "Cores: $(nproc) logical, $(lscpu | grep 'Core(s) per socket' | sed 's/.*: *//')"
           echo ""
 
-          echo "=== AXIOM (ISA dispatch selects best kernel, 2 threads) ==="
-          OMP_NUM_THREADS=2 timeout 120 build/bench_large train-cpu 2>&1 | grep -E "epoch|median|threads"
+          echo "=== AXIOM (ISA dispatch, default threads) ==="
+          timeout 120 build/bench_large train-cpu 2>&1 | grep -E "epoch|median|threads"
           echo ""
 
-          echo "=== TENSORFLOW oneDNN (2 threads) ==="
+          echo "=== TENSORFLOW oneDNN (default threads) ==="
           pip install -q tensorflow 2>/dev/null || pip install -q tensorflow-cpu 2>/dev/null
-          AX_BENCH_THREADS=2 timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1 | grep -E "epoch|median|threads"
+          timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1 | grep -E "epoch|median|threads"
 
       - name: large-scale benchmark (cloud has more RAM)
         continue-on-error: true
@@ -72,8 +72,7 @@ jobs:
           os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
           os.environ["CUDA_VISIBLE_DEVICES"] = ""
           import tensorflow as tf
-          tf.config.threading.set_intra_op_parallelism_threads(2)
-          tf.config.threading.set_inter_op_parallelism_threads(1)
+          # let tf use its default thread count
           tf.random.set_seed(42); np.random.seed(42)
           dd = "examples/data"
           def ri(p,n):
@@ -187,7 +186,7 @@ jobs:
           cd ..
 
           echo "--- Axiom AVX-512 ---"
-          OMP_NUM_THREADS=2 timeout 300 build/bench_xlarge 2>&1
+          timeout 300 build/bench_xlarge 2>&1
 
           echo "--- TensorFlow ---"
           timeout 300 python3 /tmp/bench_xlarge.py 2>&1 | grep -v WARNING | grep -v "I0000"
@@ -225,7 +224,7 @@ jobs:
           echo "CPU: $(lscpu | grep 'Model name' | sed 's/.*: *//')"
           if [ -f build/bench_large ] && [ -f examples/data/train-images-idx3-ubyte ]; then
             echo "=== AXIOM NEON (8x12 kernel) ==="
-            OMP_NUM_THREADS=4 timeout 120 build/bench_large train-cpu 2>&1
+            timeout 120 build/bench_large train-cpu 2>&1
           fi
 
       - name: benchmark tensorflow (arm)
@@ -233,8 +232,8 @@ jobs:
         run: |
           pip install -q tensorflow 2>/dev/null || pip install -q tensorflow-cpu 2>/dev/null || true
           if [ -f benchmarks/bench_large_tf.py ] && [ -f examples/data/train-images-idx3-ubyte ]; then
-            echo "=== TENSORFLOW (ARM, 4 threads) ==="
-            AX_BENCH_THREADS=4 timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1 | grep -v WARNING | grep -v "I0000"
+            echo "=== TENSORFLOW (ARM, default threads) ==="
+            timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1 | grep -v WARNING | grep -v "I0000"
           fi
 
   # x86_64 + CUDA: tests GPU backend (if runner has nvidia GPU)
