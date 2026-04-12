@@ -39,14 +39,25 @@ jobs:
             gunzip "${f}.gz"
           done
 
-      - name: benchmark (optional, non-blocking)
+      - name: benchmark axiom (avx-512)
         continue-on-error: true
         run: |
-          cd build
-          if [ -f bench_large ] && [ -f ../examples/data/train-images-idx3-ubyte ]; then
-            cd .. && OMP_NUM_THREADS=2 timeout 120 build/bench_large train-cpu 2>&1 || echo "bench exited with $?"
+          if [ -f build/bench_large ] && [ -f examples/data/train-images-idx3-ubyte ]; then
+            echo "=== AXIOM (AVX-512, 2 threads) ==="
+            OMP_NUM_THREADS=2 timeout 120 build/bench_large train-cpu 2>&1
           else
             echo "skipped: bench_large or mnist data not available"
+          fi
+
+      - name: benchmark tensorflow (cpu, same machine)
+        continue-on-error: true
+        run: |
+          pip install -q tensorflow 2>/dev/null || pip install -q tensorflow-cpu 2>/dev/null
+          if [ -f benchmarks/bench_large_tf.py ] && [ -f examples/data/train-images-idx3-ubyte ]; then
+            echo "=== TENSORFLOW (CPU, 2 threads) ==="
+            AX_BENCH_THREADS=2 timeout 120 python3 benchmarks/bench_large_tf.py train 2>&1
+          else
+            echo "skipped: tf benchmark or mnist data not available"
           fi
 
   # aarch64: cross-compile + QEMU correctness test for NEON kernel
