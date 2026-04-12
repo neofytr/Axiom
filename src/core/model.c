@@ -18,6 +18,7 @@ ax_model_t *ax_model_create(ax_layer_t *net)
     return m;
 }
 
+#ifndef AX_INFERENCE_ONLY
 void ax_model_compile(ax_model_t *model, ax_optimizer_t *opt, ax_loss_fn_t loss_fn)
 {
     if (!model) return;
@@ -79,6 +80,7 @@ float ax_model_train_step(ax_model_t *model, ax_tensor_t *input, ax_tensor_t *ta
 
     return loss_val;
 }
+#endif
 
 ax_tensor_t *ax_model_predict(ax_model_t *model, ax_tensor_t *input)
 {
@@ -93,6 +95,7 @@ ax_tensor_t *ax_model_predict(ax_model_t *model, ax_tensor_t *input)
     return out;
 }
 
+#ifndef AX_INFERENCE_ONLY
 void ax_model_fit(ax_model_t *model,
                   ax_tensor_t *train_x, ax_tensor_t *train_y,
                   int epochs, int print_every)
@@ -109,6 +112,7 @@ void ax_model_fit(ax_model_t *model,
         }
     }
 }
+#endif
 
 void ax_model_summary(ax_model_t *model)
 {
@@ -119,7 +123,9 @@ void ax_model_summary(ax_model_t *model)
 void ax_model_destroy(ax_model_t *model)
 {
     if (!model) return;
+#ifndef AX_INFERENCE_ONLY
     if (model->opt) ax_optimizer_destroy(model->opt);
+#endif
     if (model->net) ax_layer_destroy(model->net);
     free(model);
 }

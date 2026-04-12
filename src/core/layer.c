@@ -6,6 +6,7 @@
 #include "axiom/activations.h"
 #include "axiom/init.h"
 #include "axiom/compute.h"
+#include "axiom/autograd.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>

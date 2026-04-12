@@ -97,8 +97,10 @@ static uint32_t crc32_of_file(FILE *f, long start_pos, long end_pos)
     return crc;
 }
 
+#ifndef AX_INFERENCE_ONLY
 /* write helpers with incremental crc tracking.
-   pass crc=NULL to skip crc accumulation. */
+   pass crc=NULL to skip crc accumulation. compiled out in inference-only
+   builds — no model save path exists there, only load. */
 
 static bool write_bytes(FILE *f, const void *data, size_t len, uint32_t *crc)
 {
@@ -117,12 +119,14 @@ static bool write_u32_c(FILE *f, uint32_t v, uint32_t *c)  { return write_bytes(
 static bool write_i64_c(FILE *f, int64_t v, uint32_t *c)   { return write_bytes(f, &v, 8, c); }
 static bool write_f32_c(FILE *f, float v, uint32_t *c)     { return write_bytes(f, &v, 4, c); }
 static bool write_u8_c(FILE *f, uint8_t v, uint32_t *c)    { return write_bytes(f, &v, 1, c); }
+#endif /* !AX_INFERENCE_ONLY */
 
 static bool read_u32(FILE *f, uint32_t *v) { return fread(v, 4, 1, f) == 1; }
 static bool read_i64(FILE *f, int64_t *v)  { return fread(v, 8, 1, f) == 1; }
 static bool read_f32(FILE *f, float *v)    { return fread(v, 4, 1, f) == 1; }
 static bool read_u8(FILE *f, uint8_t *v)   { return fread(v, 1, 1, f) == 1; }
 
+#ifndef AX_INFERENCE_ONLY
 /* write a tensor's metadata + data to file, optionally tracking crc */
 static bool write_tensor_crc(FILE *f, ax_tensor_t *t, uint32_t *crc)
 {
@@ -157,6 +161,7 @@ static bool write_tensor(FILE *f, ax_tensor_t *t)
 {
     return write_tensor_crc(f, t, NULL);
 }
+#endif /* !AX_INFERENCE_ONLY */
 
 /* safe multiply for serialization validation — all four sign combinations */
 static bool ser_safe_mul(int64_t a, int64_t b, int64_t *result) {
@@ -243,6 +248,7 @@ static ax_tensor_t *read_tensor(FILE *f)
 
 /* tensor save/load */
 
+#ifndef AX_INFERENCE_ONLY
 ax_status_t ax_tensor_save(ax_tensor_t *t, const char *path)
 {
     if (!t || !path)
@@ -268,6 +274,7 @@ ax_status_t ax_tensor_save(ax_tensor_t *t, const char *path)
     }
     return AX_OK;
 }
+#endif /* !AX_INFERENCE_ONLY */
 
 ax_tensor_t *ax_tensor_load(const char *path)
 {
@@ -296,6 +303,7 @@ ax_tensor_t *ax_tensor_load(const char *path)
 
 /* model save */
 
+#ifndef AX_INFERENCE_ONLY
 ax_status_t ax_model_save(ax_model_t *model, const char *path)
 {
     if (!model || !model->net || !path)
@@ -433,6 +441,7 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
     fclose(f);
     return AX_OK;
 }
+#endif /* !AX_INFERENCE_ONLY */
 
 
 /* model load */

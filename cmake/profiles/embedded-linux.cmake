@@ -25,6 +25,10 @@ set(AX_SINGLE_THREADED OFF CACHE BOOL "disable thread-local storage and omp")
 # linux has stderr, keep diagnostics.
 set(AX_NO_STDIO OFF CACHE BOOL "drop fprintf(stderr,...) diagnostics")
 
+# default to full training+inference library. flip to ON if you only
+# ever run pre-trained models on the target (most edge deployments).
+set(AX_INFERENCE_ONLY OFF CACHE BOOL "exclude training code from the library")
+
 # smaller gemm tile defaults tuned for l2 caches typical of cortex-a:
 # 48/128/128 -> pack_a 24 kb, pack_b 64 kb. fits in a 256 kb l2 with
 # margin. users with larger l2 (jetson orin has 2 mb) can still bump

@@ -53,6 +53,8 @@ struct ax_grad_fn
     void (*ctx_cleanup)(void *ctx);
 };
 
+#ifndef AX_INFERENCE_ONLY
+
 /* run backward pass starting from this tensor.
    tensor should be a scalar (1 element).
    computes gradients for all tensors in the graph that
@@ -88,6 +90,27 @@ ax_grad_fn_t *ax_grad_fn_create(ax_backward_fn_t fn);
 
 /* free a grad_fn (returns to thread-local slab free-list) */
 void ax_grad_fn_destroy(ax_grad_fn_t *gf);
+
+#else /* AX_INFERENCE_ONLY */
+
+/* inference-only stubs: grad tracking is permanently disabled. forward
+   files compile unchanged — the compiler constant-folds the returned
+   false and dce's all grad_fn setup branches. ax_grad_fn_create is
+   provided as a NULL stub so the forward files' unused grad_fn code
+   paths still typecheck but never execute. */
+static inline bool  ax_grad_enabled(void)       { return false; }
+static inline void  ax_no_grad(void)            { }
+static inline void  ax_enable_grad(void)        { }
+static inline ax_grad_fn_t *ax_grad_fn_create(ax_backward_fn_t fn) {
+    (void)fn; return NULL;
+}
+static inline void  ax_grad_fn_destroy(ax_grad_fn_t *gf) { (void)gf; }
+
+/* training-only entry points: declared but undefined. any inference-only
+   user code that calls these gets a link error, which is the clearest
+   signal that this build doesn't support training. */
+
+#endif /* AX_INFERENCE_ONLY */
 
 /* get the thread-local backward scratch arena. backward functions can
    use this for temporary buffers that are freed in bulk after ax_backward().

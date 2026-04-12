@@ -95,11 +95,26 @@ if(AX_NO_STDIO)
     add_compile_definitions(AX_NO_STDIO=1)
 endif()
 
+# inference-only mode: strip all training code from the library.
+# excludes autograd, optimizers, loss functions, lr schedulers, and the
+# dataset/dataloader from AXIOM_SOURCES. the forward files (conv/norm/
+# ops/activations/layer) still compile unchanged — ax_grad_enabled() is
+# stubbed to a constant false in the header, so the compiler dce's every
+# grad_fn setup branch and never emits references to the excluded code.
+# default off; the embedded-baremetal profile flips it on.
+if(AX_INFERENCE_ONLY)
+    message(STATUS "inference-only build (training code excluded)")
+    add_compile_definitions(AX_INFERENCE_ONLY=1)
+endif()
+
 # hardening flags for release
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O3 -fno-math-errno -funroll-loops -fno-trapping-math -D_FORTIFY_SOURCE=2)
 endif()
 
+# library sources — split into always-on (forward + shared infra) and
+# training-only (autograd, optimizers, losses, dataloader, lr schedules).
+# under AX_INFERENCE_ONLY the training group is dropped from the build.
 # runtime isa dispatch for cpu_opt. when on, cpu_opt.c is compiled
 # twice: once with -mavx2 -mfma (AX_CPU_OPT_SUFFIX=_avx2) and once
 # with vector extensions disabled (AX_CPU_OPT_SUFFIX=_scalar). the
@@ -109,26 +124,19 @@ endif()
 # default off — costs nothing on a fixed-target deployment.
 option(AX_CPU_ISA_DISPATCH "build cpu_opt twice (avx2 + scalar) and select at runtime" OFF)
 
-# library sources
 set(AXIOM_SOURCES
     src/core/error.c
     src/core/memory.c
     src/core/tensor.c
     src/core/broadcast.c
     src/core/ops.c
-    src/core/autograd.c
-    src/core/autograd_ops.c
     src/core/activations.c
-    src/core/losses.c
-    src/core/optim.c
     src/core/init.c
     src/core/layer.c
     src/core/model.c
     src/core/serialize.c
-    src/core/data.c
     src/core/conv.c
     src/core/norm.c
-    src/core/lr_scheduler.c
     src/core/rng.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
@@ -138,6 +146,17 @@ set(AXIOM_SOURCES
 # below.
 if(NOT AX_CPU_ISA_DISPATCH)
     list(APPEND AXIOM_SOURCES src/compute/backends/cpu_opt.c)
+endif()
+
+if(NOT AX_INFERENCE_ONLY)
+    list(APPEND AXIOM_SOURCES
+        src/core/autograd.c
+        src/core/autograd_ops.c
+        src/core/losses.c
+        src/core/optim.c
+        src/core/data.c
+        src/core/lr_scheduler.c
+    )
 endif()
 
 if(AX_CUDA)
@@ -239,29 +258,37 @@ set_target_properties(axiom_shared PROPERTIES OUTPUT_NAME axiom)
 # tests
 enable_testing()
 
+# always-available tests (exercise only forward-path + tensor machinery)
 set(TEST_SOURCES
     tests/test_error.c
     tests/test_memory.c
     tests/test_tensor.c
     tests/test_compute.c
-    tests/test_autograd.c
     tests/test_ops.c
     tests/test_activations.c
-    tests/test_losses.c
-    tests/test_optim.c
     tests/test_layer.c
     tests/test_serialize.c
-    tests/test_data.c
     tests/test_conv.c
     tests/test_norm.c
-    tests/test_integration.c
-    tests/test_grad_verify.c
-    tests/test_serialize_all.c
-    tests/test_lr_sched.c
     tests/test_backend_opt.c
-    tests/test_inplace.c
     tests/test_cuda.c
 )
+
+# training-only tests: autograd, losses, optimizers, lr schedules,
+# dataloader, and any integration/grad-verify test that calls ax_backward.
+if(NOT AX_INFERENCE_ONLY)
+    list(APPEND TEST_SOURCES
+        tests/test_autograd.c
+        tests/test_losses.c
+        tests/test_optim.c
+        tests/test_data.c
+        tests/test_integration.c
+        tests/test_grad_verify.c
+        tests/test_serialize_all.c
+        tests/test_lr_sched.c
+        tests/test_inplace.c
+    )
+endif()
 
 foreach(test_src ${TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
@@ -289,21 +316,24 @@ foreach(test_src ${TEST_SOURCES})
     endif()
 endforeach()
 
-# examples (leak detection stays on for these — they use the full api)
-add_executable(example_mnist examples/mnist.c)
-target_link_libraries(example_mnist PRIVATE axiom_static)
+# examples — training examples are excluded under AX_INFERENCE_ONLY
+# since they all call ax_backward / optimizers.
+if(NOT AX_INFERENCE_ONLY)
+    add_executable(example_mnist examples/mnist.c)
+    target_link_libraries(example_mnist PRIVATE axiom_static)
 
-add_executable(mnist_cnn examples/mnist_cnn.c)
-target_link_libraries(mnist_cnn PRIVATE axiom_static)
+    add_executable(mnist_cnn examples/mnist_cnn.c)
+    target_link_libraries(mnist_cnn PRIVATE axiom_static)
 
-add_executable(deep_mlp examples/deep_mlp.c)
-target_link_libraries(deep_mlp PRIVATE axiom_static)
+    add_executable(deep_mlp examples/deep_mlp.c)
+    target_link_libraries(deep_mlp PRIVATE axiom_static)
 
-add_executable(bench_backend examples/bench_backend.c)
-target_link_libraries(bench_backend PRIVATE axiom_static)
+    add_executable(bench_backend examples/bench_backend.c)
+    target_link_libraries(bench_backend PRIVATE axiom_static)
 
-add_executable(bench_optimizations examples/bench_optimizations.c)
-target_link_libraries(bench_optimizations PRIVATE axiom_static)
+    add_executable(bench_optimizations examples/bench_optimizations.c)
+    target_link_libraries(bench_optimizations PRIVATE axiom_static)
+endif()
 
 # convenience target: run all tests
 add_custom_target(run_tests

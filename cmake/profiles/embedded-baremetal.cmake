@@ -31,6 +31,13 @@ set(AX_SINGLE_THREADED ON CACHE BOOL "disable thread-local storage and omp")
 # saves ~20 kb of pulled-in stdio machinery on flash-constrained targets.
 set(AX_NO_STDIO ON CACHE BOOL "drop fprintf(stderr,...) diagnostics")
 
+# inference-only by default: drop the autograd graph walker, optimizers,
+# loss functions, dataloader, and lr scheduler. training-on-mcu is
+# almost never what people want and those files are ~90 kb of dead
+# code on a flash-budget target. override with -DAX_INFERENCE_ONLY=OFF
+# if you're the rare person doing edge training.
+set(AX_INFERENCE_ONLY ON CACHE BOOL "exclude training code from the library")
+
 # tiny gemm tiles. pack_a 24*64*4 = 6 kb, pack_b 32*64*4 = 8 kb.
 # fits comfortably in a 64 kb sram with room for stack, model, and
 # scratch. users with more sram can override at configure time:

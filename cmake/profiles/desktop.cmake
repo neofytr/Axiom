@@ -5,19 +5,22 @@
 message(STATUS "axiom profile: desktop")
 
 # parallelism on by default. every modern desktop has multi-core + libgomp.
-set(AX_OPENMP ON CACHE BOOL "enable openmp multi-core parallelism" FORCE)
+set(AX_OPENMP ON CACHE BOOL "enable openmp multi-core parallelism")
 
 # runtime hybrid-cpu autotuner on by default. probes per-core speed at
 # first use and pins omp workers to the fast cores on alder lake style
 # hybrid cpus. ~200ms calibration budget, opt out via AX_NO_AUTOTUNE=1 env.
-set(AX_NO_AUTOTUNE OFF CACHE BOOL "disable runtime cpu autotuner" FORCE)
+set(AX_NO_AUTOTUNE OFF CACHE BOOL "disable runtime cpu autotuner")
 
 # tls-backed per-thread pack buffers for gemm. requires _Thread_local
 # support from the toolchain (all modern desktop toolchains have it).
-set(AX_SINGLE_THREADED OFF CACHE BOOL "disable thread-local storage and omp" FORCE)
+set(AX_SINGLE_THREADED OFF CACHE BOOL "disable thread-local storage and omp")
 
 # stderr logging on. users see autotuner diagnostics and gemm tile warnings.
-set(AX_NO_STDIO OFF CACHE BOOL "drop fprintf(stderr,...) diagnostics" FORCE)
+set(AX_NO_STDIO OFF CACHE BOOL "drop fprintf(stderr,...) diagnostics")
+
+# full training + inference library.
+set(AX_INFERENCE_ONLY OFF CACHE BOOL "exclude training code from the library")
 
 # gemm tile defaults are the compile-time baseline. the runtime
 # AX_GEMM_MC/NC/KC env vars still override at process startup.
