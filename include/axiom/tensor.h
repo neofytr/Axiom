@@ -79,6 +79,11 @@ ax_tensor_t *ax_tensor_zeros(const int64_t *shape, int ndim, ax_dtype_t dtype);
 struct ax_arena;
 ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape, int ndim, ax_dtype_t dtype);
 
+/* arena-allocated uninitialised tensor — same lifecycle as arena_zeros but
+   skips the memset. use when the caller will immediately overwrite the
+   entire buffer via a compute op (gemm, copy). saves one full memory pass. */
+ax_tensor_t *ax_tensor_arena_create(struct ax_arena *arena, const int64_t *shape, int ndim, ax_dtype_t dtype);
+
 /* create and fill with ones */
 ax_tensor_t *ax_tensor_ones(const int64_t *shape, int ndim, ax_dtype_t dtype);
 

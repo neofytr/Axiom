@@ -499,13 +499,15 @@ ax_tensor_t *ax_tensor_scalar(float value) {
     return t;
 }
 
-/* arena-allocated zero tensor — metadata struct, storage struct, and data buffer
-   are all bumped from the supplied arena. release/destroy are no-ops; the caller
-   resets the arena to free in bulk. on arena exhaustion, falls back to the heap
-   path so call sites don't need NULL handling. intended for short-lived backward
-   scratch tensors that never escape ax_backward(). */
-ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape, int ndim, ax_dtype_t dtype) {
-    if (!arena) return ax_tensor_zeros(shape, ndim, dtype);
+/* shared helper for arena-allocated tensors. callers choose whether
+   the data buffer is zero-initialised (zeros=true) or left uninitialised
+   (zeros=false). uninitialised is safe when the caller will immediately
+   overwrite the entire buffer via a compute op (gemm, copy, etc.). */
+static ax_tensor_t *tensor_arena_alloc_impl(struct ax_arena *arena,
+        const int64_t *shape, int ndim, ax_dtype_t dtype, bool zeros)
+{
+    if (!arena) return zeros ? ax_tensor_zeros(shape, ndim, dtype)
+                             : ax_tensor_create(shape, ndim, dtype);
     if (ndim < 0 || ndim > AX_MAX_DIMS) return NULL;
     if ((int)dtype < 0 || dtype >= AX_DTYPE_COUNT) return NULL;
 
@@ -523,8 +525,8 @@ ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape,
     ax_storage_t *s = t ? (ax_storage_t *)ax_arena_alloc(arena, sizeof(ax_storage_t), alignof(ax_storage_t)) : NULL;
     void *data = s ? ax_arena_alloc(arena, bytes, AX_DEFAULT_ALIGNMENT) : NULL;
     if (!t || !s || !data) {
-        /* arena exhausted (rare) — fall back to a normal heap zero tensor */
-        return ax_tensor_zeros(shape, ndim, dtype);
+        return zeros ? ax_tensor_zeros(shape, ndim, dtype)
+                     : ax_tensor_create(shape, ndim, dtype);
     }
 
     memset(t, 0, sizeof(*t));
@@ -539,10 +541,24 @@ ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape,
     s->device = AX_DEVICE_CPU;
     s->is_arena_temp = true;
     s->generation = 1;
-    memset(data, 0, bytes);
+    if (zeros) memset(data, 0, bytes);
 
     t->storage = s;
     return t;
+}
+
+/* arena-allocated zero tensor — see tensor_arena_alloc_impl. */
+ax_tensor_t *ax_tensor_arena_zeros(struct ax_arena *arena, const int64_t *shape, int ndim, ax_dtype_t dtype) {
+    return tensor_arena_alloc_impl(arena, shape, ndim, dtype, true);
+}
+
+/* arena-allocated uninitialised tensor — use when the caller will
+   immediately overwrite the entire data buffer (gemm output, copy
+   target, etc.). skips the memset, saving one full memory pass per
+   allocation. for a 256×1024 matmul grad that's 1 MB of memset
+   avoided per backward call. */
+ax_tensor_t *ax_tensor_arena_create(struct ax_arena *arena, const int64_t *shape, int ndim, ax_dtype_t dtype) {
+    return tensor_arena_alloc_impl(arena, shape, ndim, dtype, false);
 }
 
 /* destruction */

@@ -64,8 +64,8 @@ def main():
     print(f"params: {n_params}")
 
     if mode == "train":
-        train_x = read_idx_images(os.path.join(data_dir, "train-images-idx3-ubyte"), 10000)
-        train_y = read_idx_labels(os.path.join(data_dir, "train-labels-idx1-ubyte"), 10000)
+        train_x = read_idx_images(os.path.join(data_dir, "train-images-idx3-ubyte"), 60000)
+        train_y = read_idx_labels(os.path.join(data_dir, "train-labels-idx1-ubyte"), 60000)
         test_x = read_idx_images(os.path.join(data_dir, "t10k-images-idx3-ubyte"), 10000)
         test_y = read_idx_labels(os.path.join(data_dir, "t10k-labels-idx1-ubyte"), 10000)
         print(f"loaded mnist: train={len(train_x)} test={len(test_x)}")
