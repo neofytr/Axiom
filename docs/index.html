@@ -16,32 +16,30 @@
             <a href="architecture.html">Architecture</a>
             <a href="api-tensor.html">API</a>
             <a href="guide-training.html">Guides</a>
-            <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+            <a href="https://github.com/neofytr/Axiom" target="_blank">GitHub</a>
         </nav>
     </div>
 </header>
 
 <main class="landing-page">
 
-    <!-- hero -->
     <section class="hero">
         <h1>Axiom</h1>
-        <p class="tagline">Deep learning framework in C. No dependencies. No compromises.</p>
+        <p class="tagline">Deep learning in C. No dependencies. No compromises.</p>
         <div class="hero-buttons">
             <a href="quickstart.html" class="btn btn-primary">Get Started</a>
-            <a href="https://github.com/neofytr/neoNN" class="btn btn-secondary" target="_blank">GitHub</a>
+            <a href="https://github.com/neofytr/Axiom" class="btn btn-secondary" target="_blank">GitHub</a>
         </div>
     </section>
 
-    <!-- stats -->
     <section class="stats-bar">
         <div class="stat-item">
-            <span class="stat-value">2.3x</span>
-            <span class="stat-label">Faster inference vs TensorFlow</span>
+            <span class="stat-value">1.78x</span>
+            <span class="stat-label">Faster GPU training vs TensorFlow</span>
         </div>
         <div class="stat-item">
-            <span class="stat-value">19K</span>
-            <span class="stat-label">Lines of C</span>
+            <span class="stat-value">2.3x</span>
+            <span class="stat-label">Faster inference on CPU</span>
         </div>
         <div class="stat-item">
             <span class="stat-value">Zero</span>
@@ -53,12 +51,34 @@
         </div>
     </section>
 
-    <!-- benchmarks -->
     <section class="section">
         <h2 class="section-title">Benchmarks</h2>
-        <p class="section-subtitle">Same model, same dataset, same thread count, same CI machine. No cherry-picking.</p>
+        <p class="section-subtitle">Same model, same dataset, same hardware. No cherry-picking.</p>
 
-        <h3 style="margin-bottom: 12px;">Training (MNIST, 60K samples, Adam, batch 256)</h3>
+        <h3 style="margin-bottom: 12px; color: #F0F2F4; font-size: 15px; font-weight: 600;">GPU Training (RTX 3050, 575K params, MNIST 60K, 10 epochs)</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Framework</th>
+                    <th>Time / Epoch</th>
+                    <th>Throughput</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td><strong>Axiom GPU</strong></td>
+                    <td><strong>0.185s</strong></td>
+                    <td><strong>323K samples/s</strong></td>
+                </tr>
+                <tr>
+                    <td>TensorFlow GPU</td>
+                    <td>0.330s</td>
+                    <td>~182K samples/s</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <h3 style="margin-top: 32px; margin-bottom: 12px; color: #F0F2F4; font-size: 15px; font-weight: 600;">CPU Training (MNIST, 60K samples, Adam, batch 256)</h3>
         <table>
             <thead>
                 <tr>
@@ -70,23 +90,18 @@
             <tbody>
                 <tr>
                     <td>12.6M params</td>
-                    <td><strong>Axiom 69s</strong> / TF 87s</td>
+                    <td><strong>Axiom 69s</strong> / TF 87s (1.25x)</td>
                     <td>-</td>
-                </tr>
-                <tr>
-                    <td>4.2M params</td>
-                    <td><strong>Axiom 34s</strong> / TF 36s</td>
-                    <td><strong>Axiom 26s</strong> / TF 30s</td>
                 </tr>
                 <tr>
                     <td>1.46M params</td>
                     <td><strong>Axiom 16s</strong> / TF 17s</td>
-                    <td><strong>Axiom 16s</strong> / TF 20s</td>
+                    <td><strong>Axiom 16s</strong> / TF 20s (1.21x)</td>
                 </tr>
             </tbody>
         </table>
 
-        <h3 style="margin-top: 32px; margin-bottom: 12px;">Inference (1.46M params, batch 256, 1000 forward passes)</h3>
+        <h3 style="margin-top: 32px; margin-bottom: 12px; color: #F0F2F4; font-size: 15px; font-weight: 600;">Inference (1.46M params, batch 256, 1000 forward passes)</h3>
         <table>
             <thead>
                 <tr>
@@ -110,7 +125,6 @@
         </table>
     </section>
 
-    <!-- features -->
     <section class="section">
         <h2 class="section-title">What you get</h2>
         <p class="section-subtitle">Everything needed to train and deploy neural networks. Nothing you don't need.</p>
@@ -148,7 +162,6 @@
         </div>
     </section>
 
-    <!-- code example -->
     <section class="section">
         <h2 class="section-title">What it looks like</h2>
         <p class="section-subtitle">A complete training loop in a few lines of C.</p>
@@ -191,7 +204,7 @@
         <a href="architecture.html">Architecture</a>
         <a href="api-tensor.html">API Reference</a>
         <a href="guide-training.html">Guides</a>
-        <a href="https://github.com/neofytr/neoNN" target="_blank">GitHub</a>
+        <a href="https://github.com/neofytr/Axiom" target="_blank">GitHub</a>
     </div>
     <p>Axiom is MIT licensed.</p>
 </footer>
