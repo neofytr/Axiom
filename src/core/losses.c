@@ -343,6 +343,88 @@ static void ce_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
 }
 
+/* gpu backward for cross-entropy: grad_input += (softmax - target) * scale.
+   all ops go through dispatch so they run on the active device. */
+static void ce_backward_device(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    ax_tensor_t *pred = self->saved[0];
+    ax_tensor_t *target = self->saved[1];
+    ax_tensor_t *softmax_out = self->saved[2];
+    if (!pred->requires_grad) return;
+    if (!pred->grad)
+        pred->grad = ax_tensor_zeros(pred->shape, pred->ndim, pred->dtype);
+    if (!pred->grad) return;
+
+    int64_t i0[] = {0};
+    float g = ax_tensor_get_f32(grad_out, i0);
+    float scale = g / (float)pred->shape[0];
+
+    /* diff = softmax - target */
+    ax_tensor_t *diff = ax_tensor_zeros(pred->shape, pred->ndim, pred->dtype);
+    if (!diff) return;
+    ax_compute_sub(softmax_out, target, diff);
+    /* pred->grad += scale * diff */
+    ax_compute_axpy(diff, scale, pred->grad);
+    ax_tensor_destroy(diff);
+}
+
+/* gpu forward for cross-entropy: composes from existing dispatch ops.
+   avoids all raw pointer access. the cpu path below stays unchanged. */
+static ax_tensor_t *cross_entropy_loss_device(ax_tensor_t *pred, ax_tensor_t *target)
+{
+    int64_t batch = pred->shape[0];
+
+    /* softmax */
+    ax_tensor_t *sm = ax_tensor_zeros(pred->shape, pred->ndim, pred->dtype);
+    if (!sm) return NULL;
+    if (ax_compute_softmax_rowwise(pred, sm) != AX_OK) {
+        ax_tensor_destroy(sm);
+        return NULL;
+    }
+
+    /* log(softmax) */
+    ax_tensor_t *log_sm = ax_tensor_zeros(pred->shape, pred->ndim, pred->dtype);
+    if (!log_sm) { ax_tensor_destroy(sm); return NULL; }
+    ax_compute_log(sm, log_sm);
+
+    /* element-wise target * log_sm */
+    ax_tensor_t *prod = ax_tensor_zeros(pred->shape, pred->ndim, pred->dtype);
+    if (!prod) { ax_tensor_destroy(sm); ax_tensor_destroy(log_sm); return NULL; }
+    ax_compute_mul(target, log_sm, prod);
+    ax_tensor_destroy(log_sm);
+
+    /* sum all elements */
+    int64_t one_shape[] = {1};
+    ax_tensor_t *total = ax_tensor_zeros(one_shape, 1, AX_FLOAT32);
+    if (!total) { ax_tensor_destroy(sm); ax_tensor_destroy(prod); return NULL; }
+    ax_compute_sum(prod, -1, total);
+    ax_tensor_destroy(prod);
+
+    /* loss = -total / batch */
+    ax_tensor_t *loss = ax_tensor_zeros(one_shape, 1, AX_FLOAT32);
+    if (!loss) { ax_tensor_destroy(sm); ax_tensor_destroy(total); return NULL; }
+    ax_compute_mul_scalar(total, -1.0 / (double)batch, loss);
+    ax_tensor_destroy(total);
+
+    if (ax_grad_enabled() && pred->requires_grad) {
+        loss->requires_grad = true;
+        ax_grad_fn_t *gf = ax_grad_fn_create(ce_backward_device);
+        gf->inputs[0] = pred;
+        gf->n_inputs = 1;
+        gf->saved[0] = pred;
+        gf->saved_owned[0] = false;
+        gf->saved[1] = target;
+        gf->saved_owned[1] = false;
+        gf->saved[2] = sm;
+        gf->saved_owned[2] = true;
+        gf->n_saved = 3;
+        loss->grad_fn = gf;
+    } else {
+        ax_tensor_destroy(sm);
+    }
+    return loss;
+}
+
 ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
 {
     if (!pred || !target)
@@ -369,6 +451,12 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
         return NULL;
     }
 
+    /* gpu fast path: compose from dispatch ops, no raw pointer access */
+    if (pred->storage->device != AX_DEVICE_CPU) {
+        return cross_entropy_loss_device(pred, target);
+    }
+
+    /* cpu path below: character-for-character identical to before */
     int64_t batch = pred->shape[0];
     int64_t classes = pred->shape[1];
     float *pd = (float *)pred->storage->data;
