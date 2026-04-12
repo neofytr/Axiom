@@ -52,7 +52,22 @@ static ax_status_t cuda_init_hook(void) {
        doesn't race with lazy allocation. if no cuda device is present
        this silently leaves g_cublas NULL and later ops will fail with
        a cublas status error. */
-    ax_cuda_cublas_handle();
+    cublasHandle_t h = ax_cuda_cublas_handle();
+
+    /* enable tf32 tensor-core math on ampere+ gpus (sm_80+). this gives
+       ~2x gemm throughput at 19-bit mantissa precision — indistinguishable
+       from fp32 for training. on pre-ampere gpus the call succeeds but
+       has no effect. the mode only applies to cublasSgemm; custom kernels
+       still use full fp32. */
+    if (h) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        if (major >= 8) {
+            cublasSetMathMode(h, CUBLAS_TF32_TENSOR_OP_MATH);
+        }
+    }
     /* allocate the persistent device-side scratch arena. on failure
        we silently leave it NULL; ops that need scratch will then fall
        back to their per-call cudaMalloc path (or just fail). */
@@ -124,6 +139,8 @@ extern const ax_backend_ops_t ax_cuda_ops = {
     .add_scalar = cuda_add_scalar,
     .mul_scalar = cuda_mul_scalar,
     .gemm       = cuda_gemm,
+    .gemm_nt    = cuda_gemm_nt,
+    .gemm_tn    = cuda_gemm_tn,
     .gemm_ex    = cuda_gemm_ex,
     .add_relu   = cuda_add_relu,
     .axpy       = cuda_axpy,

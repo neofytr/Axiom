@@ -91,14 +91,26 @@ ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
         return AX_ERR_SHAPE_MISMATCH;
     }
 
-    /* allocate the col scratch on device. too big for the persistent
-       arena in typical conv shapes. */
+    /* persistent col buffer: reuse across calls to avoid the cudaMalloc /
+       cudaFree driver sync that costs ~0.5 ms per call. reallocated only
+       when the new col matrix exceeds the cached size. the buffer stays
+       live until backend shutdown. safe because cuda conv_gemm is always
+       called from the default stream (no concurrent overlap). */
+    static float *s_col_buf = NULL;
+    static size_t s_col_cap = 0;
+
     size_t col_bytes = (size_t)K * (size_t)M * sizeof(float);
-    float *d_col = NULL;
-    if (cudaMalloc(&d_col, col_bytes) != cudaSuccess) {
-        ax_err_set(AX_ERR_ALLOC, "cuda conv_gemm: cudaMalloc col failed");
-        return AX_ERR_ALLOC;
+    if (col_bytes > s_col_cap) {
+        if (s_col_buf) cudaFree(s_col_buf);
+        s_col_buf = NULL;
+        s_col_cap = 0;
+        if (cudaMalloc(&s_col_buf, col_bytes) != cudaSuccess) {
+            ax_err_set(AX_ERR_ALLOC, "cuda conv_gemm: cudaMalloc col failed");
+            return AX_ERR_ALLOC;
+        }
+        s_col_cap = col_bytes;
     }
+    float *d_col = s_col_buf;
 
     /* im2col: 2d grid, x along out columns (M), y along in rows (K).
        one 16x16 block shape balances coalescing along x with warp
@@ -115,7 +127,6 @@ ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
         d_col);
     cudaError_t cerr = cudaGetLastError();
     if (cerr != cudaSuccess) {
-        cudaFree(d_col);
         ax_err_set(AX_ERR_BACKEND, "cuda conv_gemm im2col launch failed: %s",
                    cudaGetErrorString(cerr));
         return AX_ERR_BACKEND;
@@ -136,7 +147,7 @@ ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
         wd,    (int)K,
         &beta,
         od,    (int)M);
-    cudaFree(d_col);
+    /* d_col is the persistent buffer — NOT freed here. reused on next call. */
     if (st != CUBLAS_STATUS_SUCCESS) {
         ax_err_set(AX_ERR_BACKEND, "cuda conv_gemm cublasSgemm failed (%d)", (int)st);
         return AX_ERR_BACKEND;

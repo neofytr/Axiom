@@ -63,7 +63,16 @@ if(AX_CUDA)
     find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_STANDARD 14)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-    message(STATUS "CUDA enabled (toolkit ${CUDAToolkit_VERSION})")
+
+    # multi-arch fat binary: covers maxwell through ada lovelace. the
+    # user can narrow to a single arch for faster compile + smaller
+    # binary via -DCMAKE_CUDA_ARCHITECTURES=86 etc.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "52;60;70;75;80;86;89")
+    endif()
+
+    message(STATUS "CUDA enabled (toolkit ${CUDAToolkit_VERSION}, "
+                   "architectures: ${CMAKE_CUDA_ARCHITECTURES})")
     add_compile_definitions(AX_HAVE_CUDA)
 endif()
 
