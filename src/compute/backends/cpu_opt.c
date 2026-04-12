@@ -464,9 +464,23 @@ static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc
 static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc,
                       int64_t n_remain, float *packed)
 {
+    /* b_src is [N, K] (row-major), we want to pack as if transposed:
+       packed[p * NR + jj] = b_src[(j + jj) * ldb + p]. the naive code
+       accesses b with stride=ldb between jj values → one L1 miss per
+       element for large ldb.
+
+       optimisation: prefetch the next k-iteration's elements from each
+       row so the cache line is already in L1 by the time we read it.
+       with NR=16 rows and 1 prefetch per row, that's 16 prefetches
+       per K iteration — cheap versus the 16 cache misses they avoid. */
     for (int64_t j = 0; j < nc; j += GEMM_NR) {
         int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
         for (int64_t p = 0; p < kc; p++) {
+            /* prefetch next K position for each row */
+            if (p + 8 < kc) {
+                for (int64_t jj = 0; jj < nr; jj++)
+                    __builtin_prefetch(b_src + (j + jj) * ldb_src + p + 8, 0, 1);
+            }
             for (int64_t jj = 0; jj < GEMM_NR; jj++) {
                 if (jj < nr)
                     packed[jj] = b_src[(j + jj) * ldb_src + p];
@@ -1521,16 +1535,33 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
 
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
-    float *pack_a_buf = tl_pack_a_buf;
-    float *pack_b_buf = tl_pack_b_buf;
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+    /* JC parallelism when there's enough compute to justify OMP overhead
+       (~1M FLOPs threshold matches the standard gemm heuristic). */
+    int max_threads = 1;
+    int64_t total_flops = m * n * k;
+    #ifdef _OPENMP
+    if (!omp_in_parallel() && total_flops > 1000000) max_threads = omp_get_max_threads();
+    #endif
+    int64_t n_jc_tiles = (n + GEMM_NC - 1) / GEMM_NC;
+    int gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
+    (void)gemm_threads;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(gemm_threads) schedule(static)
+    #endif
+    for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+        ensure_tl_pack_bufs();
+        float *pack_a_buf = tl_pack_a_buf;
+        float *pack_b_buf = tl_pack_b_buf;
+        if (!pack_a_buf || !pack_b_buf) continue;
+
+        int64_t jc = jct * GEMM_NC;
         int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
         int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
         for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
             int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
-            /* pack B^T: source b[j*k + p], we want packed[p*NR + jj] = b[(jc+j+jj)*k + pc + p] */
             pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, pack_b_buf);
             for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                 int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
@@ -1601,11 +1632,27 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
 
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
-    float *pack_a_buf = tl_pack_a_buf;
-    float *pack_b_buf = tl_pack_b_buf;
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
+    int max_threads = 1;
+    int64_t total_flops = m * n * k;
+    #ifdef _OPENMP
+    if (!omp_in_parallel() && total_flops > 1000000) max_threads = omp_get_max_threads();
+    #endif
+    int64_t n_jc_tiles = (n + GEMM_NC - 1) / GEMM_NC;
+    int gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
+    (void)gemm_threads;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(gemm_threads) schedule(static)
+    #endif
+    for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+        ensure_tl_pack_bufs();
+        float *pack_a_buf = tl_pack_a_buf;
+        float *pack_b_buf = tl_pack_b_buf;
+        if (!pack_a_buf || !pack_b_buf) continue;
+
+        int64_t jc = jct * GEMM_NC;
         int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
         int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
         for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
@@ -1614,8 +1661,6 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
             for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                 int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                /* pack A^T: source a[k, m], slice is [pc:pc+kc, ic:ic+mc] in A^T space,
-                   i.e. we want packed[ii,p] = a[pc+p, ic+ii] = a_src[(pc+p)*m + ic+ii]. */
                 pack_a_t(ad + pc * m + ic, m, mc_pack, kc, mc, pack_a_buf);
                 for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                     int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);

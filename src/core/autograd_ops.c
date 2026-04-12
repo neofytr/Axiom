@@ -80,32 +80,50 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
                this makes backward work on cuda tensors without any
                host-side raw-pointer access. */
             if (t->grad->storage->device != AX_DEVICE_CPU) {
-                ax_compute_axpy(grad_to_add, 1.0f, t->grad);
+                if (t->grad->storage->generation == 0) {
+                    ax_compute_copy(grad_to_add, t->grad);
+                } else {
+                    ax_compute_axpy(grad_to_add, 1.0f, t->grad);
+                }
                 ax_storage_touch(t->grad->storage);
                 return;
             }
 
-            /* cpu fast path: simd accumulation when both are contiguous */
+            /* cpu fast path. when the grad is fresh (generation==0, set
+               by zero_grad or ensure_grad), use memcpy (write-only stream)
+               instead of simd-add (read+read+write). saves one full memory
+               pass over the gradient buffer. */
             int64_t n = ax_tensor_numel(t->grad);
             float *gd = (float *)t->grad->storage->data;
             float *ad = (float *)grad_to_add->storage->data;
             int64_t goff = (int64_t)t->grad->offset;
             int64_t aoff = (int64_t)grad_to_add->offset;
+            bool fresh = (t->grad->storage->generation == 0);
 
             if (goff == 0 && aoff == 0
                 && ax_tensor_is_contiguous(t->grad)
                 && ax_tensor_is_contiguous(grad_to_add))
             {
-                int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
-                for (; i < ve; i += AX_VF32_WIDTH)
-                    ax_vf32_store(gd + i, ax_vf32_add(ax_vf32_load(gd + i), ax_vf32_load(ad + i)));
-                for (; i < n; i++)
-                    gd[i] += ad[i];
+                if (fresh) {
+                    /* first write: memcpy (1 write stream) vs add (2 reads + 1 write) */
+                    memcpy(gd, ad, (size_t)n * sizeof(float));
+                } else {
+                    int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
+                    for (; i < ve; i += AX_VF32_WIDTH)
+                        ax_vf32_store(gd + i, ax_vf32_add(ax_vf32_load(gd + i), ax_vf32_load(ad + i)));
+                    for (; i < n; i++)
+                        gd[i] += ad[i];
+                }
             }
             else
             {
-                for (int64_t i = 0; i < n; i++)
-                    gd[goff + i] += ad[aoff + i];
+                if (fresh) {
+                    for (int64_t i = 0; i < n; i++)
+                        gd[goff + i] = ad[aoff + i];
+                } else {
+                    for (int64_t i = 0; i < n; i++)
+                        gd[goff + i] += ad[aoff + i];
+                }
             }
             ax_storage_touch(t->grad->storage);
             return;
@@ -485,27 +503,25 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
        when the grad already existed (residual connections, shared params),
        we fall back to the temp + accumulate path so += semantics are
        preserved. */
+    /* dA = grad_out @ b^T. direct-write when fresh, temp + accumulate otherwise. */
     if (self->inputs[0]->requires_grad)
     {
         bool fresh_a;
         if (!ensure_grad_ex(self->inputs[0], &fresh_a)) return;
 
         if (fresh_a) {
-            /* direct write into input.grad — no temp, no accumulate */
             if (ax_compute_has_gemm_nt()) {
                 ax_compute_gemm_nt(grad_out, b, self->inputs[0]->grad);
             } else {
                 ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
-                if (!bt) return;
-                ax_tensor_t *bt_c = ax_tensor_contiguous(bt);
-                ax_tensor_destroy(bt);
+                ax_tensor_t *bt_c = bt ? ax_tensor_contiguous(bt) : NULL;
+                if (bt) ax_tensor_destroy(bt);
                 if (!bt_c) return;
                 ax_compute_gemm(grad_out, bt_c, self->inputs[0]->grad);
                 ax_tensor_destroy(bt_c);
             }
             ax_storage_touch(self->inputs[0]->grad->storage);
         } else {
-            /* grad already has data from another backward path; use temp + accumulate */
             int64_t ga_shape[] = {grad_out->shape[0], b->shape[0]};
             ax_tensor_t *grad_a = ax_tensor_arena_create(ar, ga_shape, 2, grad_out->dtype);
             if (!grad_a) return;
@@ -513,9 +529,8 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 ax_compute_gemm_nt(grad_out, b, grad_a);
             } else {
                 ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
-                if (!bt) return;
-                ax_tensor_t *bt_c = ax_tensor_contiguous(bt);
-                ax_tensor_destroy(bt);
+                ax_tensor_t *bt_c = bt ? ax_tensor_contiguous(bt) : NULL;
+                if (bt) ax_tensor_destroy(bt);
                 if (!bt_c) return;
                 ax_compute_gemm(grad_out, bt_c, grad_a);
                 ax_tensor_destroy(bt_c);
@@ -524,7 +539,7 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         }
     }
 
-    /* d/db = a^T @ grad_out. same direct-write optimisation. */
+    /* dB = a^T @ grad_out. same pattern. */
     if (self->inputs[1]->requires_grad)
     {
         bool fresh_b;
@@ -535,9 +550,8 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 ax_compute_gemm_tn(a, grad_out, self->inputs[1]->grad);
             } else {
                 ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
-                if (!at) return;
-                ax_tensor_t *at_c = ax_tensor_contiguous(at);
-                ax_tensor_destroy(at);
+                ax_tensor_t *at_c = at ? ax_tensor_contiguous(at) : NULL;
+                if (at) ax_tensor_destroy(at);
                 if (!at_c) return;
                 ax_compute_gemm(at_c, grad_out, self->inputs[1]->grad);
                 ax_tensor_destroy(at_c);
@@ -551,9 +565,8 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 ax_compute_gemm_tn(a, grad_out, grad_b);
             } else {
                 ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
-                if (!at) return;
-                ax_tensor_t *at_c = ax_tensor_contiguous(at);
-                ax_tensor_destroy(at);
+                ax_tensor_t *at_c = at ? ax_tensor_contiguous(at) : NULL;
+                if (at) ax_tensor_destroy(at);
                 if (!at_c) return;
                 ax_compute_gemm(at_c, grad_out, grad_b);
                 ax_tensor_destroy(at_c);
@@ -575,27 +588,35 @@ static void matmul_bias_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     /* compute dBias if bias (saved[2]) is present and requires grad */
     ax_tensor_t *bias = self->saved[2];
     if (bias && bias->requires_grad) {
-        if (!ensure_grad(bias)) return;
-        /* dBias = sum(grad_out, axis=0). for a [M, N] grad_out, this
-           produces a [N] vector. use ax_compute_sum if we can trust the
-           shapes, otherwise scalar fallback. */
+        bool fresh_bias;
+        if (!ensure_grad_ex(bias, &fresh_bias)) return;
+        /* dBias = sum(grad_out, axis=0). */
         if (grad_out->storage->device != AX_DEVICE_CPU) {
-            /* device path: dispatch through compute */
             ax_tensor_t *dbias_tmp = ax_tensor_create(bias->shape, bias->ndim, bias->dtype);
             if (dbias_tmp) {
                 ax_compute_sum(grad_out, 0, dbias_tmp);
-                ax_compute_axpy(dbias_tmp, 1.0f, bias->grad);
+                if (fresh_bias)
+                    ax_compute_copy(dbias_tmp, bias->grad);
+                else
+                    ax_compute_axpy(dbias_tmp, 1.0f, bias->grad);
                 ax_tensor_destroy(dbias_tmp);
             }
         } else {
-            /* cpu path: direct simd accumulation into bias->grad */
             int64_t m = grad_out->shape[0], n = grad_out->shape[1];
             const float *gd = (const float *)grad_out->storage->data + grad_out->offset;
             float *bg = (float *)bias->grad->storage->data + bias->grad->offset;
-            for (int64_t j = 0; j < n; j++) {
-                float s = 0.0f;
-                for (int64_t i = 0; i < m; i++) s += gd[i * n + j];
-                bg[j] += s;
+            if (fresh_bias) {
+                for (int64_t j = 0; j < n; j++) {
+                    float s = 0.0f;
+                    for (int64_t i = 0; i < m; i++) s += gd[i * n + j];
+                    bg[j] = s;
+                }
+            } else {
+                for (int64_t j = 0; j < n; j++) {
+                    float s = 0.0f;
+                    for (int64_t i = 0; i < m; i++) s += gd[i * n + j];
+                    bg[j] += s;
+                }
             }
         }
         ax_storage_touch(bias->grad->storage);
