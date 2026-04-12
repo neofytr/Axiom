@@ -33,8 +33,10 @@ extern const ax_backend_ops_t ax_cpu_naive_ops;
    runtime via __builtin_cpu_supports. single-build mode (default)
    exports the plain ax_cpu_opt_ops symbol. */
 #ifdef AX_CPU_ISA_DISPATCH
+extern const ax_backend_ops_t ax_cpu_opt_ops_avx512;
 extern const ax_backend_ops_t ax_cpu_opt_ops_avx2;
 extern const ax_backend_ops_t ax_cpu_opt_ops_scalar;
+extern void ax_cpu_opt_tune_init_avx512(void);
 extern void ax_cpu_opt_tune_init_avx2(void);
 extern void ax_cpu_opt_tune_init_scalar(void);
 #else
@@ -96,7 +98,9 @@ ax_status_t ax_compute_init(void) {
        otherwise the single-build vtable wins unconditionally. */
     backends[AX_BACKEND_CPU_NAIVE] = &ax_cpu_naive_ops;
 #ifdef AX_CPU_ISA_DISPATCH
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("fma")) {
+        backends[AX_BACKEND_CPU_SIMD] = &ax_cpu_opt_ops_avx512;
+    } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
         backends[AX_BACKEND_CPU_SIMD] = &ax_cpu_opt_ops_avx2;
     } else {
         backends[AX_BACKEND_CPU_SIMD] = &ax_cpu_opt_ops_scalar;
@@ -125,7 +129,9 @@ ax_status_t ax_compute_init(void) {
        here. idempotent — a second call is a no-op on hosted builds.
        under AX_CPU_ISA_DISPATCH we call the variant that got selected. */
 #ifdef AX_CPU_ISA_DISPATCH
-    if (active_ops == &ax_cpu_opt_ops_avx2) {
+    if (active_ops == &ax_cpu_opt_ops_avx512) {
+        ax_cpu_opt_tune_init_avx512();
+    } else if (active_ops == &ax_cpu_opt_ops_avx2) {
         ax_cpu_opt_tune_init_avx2();
     } else {
         ax_cpu_opt_tune_init_scalar();

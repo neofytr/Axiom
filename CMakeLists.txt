@@ -197,9 +197,20 @@ endif()
 # both into axiom_static/axiom_shared. dispatch.c selects the
 # active vtable at ax_compute_init via __builtin_cpu_supports.
 if(AX_CPU_ISA_DISPATCH)
-    message(STATUS "cpu_opt runtime isa dispatch enabled (avx2 + scalar variants)")
+    message(STATUS "cpu_opt runtime isa dispatch enabled (avx512 + avx2 + scalar variants)")
 
-    # avx2+fma variant — the fast one on modern x86.
+    # avx-512 variant — fastest on xeon / ice lake+.
+    add_library(axiom_cpu_opt_avx512 OBJECT src/compute/backends/cpu_opt.c)
+    target_include_directories(axiom_cpu_opt_avx512 PUBLIC include
+        PRIVATE src/compute/backends)
+    target_compile_definitions(axiom_cpu_opt_avx512 PRIVATE AX_CPU_OPT_SUFFIX=_avx512)
+    target_compile_options(axiom_cpu_opt_avx512 PRIVATE -mavx512f -mavx2 -mfma)
+    set_property(TARGET axiom_cpu_opt_avx512 PROPERTY POSITION_INDEPENDENT_CODE ON)
+    if(AX_OPENMP AND OpenMP_C_FOUND)
+        target_link_libraries(axiom_cpu_opt_avx512 PUBLIC OpenMP::OpenMP_C)
+    endif()
+
+    # avx2+fma variant — fast on most x86_64 since haswell (2013).
     add_library(axiom_cpu_opt_avx2 OBJECT src/compute/backends/cpu_opt.c)
     target_include_directories(axiom_cpu_opt_avx2 PUBLIC include
         PRIVATE src/compute/backends)
@@ -239,7 +250,7 @@ if(AX_OPENMP AND OpenMP_C_FOUND)
 endif()
 if(AX_CPU_ISA_DISPATCH)
     target_link_libraries(axiom_static PUBLIC
-        axiom_cpu_opt_avx2 axiom_cpu_opt_scalar)
+        axiom_cpu_opt_avx512 axiom_cpu_opt_avx2 axiom_cpu_opt_scalar)
 endif()
 if(AX_CUDA)
     target_link_libraries(axiom_static PUBLIC CUDA::cudart CUDA::cublas)

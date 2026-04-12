@@ -276,12 +276,19 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
    6x16 micro-kernel on AVX2: 12 YMM accumulators + 2 B loads + 1 A broadcast
    = 15 of 16 registers. no spills, near-peak FMA throughput. */
 
-#if defined(AX_SIMD_AVX2)
+#if defined(AX_SIMD_AVX512)
+    #define GEMM_MR 14
+    #define GEMM_NR 32     /* 2 x 16-wide AVX-512 vectors per row.
+                              28 accumulators + 2 B + 1 A + 1 spare = 32 ZMM.
+                              matches BLIS reference for Skylake-X. */
+#elif defined(AX_SIMD_AVX2)
     #define GEMM_MR 6
     #define GEMM_NR 16     /* 2 x 8-wide AVX2 vectors per row */
 #elif defined(AX_SIMD_NEON)
-    #define GEMM_MR 4
-    #define GEMM_NR 8      /* 2 x 4-wide NEON vectors per row */
+    #define GEMM_MR 8
+    #define GEMM_NR 12     /* 3 x 4-wide NEON vectors per row.
+                              24 accumulators + 3 B + 2 A = 29 Q regs.
+                              uses vfmaq_laneq_f32 (lane-broadcast FMA). */
 #else
     #define GEMM_MR 4
     #define GEMM_NR 4
@@ -294,6 +301,17 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
    at runtime AX_GEMM_MC/NC/KC env vars override these (hosted targets
    only). the init hook also logs a warning if the pack_b panel exceeds
    detected l2 so users know to tune. */
+/* isa-adaptive tile defaults. the cmake profile sets one set of defaults
+   for the target class (desktop / embedded-linux / baremetal). when the
+   isa is known at compile time, override with values that fill the typical
+   cache hierarchy for that ISA. env vars still win over everything. */
+#if defined(AX_SIMD_AVX512) && !defined(AX_GEMM_DEFAULT_MC)
+    /* xeon: 1 MB L2. MC=168=12×14, pack_a=168×256×4=168KB.
+       NC=512, pack_b=512×256×4=512KB. total=680KB < 1MB. */
+    #define AX_GEMM_DEFAULT_MC 168
+    #define AX_GEMM_DEFAULT_NC 512
+    #define AX_GEMM_DEFAULT_KC 256
+#endif
 #ifndef AX_GEMM_DEFAULT_MC
 #define AX_GEMM_DEFAULT_MC 72
 #endif
@@ -599,7 +617,92 @@ static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
 }
 
 
-#if defined(AX_SIMD_AVX2)
+#if defined(AX_SIMD_AVX512)
+
+/* 14×32 AVX-512 micro-kernel.
+   28 ZMM accumulators (14 rows × 2 vectors), fully pinned in registers.
+   per K iteration: 2 B loads + 14 A broadcasts + 28 FMA.
+   FMA throughput: 28/2 = 14 cycles (2 FMA ports).
+   broadcast throughput: 14/1 = 14 cycles (port 5).
+   both co-bottleneck at 14 cycles → 28×16×2/14 = 64 FLOPs/cycle
+   = theoretical peak for 2-FMA-port AVX-512. */
+
+static void micro_kernel(int64_t kc, const float *restrict ap, const float *restrict bp,
+                          float *restrict c, int64_t ldc, int64_t mr, int64_t nr)
+{
+    __m512 c00=_mm512_setzero_ps(), c01=_mm512_setzero_ps();
+    __m512 c10=_mm512_setzero_ps(), c11=_mm512_setzero_ps();
+    __m512 c20=_mm512_setzero_ps(), c21=_mm512_setzero_ps();
+    __m512 c30=_mm512_setzero_ps(), c31=_mm512_setzero_ps();
+    __m512 c40=_mm512_setzero_ps(), c41=_mm512_setzero_ps();
+    __m512 c50=_mm512_setzero_ps(), c51=_mm512_setzero_ps();
+    __m512 c60=_mm512_setzero_ps(), c61=_mm512_setzero_ps();
+    __m512 c70=_mm512_setzero_ps(), c71=_mm512_setzero_ps();
+    __m512 c80=_mm512_setzero_ps(), c81=_mm512_setzero_ps();
+    __m512 c90=_mm512_setzero_ps(), c91=_mm512_setzero_ps();
+    __m512 cA0=_mm512_setzero_ps(), cA1=_mm512_setzero_ps();
+    __m512 cB0=_mm512_setzero_ps(), cB1=_mm512_setzero_ps();
+    __m512 cC0=_mm512_setzero_ps(), cC1=_mm512_setzero_ps();
+    __m512 cD0=_mm512_setzero_ps(), cD1=_mm512_setzero_ps();
+
+    /* prefetch output C */
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 16) __builtin_prefetch(c + row * ldc + 16, 0, 3);
+    }
+
+    for (int64_t p = 0; p < kc; p++) {
+        __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
+        __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
+
+        __m512 b0 = _mm512_load_ps(bp);
+        __m512 b1 = _mm512_load_ps(bp + 16);
+
+        #define FMA_ROW(row, lo, hi) { \
+            __m512 a = _mm512_set1_ps(ap[row]); \
+            lo = _mm512_fmadd_ps(a, b0, lo); \
+            hi = _mm512_fmadd_ps(a, b1, hi); \
+        }
+        FMA_ROW( 0, c00, c01); FMA_ROW( 1, c10, c11);
+        FMA_ROW( 2, c20, c21); FMA_ROW( 3, c30, c31);
+        FMA_ROW( 4, c40, c41); FMA_ROW( 5, c50, c51);
+        FMA_ROW( 6, c60, c61); FMA_ROW( 7, c70, c71);
+        FMA_ROW( 8, c80, c81); FMA_ROW( 9, c90, c91);
+        FMA_ROW(10, cA0, cA1); FMA_ROW(11, cB0, cB1);
+        FMA_ROW(12, cC0, cC1); FMA_ROW(13, cD0, cD1);
+        #undef FMA_ROW
+
+        ap += GEMM_MR;
+        bp += GEMM_NR;
+    }
+
+    /* writeback */
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define STORE_ROW(row, lo, hi) \
+            _mm512_storeu_ps(c + (row)*ldc,      _mm512_add_ps(lo, _mm512_loadu_ps(c + (row)*ldc))); \
+            _mm512_storeu_ps(c + (row)*ldc + 16, _mm512_add_ps(hi, _mm512_loadu_ps(c + (row)*ldc + 16)));
+        STORE_ROW( 0,c00,c01); STORE_ROW( 1,c10,c11); STORE_ROW( 2,c20,c21); STORE_ROW( 3,c30,c31);
+        STORE_ROW( 4,c40,c41); STORE_ROW( 5,c50,c51); STORE_ROW( 6,c60,c61); STORE_ROW( 7,c70,c71);
+        STORE_ROW( 8,c80,c81); STORE_ROW( 9,c90,c91); STORE_ROW(10,cA0,cA1); STORE_ROW(11,cB0,cB1);
+        STORE_ROW(12,cC0,cC1); STORE_ROW(13,cD0,cD1);
+        #undef STORE_ROW
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define EXT_ROW(row, lo, hi) \
+            _mm512_store_ps(buf + (row)*GEMM_NR,      lo); \
+            _mm512_store_ps(buf + (row)*GEMM_NR + 16, hi);
+        EXT_ROW( 0,c00,c01); EXT_ROW( 1,c10,c11); EXT_ROW( 2,c20,c21); EXT_ROW( 3,c30,c31);
+        EXT_ROW( 4,c40,c41); EXT_ROW( 5,c50,c51); EXT_ROW( 6,c60,c61); EXT_ROW( 7,c70,c71);
+        EXT_ROW( 8,c80,c81); EXT_ROW( 9,c90,c91); EXT_ROW(10,cA0,cA1); EXT_ROW(11,cB0,cB1);
+        EXT_ROW(12,cC0,cC1); EXT_ROW(13,cD0,cD1);
+        #undef EXT_ROW
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
+#elif defined(AX_SIMD_AVX2)
 
 /* 6x16 AVX2+FMA micro-kernel.
    12 YMM accumulators (6 rows x 2 vectors), fully pinned in registers.
@@ -689,27 +792,115 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
     }
 }
 
+#elif defined(AX_SIMD_NEON)
+
+/* 8×12 NEON micro-kernel using vfmaq_laneq_f32.
+   24 Q accumulators (8 rows × 3 vectors of 4 floats).
+   per K iteration: 3 B loads (b0..b2) + 2 A loads (a_lo, a_hi as Q regs)
+   + 24 FMLA via lane-broadcast (vfmaq_laneq_f32 is a single instruction
+   on A64: FMLA Vd.4S, Vn.4S, Vm.S[lane]).
+   this avoids the scalar broadcast + separate FMA of the generic path,
+   giving ~2× the throughput on Cortex-A76 and Neoverse N1. */
+
+static void micro_kernel(int64_t kc, const float *restrict ap, const float *restrict bp,
+                          float *restrict c, int64_t ldc, int64_t mr, int64_t nr)
+{
+    float32x4_t c00=vdupq_n_f32(0), c01=vdupq_n_f32(0), c02=vdupq_n_f32(0);
+    float32x4_t c10=vdupq_n_f32(0), c11=vdupq_n_f32(0), c12=vdupq_n_f32(0);
+    float32x4_t c20=vdupq_n_f32(0), c21=vdupq_n_f32(0), c22=vdupq_n_f32(0);
+    float32x4_t c30=vdupq_n_f32(0), c31=vdupq_n_f32(0), c32=vdupq_n_f32(0);
+    float32x4_t c40=vdupq_n_f32(0), c41=vdupq_n_f32(0), c42=vdupq_n_f32(0);
+    float32x4_t c50=vdupq_n_f32(0), c51=vdupq_n_f32(0), c52=vdupq_n_f32(0);
+    float32x4_t c60=vdupq_n_f32(0), c61=vdupq_n_f32(0), c62=vdupq_n_f32(0);
+    float32x4_t c70=vdupq_n_f32(0), c71=vdupq_n_f32(0), c72=vdupq_n_f32(0);
+
+    for (int64_t p = 0; p < kc; p++) {
+        float32x4_t b0 = vld1q_f32(bp);
+        float32x4_t b1 = vld1q_f32(bp + 4);
+        float32x4_t b2 = vld1q_f32(bp + 8);
+
+        /* load 8 A values as 2 Q registers, broadcast via lane index */
+        float32x4_t a_lo = vld1q_f32(ap);       /* ap[0..3] */
+        float32x4_t a_hi = vld1q_f32(ap + 4);   /* ap[4..7] */
+
+        /* row 0: a_lo[0] */
+        c00 = vfmaq_laneq_f32(c00, b0, a_lo, 0);
+        c01 = vfmaq_laneq_f32(c01, b1, a_lo, 0);
+        c02 = vfmaq_laneq_f32(c02, b2, a_lo, 0);
+        /* row 1: a_lo[1] */
+        c10 = vfmaq_laneq_f32(c10, b0, a_lo, 1);
+        c11 = vfmaq_laneq_f32(c11, b1, a_lo, 1);
+        c12 = vfmaq_laneq_f32(c12, b2, a_lo, 1);
+        /* row 2: a_lo[2] */
+        c20 = vfmaq_laneq_f32(c20, b0, a_lo, 2);
+        c21 = vfmaq_laneq_f32(c21, b1, a_lo, 2);
+        c22 = vfmaq_laneq_f32(c22, b2, a_lo, 2);
+        /* row 3: a_lo[3] */
+        c30 = vfmaq_laneq_f32(c30, b0, a_lo, 3);
+        c31 = vfmaq_laneq_f32(c31, b1, a_lo, 3);
+        c32 = vfmaq_laneq_f32(c32, b2, a_lo, 3);
+        /* row 4: a_hi[0] */
+        c40 = vfmaq_laneq_f32(c40, b0, a_hi, 0);
+        c41 = vfmaq_laneq_f32(c41, b1, a_hi, 0);
+        c42 = vfmaq_laneq_f32(c42, b2, a_hi, 0);
+        /* row 5: a_hi[1] */
+        c50 = vfmaq_laneq_f32(c50, b0, a_hi, 1);
+        c51 = vfmaq_laneq_f32(c51, b1, a_hi, 1);
+        c52 = vfmaq_laneq_f32(c52, b2, a_hi, 1);
+        /* row 6: a_hi[2] */
+        c60 = vfmaq_laneq_f32(c60, b0, a_hi, 2);
+        c61 = vfmaq_laneq_f32(c61, b1, a_hi, 2);
+        c62 = vfmaq_laneq_f32(c62, b2, a_hi, 2);
+        /* row 7: a_hi[3] */
+        c70 = vfmaq_laneq_f32(c70, b0, a_hi, 3);
+        c71 = vfmaq_laneq_f32(c71, b1, a_hi, 3);
+        c72 = vfmaq_laneq_f32(c72, b2, a_hi, 3);
+
+        ap += GEMM_MR;
+        bp += GEMM_NR;
+    }
+
+    /* writeback */
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define NEON_STORE_ROW(row, v0, v1, v2) \
+            vst1q_f32(c + (row)*ldc,     vaddq_f32(v0, vld1q_f32(c + (row)*ldc))); \
+            vst1q_f32(c + (row)*ldc + 4, vaddq_f32(v1, vld1q_f32(c + (row)*ldc + 4))); \
+            vst1q_f32(c + (row)*ldc + 8, vaddq_f32(v2, vld1q_f32(c + (row)*ldc + 8)));
+        NEON_STORE_ROW(0, c00, c01, c02); NEON_STORE_ROW(1, c10, c11, c12);
+        NEON_STORE_ROW(2, c20, c21, c22); NEON_STORE_ROW(3, c30, c31, c32);
+        NEON_STORE_ROW(4, c40, c41, c42); NEON_STORE_ROW(5, c50, c51, c52);
+        NEON_STORE_ROW(6, c60, c61, c62); NEON_STORE_ROW(7, c70, c71, c72);
+        #undef NEON_STORE_ROW
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define NEON_EXT(row, v0, v1, v2) \
+            vst1q_f32(buf + (row)*GEMM_NR,     v0); \
+            vst1q_f32(buf + (row)*GEMM_NR + 4, v1); \
+            vst1q_f32(buf + (row)*GEMM_NR + 8, v2);
+        NEON_EXT(0, c00, c01, c02); NEON_EXT(1, c10, c11, c12);
+        NEON_EXT(2, c20, c21, c22); NEON_EXT(3, c30, c31, c32);
+        NEON_EXT(4, c40, c41, c42); NEON_EXT(5, c50, c51, c52);
+        NEON_EXT(6, c60, c61, c62); NEON_EXT(7, c70, c71, c72);
+        #undef NEON_EXT
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
 #else
 
-/* generic micro-kernel using the SIMD abstraction layer.
-   on NEON: 4x8 (8 accumulators). on scalar: 4x4.
-   uses loadu/storeu for safe unaligned writeback at tile edges. */
+/* generic scalar micro-kernel. slowest but correct on any platform. */
 static void micro_kernel(int64_t kc, const float *ap, const float *bp,
                           float *c, int64_t ldc, int64_t mr, int64_t nr)
 {
-    /* NR/AX_VF32_WIDTH vectors per row */
     #define NVEC (GEMM_NR / AX_VF32_WIDTH)
     ax_vf32 acc[GEMM_MR][NVEC];
     for (int ii = 0; ii < GEMM_MR; ii++)
         for (int v = 0; v < NVEC; v++)
             acc[ii][v] = ax_vf32_zero();
 
-    /* prefetch 8 iterations ahead keeps both packed panels warm in l1
-       without evicting current lines. portable via __builtin_prefetch. */
     for (int64_t p = 0; p < kc; p++) {
-        __builtin_prefetch(ap + 8 * GEMM_MR, 0, 3);
-        __builtin_prefetch(bp + 8 * GEMM_NR, 0, 3);
-
         for (int v = 0; v < NVEC; v++) {
             ax_vf32 bv = ax_vf32_loadu(bp + v * AX_VF32_WIDTH);
             for (int ii = 0; ii < GEMM_MR; ii++) {
@@ -721,7 +912,6 @@ static void micro_kernel(int64_t kc, const float *ap, const float *bp,
         bp += GEMM_NR;
     }
 
-    /* writeback: C may not be aligned at tile boundaries */
     if (mr == GEMM_MR && nr == GEMM_NR) {
         for (int ii = 0; ii < GEMM_MR; ii++)
             for (int v = 0; v < NVEC; v++) {

@@ -10,8 +10,13 @@
 /* max scratch bytes any single kernel may allocate */
 #define AX_MAX_SCRATCH_BYTES ((size_t)64u * 1024u * 1024u)
 
-/* platform detection */
-#if defined(__AVX2__) && defined(__FMA__)
+/* platform detection — ordered from widest to narrowest. avx-512 must
+   be checked BEFORE avx2 because avx-512 cpus also define __AVX2__. */
+#if defined(__AVX512F__) && defined(__FMA__)
+    #define AX_SIMD_AVX512 1
+    #define AX_HAS_SIMD 1
+    #include <immintrin.h>
+#elif defined(__AVX2__) && defined(__FMA__)
     #define AX_SIMD_AVX2 1
     #define AX_HAS_SIMD 1
     #include <immintrin.h>
@@ -22,7 +27,115 @@
 #endif
 
 
-#if defined(AX_SIMD_AVX2)
+/* ================================================================
+   AVX-512 tier: 16-wide float vectors using ZMM registers.
+   32 ZMM registers enable a 14×32 GEMM micro-kernel (28 accumulators
+   + 2 B loads + 1 A broadcast + 1 spare = 32 registers, zero spills).
+   ================================================================ */
+#if defined(AX_SIMD_AVX512)
+
+#define AX_VF32_WIDTH 16
+typedef __m512 ax_vf32;
+
+static inline ax_vf32 ax_vf32_load(const float *p)    { return _mm512_load_ps(p); }
+static inline ax_vf32 ax_vf32_loadu(const float *p)   { return _mm512_loadu_ps(p); }
+static inline void    ax_vf32_store(float *p, ax_vf32 v)  { _mm512_store_ps(p, v); }
+static inline void    ax_vf32_storeu(float *p, ax_vf32 v) { _mm512_storeu_ps(p, v); }
+static inline ax_vf32 ax_vf32_set1(float v)            { return _mm512_set1_ps(v); }
+static inline ax_vf32 ax_vf32_zero(void)               { return _mm512_setzero_ps(); }
+static inline ax_vf32 ax_vf32_add(ax_vf32 a, ax_vf32 b) { return _mm512_add_ps(a, b); }
+static inline ax_vf32 ax_vf32_sub(ax_vf32 a, ax_vf32 b) { return _mm512_sub_ps(a, b); }
+static inline ax_vf32 ax_vf32_mul(ax_vf32 a, ax_vf32 b) { return _mm512_mul_ps(a, b); }
+static inline ax_vf32 ax_vf32_div(ax_vf32 a, ax_vf32 b) { return _mm512_div_ps(a, b); }
+static inline ax_vf32 ax_vf32_neg(ax_vf32 a)           { return _mm512_sub_ps(_mm512_setzero_ps(), a); }
+static inline ax_vf32 ax_vf32_max(ax_vf32 a, ax_vf32 b) { return _mm512_max_ps(a, b); }
+static inline ax_vf32 ax_vf32_min(ax_vf32 a, ax_vf32 b) { return _mm512_min_ps(a, b); }
+static inline ax_vf32 ax_vf32_fmadd(ax_vf32 a, ax_vf32 b, ax_vf32 c) { return _mm512_fmadd_ps(a, b, c); }
+static inline ax_vf32 ax_vf32_sqrt(ax_vf32 a)          { return _mm512_sqrt_ps(a); }
+
+static inline ax_vf32 ax_vf32_abs(ax_vf32 a) {
+    return _mm512_abs_ps(a);
+}
+static inline ax_vf32 ax_vf32_relu(ax_vf32 a) {
+    return _mm512_max_ps(a, _mm512_setzero_ps());
+}
+
+/* avx-512 compare: returns mask. for cmpgt producing a float vector
+   of 1.0/0.0 (like the avx2 path), use mask blend. */
+static inline ax_vf32 ax_vf32_cmpgt(ax_vf32 a, ax_vf32 b) {
+    __mmask16 m = _mm512_cmp_ps_mask(a, b, _CMP_GT_OQ);
+    return _mm512_mask_blend_ps(m, _mm512_setzero_ps(), _mm512_set1_ps(1.0f));
+}
+
+/* horizontal sum: reduce 16 floats to 1 */
+static inline float ax_vf32_hsum(ax_vf32 v) {
+    return _mm512_reduce_add_ps(v);
+}
+
+/* horizontal max: reduce 16 floats to max */
+static inline float ax_vf32_hmax(ax_vf32 v) {
+    return _mm512_reduce_max_ps(v);
+}
+
+/* fast exp: same polynomial as avx2 but 16-wide */
+static inline ax_vf32 ax_vf32_exp(ax_vf32 x) {
+    x = _mm512_max_ps(x, _mm512_set1_ps(-88.0f));
+    x = _mm512_min_ps(x, _mm512_set1_ps(88.0f));
+    __m512 ln2_inv = _mm512_set1_ps(1.4426950408889634f);
+    __m512 t = _mm512_mul_ps(x, ln2_inv);
+    __m512 tn = _mm512_roundscale_ps(t, _MM_FROUND_TO_NEAREST_INT);
+    __m512 f = _mm512_sub_ps(t, tn);
+    __m512i ni = _mm512_cvtps_epi32(tn);
+    __m512i exp_bits = _mm512_slli_epi32(_mm512_add_epi32(ni, _mm512_set1_epi32(127)), 23);
+    __m512 pow2n = _mm512_castsi512_ps(exp_bits);
+    __m512 c0 = _mm512_set1_ps(1.0f);
+    __m512 c1 = _mm512_set1_ps(0.6931472f);
+    __m512 c2 = _mm512_set1_ps(0.2402265f);
+    __m512 c3 = _mm512_set1_ps(0.0554953f);
+    __m512 c4 = _mm512_set1_ps(0.0096813f);
+    __m512 c5 = _mm512_set1_ps(0.0013376f);
+    __m512 p = _mm512_fmadd_ps(c5, f, c4);
+    p = _mm512_fmadd_ps(p, f, c3);
+    p = _mm512_fmadd_ps(p, f, c2);
+    p = _mm512_fmadd_ps(p, f, c1);
+    p = _mm512_fmadd_ps(p, f, c0);
+    return _mm512_mul_ps(p, pow2n);
+}
+
+/* vector log: same Cephes-style polynomial as avx2 but 16-wide */
+static inline ax_vf32 ax_vf32_log(ax_vf32 x) {
+    __m512i xi = _mm512_castps_si512(x);
+    __m512i exp = _mm512_sub_epi32(_mm512_srli_epi32(xi, 23), _mm512_set1_epi32(127));
+    __m512i mant = _mm512_or_si512(_mm512_and_si512(xi, _mm512_set1_epi32(0x007FFFFF)),
+                                    _mm512_set1_epi32(0x3F800000));
+    __m512 m = _mm512_castsi512_ps(mant);
+    __m512 e = _mm512_cvtepi32_ps(exp);
+    __m512 one = _mm512_set1_ps(1.0f);
+    __m512 f = _mm512_sub_ps(m, one);
+    __m512 s = _mm512_div_ps(f, _mm512_add_ps(m, one));
+    __m512 s2 = _mm512_mul_ps(s, s);
+    __m512 r = _mm512_fmadd_ps(_mm512_set1_ps(0.2392088f), s2, _mm512_set1_ps(0.2850606f));
+    r = _mm512_fmadd_ps(r, s2, _mm512_set1_ps(0.4000006f));
+    r = _mm512_fmadd_ps(r, s2, _mm512_set1_ps(0.6666667f));
+    r = _mm512_fmadd_ps(r, s2, _mm512_set1_ps(2.0f));
+    r = _mm512_fmadd_ps(r, s, _mm512_setzero_ps());
+    return _mm512_fmadd_ps(e, _mm512_set1_ps(0.6931472f), r);
+}
+
+/* vector tanh via 2*sigmoid(2x) - 1 identity */
+static inline ax_vf32 ax_vf32_tanh(ax_vf32 x) {
+    __m512 two = _mm512_set1_ps(2.0f);
+    __m512 one = _mm512_set1_ps(1.0f);
+    __m512 exp_neg = ax_vf32_exp(_mm512_sub_ps(_mm512_setzero_ps(), _mm512_mul_ps(two, x)));
+    __m512 sig2 = _mm512_div_ps(two, _mm512_add_ps(one, exp_neg));
+    return _mm512_sub_ps(sig2, one);
+}
+
+
+/* ================================================================
+   AVX2 tier: 8-wide float vectors using YMM registers.
+   ================================================================ */
+#elif defined(AX_SIMD_AVX2)
 
 /* avx2: 8-wide float vectors */
 #define AX_VF32_WIDTH 8
