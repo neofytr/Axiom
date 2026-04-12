@@ -1819,13 +1819,15 @@ static ax_status_t opt_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
         const float *irow = id + r * cols;
         float *orow = od + r * cols;
 
-        /* pass 1: row-max with simd. */
+        /* pass 1: row-max with simd. use loadu/storeu because rows are
+           not guaranteed to be aligned (cols may not be a multiple of
+           AX_VF32_WIDTH, making row offsets misaligned). */
         int64_t c = 0, ve = cols - (cols % AX_VF32_WIDTH);
         float mx;
         if (ve > 0) {
-            ax_vf32 vmx = ax_vf32_load(irow);
+            ax_vf32 vmx = ax_vf32_loadu(irow);
             for (c = AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
-                vmx = ax_vf32_max(vmx, ax_vf32_load(irow + c));
+                vmx = ax_vf32_max(vmx, ax_vf32_loadu(irow + c));
             mx = ax_vf32_hmax(vmx);
         } else {
             mx = irow[0];
@@ -1838,8 +1840,8 @@ static ax_status_t opt_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
         ax_vf32 vsum = ax_vf32_zero();
         c = 0;
         for (; c < ve; c += AX_VF32_WIDTH) {
-            ax_vf32 ve_vals = ax_vf32_exp(ax_vf32_sub(ax_vf32_load(irow + c), vmx_b));
-            ax_vf32_store(orow + c, ve_vals);
+            ax_vf32 ve_vals = ax_vf32_exp(ax_vf32_sub(ax_vf32_loadu(irow + c), vmx_b));
+            ax_vf32_storeu(orow + c, ve_vals);
             vsum = ax_vf32_add(vsum, ve_vals);
         }
         float sum = ax_vf32_hsum(vsum);
@@ -1854,7 +1856,7 @@ static ax_status_t opt_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
         ax_vf32 vinv = ax_vf32_set1(inv);
         c = 0;
         for (; c < ve; c += AX_VF32_WIDTH)
-            ax_vf32_store(orow + c, ax_vf32_mul(ax_vf32_load(orow + c), vinv));
+            ax_vf32_storeu(orow + c, ax_vf32_mul(ax_vf32_loadu(orow + c), vinv));
         for (; c < cols; c++) orow[c] *= inv;
     }
     return AX_OK;
