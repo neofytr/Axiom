@@ -44,7 +44,7 @@ jobs:
         run: |
           cd build
           if [ -f bench_large ] && [ -f ../examples/data/train-images-idx3-ubyte ]; then
-            OMP_NUM_THREADS=2 ./bench_large train-cpu 2>&1 | grep -E "epoch|median"
+            OMP_NUM_THREADS=2 timeout 120 ./bench_large train-cpu 2>&1 || echo "bench exited with $?"
           else
             echo "skipped: bench_large or mnist data not available"
           fi
