@@ -465,8 +465,14 @@ void ax_optimizer_zero_grad(ax_optimizer_t *opt)
     if (!opt) return;
     for (int i = 0; i < opt->n_params; i++)
     {
-        if (opt->params[i]->grad)
+        if (opt->params[i]->grad) {
             ax_compute_fill(opt->params[i]->grad, 0.0);
+            /* mark grad as "zero-filled and ready for direct overwrite"
+               by setting generation to 0. matmul_backward's direct-write
+               path checks this: if gen == 0, the grad is known-zero and
+               gemm can write directly without a temp + accumulate. */
+            opt->params[i]->grad->storage->generation = 0;
+        }
     }
 }
 

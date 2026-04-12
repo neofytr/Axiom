@@ -46,31 +46,11 @@ static const char *layer_type_name(ax_layer_type_t type)
 static ax_tensor_t *dense_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_dense_t *d = (ax_dense_t *)self;
-
-    /* out = input @ weight */
-    ax_tensor_t *out = ax_matmul(input, d->weight);
-    if (!out) return NULL;
-
-    /* out = out + bias (if present) */
-    if (d->use_bias && d->bias)
-    {
-        ax_tensor_t *biased = ax_add(out, d->bias);
-        if (!biased)
-        {
-            /* ax_add failed: clean up the matmul intermediate and bail.
-               in training mode, out may be in a partial graph — still safe
-               to destroy here because ax_add failed before recording it. */
-            if (!ax_grad_enabled() && !out->grad_fn)
-                ax_tensor_destroy(out);
-            return NULL;
-        }
-        /* in inference mode we can free the matmul intermediate now.
-           in training mode, backward needs it, so leave it. */
-        if (!ax_grad_enabled() && !out->grad_fn)
-            ax_tensor_destroy(out);
-        return biased;
-    }
-    return out;
+    /* fused matmul + bias: one output tensor, one grad_fn.
+       saves one tensor allocation + one autograd node per forward call
+       compared to the old ax_matmul + ax_add(bias) two-op path. */
+    return ax_matmul_bias(input, d->weight,
+                          (d->use_bias && d->bias) ? d->bias : NULL);
 }
 
 static void dense_destroy(ax_layer_t *self)

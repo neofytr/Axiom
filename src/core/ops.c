@@ -284,6 +284,14 @@ ax_tensor_t *ax_mul_scalar(ax_tensor_t *a, double s)
 
 ax_tensor_t *ax_matmul(ax_tensor_t *a, ax_tensor_t *b)
 {
+    return ax_matmul_bias(a, b, NULL);
+}
+
+extern ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
+                                                    ax_tensor_t *bias, ax_tensor_t *out);
+
+ax_tensor_t *ax_matmul_bias(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias)
+{
     if (!a || !b)
     {
         ax_err_set(AX_ERR_NULL_ARG, "matmul: NULL tensor");
@@ -308,10 +316,28 @@ ax_tensor_t *ax_matmul(ax_tensor_t *a, ax_tensor_t *b)
 
     ax_compute_gemm(a, b, out);
 
-    if (needs_grad(a, b))
+    /* fused bias add: single-pass broadcast-add along axis 0.
+       uses ax_compute_bias_add if available (one vectorised pass),
+       otherwise falls back to a scalar loop. either way, the result
+       is in `out` — no new tensor. */
+    if (bias) {
+        if (ax_compute_has_bias_add()) {
+            ax_compute_bias_add(out, bias, 0, out);
+        } else {
+            /* scalar fallback: bias is [N], out is [M, N] */
+            float *od = (float *)out->storage->data + out->offset;
+            const float *bd = (const float *)bias->storage->data + bias->offset;
+            int64_t m = out->shape[0], n = out->shape[1];
+            for (int64_t i = 0; i < m; i++)
+                for (int64_t j = 0; j < n; j++)
+                    od[i * n + j] += bd[j];
+        }
+    }
+
+    if (needs_grad(a, b) || (bias && bias->requires_grad))
     {
         out->requires_grad = true;
-        out->grad_fn = ax_make_matmul_backward(a, b, out);
+        out->grad_fn = ax_make_matmul_bias_backward(a, b, bias, out);
     }
     return out;
 }

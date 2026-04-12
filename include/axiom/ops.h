@@ -33,6 +33,13 @@ ax_tensor_t *ax_mul_scalar(ax_tensor_t *a, double s);
    both inputs must be 2d for now. */
 ax_tensor_t *ax_matmul(ax_tensor_t *a, ax_tensor_t *b);
 
+/* fused matmul + bias: out = (a @ b) + bias.
+   single output tensor + single grad_fn. backward computes dA, dB, and
+   dBias in one traversal step. eliminates the extra tensor allocation +
+   extra autograd node that a separate ax_add(matmul_result, bias) would
+   create. bias may be NULL for matmul-only (equivalent to ax_matmul). */
+ax_tensor_t *ax_matmul_bias(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias);
+
 /* reductions */
 /* axis = -1 reduces everything to a scalar */
 

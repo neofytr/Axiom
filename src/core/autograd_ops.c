@@ -32,6 +32,27 @@ static bool ensure_grad(ax_tensor_t *t)
     return true;
 }
 
+/* like ensure_grad but also reports whether the grad was just created
+   (true) or already existed (false). callers can skip accumulate_grad
+   and write directly to the fresh zero-init'd grad when *fresh is true,
+   eliminating one full memory pass over the gradient buffer. */
+static bool ensure_grad_ex(ax_tensor_t *t, bool *fresh)
+{
+    *fresh = false;
+    if (!t->requires_grad) return true;
+    if (!t->grad) {
+        t->grad = ax_tensor_zeros(t->shape, t->ndim, t->dtype);
+        if (!t->grad) return false;
+        *fresh = true;
+    } else if (t->grad->storage->generation == 0) {
+        /* generation 0 is a sentinel set by optimizer_zero_grad to
+           indicate "this grad is known-zero and safe for direct overwrite."
+           treat it as fresh so matmul_backward skips temp + accumulate. */
+        *fresh = true;
+    }
+    return true;
+}
+
 /* helper: accumulate grad_to_add into t->grad (element-wise addition).
    handles the case where grad_to_add has been broadcast and needs
    to be reduced back to match t's shape. */
@@ -454,52 +475,152 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_arena_t *ar = ax_backward_arena();
 
     /* d/da = grad_out @ b^T.
-       when the backend provides gemm_nt we can skip the physical b^T
-       copy entirely. fallback to transpose+copy+gemm when not available. */
+       direct-write optimisation: when input[0]->grad is freshly created
+       (all zeros), we gemm directly into it (beta=0 semantics) and skip
+       the temp allocation + accumulate_grad copy. this eliminates 2
+       memory passes (write temp + read temp) per backward matmul. for
+       the common case of a linear graph where each tensor has exactly
+       one consumer, the fresh flag is always true.
+
+       when the grad already existed (residual connections, shared params),
+       we fall back to the temp + accumulate path so += semantics are
+       preserved. */
     if (self->inputs[0]->requires_grad)
     {
-        int64_t ga_shape[] = {grad_out->shape[0], b->shape[0]};
-        /* uninit: gemm_nt will overwrite every element */
-        ax_tensor_t *grad_a = ax_tensor_arena_create(ar, ga_shape, 2, grad_out->dtype);
-        if (!grad_a) return;
+        bool fresh_a;
+        if (!ensure_grad_ex(self->inputs[0], &fresh_a)) return;
 
-        if (ax_compute_has_gemm_nt()) {
-            ax_compute_gemm_nt(grad_out, b, grad_a);
+        if (fresh_a) {
+            /* direct write into input.grad — no temp, no accumulate */
+            if (ax_compute_has_gemm_nt()) {
+                ax_compute_gemm_nt(grad_out, b, self->inputs[0]->grad);
+            } else {
+                ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
+                if (!bt) return;
+                ax_tensor_t *bt_c = ax_tensor_contiguous(bt);
+                ax_tensor_destroy(bt);
+                if (!bt_c) return;
+                ax_compute_gemm(grad_out, bt_c, self->inputs[0]->grad);
+                ax_tensor_destroy(bt_c);
+            }
+            ax_storage_touch(self->inputs[0]->grad->storage);
         } else {
-            ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
-            if (!bt) return;
-            ax_tensor_t *bt_contig = ax_tensor_arena_create(ar, bt->shape, bt->ndim, bt->dtype);
-            if (!bt_contig) { ax_tensor_destroy(bt); return; }
-            ax_compute_copy(bt, bt_contig);
-            ax_compute_gemm(grad_out, bt_contig, grad_a);
-            ax_tensor_destroy(bt);
+            /* grad already has data from another backward path; use temp + accumulate */
+            int64_t ga_shape[] = {grad_out->shape[0], b->shape[0]};
+            ax_tensor_t *grad_a = ax_tensor_arena_create(ar, ga_shape, 2, grad_out->dtype);
+            if (!grad_a) return;
+            if (ax_compute_has_gemm_nt()) {
+                ax_compute_gemm_nt(grad_out, b, grad_a);
+            } else {
+                ax_tensor_t *bt = ax_tensor_transpose(b, 0, 1);
+                if (!bt) return;
+                ax_tensor_t *bt_c = ax_tensor_contiguous(bt);
+                ax_tensor_destroy(bt);
+                if (!bt_c) return;
+                ax_compute_gemm(grad_out, bt_c, grad_a);
+                ax_tensor_destroy(bt_c);
+            }
+            accumulate_grad(self->inputs[0], grad_a);
         }
-
-        accumulate_grad(self->inputs[0], grad_a);
     }
 
-    /* d/db = a^T @ grad_out. same deal with gemm_tn. */
+    /* d/db = a^T @ grad_out. same direct-write optimisation. */
     if (self->inputs[1]->requires_grad)
     {
-        int64_t gb_shape[] = {a->shape[1], grad_out->shape[1]};
-        /* uninit: gemm_tn will overwrite every element */
-        ax_tensor_t *grad_b = ax_tensor_arena_create(ar, gb_shape, 2, grad_out->dtype);
-        if (!grad_b) return;
+        bool fresh_b;
+        if (!ensure_grad_ex(self->inputs[1], &fresh_b)) return;
 
-        if (ax_compute_has_gemm_tn()) {
-            ax_compute_gemm_tn(a, grad_out, grad_b);
+        if (fresh_b) {
+            if (ax_compute_has_gemm_tn()) {
+                ax_compute_gemm_tn(a, grad_out, self->inputs[1]->grad);
+            } else {
+                ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
+                if (!at) return;
+                ax_tensor_t *at_c = ax_tensor_contiguous(at);
+                ax_tensor_destroy(at);
+                if (!at_c) return;
+                ax_compute_gemm(at_c, grad_out, self->inputs[1]->grad);
+                ax_tensor_destroy(at_c);
+            }
+            ax_storage_touch(self->inputs[1]->grad->storage);
         } else {
-            ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
-            if (!at) return;
-            ax_tensor_t *at_contig = ax_tensor_arena_create(ar, at->shape, at->ndim, at->dtype);
-            if (!at_contig) { ax_tensor_destroy(at); return; }
-            ax_compute_copy(at, at_contig);
-            ax_compute_gemm(at_contig, grad_out, grad_b);
-            ax_tensor_destroy(at);
+            int64_t gb_shape[] = {a->shape[1], grad_out->shape[1]};
+            ax_tensor_t *grad_b = ax_tensor_arena_create(ar, gb_shape, 2, grad_out->dtype);
+            if (!grad_b) return;
+            if (ax_compute_has_gemm_tn()) {
+                ax_compute_gemm_tn(a, grad_out, grad_b);
+            } else {
+                ax_tensor_t *at = ax_tensor_transpose(a, 0, 1);
+                if (!at) return;
+                ax_tensor_t *at_c = ax_tensor_contiguous(at);
+                ax_tensor_destroy(at);
+                if (!at_c) return;
+                ax_compute_gemm(at_c, grad_out, grad_b);
+                ax_tensor_destroy(at_c);
+            }
+            accumulate_grad(self->inputs[1], grad_b);
         }
-
-        accumulate_grad(self->inputs[1], grad_b);
     }
+}
+
+/* matmul_bias: fused matmul + bias backward. computes dA, dB (same as
+   matmul_backward) plus dBias = sum(grad_out, axis=0) when bias is
+   present. saves one tensor allocation + one autograd node per dense
+   layer compared to separate matmul + add(bias) backwards. */
+static void matmul_bias_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
+{
+    /* reuse matmul_backward for dA and dB */
+    matmul_backward(self, grad_out);
+
+    /* compute dBias if bias (saved[2]) is present and requires grad */
+    ax_tensor_t *bias = self->saved[2];
+    if (bias && bias->requires_grad) {
+        if (!ensure_grad(bias)) return;
+        /* dBias = sum(grad_out, axis=0). for a [M, N] grad_out, this
+           produces a [N] vector. use ax_compute_sum if we can trust the
+           shapes, otherwise scalar fallback. */
+        if (grad_out->storage->device != AX_DEVICE_CPU) {
+            /* device path: dispatch through compute */
+            ax_tensor_t *dbias_tmp = ax_tensor_create(bias->shape, bias->ndim, bias->dtype);
+            if (dbias_tmp) {
+                ax_compute_sum(grad_out, 0, dbias_tmp);
+                ax_compute_axpy(dbias_tmp, 1.0f, bias->grad);
+                ax_tensor_destroy(dbias_tmp);
+            }
+        } else {
+            /* cpu path: direct simd accumulation into bias->grad */
+            int64_t m = grad_out->shape[0], n = grad_out->shape[1];
+            const float *gd = (const float *)grad_out->storage->data + grad_out->offset;
+            float *bg = (float *)bias->grad->storage->data + bias->grad->offset;
+            for (int64_t j = 0; j < n; j++) {
+                float s = 0.0f;
+                for (int64_t i = 0; i < m; i++) s += gd[i * n + j];
+                bg[j] += s;
+            }
+        }
+        ax_storage_touch(bias->grad->storage);
+    }
+}
+
+ax_grad_fn_t *ax_make_matmul_bias_backward(ax_tensor_t *a, ax_tensor_t *b,
+                                             ax_tensor_t *bias, ax_tensor_t *out)
+{
+    ax_grad_fn_t *gf = ax_grad_fn_create(matmul_bias_backward);
+    gf->inputs[0] = a;
+    gf->inputs[1] = b;
+    gf->n_inputs = 2;
+    /* save a and b (contiguous copies) for dA/dB computation */
+    ax_tensor_t *a_safe = ax_ensure_contiguous(a);
+    gf->saved[0] = a_safe;
+    gf->saved_owned[0] = (a_safe != a);
+    ax_tensor_t *b_safe = ax_ensure_contiguous(b);
+    gf->saved[1] = b_safe;
+    gf->saved_owned[1] = (b_safe != b);
+    /* save bias reference (not owned) for dBias */
+    gf->saved[2] = bias;  /* NULL if no bias */
+    gf->saved_owned[2] = false;
+    gf->n_saved = 3;
+    return gf;
 }
 
 ax_grad_fn_t *ax_make_matmul_backward(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *out)
