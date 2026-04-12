@@ -14,7 +14,7 @@
 
 /* max saved tensors per backward fn (some ops need to
    stash their inputs/outputs for the backward pass) */
-#define AX_GRAD_MAX_SAVED 3
+#define AX_GRAD_MAX_SAVED 4
 
 /* forward declaration so the fn pointer type can reference it */
 typedef struct ax_grad_fn ax_grad_fn_t;
