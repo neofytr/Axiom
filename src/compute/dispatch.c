@@ -28,6 +28,12 @@
 extern const ax_backend_ops_t ax_cpu_naive_ops;
 extern const ax_backend_ops_t ax_cpu_opt_ops;
 
+/* declared in cpu_opt.c — idempotent init that reads AX_GEMM_* env
+   overrides and applies the l2 size warning. called both from the
+   ctor (hosted builds) and explicitly from ax_compute_init below as
+   a fallback for baremetal crt0 that doesn't walk .init_array. */
+extern void ax_cpu_opt_tune_init(void);
+
 #ifdef AX_HAVE_CUDA
 extern const ax_backend_ops_t ax_cuda_ops;
 #endif
@@ -95,8 +101,15 @@ ax_status_t ax_compute_init(void) {
     active_ops = &ax_cpu_opt_ops;
     compute_initialized = 1;
 
+    /* explicit fallback for baremetal: the cpu_opt tile-size init is
+       normally driven by an __attribute__((constructor)), but some
+       embedded crt0 scripts don't walk .init_array, so we also call it
+       here. idempotent — a second call is a no-op on hosted builds. */
+    ax_cpu_opt_tune_init();
+
     /* runtime hybrid-cpu autotune. only emits a stderr line when it
-       actually calibrates (i.e. user did not pin threads explicitly). */
+       actually calibrates (i.e. user did not pin threads explicitly).
+       compiled out entirely on baremetal (AX_NO_AUTOTUNE). */
     ax_autotune_threads();
 
     return AX_OK;
@@ -429,10 +442,15 @@ static double ax_autotune_run_kernel(void)
 #endif
 
 /* picks fast cores on hybrid cpus and pins the omp worker pool to them
-   so the os scheduler can't migrate workers back onto slow e-cores. */
+   so the os scheduler can't migrate workers back onto slow e-cores.
+   compiled out entirely when AX_NO_AUTOTUNE is defined at build time —
+   baremetal profiles set this because sched_setaffinity/sysconf aren't
+   available and there's no threading runtime to tune anyway. */
 int ax_autotune_threads(void)
 {
-#ifndef _OPENMP
+#if defined(AX_NO_AUTOTUNE)
+    return 1;
+#elif !defined(_OPENMP)
     /* nothing to tune without openmp */
     return 1;
 #else
@@ -566,6 +584,7 @@ int ax_autotune_threads(void)
         off += (size_t)w_;
     }
 
+#ifndef AX_NO_STDIO
     fprintf(stderr, "axiom: autotune chose %d fast cores (%.1fms calibration)\n",
             fast_count, total_ms);
     fprintf(stderr, "axiom: pinned %d omp workers to cores [%s]%s\n",
@@ -575,6 +594,9 @@ int ax_autotune_threads(void)
         fprintf(stderr, "axiom: sched_setaffinity failed for %d/%d workers\n",
                 pin_failures, fast_count);
     }
+#else
+    (void)total_ms; (void)cpu_list; (void)pin_failures;
+#endif
 
     return fast_count;
 #endif /* __linux__ */

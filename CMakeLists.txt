@@ -9,6 +9,25 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING "Build type" FORCE)
 endif()
 
+# build profile: picks sane defaults for a target class (desktop vs
+# linux-embedded vs baremetal). each profile file under cmake/profiles/
+# sets cache defaults for AX_OPENMP, AX_NO_AUTOTUNE, AX_SINGLE_THREADED,
+# AX_NO_STDIO, and the compile-time GEMM tile sizes. command-line
+# overrides (e.g. -DAX_OPENMP=OFF) still win. see docs/embedded.md.
+if(NOT AX_PROFILE)
+    set(AX_PROFILE "desktop" CACHE STRING
+        "build profile: desktop | embedded-linux | embedded-baremetal")
+endif()
+set_property(CACHE AX_PROFILE PROPERTY STRINGS
+    desktop embedded-linux embedded-baremetal)
+
+set(_ax_profile_file "${CMAKE_CURRENT_SOURCE_DIR}/cmake/profiles/${AX_PROFILE}.cmake")
+if(NOT EXISTS "${_ax_profile_file}")
+    message(FATAL_ERROR "unknown AX_PROFILE '${AX_PROFILE}' — expected one of "
+                        "desktop / embedded-linux / embedded-baremetal")
+endif()
+include("${_ax_profile_file}")
+
 # base warnings — strict by default
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter
                     -Wformat=2 -Wformat-security -Wconversion
@@ -48,8 +67,7 @@ if(AX_CUDA)
     add_compile_definitions(AX_HAVE_CUDA)
 endif()
 
-# openmp parallelism: cmake -DAX_OPENMP=ON .. (default ON for desktop)
-option(AX_OPENMP "enable openmp multi-core parallelism" ON)
+# openmp parallelism (default set by AX_PROFILE; override via -DAX_OPENMP=ON|OFF)
 if(AX_OPENMP)
     find_package(OpenMP)
     if(OpenMP_C_FOUND)
@@ -59,6 +77,22 @@ if(AX_OPENMP)
         message(STATUS "openmp requested but not found — building single-threaded")
         set(AX_OPENMP OFF)
     endif()
+endif()
+
+# tier-2 baremetal gates. each one disables a feature that assumes
+# a hosted os / glibc / threading runtime. all propagate into the code
+# as preprocessor defines consumed by cpu_opt.c, dispatch.c, etc.
+if(AX_NO_AUTOTUNE)
+    message(STATUS "runtime cpu autotuner disabled")
+    add_compile_definitions(AX_NO_AUTOTUNE=1)
+endif()
+if(AX_SINGLE_THREADED)
+    message(STATUS "single-threaded build (_Thread_local -> static)")
+    add_compile_definitions(AX_SINGLE_THREADED=1)
+endif()
+if(AX_NO_STDIO)
+    message(STATUS "stderr diagnostics disabled (AX_NO_STDIO)")
+    add_compile_definitions(AX_NO_STDIO=1)
 endif()
 
 # hardening flags for release

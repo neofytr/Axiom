@@ -12,13 +12,35 @@
 #include <float.h>
 #include <stdint.h>
 #include <stdlib.h>
+#ifndef AX_NO_STDIO
 #include <stdio.h>
+#endif
 #ifdef __linux__
 #include <unistd.h>
 #endif
 
 #ifdef _OPENMP
 #include <omp.h>
+#endif
+
+/* thread-local storage qualifier. on hosted builds, _Thread_local backs
+   the gemm pack buffers and pack_b cache keys per worker thread. on
+   baremetal / rtos targets (AX_SINGLE_THREADED) we drop it and rely on
+   the single-threaded invariant — still correct because AX_SINGLE_THREADED
+   implies AX_OPENMP=OFF so nothing ever races. */
+#ifdef AX_SINGLE_THREADED
+#define AX_TLS static
+#else
+#define AX_TLS static _Thread_local
+#endif
+
+/* log sink: fprintf(stderr, ...) normally, nothing on baremetal. keeps
+   the autotuner / gemm-tile diagnostics from pulling in 20+ kb of stdio
+   machinery on flash-constrained targets. */
+#ifdef AX_NO_STDIO
+#define AX_LOG(...) ((void)0)
+#else
+#define AX_LOG(...) fprintf(stderr, __VA_ARGS__)
 #endif
 
 /* threshold for parallelizing element-wise ops.
@@ -38,23 +60,37 @@ static inline int64_t ax_par_threshold(void) {
 static inline int64_t ax_par_threshold(void) { return (int64_t)1 << 62; }
 #endif
 
-/* thread-local persistent pack buffers for GEMM — allocated once per thread,
-   reused on every call. eliminates ~16 malloc/free per GEMM invocation. */
-static _Thread_local float *tl_pack_a_buf = NULL;  /* GEMM_MC * GEMM_KC floats */
-static _Thread_local float *tl_pack_b_buf = NULL;  /* GEMM_NC * GEMM_KC floats */
+/* per-thread persistent pack buffers for GEMM — allocated once per thread,
+   reused on every call. eliminates ~16 malloc/free per GEMM invocation.
+   uses AX_TLS so single-threaded baremetal builds drop the _Thread_local. */
+AX_TLS float *tl_pack_a_buf = NULL;  /* GEMM_MC * GEMM_KC floats */
+AX_TLS float *tl_pack_b_buf = NULL;  /* GEMM_NC * GEMM_KC floats */
 
-/* thread-local pack_b cache: skip re-packing B when the same tile is requested
-   back-to-back. hit path is typical in backward passes where the same weight
-   matrix is used twice (e.g. dY @ W for dX, then X^T @ dY for dW). the key is
-   the exact set of inputs pack_b reads: B base ptr, ldb, and (jc, pc, kc, nc_pack, nc).
-   a NULL ptr means the cache is empty / invalidated. */
-static _Thread_local const float *tl_pack_b_cache_bptr = NULL;
-static _Thread_local int64_t tl_pack_b_cache_ldb = 0;
-static _Thread_local int64_t tl_pack_b_cache_jc = 0;
-static _Thread_local int64_t tl_pack_b_cache_pc = 0;
-static _Thread_local int64_t tl_pack_b_cache_kc = 0;
-static _Thread_local int64_t tl_pack_b_cache_nc = 0;
-static _Thread_local int64_t tl_pack_b_cache_ncp = 0;
+/* pack_b cache: skip re-packing B when the same tile is requested back-to-
+   back. hit path is typical in backward passes where the same weight
+   matrix is used twice (e.g. dY @ W for dX, then X^T @ dY for dW). the
+   key is the exact set of inputs pack_b reads — bptr, ldb,
+   (jc, pc, kc, nc_pack, nc) — plus the storage generation at pack time.
+
+   the generation check is the correctness fix for stale cache hits. the
+   cache only stored a raw pointer before, so if the buffer contents got
+   mutated in place (optimizer step on a weight, for instance) between
+   two gemm calls sharing the same B pointer, the cache would return the
+   previous pack and the backward pass would silently compute on stale
+   weights. now every in-place write site bumps storage->generation
+   (dispatch.c wrappers, tensor.c host helpers, optim.c, ops.c inplace
+   activations) and this cache rejects the hit when the generation
+   doesn't match.
+
+   a NULL bptr means the cache is empty / invalidated. */
+AX_TLS const float *tl_pack_b_cache_bptr = NULL;
+AX_TLS uint64_t tl_pack_b_cache_gen = 0;
+AX_TLS int64_t tl_pack_b_cache_ldb = 0;
+AX_TLS int64_t tl_pack_b_cache_jc = 0;
+AX_TLS int64_t tl_pack_b_cache_pc = 0;
+AX_TLS int64_t tl_pack_b_cache_kc = 0;
+AX_TLS int64_t tl_pack_b_cache_nc = 0;
+AX_TLS int64_t tl_pack_b_cache_ncp = 0;
 
 /* reference backend for fallback */
 extern const ax_backend_ops_t ax_cpu_naive_ops;
@@ -112,7 +148,9 @@ static inline int64_t validate_triple_same(const ax_tensor_t *a, const ax_tensor
 #ifdef _OPENMP
 #define AX_OMP_PAR_FOR_IF(n) _Pragma("omp parallel for schedule(static) if((n) > ax_par_threshold())")
 #else
-#define AX_OMP_PAR_FOR_IF(n)
+/* non-omp build: the alias variable used as the macro arg stays live
+   (casts to void) so callers don't trip -Wunused-variable. */
+#define AX_OMP_PAR_FOR_IF(n) (void)(n);
 #endif
 
 #define DEFINE_OPT_BINOP(name, simd_expr, scalar_expr, naive_fn) \
@@ -232,14 +270,26 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     #define GEMM_NR 4
 #endif
 
-/* macro-kernel tile sizes. compile-time defaults tuned for desktop x86
-   with ~256 KB l2. runtime-tunable via AX_GEMM_MC / AX_GEMM_NC /
-   AX_GEMM_KC env vars — embedded targets with smaller caches should
-   shrink these. the init ctor also logs a warning if the pack_b panel
-   exceeds detected l2 so users know when to tune. */
-static int64_t GEMM_MC = 72;
-static int64_t GEMM_NC = 256;
-static int64_t GEMM_KC = 256;
+/* macro-kernel tile sizes. compile-time defaults come from the build
+   profile via the AX_GEMM_DEFAULT_MC / NC / KC preprocessor defines
+   set in cmake profiles: 72/256/256 for desktop, 48/128/128 for
+   embedded-linux, 24/32/64 for baremetal.
+   at runtime AX_GEMM_MC/NC/KC env vars override these (hosted targets
+   only). the init hook also logs a warning if the pack_b panel exceeds
+   detected l2 so users know to tune. */
+#ifndef AX_GEMM_DEFAULT_MC
+#define AX_GEMM_DEFAULT_MC 72
+#endif
+#ifndef AX_GEMM_DEFAULT_NC
+#define AX_GEMM_DEFAULT_NC 256
+#endif
+#ifndef AX_GEMM_DEFAULT_KC
+#define AX_GEMM_DEFAULT_KC 256
+#endif
+
+static int64_t GEMM_MC = AX_GEMM_DEFAULT_MC;
+static int64_t GEMM_NC = AX_GEMM_DEFAULT_NC;
+static int64_t GEMM_KC = AX_GEMM_DEFAULT_KC;
 
 static void ax_gemm_read_env(const char *name, int64_t *slot, int64_t multiple_of) {
     const char *s = getenv(name);
@@ -252,24 +302,46 @@ static void ax_gemm_read_env(const char *name, int64_t *slot, int64_t multiple_o
     *slot = (int64_t)v;
 }
 
-static __attribute__((constructor)) void ax_cpu_opt_init(void) {
+/* one-shot init: read env overrides + emit l2 size warning.
+   called both from an attribute((constructor)) (hosted builds, runs
+   before main) AND explicitly from ax_compute_init as a fallback for
+   baremetal crt0 that doesn't walk .init_array. guarded by a flag so
+   a second invocation is a no-op. */
+static bool ax_cpu_opt_init_done = false;
+
+static void ax_cpu_opt_init_impl(void) {
+    if (ax_cpu_opt_init_done) return;
+    ax_cpu_opt_init_done = true;
+
     ax_gemm_read_env("AX_GEMM_MC", &GEMM_MC, GEMM_MR);
     ax_gemm_read_env("AX_GEMM_NC", &GEMM_NC, GEMM_NR);
     ax_gemm_read_env("AX_GEMM_KC", &GEMM_KC, 1);
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(AX_NO_STDIO)
     long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
     if (l2 > 0) {
         size_t pack_b_bytes = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
         if ((long)pack_b_bytes > l2) {
-            fprintf(stderr,
-                "axiom: gemm pack_b buffer %zu kB exceeds detected l2 %ld kB; "
-                "consider setting AX_GEMM_KC / AX_GEMM_NC smaller on this target\n",
-                pack_b_bytes / 1024, l2 / 1024);
+            AX_LOG("axiom: gemm pack_b buffer %zu kB exceeds detected l2 %ld kB; "
+                   "consider setting AX_GEMM_KC / AX_GEMM_NC smaller on this target\n",
+                   pack_b_bytes / 1024, l2 / 1024);
         }
     }
 #endif
 }
+
+/* public entry point — called from ax_compute_init() in dispatch.c so
+   baremetal targets without .init_array support still apply the env
+   overrides. idempotent: second call is a no-op. */
+void ax_cpu_opt_tune_init(void) {
+    ax_cpu_opt_init_impl();
+}
+
+#if !defined(AX_NO_CONSTRUCTORS) && (defined(__GNUC__) || defined(__clang__))
+static __attribute__((constructor)) void ax_cpu_opt_ctor(void) {
+    ax_cpu_opt_init_impl();
+}
+#endif
 
 /* lazily allocate this thread's pack_a and pack_b buffers (once per thread) */
 static bool ensure_tl_pack_bufs(void) {
@@ -291,14 +363,19 @@ static inline void pack_b_cache_invalidate(void) {
 }
 
 /* pack_b with cache: if the last pack_b into tl_pack_b_buf used the exact
-   same (bptr, ldb, jc, pc, kc, nc, nc_pack), the buffer is still valid and
-   we can skip the copy. otherwise re-pack and update the cache key.
-   'tile_bptr' must be (bd + pc*ldb + jc) — the actual address pack_b reads from. */
-static inline void pack_b_cached(const float *tile_bptr, int64_t ldb,
+   same (bptr, ldb, jc, pc, kc, nc, nc_pack) AND the storage generation
+   hasn't changed since then, the buffer is still valid and we can skip
+   the copy. otherwise re-pack and update the cache key. 'tile_bptr' must
+   be (bd + pc*ldb + jc) — the actual address pack_b reads from.
+   'b_gen' is the storage generation counter of the B tensor at call
+   time; the caller passes b->storage->generation. */
+static inline void pack_b_cached(const float *tile_bptr, uint64_t b_gen,
+                                  int64_t ldb,
                                   int64_t kc, int64_t nc_pack, int64_t nc,
                                   int64_t jc, int64_t pc)
 {
     if (tl_pack_b_cache_bptr == tile_bptr
+        && tl_pack_b_cache_gen == b_gen
         && tl_pack_b_cache_ldb == ldb
         && tl_pack_b_cache_jc  == jc
         && tl_pack_b_cache_pc  == pc
@@ -309,6 +386,7 @@ static inline void pack_b_cached(const float *tile_bptr, int64_t ldb,
     }
     pack_b(tile_bptr, ldb, kc, nc_pack, nc, tl_pack_b_buf);
     tl_pack_b_cache_bptr = tile_bptr;
+    tl_pack_b_cache_gen  = b_gen;
     tl_pack_b_cache_ldb  = ldb;
     tl_pack_b_cache_jc   = jc;
     tl_pack_b_cache_pc   = pc;
@@ -630,6 +708,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     } else if (use_fine_par) {
         gemm_threads = (int)(fine_units < (int64_t)max_threads ? fine_units : (int64_t)max_threads);
     }
+    (void)gemm_threads; /* only read by num_threads() in the omp pragmas below */
 
     /* ensure the calling thread has its pack buffers (serial init before parallel region) */
     if (!ensure_tl_pack_bufs())
@@ -662,7 +741,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                 int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
                 /* jc-parallel: pack_b target is this thread's TLS buffer,
                    which pack_b_cached also writes to via tl_pack_b_buf. */
-                pack_b_cached(bd + pc * n + jc, n, kc, nc_pack, nc, jc, pc);
+                pack_b_cached(bd + pc * n + jc, b->storage->generation, n, kc, nc_pack, nc, jc, pc);
 
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
@@ -699,7 +778,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 
                 /* fine-parallel: pack_b target is main_pack_b == tl_pack_b_buf,
                    same target as pack_b_cached. */
-                pack_b_cached(bd + pc * n + jc, n, kc, nc_pack, nc, jc, pc);
+                pack_b_cached(bd + pc * n + jc, b->storage->generation, n, kc, nc_pack, nc, jc, pc);
                 pack_a(ad + pc, k, mc_pack, kc, mc, main_pack_a);
 
                 int64_t ir_tiles = mc_pack / GEMM_MR;
@@ -734,7 +813,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
                 int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
                 /* serial/IC path: pack_b target is tl_pack_b_buf of the calling thread. */
-                pack_b_cached(bd + pc * n + jc, n, kc, nc_pack, nc, jc, pc);
+                pack_b_cached(bd + pc * n + jc, b->storage->generation, n, kc, nc_pack, nc, jc, pc);
                 const float *pack_b_buf = main_pack_b;  /* shared read-only in parallel region */
 
                 #ifdef _OPENMP
