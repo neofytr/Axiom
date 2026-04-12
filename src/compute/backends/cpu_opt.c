@@ -363,7 +363,7 @@ static void ax_cpu_opt_init_impl(void) {
        pack_a=72KB > 64KB, and on zen3/4 (32KB L1d). */
     long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
     if (l1d > 0) {
-        long l1_budget = (long)(l1d * 0.80);
+        long l1_budget = (long)((double)l1d * 0.80);
         size_t pack_a_bytes = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
         if ((long)pack_a_bytes > l1_budget) {
             int64_t new_mc = l1_budget / ((int64_t)GEMM_KC * (int64_t)sizeof(float));
@@ -384,7 +384,7 @@ static void ax_cpu_opt_init_impl(void) {
     /* L2 auto-tune: pack_a (MC×KC) + pack_b (NC×KC) ≤ 80% of L2 */
     long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
     if (l2 > 0) {
-        long budget = (long)(l2 * 0.80);
+        long budget = (long)((double)l2 * 0.80);
         size_t pack_a_bytes = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
         size_t pack_b_bytes = (size_t)GEMM_NC * (size_t)GEMM_KC * sizeof(float);
 

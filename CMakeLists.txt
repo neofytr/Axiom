@@ -279,26 +279,28 @@ set_target_properties(axiom_shared PROPERTIES OUTPUT_NAME axiom)
 # tests
 enable_testing()
 
-# always-available tests (exercise only forward-path + tensor machinery)
+# always-available tests (exercise only forward-path + tensor machinery).
+# these must NOT call ax_backward, optimizers, losses, or model_save —
+# those symbols are stripped from inference-only builds.
 set(TEST_SOURCES
     tests/test_error.c
     tests/test_memory.c
     tests/test_tensor.c
     tests/test_compute.c
     tests/test_ops.c
-    tests/test_activations.c
-    tests/test_layer.c
-    tests/test_serialize.c
     tests/test_conv.c
     tests/test_norm.c
-    tests/test_backend_opt.c
     tests/test_cuda.c
 )
 
-# training-only tests: autograd, losses, optimizers, lr schedules,
-# dataloader, and any integration/grad-verify test that calls ax_backward.
+# training-only tests: anything that calls ax_backward, optimizers,
+# losses, model_compile, model_train_step, tensor_save, or model_save.
 if(NOT AX_INFERENCE_ONLY)
     list(APPEND TEST_SOURCES
+        tests/test_activations.c
+        tests/test_layer.c
+        tests/test_serialize.c
+        tests/test_backend_opt.c
         tests/test_autograd.c
         tests/test_losses.c
         tests/test_optim.c
