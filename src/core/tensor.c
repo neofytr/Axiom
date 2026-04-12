@@ -334,11 +334,61 @@ ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype) 
     return t;
 }
 
+/* device-aware host-to-tensor helpers.
+
+   core code historically wrote to tensor->storage->data directly with
+   memcpy/memset, assuming the buffer was host-addressable. that was
+   true as long as the cuda backend used cudaMallocManaged, because the
+   driver transparently page-faulted host reads/writes into gpu pages.
+   now that we're moving toward explicit device memory, every host-side
+   write has to check the tensor's device and either memcpy (cpu) or
+   go through the owning backend's h2d / fill hooks (non-cpu).
+
+   these helpers encapsulate that. they return AX_OK on success and set
+   ax_err_set on failure. callers that don't check the return value get
+   silent failures, which matches the existing init.c void-return
+   contract. */
+
+/* fill entire tensor storage with a single scalar value. */
+static ax_status_t tensor_fill_value(ax_tensor_t *t, double value) {
+    if (t->storage->device == AX_DEVICE_CPU) {
+        /* fast path: in-process memset for zero, kernel loop otherwise */
+        if (value == 0.0) {
+            memset(t->storage->data, 0, t->storage->size_bytes);
+            return AX_OK;
+        }
+        return ax_compute_fill(t, value);
+    }
+    const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
+    if (!ops || !ops->fill) {
+        ax_err_set(AX_ERR_BACKEND,
+                   "device %d has no fill hook", (int)t->storage->device);
+        return AX_ERR_BACKEND;
+    }
+    return ops->fill(t, value);
+}
+
+/* copy `bytes` from host buffer `data` into tensor storage at t->offset.
+   `bytes` must equal numel * dtype_size; caller's job to enforce. */
+static ax_status_t tensor_write_from_host(ax_tensor_t *t, const void *data, size_t bytes) {
+    void *dst = (char *)t->storage->data + t->offset * ax_dtype_size(t->dtype);
+    if (t->storage->device == AX_DEVICE_CPU) {
+        memcpy(dst, data, bytes);
+        return AX_OK;
+    }
+    const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
+    if (!ops || !ops->memcpy_h2d) {
+        ax_err_set(AX_ERR_BACKEND,
+                   "device %d has no h2d hook", (int)t->storage->device);
+        return AX_ERR_BACKEND;
+    }
+    return ops->memcpy_h2d(dst, data, bytes);
+}
+
 ax_tensor_t *ax_tensor_zeros(const int64_t *shape, int ndim, ax_dtype_t dtype) {
     ax_tensor_t *t = ax_tensor_create(shape, ndim, dtype);
     if (!t) return NULL;
-    /* Unified memory is CPU-accessible, so memset works for both CPU and CUDA storage. */
-    memset(t->storage->data, 0, t->storage->size_bytes);
+    if (tensor_fill_value(t, 0.0) != AX_OK) { ax_tensor_destroy(t); return NULL; }
     return t;
 }
 
@@ -349,7 +399,7 @@ ax_tensor_t *ax_tensor_ones(const int64_t *shape, int ndim, ax_dtype_t dtype) {
 ax_tensor_t *ax_tensor_full(const int64_t *shape, int ndim, ax_dtype_t dtype, double value) {
     ax_tensor_t *t = ax_tensor_create(shape, ndim, dtype);
     if (!t) return NULL;
-    ax_compute_fill(t, value);
+    if (tensor_fill_value(t, value) != AX_OK) { ax_tensor_destroy(t); return NULL; }
     return t;
 }
 
@@ -361,7 +411,10 @@ ax_tensor_t *ax_tensor_from_array(const void *data, const int64_t *shape, int nd
     int64_t n = compute_numel(shape, ndim);
     if (n < 0) { ax_tensor_destroy(t); return NULL; }
     size_t bytes = (size_t)n * ax_dtype_size(dtype);
-    memcpy(t->storage->data, data, bytes);
+    if (tensor_write_from_host(t, data, bytes) != AX_OK) {
+        ax_tensor_destroy(t);
+        return NULL;
+    }
     return t;
 }
 
@@ -372,20 +425,29 @@ ax_tensor_t *ax_tensor_arange(int64_t start, int64_t end, ax_dtype_t dtype) {
     ax_tensor_t *t = ax_tensor_create(&len, 1, dtype);
     if (!t) return NULL;
 
-    /* fill with sequential values */
+    /* build sequential values into a host scratch buffer and commit
+       via tensor_write_from_host so this works for any device. */
+    size_t elem = ax_dtype_size(dtype);
+    void *scratch = malloc((size_t)len * elem);
+    if (!scratch) { ax_tensor_destroy(t); return NULL; }
+
     if (dtype == AX_FLOAT32) {
-        float *d = (float *)t->storage->data;
+        float *d = (float *)scratch;
         for (int64_t i = 0; i < len; i++) d[i] = (float)(start + i);
     } else if (dtype == AX_INT32) {
-        int32_t *d = (int32_t *)t->storage->data;
+        int32_t *d = (int32_t *)scratch;
         for (int64_t i = 0; i < len; i++) d[i] = (int32_t)(start + i);
     } else if (dtype == AX_FLOAT64) {
-        double *d = (double *)t->storage->data;
+        double *d = (double *)scratch;
         for (int64_t i = 0; i < len; i++) d[i] = (double)(start + i);
     } else if (dtype == AX_INT64) {
-        int64_t *d = (int64_t *)t->storage->data;
+        int64_t *d = (int64_t *)scratch;
         for (int64_t i = 0; i < len; i++) d[i] = start + i;
     }
+
+    ax_status_t st = tensor_write_from_host(t, scratch, (size_t)len * elem);
+    free(scratch);
+    if (st != AX_OK) { ax_tensor_destroy(t); return NULL; }
     return t;
 }
 
@@ -394,10 +456,22 @@ ax_tensor_t *ax_tensor_rand(const int64_t *shape, int ndim, float low, float hig
     if (!t) return NULL;
 
     int64_t n = compute_numel(shape, ndim);
-    float *d = (float *)t->storage->data;
-    for (int64_t i = 0; i < n; i++) {
-        d[i] = ax_rng_uniform(low, high);
+    if (n < 0) { ax_tensor_destroy(t); return NULL; }
+
+    if (t->storage->device == AX_DEVICE_CPU) {
+        /* fast path: rng straight into device-visible buffer */
+        float *d = (float *)t->storage->data;
+        for (int64_t i = 0; i < n; i++) d[i] = ax_rng_uniform(low, high);
+        return t;
     }
+
+    /* non-cpu: rng into a host scratch buffer, then h2d transfer */
+    float *scratch = (float *)malloc((size_t)n * sizeof(float));
+    if (!scratch) { ax_tensor_destroy(t); return NULL; }
+    for (int64_t i = 0; i < n; i++) scratch[i] = ax_rng_uniform(low, high);
+    ax_status_t st = tensor_write_from_host(t, scratch, (size_t)n * sizeof(float));
+    free(scratch);
+    if (st != AX_OK) { ax_tensor_destroy(t); return NULL; }
     return t;
 }
 
@@ -405,7 +479,10 @@ ax_tensor_t *ax_tensor_scalar(float value) {
     int64_t shape[] = {1};
     ax_tensor_t *t = ax_tensor_create(shape, 1, AX_FLOAT32);
     if (!t) return NULL;
-    ((float *)t->storage->data)[0] = value;
+    if (tensor_write_from_host(t, &value, sizeof(float)) != AX_OK) {
+        ax_tensor_destroy(t);
+        return NULL;
+    }
     return t;
 }
 
@@ -672,6 +749,17 @@ float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices) {
     for (int i = 0; i < t->ndim; i++) {
         offset += indices[i] * t->strides[i];
     }
+    /* non-cpu: one-element d2h round trip. expensive for bulk access;
+       callers that care about throughput should ax_tensor_to_cpu() the
+       whole thing first. for diagnostics this is fine. */
+    if (t->storage->device != AX_DEVICE_CPU) {
+        const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
+        if (!ops || !ops->memcpy_d2h) return 0.0f;
+        float v = 0.0f;
+        const void *src = (const char *)t->storage->data + offset * sizeof(float);
+        ops->memcpy_d2h(&v, src, sizeof(float));
+        return v;
+    }
     return ((float *)t->storage->data)[offset];
 }
 
@@ -687,6 +775,14 @@ void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value) {
     size_t offset = t->offset;
     for (int i = 0; i < t->ndim; i++) {
         offset += indices[i] * t->strides[i];
+    }
+    /* non-cpu: one-element h2d round trip. same cost caveat as get. */
+    if (t->storage->device != AX_DEVICE_CPU) {
+        const ax_backend_ops_t *ops = ax_backend_for_device(t->storage->device);
+        if (!ops || !ops->memcpy_h2d) return;
+        void *dst = (char *)t->storage->data + offset * sizeof(float);
+        ops->memcpy_h2d(dst, &value, sizeof(float));
+        return;
     }
     ((float *)t->storage->data)[offset] = value;
 }
@@ -818,7 +914,18 @@ void ax_tensor_print(const ax_tensor_t *t) {
         return;
     }
 
-    int64_t n = ax_tensor_numel(t);
+    /* for non-cpu tensors, mirror the whole thing to cpu first so the
+       per-element reads below stay free. one bulk d2h beats 20 tiny
+       ones and prints are cold-path anyway. */
+    ax_tensor_t *view = NULL;
+    const ax_tensor_t *readable = t;
+    if (t->storage->device != AX_DEVICE_CPU) {
+        view = ax_tensor_to_cpu((ax_tensor_t *)t);
+        if (!view) { printf("  (failed to copy to cpu)\n"); return; }
+        readable = view;
+    }
+
+    int64_t n = ax_tensor_numel(readable);
     int64_t limit = n > 20 ? 20 : n; /* print at most 20 elements */
 
     printf("  [");
@@ -826,13 +933,15 @@ void ax_tensor_print(const ax_tensor_t *t) {
         /* compute nd indices from flat index */
         int64_t remaining = i;
         int64_t indices[AX_MAX_DIMS];
-        for (int d = t->ndim - 1; d >= 0; d--) {
-            indices[d] = remaining % t->shape[d];
-            remaining /= t->shape[d];
+        for (int d = readable->ndim - 1; d >= 0; d--) {
+            indices[d] = remaining % readable->shape[d];
+            remaining /= readable->shape[d];
         }
-        float v = ax_tensor_get_f32(t, indices);
+        float v = ax_tensor_get_f32(readable, indices);
         printf("%.4f%s", v, i < limit - 1 ? ", " : "");
     }
     if (n > limit) printf(", ... (%" PRId64 " more)", n - limit);
     printf("]\n");
+
+    if (view) ax_tensor_destroy(view);
 }
