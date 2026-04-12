@@ -122,6 +122,13 @@ static inline ax_vf32 ax_vf32_log(ax_vf32 x) {
     return _mm512_fmadd_ps(e, _mm512_set1_ps(0.6931472f), r);
 }
 
+/* sigmoid: 1 / (1 + exp(-x)) */
+static inline ax_vf32 ax_vf32_sigmoid(ax_vf32 x) {
+    __m512 one = _mm512_set1_ps(1.0f);
+    __m512 neg_x = _mm512_sub_ps(_mm512_setzero_ps(), x);
+    return _mm512_div_ps(one, _mm512_add_ps(one, ax_vf32_exp(neg_x)));
+}
+
 /* vector tanh via 2*sigmoid(2x) - 1 identity */
 static inline ax_vf32 ax_vf32_tanh(ax_vf32 x) {
     __m512 two = _mm512_set1_ps(2.0f);
@@ -129,6 +136,17 @@ static inline ax_vf32 ax_vf32_tanh(ax_vf32 x) {
     __m512 exp_neg = ax_vf32_exp(_mm512_sub_ps(_mm512_setzero_ps(), _mm512_mul_ps(two, x)));
     __m512 sig2 = _mm512_div_ps(two, _mm512_add_ps(one, exp_neg));
     return _mm512_sub_ps(sig2, one);
+}
+
+/* horizontal min */
+static inline float ax_vf32_hmin(ax_vf32 v) {
+    return _mm512_reduce_min_ps(v);
+}
+
+/* compare equal: returns 1.0f where a==b, 0.0f elsewhere */
+static inline ax_vf32 ax_vf32_cmpeq(ax_vf32 a, ax_vf32 b) {
+    __mmask16 m = _mm512_cmp_ps_mask(a, b, _CMP_EQ_OQ);
+    return _mm512_mask_blend_ps(m, _mm512_setzero_ps(), _mm512_set1_ps(1.0f));
 }
 
 
