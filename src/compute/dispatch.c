@@ -672,8 +672,13 @@ int ax_autotune_threads(void)
         return omp_get_max_threads();
     }
 
-    /* fast cores: within 25% of best (i.e. time <= 1.25 * best) */
-    double threshold = best * 1.25;
+    /* include all cores that are within 2× of the fastest. the old 1.25
+       threshold excluded e-cores on hybrid cpus (alder lake etc.) even
+       though the total throughput with all cores is higher than p-cores
+       alone for bandwidth-bound workloads like gemm. a core is only
+       excluded if it's more than 2× slower — which catches thermal-
+       throttled or offline cores without cutting viable e-cores. */
+    double threshold = best * 2.0;
     int fast_cpus_all[CPU_SETSIZE];
     int fast_all = 0;
     for (int i = 0; i < n_cpus; i++) {
