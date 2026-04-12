@@ -24,6 +24,11 @@ examples/data/
 .vscode/
 .idea/
 
+# docs site
+docs-site/node_modules/
+docs-site/dist/
+docs-site/.vinxi/
+
 # claude local settings
 .claude/settings.local.json
 .claude/hooks/
