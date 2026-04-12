@@ -352,13 +352,13 @@ if(NOT AX_INFERENCE_ONLY)
     add_executable(deep_mlp examples/deep_mlp.c)
     target_link_libraries(deep_mlp PRIVATE axiom_static)
 
-    add_executable(bench_backend examples/bench_backend.c)
+    # benchmarks
+    add_executable(bench_backend benchmarks/bench_backend.c)
     target_link_libraries(bench_backend PRIVATE axiom_static)
 
-    add_executable(bench_optimizations examples/bench_optimizations.c)
+    add_executable(bench_optimizations benchmarks/bench_optimizations.c)
     target_link_libraries(bench_optimizations PRIVATE axiom_static)
 
-    # large MLP benchmark for CI perf validation
     if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_large.c")
         add_executable(bench_large benchmarks/bench_large.c)
         target_link_libraries(bench_large PRIVATE axiom_static)

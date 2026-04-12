@@ -1,67 +1,74 @@
 <p align="center">
-  <h1 align="center">Axiom</h1>
-  <p align="center">
-    A deep learning framework built from scratch in C.<br>
-    No Python. No BLAS. No dependencies. Faster than TensorFlow.
-  </p>
+  <img src="https://img.shields.io/badge/lang-C-555?style=flat-square&logo=c&logoColor=white" alt="C">
+  <img src="https://img.shields.io/badge/deps-zero-2ea44f?style=flat-square" alt="Zero dependencies">
+  <img src="https://img.shields.io/badge/inference_binary-<100KB-blue?style=flat-square" alt="Under 100KB">
 </p>
 
-<p align="center">
-  <a href="#performance"><img src="https://img.shields.io/badge/vs_TensorFlow-1.21x_faster-brightgreen" alt="Performance"></a>
-  <a href="#building"><img src="https://img.shields.io/badge/dependencies-zero-blue" alt="Zero deps"></a>
-  <a href="#build-profiles"><img src="https://img.shields.io/badge/binary-under_100KB-orange" alt="Small binary"></a>
-  <a href="#testing"><img src="https://img.shields.io/badge/tests-22_binaries-informational" alt="Tests"></a>
-</p>
+# Axiom
 
----
+Deep learning framework in C. Trains neural networks from scratch with no external dependencies, no Python runtime, no BLAS library. Written to run on everything from cloud servers to microcontrollers.
 
-Axiom started as a question: how fast can a neural network train if you strip away every abstraction layer? Turns out, faster than TensorFlow on the same hardware. No hand-tuned assembly, no vendor math libraries. Just C, SIMD intrinsics, and careful engineering.
+It's also faster than TensorFlow on CPU. Not by gaming benchmarks or picking favorable shapes, but on real training workloads head to head on the same hardware.
 
-## Performance
+## Benchmarks
 
-Benchmarked head-to-head against TensorFlow (oneDNN/MKL backend) on identical CI hardware. Same model, same data, same thread count. No cherry-picking.
+All numbers from GitHub Actions CI. Same model, same dataset, same thread count, same machine.
 
-### x86_64 (AMD EPYC 9V74, 4 threads)
+**Training (MNIST, 60K samples, Adam optimizer, batch 256)**
 
-```
-Model: 784 -> 4096 -> 2048 -> 512 -> 10   (12.6M parameters)
-Dataset: MNIST 60K, batch 256, 2 epochs
+| | x86 (EPYC, 4 threads) | ARM (Graviton3, 4 threads) |
+|---|---|---|
+| **12.6M params** | Axiom 69s / TF 87s | |
+| **4.2M params** | Axiom 34s / TF 36s | Axiom 26s / TF 30s |
+| **1.46M params** | Axiom 16s / TF 17s | Axiom 16s / TF 20s |
 
-  Axiom        35.0s
-  TensorFlow   42.4s
-                        ─── Axiom is 1.21x faster ───
-```
+**Inference (1.46M params, batch 256, 1000 forward passes)**
 
-### ARM (Graviton3 Neoverse-N2, 4 threads)
+| | Axiom | TensorFlow |
+|---|---|---|
+| Throughput | **51,226 img/s** | 22,185 img/s |
+| Per batch | 4.99ms | 11.54ms |
 
-```
-Model: 784 -> 1024 -> 512 -> 256 -> 10   (1.46M parameters)
-Dataset: MNIST 60K, batch 256, 5 epochs
+2.3x faster on inference. The gap comes from TF's Python dispatch overhead and graph executor, which matter more when the compute per op is small.
 
-  Axiom        3.10s
-  TensorFlow   3.76s
-                        ─── Axiom is 1.21x faster ───
-```
+## What's in here
 
-The advantage grows with model size. At 1.46M params on x86 the two frameworks are neck-and-neck; at 12.6M params Axiom pulls ahead by 21%. This is because Axiom's tiled GEMM kernels have better cache utilization on large matrices where TensorFlow's overhead starts to show.
+Everything you need to train and deploy small-to-medium neural nets.
 
-## Features
+**The basics**: tensors with arbitrary dims, views, slicing, broadcasting. Reverse-mode autograd that records a computation graph and backpropagates through it.
 
-```
-Tensors          arbitrary dims, views, slicing, broadcasting
-Autograd         reverse-mode, computation graph, automatic cleanup
-Layers           Dense, Conv2D, BatchNorm, LayerNorm, Dropout,
-                 MaxPool, AvgPool, GlobalAvgPool, Flatten
-Activations      ReLU, Sigmoid, Tanh, GELU, Swish, LeakyReLU, ELU, Softmax
-Losses           MSE, Cross-Entropy
-Optimizers       SGD (momentum + nesterov), Adam, AdamW, RMSprop, Adagrad
-LR Schedulers    Step decay, Exponential, Cosine annealing, Warmup + Cosine
-Serialization    compact binary format, model save/load
-Data             batching, shuffling, train/test splits
-GPU              CUDA backend with cuBLAS, fused kernels, explicit device memory
+**Layers**: Dense, Conv2D, BatchNorm, LayerNorm, Dropout, MaxPool, AvgPool, GlobalAvgPool, Flatten.
+
+**Activations**: ReLU, Sigmoid, Tanh, GELU, Swish, LeakyReLU, ELU, Softmax.
+
+**Training**: MSE and cross-entropy losses. SGD (momentum + nesterov), Adam, AdamW, RMSprop, Adagrad. Cosine annealing, step decay, exponential, and warmup LR schedules. Gradient clipping. Data batching and shuffling.
+
+**I/O**: Model save/load in a compact binary format. Works across platforms.
+
+**GPU**: CUDA backend with cuBLAS GEMM, fused element-wise kernels, explicit device memory management.
+
+## Building
+
+```bash
+mkdir build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release ..
+make -j$(nproc)
+ctest --output-on-failure
 ```
 
-## Quick Start
+That's it. No package manager, no `pip install`, no downloading pretrained weights. The compiler is the only dependency.
+
+### Build options
+
+| Flag | What it does |
+|------|-------------|
+| `-DAX_CPU_ISA_DISPATCH=ON` | Builds AVX-512 + AVX2 + scalar, picks fastest at runtime |
+| `-DAX_CUDA=ON` | Enables GPU backend (needs CUDA toolkit) |
+| `-DAX_INFERENCE_ONLY=ON` | Strips all training code. Binary under 100KB on ARM |
+| `-DAX_PROFILE=embedded-linux` | Smaller buffers, trimmed for embedded Linux targets |
+| `-DAX_PROFILE=embedded-baremetal` | No stdio, no heap, no threads. Runs on Cortex-M |
+
+## Example
 
 ```c
 #include "axiom/axiom.h"
@@ -69,113 +76,82 @@ GPU              CUDA backend with cuBLAS, fused kernels, explicit device memory
 int main(void) {
     ax_init();
 
+    // 784 -> 128 -> 10 classifier
     ax_layer_t *net = ax_sequential_create();
     ax_sequential_add(net, ax_dense_create(784, 128, true));
     ax_sequential_add(net, ax_relu_layer_create());
     ax_sequential_add(net, ax_dense_create(128, 10, true));
 
-    ax_model_t *model = ax_model_create(net);
+    ax_model_t *m = ax_model_create(net);
     ax_optimizer_t *opt = ax_adam_create(
-        model->params, model->n_params,
-        1e-3f, 0.9f, 0.999f, 1e-8f, 0);
-    ax_model_compile(model, opt, ax_cross_entropy_loss);
+        m->params, m->n_params, 1e-3f, 0.9f, 0.999f, 1e-8f, 0);
+    ax_model_compile(m, opt, ax_cross_entropy_loss);
 
     for (int i = 0; i < 1000; i++)
-        ax_model_train_step(model, train_x, train_y);
+        ax_model_train_step(m, train_x, train_y);
 
-    ax_model_save(model, "model.axm");
-    ax_model_destroy(model);
+    ax_model_save(m, "model.axm");
+    ax_model_destroy(m);
     ax_shutdown();
 }
 ```
 
-See `examples/` for complete programs: XOR, MNIST (MLP + CNN), deep MLP.
+There are more complete examples in `examples/` (XOR, MNIST MLP, MNIST CNN, deep MLP with batchnorm + dropout + LR scheduling).
 
-## Building
+## How it's fast
 
-```bash
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-cmake --build . -j$(nproc)
-ctest --output-on-failure
-```
+The short version: Axiom does the same math as TensorFlow but with less stuff between you and the hardware.
 
-### Build Profiles
+The longer version:
 
-| Profile | Flag | Use case |
-|---------|------|----------|
-| **Desktop** | _(default)_ | Full framework, OpenMP, all features |
-| **ISA Dispatch** | `-DAX_CPU_ISA_DISPATCH=ON` | Builds AVX-512 + AVX2 + scalar, picks best at runtime |
-| **CUDA** | `-DAX_CUDA=ON` | GPU backend (needs CUDA toolkit) |
-| **Inference Only** | `-DAX_INFERENCE_ONLY=ON` | Strips training code, under 100KB on ARM |
-| **Embedded Linux** | `-DAX_PROFILE=embedded-linux` | Smaller buffers, no unnecessary features |
-| **Baremetal** | `-DAX_PROFILE=embedded-baremetal` | No stdio, no threads, no dynamic allocation |
+**GEMM kernels** are the heart of it. Axiom uses BLIS-style tiled matrix multiplication with micro-kernels sized to the register file: 14x32 on AVX-512 (uses all 32 ZMM registers), 6x16 on AVX2, 8x12 on NEON. The tiles are auto-tuned to the CPU's L1 and L2 cache sizes at startup.
 
-## Why It's Fast
+**Op fusion** eliminates memory round-trips. Dense + ReLU compiles into a single kernel call where the activation runs while the matmul output is still in cache. The cross-entropy backward pass computes `softmax - target` in one SIMD pass instead of materializing the full softmax Jacobian.
 
-No magic. Just doing the obvious things without ten layers of abstraction in the way.
+**Autograd overhead is minimal.** Grad nodes come from a thread-local slab allocator (no malloc per op). Fresh gradients skip the accumulate step and write directly. Lazy zero_grad skips the memset entirely and just marks the generation counter.
 
-**Compute**
-- BLIS-style tiled GEMM with architecture-specific micro-kernels: 14x32 (AVX-512), 6x16 (AVX2), 8x12 (NEON)
-- Fused Dense+ReLU: one kernel call, output stays cache-hot through matmul and activation
-- Runtime ISA dispatch: builds multiple SIMD variants, picks the fastest at startup
-- Cache auto-tuning: reads L1d/L2 sizes from the OS, adjusts tile dimensions to fit
+**Threading is careful.** Axiom detects hyperthreading siblings and pins workers to physical cores. The JC tile loop auto-shrinks when there aren't enough tiles to fill all threads. Pack buffers are per-thread with no lock contention.
 
-**Autograd**
-- Direct-write backward: fresh gradients are written directly, no temp allocation + accumulate
-- Pack-b caching with generation counter invalidation across batches
-- Thread-local slab allocator for grad_fn nodes (eliminates per-op malloc)
+None of this is microarchitecture-specific. No hand-written assembly, no Zen4-only codepaths. The same binary runs on any x86 with AVX2, any aarch64 with NEON, or falls back to scalar C.
 
-**Threading**
-- Adaptive JC tiling: auto-shrinks tile width when tiles < threads to eliminate idle cores
-- HT/SMT dedup: detects hyperthreading siblings, pins to physical cores
-- Per-thread pack buffers: no lock contention in the GEMM hot path
-
-All general-purpose. No microarchitecture-specific tuning. The same binary runs on Zen3, Ice Lake, Graviton, or a Raspberry Pi.
-
-## Project Structure
+## Project layout
 
 ```
-include/axiom/       public API headers
-src/core/            tensors, autograd, ops, layers, optimizers, losses
-src/compute/         dispatch layer + backends
-  backends/          cpu_naive.c, cpu_opt.c (SIMD), simd_defs.h, cuda/
-tests/               22 test binaries, ~5700 lines
-examples/            xor, mnist, mnist_cnn, deep_mlp
-benchmarks/          axiom vs tensorflow comparisons
+include/axiom/     24 public headers
+src/core/          tensor, autograd, ops, layers, optimizers, losses
+src/compute/       dispatch + backends (cpu_naive, cpu_opt, cuda/)
+tests/             22 test binaries covering everything
+examples/          xor, mnist, mnist_cnn, deep_mlp
+benchmarks/        perf comparisons, TF baselines
+docs/              embedded deployment guide
 ```
 
-~19K lines of C total. The whole framework.
+About 19K lines of C for the whole framework.
 
 ## Testing
 
-22 test binaries, CI on x86_64 (AVX-512), ARM64 (NEON), with ASan and inference-only builds.
+22 test binaries. CI runs on x86 (AVX-512 Xeon), ARM (Graviton3 NEON), plus ASan and inference-only builds. The test suite covers tensor math, autograd correctness, every activation and optimizer, SIMD-vs-naive cross-checks, gradient numerical verification, models up to 12.6M parameters, odd-dimension edge cases, memory pressure under repeated train/cleanup cycles, and model serialization roundtrips.
 
-Tests cover: tensor ops and broadcasting, every activation forward + backward, every optimizer on XOR, SIMD vs naive cross-checks, conv/batchnorm/layernorm/dropout gradient flow, large model stress (up to 12.6M params), fused op correctness, numerical gradient verification (finite differences vs analytical), odd-dimension edge cases, memory pressure, model serialization roundtrip.
+## Why not just use PyTorch
 
-## How It Differs From TensorFlow / PyTorch
+You should, probably. PyTorch and TensorFlow are mature, battle-tested, and have enormous ecosystems.
 
-Axiom is not trying to replace TensorFlow. Different tool, different constraints.
+Axiom exists for the cases where they don't fit:
 
-| | Axiom | TensorFlow |
-|---|---|---|
-| **Dependencies** | None. One C library. | Python, protobuf, BLAS, 500MB+ install |
-| **Binary size** | < 100KB (inference, ARM) | Hundreds of MB |
-| **Embedded** | Baremetal Cortex-M, no heap | Not an option |
-| **Ops** | ~30 core ops | Thousands |
-| **Distributed** | Single machine | Multi-node, TPU pods |
-| **Ecosystem** | Just the framework | Massive |
+- You need inference on a microcontroller with 256KB of flash and no OS
+- You want to understand exactly what your training loop does, down to the SIMD instruction
+- You need a self-contained C library with zero transitive dependencies
+- You're building something where a 500MB Python runtime isn't an option
 
-If you need ResNet-152 on a TPU pod, use TensorFlow. If you need a 100KB inference engine on a microcontroller, or you want to understand exactly what your training loop is doing down to the SIMD instruction, Axiom is the tool.
+If none of those apply, the mainstream frameworks will serve you better.
 
 ## Roadmap
 
-- [ ] INT8 quantization with calibration
-- [ ] Attention / transformer layers
-- [ ] ONNX model import
-- [ ] Multi-GPU data parallelism
-- [ ] Depthwise separable and dilated convolutions
-- [ ] RISC-V vector extension support
+- INT8 quantization with calibration
+- Attention / transformer layers
+- ONNX model import
+- Multi-GPU data parallelism
+- Depthwise separable and dilated convolutions
 
 ## License
 
