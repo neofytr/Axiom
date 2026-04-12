@@ -290,6 +290,21 @@ ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 int ax_compute_has_gemm_nt(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_nt) ? 1 : 0; }
 int ax_compute_has_gemm_tn(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_tn) ? 1 : 0; }
 
+/* fused-scaling gemm: out = alpha * (a @ b) + beta * out. */
+ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
+                                float alpha, float beta, ax_tensor_t *out)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->gemm_ex) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "gemm_ex not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return dispatch_touch_on_ok(out, active_ops->gemm_ex(a, b, alpha, beta, out));
+}
+
+int ax_compute_has_gemm_ex(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_ex) ? 1 : 0; }
+
 /* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias. */
 ax_status_t ax_compute_bias_add(const ax_tensor_t *in, const ax_tensor_t *bias,
                                  int axis, ax_tensor_t *out)

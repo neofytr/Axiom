@@ -186,6 +186,45 @@ static ax_status_t cpu_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     return AX_OK;
 }
 
+/* fused-scaling gemm: out = alpha * (a @ b) + beta * out.
+   naive reference implementation — correct for arbitrary alpha/beta. */
+static ax_status_t cpu_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
+                                float alpha, float beta, ax_tensor_t *out)
+{
+    if (a->dtype != AX_FLOAT32) {
+        ax_err_set(AX_ERR_DTYPE_MISMATCH, "gemm_ex only supports float32");
+        return AX_ERR_DTYPE_MISMATCH;
+    }
+    if (a->ndim != 2 || b->ndim != 2 || out->ndim != 2) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "gemm_ex requires 2d tensors");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+    int64_t m = a->shape[0], k = a->shape[1], n = b->shape[1];
+    if (b->shape[0] != k || out->shape[0] != m || out->shape[1] != n) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "gemm_ex shape mismatch");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+
+    float *ad = (float *)a->storage->data;
+    float *bd = (float *)b->storage->data;
+    float *od = (float *)out->storage->data;
+
+    for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int64_t p = 0; p < k; p++) {
+                float av = ad[a->offset + i * a->strides[0] + p * a->strides[1]];
+                float bv = bd[b->offset + p * b->strides[0] + j * b->strides[1]];
+                sum += av * bv;
+            }
+            int64_t oi = out->offset + i * out->strides[0] + j * out->strides[1];
+            float prev = (beta == 0.0f) ? 0.0f : beta * od[oi];
+            od[oi] = alpha * sum + prev;
+        }
+    }
+    return AX_OK;
+}
+
 /* reduction ops */
 
 static ax_status_t cpu_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
@@ -472,6 +511,7 @@ const ax_backend_ops_t ax_cpu_naive_ops = {
     .add_scalar = cpu_add_scalar,
     .mul_scalar = cpu_mul_scalar,
     .gemm       = cpu_gemm,
+    .gemm_ex    = cpu_gemm_ex,
     .sum        = cpu_sum,
     .mean       = cpu_mean,
     .max_op     = cpu_max,

@@ -147,6 +147,8 @@ ax_status_t cuda_min(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 
 /* matrix multiply (ops_gemm.cu) */
 ax_status_t cuda_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
+ax_status_t cuda_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
+                          float alpha, float beta, ax_tensor_t *out);
 
 /* implicit im2col conv forward (ops_conv.cu). per-sample. */
 ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,

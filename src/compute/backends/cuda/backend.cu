@@ -124,6 +124,7 @@ extern const ax_backend_ops_t ax_cuda_ops = {
     .add_scalar = cuda_add_scalar,
     .mul_scalar = cuda_mul_scalar,
     .gemm       = cuda_gemm,
+    .gemm_ex    = cuda_gemm_ex,
     .conv_gemm  = cuda_conv_gemm,
     .sum        = cuda_sum,
     .mean       = cuda_mean,

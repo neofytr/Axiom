@@ -61,6 +61,15 @@ typedef struct {
        NULL when unimplemented. */
     ax_status_t (*gemm_tn)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+    /* optional: fused-scaling gemm. out = alpha * (a @ b) + beta * out.
+       matches the standard blas sgemm signature so callers can fuse
+       an accumulate (beta=1), a scale (alpha!=1), or a bias-add
+       pre-initialised out (out=bias then beta=1 alpha=1) into a
+       single dispatch. NULL when unimplemented — callers should fall
+       back to a plain gemm + scalar post-pass. */
+    ax_status_t (*gemm_ex)(const ax_tensor_t *a, const ax_tensor_t *b,
+                            float alpha, float beta, ax_tensor_t *out);
+
     /* optional: fused bias add. out = in + broadcast(bias) along `axis`.
        bias is rank-1 with numel matching in->shape[axis]. saves a separate
        pass over out after linear/conv. NULL when unimplemented. */

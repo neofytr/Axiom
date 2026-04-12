@@ -36,4 +36,32 @@ ax_status_t cuda_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *o
     return AX_OK;
 }
 
+/* fused-scaling gemm: out = alpha * (a @ b) + beta * out.
+   cublas natively supports alpha/beta — this is a one-line change
+   from cuda_gemm, just threading the user's alpha/beta into the
+   sgemm call instead of hardcoding 1.0/0.0. */
+ax_status_t cuda_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
+                          float alpha, float beta, ax_tensor_t *out) {
+    if (a->dtype != AX_FLOAT32) {
+        ax_err_set(AX_ERR_DTYPE_MISMATCH, "cuda gemm_ex only supports float32");
+        return AX_ERR_DTYPE_MISMATCH;
+    }
+    if (a->ndim != 2 || b->ndim != 2 || out->ndim != 2) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "cuda gemm_ex requires 2d tensors");
+        return AX_ERR_SHAPE_MISMATCH;
+    }
+    int M = (int)a->shape[0], K = (int)a->shape[1], N = (int)b->shape[1];
+    const float *ad = (const float *)a->storage->data   + a->offset;
+    const float *bd = (const float *)b->storage->data   + b->offset;
+    float       *cd = (float *)      out->storage->data + out->offset;
+    cublasStatus_t st = cublasSgemm(
+        ax_cuda_cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+        N, M, K, &alpha, bd, N, ad, K, &beta, cd, N);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        ax_err_set(AX_ERR_BACKEND, "cublasSgemm (ex) failed (%d)", (int)st);
+        return AX_ERR_BACKEND;
+    }
+    return AX_OK;
+}
+
 } /* extern "C" */

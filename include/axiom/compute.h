@@ -95,6 +95,14 @@ ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 int ax_compute_has_gemm_nt(void);
 int ax_compute_has_gemm_tn(void);
 
+/* fused-scaling gemm: out = alpha * (a @ b) + beta * out.
+   classic blas sgemm signature. returns AX_ERR_NOT_IMPLEMENTED if
+   the active backend lacks the slot; callers should fall back to
+   plain gemm plus a scalar pass. */
+ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
+                                float alpha, float beta, ax_tensor_t *out);
+int ax_compute_has_gemm_ex(void);
+
 /* fused bias add. returns AX_ERR_NOT_IMPLEMENTED when the backend
    doesn't provide a fused path; callers can either fall back to a
    broadcast add or accept the error. */

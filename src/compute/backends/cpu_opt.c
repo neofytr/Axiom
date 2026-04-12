@@ -1716,6 +1716,79 @@ static ax_status_t opt_argmax(const ax_tensor_t *in, int axis, ax_tensor_t *out)
 }
 
 
+/* fused-scaling gemm: out = alpha * (a @ b) + beta * out.
+
+   dispatch strategy:
+   - alpha==1, beta==0: identical to plain gemm. reuse opt_gemm.
+   - alpha==1, beta==1: accumulate into out. run opt_gemm into a
+     temporary, then a simd add pass. (or, alternatively, skip the
+     memset(0) inside opt_gemm — but that needs a parameterised
+     variant; the temp+add version reuses the existing optimized
+     gemm unchanged.)
+   - general case: fall through to cpu_naive's reference impl.
+
+   the primary callers are backward passes and bias-accumulation
+   patterns where alpha=1 is the norm and beta is either 0 or 1.
+   other alphas are rare in practice. */
+
+static ax_status_t opt_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
+                                float alpha, float beta, ax_tensor_t *out)
+{
+    if (!a || !b || !out) {
+        ax_err_set(AX_ERR_NULL_ARG, "gemm_ex: NULL tensor");
+        return AX_ERR_NULL_ARG;
+    }
+    if (a->dtype != AX_FLOAT32 || b->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (a->ndim != 2 || b->ndim != 2 || out->ndim != 2)
+        return AX_ERR_SHAPE_MISMATCH;
+
+    /* fast path 1: alpha==1, beta==0 → plain gemm semantics. */
+    if (alpha == 1.0f && beta == 0.0f) {
+        return opt_gemm(a, b, out);
+    }
+
+    /* fast path 2: alpha==1, beta==1 → accumulate a@b into out.
+       do the gemm into a thread-local scratch, then simd-add the
+       scratch into out. cheaper than scaling up two operands. */
+    if (alpha == 1.0f && beta == 1.0f) {
+        int64_t m = a->shape[0], n = b->shape[1];
+        if (validate_contig_f32(out) < 0)
+            return ax_cpu_naive_ops.gemm_ex(a, b, alpha, beta, out);
+        int64_t numel = m * n;
+        float *scratch = (float *)ax_aligned_alloc((size_t)numel * sizeof(float), 64);
+        if (!scratch) return ax_cpu_naive_ops.gemm_ex(a, b, alpha, beta, out);
+        /* wrap the scratch in a throwaway tensor descriptor so opt_gemm
+           can write into it. share metadata with out (same shape). */
+        ax_storage_t fake_storage = {
+            .data = scratch, .size_bytes = (size_t)numel * sizeof(float),
+            .device = AX_DEVICE_CPU, .is_arena_temp = false, .generation = 1,
+        };
+        atomic_init(&fake_storage.refcount, 1);
+        ax_tensor_t fake = *out;
+        fake.storage = &fake_storage;
+        fake.offset = 0;
+        ax_status_t s = opt_gemm(a, b, &fake);
+        if (s != AX_OK) { ax_aligned_free(scratch); return s; }
+        /* simd accumulate: out += scratch */
+        float *od = raw_f32(out);
+        int64_t i = 0, ve = numel - (numel % AX_VF32_WIDTH);
+        for (; i < ve; i += AX_VF32_WIDTH) {
+            ax_vf32 o = ax_vf32_load(od + i);
+            ax_vf32 r = ax_vf32_load(scratch + i);
+            ax_vf32_store(od + i, ax_vf32_add(o, r));
+        }
+        for (; i < numel; i++) od[i] += scratch[i];
+        ax_aligned_free(scratch);
+        return AX_OK;
+    }
+
+    /* general (alpha, beta) — reference implementation is fine;
+       this path is rare in training workloads. */
+    return ax_cpu_naive_ops.gemm_ex(a, b, alpha, beta, out);
+}
+
+
 /* vtable registration */
 
 const ax_backend_ops_t ax_cpu_opt_ops = {
@@ -1733,6 +1806,7 @@ const ax_backend_ops_t ax_cpu_opt_ops = {
     .add_scalar = opt_add_scalar,
     .mul_scalar = opt_mul_scalar,
     .gemm       = opt_gemm,
+    .gemm_ex    = opt_gemm_ex,
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
     .bias_add   = opt_bias_add,
