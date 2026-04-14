@@ -208,10 +208,15 @@ static void run_train(void) {
         int64_t n_seen = 0;
         ax_batch_t b;
 
+        /* per-phase timings accumulated across the epoch */
+        double t_fwd = 0, t_bwd = 0, t_opt = 0, t_other = 0;
+
         while (ax_dataloader_next(dl, &b)) {
             ax_enable_grad();
+            double ta = now_s();
             ax_tensor_t *logits = ax_layer_forward(model, b.input);
             ax_tensor_t *loss = ax_cross_entropy_loss(logits, b.target);
+            double tb = now_s();
             if (!logits || !loss) {
                 if (logits) ax_tensor_destroy(logits);
                 ax_tensor_destroy(b.input);
@@ -223,13 +228,21 @@ static void run_train(void) {
 
             ax_optimizer_zero_grad(opt);
             ax_backward(loss);
+            double tc = now_s();
             ax_clip_grad_norm(params, np, 1.0f);
             ax_optimizer_step(opt);
+            double td = now_s();
 
             ax_graph_cleanup(loss);
             ax_tensor_destroy(loss);
             ax_tensor_destroy(b.input);
             ax_tensor_destroy(b.target);
+            double te = now_s();
+
+            t_fwd   += tb - ta;
+            t_bwd   += tc - tb;
+            t_opt   += td - tc;
+            t_other += te - td;
         }
 
         float acc = eval_accuracy(model, test_x, test_labels, N_TEST);
@@ -239,6 +252,8 @@ static void run_train(void) {
                ep + 1, EPOCHS,
                n_seen > 0 ? (float)(total_loss / (double)n_seen) : 0.0f,
                acc, dt);
+        printf("  breakdown: fwd=%.3fs bwd=%.3fs opt=%.3fs cleanup=%.3fs\n",
+               t_fwd, t_bwd, t_opt, t_other);
         fflush(stdout);
     }
 

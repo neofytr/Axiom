@@ -146,6 +146,8 @@ set(AXIOM_SOURCES
     src/core/serialize.c
     src/core/conv.c
     src/core/norm.c
+    src/core/attention.c
+    src/core/fused_attention.c
     src/core/rng.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
@@ -190,6 +192,26 @@ endif()
 # libraries with their own flags.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86" AND NOT AX_CPU_ISA_DISPATCH)
     set_source_files_properties(src/compute/backends/cpu_opt.c
+        PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
+endif()
+
+# SIMD flags for every core/*.c file that includes simd_defs.h. without
+# this the compiler doesn't predefine __AVX2__/__FMA__ and AX_HAS_SIMD
+# falls back to the scalar path, destroying throughput on GELU, BN, LN,
+# Adam, etc.  under AX_CPU_ISA_DISPATCH we still apply the baseline flags
+# (AVX2+FMA) to these TUs — they aren't dispatched per-ISA, only the
+# cpu_opt backend is.  so we target the machines that matter (AVX2+) and
+# let the top-level x86 baseline take care of pre-AVX2 fallbacks through
+# the compiler's -march setting.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
+    set_source_files_properties(
+        src/core/activations.c
+        src/core/attention.c
+        src/core/autograd_ops.c
+        src/core/conv.c
+        src/core/losses.c
+        src/core/norm.c
+        src/core/optim.c
         PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 endif()
 
@@ -299,6 +321,7 @@ set(TEST_SOURCES
 if(NOT AX_INFERENCE_ONLY)
     list(APPEND TEST_SOURCES
         tests/test_activations.c
+        tests/test_attention.c
         tests/test_layer.c
         tests/test_serialize.c
         tests/test_backend_opt.c
@@ -373,6 +396,32 @@ if(NOT AX_INFERENCE_ONLY)
         add_executable(bench_vgg benchmarks/bench_vgg.c)
         target_link_libraries(bench_vgg PRIVATE axiom_static)
     endif()
+    if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/bench_mha.c")
+        add_executable(bench_mha benchmarks/bench_mha.c)
+        target_include_directories(bench_mha PRIVATE benchmarks)
+        target_link_libraries(bench_mha PRIVATE axiom_static)
+    endif()
+    # ax_* training benchmarks mirroring the tf_*.py scripts one-to-one.
+    # each is gated on file existence so optional / in-development benches
+    # don't break the build.
+    foreach(ax_bench ax_mnist ax_train_save ax_infer_load)
+        if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/${ax_bench}.c")
+            add_executable(${ax_bench} benchmarks/${ax_bench}.c)
+            target_link_libraries(${ax_bench} PRIVATE axiom_static)
+        endif()
+    endforeach()
+
+    # comprehensive suites vs TF. each has a tf_<name>.py sidecar and
+    # benchmarks/summarize.py merges RESULT lines from both sides.
+    foreach(suite_bench
+            bench_gemm_suite bench_ops_suite bench_conv_suite
+            bench_transformer bench_stress bench_parity)
+        if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/${suite_bench}.c")
+            add_executable(${suite_bench} benchmarks/${suite_bench}.c)
+            target_include_directories(${suite_bench} PRIVATE benchmarks)
+            target_link_libraries(${suite_bench} PRIVATE axiom_static)
+        endif()
+    endforeach()
 endif()
 
 # convenience target: run all tests

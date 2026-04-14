@@ -34,6 +34,7 @@
 #include "axiom/activations.h"
 #include "axiom/conv.h"
 #include "axiom/norm.h"
+#include "axiom/attention.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -406,6 +407,14 @@ ax_status_t ax_model_save(ax_model_t *model, const char *path)
                 write_u32_c(f, 1, &crc);
                 break;
             }
+            case AX_LAYER_MHA: {
+                ax_mha_t *mh = (ax_mha_t *)l;
+                write_i64_c(f, mh->d_model, &crc);
+                write_u32_c(f, (uint32_t)mh->n_heads, &crc);
+                write_u8_c(f, mh->use_bias ? 1 : 0, &crc);
+                write_u8_c(f, mh->causal ? 1 : 0, &crc);
+                break;
+            }
             default:
                 break;
         }
@@ -600,6 +609,16 @@ ax_model_t *ax_model_load(const char *path)
                 if (!read_u32(f, &axis))
                 { ax_layer_destroy(seq); fclose(f); return NULL; }
                 layer = ax_softmax_layer_create((int)axis);
+                break;
+            }
+            case AX_LAYER_MHA: {
+                int64_t d_model; uint32_t n_heads; uint8_t use_bias, causal;
+                if (!read_i64(f, &d_model) || !read_u32(f, &n_heads) ||
+                    !read_u8(f, &use_bias) || !read_u8(f, &causal))
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                if (d_model <= 0 || n_heads == 0 || d_model % (int64_t)n_heads != 0)
+                { ax_layer_destroy(seq); fclose(f); return NULL; }
+                layer = ax_mha_create(d_model, (int)n_heads, use_bias & 1, causal & 1);
                 break;
             }
             case AX_LAYER_RELU:           layer = ax_relu_layer_create(); break;

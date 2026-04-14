@@ -19,6 +19,7 @@
 #include "serialize.h"
 #include "conv.h"
 #include "norm.h"
+#include "attention.h"
 #include "cuda.h"
 
 /* training-only subset: excluded when building inference-only.

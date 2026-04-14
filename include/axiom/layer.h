@@ -12,8 +12,9 @@
 
 #include "tensor.h"
 
-/* max parameters a single layer can have (weights + bias = 2 for dense) */
-#define AX_LAYER_MAX_PARAMS 4
+/* max parameters a single layer can have. mha is the upper bound:
+   4 projections (Wq/Wk/Wv/Wo) × {weight + optional bias} = 8. */
+#define AX_LAYER_MAX_PARAMS 8
 
 /* max non-trainable buffers a layer can have (e.g. batchnorm running stats) */
 #define AX_LAYER_MAX_BUFFERS 4
@@ -50,6 +51,7 @@ typedef enum
     AX_LAYER_DROPOUT,
     AX_LAYER_SEQUENTIAL,
     AX_LAYER_CONV_BN_RELU,   /* fused conv2d+batchnorm+relu (see conv.h) */
+    AX_LAYER_MHA,            /* multi-head attention (see attention.h) */
     AX_LAYER_TYPE_COUNT,
 } ax_layer_type_t;
 

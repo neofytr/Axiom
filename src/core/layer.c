@@ -36,6 +36,7 @@ static const char *layer_type_name(ax_layer_type_t type)
         case AX_LAYER_DROPOUT:         return "Dropout";
         case AX_LAYER_SEQUENTIAL:      return "Sequential";
         case AX_LAYER_CONV_BN_RELU:    return "ConvBNReLU";
+        case AX_LAYER_MHA:             return "MHA";
         default: return "Unknown";
     }
 }

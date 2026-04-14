@@ -6,9 +6,14 @@
 #include "axiom/autograd.h"
 #include "axiom/compute.h"
 #include "axiom/error.h"
+#include "../compute/backends/simd_defs.h"
 #include <math.h>
 #include <float.h>
 #include <stdlib.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* selu constants — from the original self-normalizing networks paper */
 #define SELU_ALPHA  1.6732632423543772f
@@ -30,10 +35,13 @@ static inline bool check_f32(ax_tensor_t *a)
 }
 
 /* helper to allocate output and get data pointers.
-   most activations follow the same pattern so this saves repetition. */
+   most activations follow the same pattern so this saves repetition.
+   uses the uninitialized allocator — every activation forward below
+   writes every element before return, so the memset in ax_tensor_zeros
+   is pure wasted bandwidth on large tensors. */
 static ax_tensor_t *alloc_out(ax_tensor_t *a)
 {
-    return ax_tensor_zeros(a->shape, a->ndim, a->dtype);
+    return ax_tensor_create(a->shape, a->ndim, a->dtype);
 }
 
 static inline bool needs_grad(ax_tensor_t *a)
@@ -264,13 +272,47 @@ ax_tensor_t *ax_gelu(ax_tensor_t *a)
     int64_t n = ax_tensor_numel(a);
     float *od = (float *)out->storage->data;
     float *ad = (float *)a->storage->data;
+    int64_t off_a = a->offset;
+    int64_t off_o = out->offset;
 
-    for (int64_t i = 0; i < n; i++)
-    {
-        float x = ad[a->offset + i];
-        float inner = SQRT_2_PI * (x + GELU_COEFF * x * x * x);
-        od[out->offset + i] = 0.5f * x * (1.0f + tanhf(inner));
+    /* SIMD tanh-approximation GELU: matches tf.nn.gelu(..., approximate=True).
+       parallel for big tensors to amortize OMP fork-join overhead. serial
+       scalar loop for tiny tensors where threading cost dominates. */
+#if defined(AX_HAS_SIMD)
+    ax_vf32 v_half = ax_vf32_set1(0.5f);
+    ax_vf32 v_one  = ax_vf32_set1(1.0f);
+    ax_vf32 v_coef = ax_vf32_set1(GELU_COEFF);
+    ax_vf32 v_sqrt = ax_vf32_set1(SQRT_2_PI);
+    int64_t ve = n - (n % AX_VF32_WIDTH);
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) if (n > 65536)
+    #endif
+    for (int64_t i = 0; i < ve; i += AX_VF32_WIDTH) {
+        ax_vf32 x = ax_vf32_loadu(ad + off_a + i);
+        ax_vf32 xx = ax_vf32_mul(x, x);
+        ax_vf32 xxx = ax_vf32_mul(xx, x);
+        /* inner = sqrt(2/pi) * (x + coeff * x^3) */
+        ax_vf32 inner = ax_vf32_mul(v_sqrt,
+                          ax_vf32_fmadd(v_coef, xxx, x));
+        ax_vf32 t = ax_vf32_tanh(inner);
+        /* 0.5 * x * (1 + t) */
+        ax_vf32 y = ax_vf32_mul(ax_vf32_mul(v_half, x),
+                                 ax_vf32_add(v_one, t));
+        ax_vf32_storeu(od + off_o + i, y);
     }
+    for (int64_t i = ve; i < n; i++) {
+        float x = ad[off_a + i];
+        float inner = SQRT_2_PI * (x + GELU_COEFF * x * x * x);
+        od[off_o + i] = 0.5f * x * (1.0f + tanhf(inner));
+    }
+#else
+    for (int64_t i = 0; i < n; i++) {
+        float x = ad[off_a + i];
+        float inner = SQRT_2_PI * (x + GELU_COEFF * x * x * x);
+        od[off_o + i] = 0.5f * x * (1.0f + tanhf(inner));
+    }
+#endif
 
     if (needs_grad(a))
     {

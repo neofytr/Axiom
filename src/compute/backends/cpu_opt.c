@@ -2563,3 +2563,688 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .sigmoid    = opt_sigmoid,
     .tanh_op    = opt_tanh_op,
 };
+
+/* ================================================================
+   SCALED DOT-PRODUCT ATTENTION — fused flashattention-style kernel
+
+   design principles:
+   1. score tiles never leave L1. process Q in MR-row strips (6 rows for
+      AVX2, 14 for AVX-512, 8 for NEON). score_strip is MR × BK ≤ 3-8 KB,
+      fits easily in L1d. GEMM → softmax → V-multiply all operate on
+      this L1-resident strip, eliminating the 64 KB L2 round-trip that a
+      naive (separate score tile, separate softmax pass) has.
+
+   2. scale is baked into packed K^T, not applied as a separate pass.
+      scale_packed() multiplies the NR-col-strip layout of Kt by 1/√dk
+      once per kj block. all subsequent score computations using this Kt
+      produce pre-scaled values.
+
+   3. K^T and V are packed ONCE per kj block and reused across every qi
+      block. this is the key locality win — a 128-row K panel is 64 KB
+      but gets accessed S/BQ = 8 times for S=1024.
+
+   4. online softmax with output correction fused into the strip loop.
+      as we accumulate contributions from each kj block, the running
+      row_max may increase. when it does, previous output contributions
+      get multiplied by exp(old_max - new_max) to correct them. this is
+      done row-by-row inside the strip loop while out[qi+ir] is L1-hot.
+
+   5. causal masking uses three-tier logic:
+      - entire strip is future (qi+ir+MR-1 < kj): skip the strip
+      - entire strip is past (qi+ir >= kj+BK-1): normal, no mask
+      - partial overlap: apply causal mask within the softmax row loop
+      this avoids per-element masking when it's not needed.
+
+   6. backward uses recompute, not P-materialization. on CPUs with
+      modest L3 (4-18 MB typical), materializing per-head S×S scores
+      thrashes L3. recomputing scores from Q/K inside the backward is
+      actually cheaper when per-head S*S*4 exceeds ~half of shared L3.
+      the score recompute uses the SAME MR-strip fused pipeline as
+      the forward, so it costs ~30% of a full forward, not 100%.
+
+   ================================================================ */
+
+#include <time.h>
+
+#define ATTN_BQ_MAX 128
+#define ATTN_BK_MAX 128
+#define ATTN_MAX_DK 256
+
+/* attention tile sizes — runtime, defaults picked so score_strip stays in L1d. */
+static int64_t ATTN_BQ = 128;
+static int64_t ATTN_BK = 128;
+
+/* in-place multiply a packed panel by a scalar (SIMD-vectorized).
+   used to bake 1/√dk into Kt_packed so the score GEMM output is
+   pre-scaled without a separate pass over the score tile. */
+static inline void attn_scale_packed(float *buf, int64_t n, float s) {
+    int64_t c = 0;
+#if defined(AX_HAS_SIMD)
+    ax_vf32 vs = ax_vf32_set1(s);
+    int64_t ve = n - (n % AX_VF32_WIDTH);
+    for (; c < ve; c += AX_VF32_WIDTH)
+        ax_vf32_storeu(buf + c, ax_vf32_mul(ax_vf32_loadu(buf + c), vs));
+#endif
+    for (; c < n; c++) buf[c] *= s;
+}
+
+/* online softmax + output correction for a single row of the score strip.
+   sr is the scaled score row (length Bk), to be overwritten with exp(sr - new_max).
+   row_max_io and row_sum_io track running state across kj blocks.
+   out_row is the accumulated output row, to be corrected in-place.
+   returns exp(old_max - new_max), the correction factor. */
+static inline void attn_fwd_softmax_row(float *sr, float *out_row,
+                                         float *row_max_io, float *row_sum_io,
+                                         int64_t Bk, int64_t dk)
+{
+    float tmx = -FLT_MAX;
+    int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+    ax_vf32 vmx = ax_vf32_set1(-FLT_MAX);
+    int64_t bve = Bk - (Bk % AX_VF32_WIDTH);
+    for (; j < bve; j += AX_VF32_WIDTH)
+        vmx = ax_vf32_max(vmx, ax_vf32_loadu(sr + j));
+    tmx = ax_vf32_hmax(vmx);
+#endif
+    for (; j < Bk; j++) if (sr[j] > tmx) tmx = sr[j];
+
+    float om = *row_max_io;
+    float nm = (om > tmx) ? om : tmx;
+    float corr = (om == -FLT_MAX) ? 0.0f : expf(om - nm);
+
+    float ts = 0;
+    j = 0;
+#if defined(AX_HAS_SIMD)
+    ax_vf32 vnm = ax_vf32_set1(nm), vts = ax_vf32_zero();
+    for (; j < bve; j += AX_VF32_WIDTH) {
+        ax_vf32 v = ax_vf32_exp(ax_vf32_sub(ax_vf32_loadu(sr + j), vnm));
+        ax_vf32_storeu(sr + j, v);
+        vts = ax_vf32_add(vts, v);
+    }
+    ts = ax_vf32_hsum(vts);
+#endif
+    for (; j < Bk; j++) { sr[j] = expf(sr[j] - nm); ts += sr[j]; }
+
+    *row_sum_io = *row_sum_io * corr + ts;
+    *row_max_io = nm;
+
+    /* apply correction to previously-accumulated output row (unless this
+       is the first kj block, signaled by old_max == -FLT_MAX). */
+    if (om != -FLT_MAX) {
+        int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+        ax_vf32 vc = ax_vf32_set1(corr);
+        int64_t dve = dk - (dk % AX_VF32_WIDTH);
+        for (; d < dve; d += AX_VF32_WIDTH)
+            ax_vf32_storeu(out_row + d, ax_vf32_mul(ax_vf32_loadu(out_row + d), vc));
+#endif
+        for (; d < dk; d++) out_row[d] *= corr;
+    }
+}
+
+/* apply causal mask to a score strip: set sr[j] = -inf for j > qi_abs.
+   qi_abs is the absolute query position (qi + ir + r).
+   kj is the column offset of this kj block.
+   Bk is the width of this block. */
+static inline void attn_apply_causal_mask(float *sr, int64_t qi_abs,
+                                            int64_t kj, int64_t Bk)
+{
+    /* sr corresponds to score for positions kj, kj+1, ..., kj+Bk-1.
+       mask all positions strictly greater than qi_abs. */
+    if (qi_abs >= kj + Bk - 1) return; /* nothing to mask in this block */
+    int64_t first_mask = qi_abs - kj + 1;
+    if (first_mask < 0) first_mask = 0;
+    for (int64_t j = first_mask; j < Bk; j++) sr[j] = -FLT_MAX;
+}
+
+/* apply padding mask to a score strip: set sr[j] = -inf wherever pad_mask[kj+j] == 0. */
+static inline void attn_apply_pad_mask(float *sr, int64_t kj, int64_t Bk,
+                                         const int8_t *pad_mask)
+{
+    for (int64_t j = 0; j < Bk; j++)
+        if (!pad_mask[kj + j]) sr[j] = -FLT_MAX;
+}
+
+/* process one (qi, kj) forward tile in MR-row strips.
+   Kt_packed must be pre-scaled by 1/√dk.
+   Bq, Bk are the actual tile dimensions (may be less than ATTN_BQ/BK on edges).
+   qi_base, kj_base are absolute positions within the sequence (for masking). */
+static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
+                                      const float *Kt_packed, const float *V_packed,
+                                      float *out_qi, float *row_max_qi, float *row_sum_qi,
+                                      int64_t Bq, int64_t Bk, int64_t dk_np,
+                                      int64_t qi_base, int64_t kj_base,
+                                      bool causal, const int8_t *pad_mask)
+{
+    int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+    float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
+    float a_q[GEMM_MR * ATTN_MAX_DK] __attribute__((aligned(64)));
+    float a_s[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
+
+    int64_t dk_p = ((dk + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+    /* causal three-tier: skip entire strip if fully in the future. */
+    for (int64_t ir = 0; ir < Bq; ir += GEMM_MR) {
+        int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq - ir);
+        int64_t qi_abs_start = qi_base + ir;
+        int64_t qi_abs_end = qi_abs_start + mr - 1;
+
+        if (causal && qi_abs_end < kj_base) continue; /* entire strip is future */
+
+        int64_t mr_p = ((mr + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+        /* need masking iff ANY row in the strip has a future key in this
+           block. the earliest row qi_abs_start gates the earliest future
+           column; if qi_abs_start < kj+Bk-1 then row 0 still sees future
+           keys. using qi_abs_end would miss strips that straddle the
+           causal boundary (later rows fully masked, earlier rows partial). */
+        bool need_causal_mask = causal && (qi_abs_start < kj_base + Bk - 1);
+
+        /* 1. pack Q strip and compute score = Q @ Kt (scale baked in) */
+        pack_a(Q_qi + ir * dk, dk, mr_p, dk, mr, a_q);
+        memset(score_strip, 0, (size_t)(mr * Bk) * sizeof(float));
+        for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
+            int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
+            if (nr <= 0) break;
+            micro_kernel(dk, a_q, Kt_packed + jr * dk,
+                         score_strip + jr, Bk, mr, nr);
+        }
+
+        /* 2. apply masks if needed */
+        if (pad_mask) {
+            for (int64_t r = 0; r < mr; r++)
+                attn_apply_pad_mask(score_strip + r * Bk, kj_base, Bk, pad_mask);
+        }
+        if (need_causal_mask) {
+            for (int64_t r = 0; r < mr; r++)
+                attn_apply_causal_mask(score_strip + r * Bk,
+                                        qi_base + ir + r, kj_base, Bk);
+        }
+
+        /* 3. online softmax + output correction (fused per row) */
+        for (int64_t r = 0; r < mr; r++) {
+            attn_fwd_softmax_row(score_strip + r * Bk,
+                                  out_qi + (ir + r) * dk,
+                                  row_max_qi + ir + r,
+                                  row_sum_qi + ir + r,
+                                  Bk, dk);
+        }
+
+        /* 4. V multiply: out[MR, dk] += score_strip[MR, Bk] @ V_packed[Bk, dk] */
+        pack_a(score_strip, Bk, mr_p, Bk, mr, a_s);
+        (void)dk_p;
+        for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
+            int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
+            if (nr <= 0) break;
+            micro_kernel(Bk, a_s, V_packed + jr * Bk,
+                         out_qi + ir * dk + jr, dk, mr, nr);
+        }
+    }
+}
+
+/* per-head forward pass. Q/K/V/out are [S, dk] contiguous for this head.
+   row_max, row_sum are [S] working buffers (caller allocates + initializes to
+   -FLT_MAX / 0). L may be NULL to skip logsumexp writeout (inference). */
+static void attn_fwd_head(const float *Q, const float *K, const float *V,
+                           float *out, float *L, float *row_max, float *row_sum,
+                           int64_t S, int64_t dk, float scale,
+                           bool causal, const int8_t *pad_mask)
+{
+    int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+    int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+    /* per-kj-block packed panels. Kt gets pre-scaled. */
+    float *Kt_packed = (float *)aligned_alloc(64, (size_t)(dk * Bk_np_max) * sizeof(float));
+    float *V_packed = (float *)aligned_alloc(64, (size_t)(ATTN_BK * dk_np) * sizeof(float));
+    if (!Kt_packed || !V_packed) { free(Kt_packed); free(V_packed); return; }
+
+    for (int64_t i = 0; i < S; i++) { row_max[i] = -FLT_MAX; row_sum[i] = 0.0f; }
+    memset(out, 0, (size_t)(S * dk) * sizeof(float));
+
+    for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
+        int64_t Bk = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
+        int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+        /* pack K^T and V for this kj block */
+        pack_b_t(K + kj * dk, dk, dk, Bk_np, Bk, Kt_packed);
+        attn_scale_packed(Kt_packed, dk * Bk_np, scale);  /* bake 1/√dk into Kt */
+        pack_b(V + kj * dk, dk, Bk, dk_np, dk, V_packed);
+
+        for (int64_t qi = 0; qi < S; qi += ATTN_BQ) {
+            int64_t Bq = (qi + ATTN_BQ <= S) ? ATTN_BQ : (S - qi);
+
+            /* causal: skip this (qi, kj) if entire block is in the future */
+            if (causal && qi + Bq - 1 < kj) continue;
+
+            attn_fwd_tile_mr(Q + qi * dk, dk, Kt_packed, V_packed,
+                              out + qi * dk, row_max + qi, row_sum + qi,
+                              Bq, Bk, dk_np, qi, kj, causal, pad_mask);
+        }
+    }
+
+    /* final normalization: out[i] /= row_sum[i], L[i] = row_max[i] + log(row_sum[i]) */
+    for (int64_t i = 0; i < S; i++) {
+        float rs = row_sum[i];
+        if (rs > 0.0f) {
+            float inv = 1.0f / rs;
+            float *o = out + i * dk;
+            int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+            ax_vf32 vi = ax_vf32_set1(inv);
+            int64_t ve = dk - (dk % AX_VF32_WIDTH);
+            for (; d < ve; d += AX_VF32_WIDTH)
+                ax_vf32_storeu(o + d, ax_vf32_mul(ax_vf32_loadu(o + d), vi));
+#endif
+            for (; d < dk; d++) o[d] *= inv;
+            if (L) L[i] = row_max[i] + logf(rs);
+        } else if (L) {
+            L[i] = -FLT_MAX;
+        }
+    }
+
+    free(Kt_packed);
+    free(V_packed);
+}
+
+/* batched SDPA forward. processes BH heads in parallel. */
+void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
+                              float *out, float *L,
+                              int64_t BH, int64_t S, int64_t dk, float scale,
+                              bool causal, const int8_t *pad_mask)
+{
+    int64_t head_sz = S * dk;
+
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        /* per-thread working buffers for row_max/row_sum */
+        float *row_max = (float *)malloc((size_t)S * sizeof(float));
+        float *row_sum = (float *)malloc((size_t)S * sizeof(float));
+        if (!row_max || !row_sum) { free(row_max); free(row_sum); goto done; }
+
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int64_t h = 0; h < BH; h++) {
+            attn_fwd_head(Q + h * head_sz, K + h * head_sz, V + h * head_sz,
+                           out + h * head_sz, L ? L + h * S : NULL,
+                           row_max, row_sum, S, dk, scale, causal, pad_mask);
+        }
+        free(row_max); free(row_sum);
+    done:;
+    }
+}
+
+/* ================================================================
+   backward pass
+
+   per-head backward does 5 GEMMs per (qi, kj) tile:
+     1. recompute score = Q @ Kt (scale baked into Kt)
+     2. softmax: P = exp(score - L) — baked scale means no extra multiply
+     3. dV += P^T @ dO
+     4. dP = dO @ V^T
+     5. dS = P * (dP - Di[:]) * scale_raw  (scale_raw = original 1/√dk,
+        needed because chain rule through score scaling)
+     6. dQ += dS @ K
+     7. dK += dS^T @ Q
+   ================================================================ */
+
+static inline void attn_bwd_softmax_row(const float *sr_pre_mask,
+                                         float Li, float *sr_out,
+                                         int64_t Bk)
+{
+    /* P = exp(score - L). score already has scale baked in from Kt.
+       exp(x - L) where L = row_max + log(row_sum) gives correctly-
+       normalized softmax without dividing. */
+    int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+    ax_vf32 vLi = ax_vf32_set1(Li);
+    int64_t bve = Bk - (Bk % AX_VF32_WIDTH);
+    for (; j < bve; j += AX_VF32_WIDTH)
+        ax_vf32_storeu(sr_out + j,
+                       ax_vf32_exp(ax_vf32_sub(ax_vf32_loadu(sr_pre_mask + j), vLi)));
+#endif
+    for (; j < Bk; j++) sr_out[j] = expf(sr_pre_mask[j] - Li);
+}
+
+static void attn_bwd_head(const float *Q, const float *K, const float *V,
+                           const float *dO, const float *L, const float *Di,
+                           float *dQ, float *dK, float *dV,
+                           int64_t S, int64_t dk, float scale, bool causal)
+{
+    int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+    int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+    int64_t Bq_p_max = ((ATTN_BQ + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+    int64_t Bk_p_max = ((ATTN_BK + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+    /* packed panels per kj block: Kt (scaled), V^T, K */
+    float *Kt_packed = (float *)aligned_alloc(64, (size_t)(dk * Bk_np_max) * sizeof(float));
+    float *Vt_packed = (float *)aligned_alloc(64, (size_t)(dk * Bk_np_max) * sizeof(float));
+    float *K_packed  = (float *)aligned_alloc(64, (size_t)(ATTN_BK * dk_np) * sizeof(float));
+
+    /* per-qi-tile buffers for score/P/dP/dS (one tile worth) */
+    int64_t tile_scores_sz = ATTN_BQ * ATTN_BK;
+    float *P_tile  = (float *)aligned_alloc(64, (size_t)tile_scores_sz * sizeof(float));
+    float *dP_tile = (float *)aligned_alloc(64, (size_t)tile_scores_sz * sizeof(float));
+    float *dS_tile = (float *)aligned_alloc(64, (size_t)tile_scores_sz * sizeof(float));
+
+    /* pack scratch for the full-tile GEMMs (dV accumulation etc.) */
+    int64_t pa_sz = Bq_p_max * ATTN_MAX_DK;
+    if (Bk_p_max * ATTN_BQ > pa_sz) pa_sz = Bk_p_max * ATTN_BQ;
+    if (Bq_p_max * ATTN_BK > pa_sz) pa_sz = Bq_p_max * ATTN_BK;
+    float *pa = (float *)aligned_alloc(64, (size_t)pa_sz * sizeof(float));
+    float *pb = (float *)aligned_alloc(64, (size_t)(ATTN_BQ * dk_np) * sizeof(float));
+
+    /* MR-strip score scratch for the forward-recompute pass */
+    float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
+    float a_q[GEMM_MR * ATTN_MAX_DK] __attribute__((aligned(64)));
+
+    if (!Kt_packed || !Vt_packed || !K_packed || !P_tile || !dP_tile ||
+        !dS_tile || !pa || !pb) { goto cleanup; }
+
+    for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
+        int64_t Bk = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
+        int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+        int64_t Bk_p = ((Bk + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+        pack_b_t(K + kj * dk, dk, dk, Bk_np, Bk, Kt_packed);
+        attn_scale_packed(Kt_packed, dk * Bk_np, scale);
+        pack_b_t(V + kj * dk, dk, dk, Bk_np, Bk, Vt_packed);
+        pack_b(K + kj * dk, dk, Bk, dk_np, dk, K_packed);
+
+        for (int64_t qi = 0; qi < S; qi += ATTN_BQ) {
+            int64_t Bq = (qi + ATTN_BQ <= S) ? ATTN_BQ : (S - qi);
+            int64_t Bq_p = ((Bq + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+            /* causal: skip this (qi, kj) if entire block is in future */
+            if (causal && qi + Bq - 1 < kj) continue;
+
+            /* recompute P[Bq, Bk] via MR-strip fused score+softmax.
+               the score uses Kt_packed (scaled), so P = exp(score - L). */
+            for (int64_t ir = 0; ir < Bq; ir += GEMM_MR) {
+                int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq - ir);
+                int64_t mr_p = ((mr + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                if (causal && qi + ir + mr - 1 < kj) {
+                    /* entire strip in future — write zeros to P */
+                    for (int64_t r = 0; r < mr; r++)
+                        memset(P_tile + (ir + r) * Bk, 0, (size_t)Bk * sizeof(float));
+                    continue;
+                }
+                /* need masking iff ANY row in the strip has a future key —
+                   gated by the EARLIEST row's absolute position (qi+ir),
+                   not the latest. see fwd path for the same invariant. */
+                bool need_mask = causal && (qi + ir < kj + Bk - 1);
+
+                pack_a(Q + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
+                memset(score_strip, 0, (size_t)(mr * Bk) * sizeof(float));
+                for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
+                    int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
+                    if (nr <= 0) break;
+                    micro_kernel(dk, a_q, Kt_packed + jr * dk,
+                                 score_strip + jr, Bk, mr, nr);
+                }
+                if (need_mask) {
+                    for (int64_t r = 0; r < mr; r++)
+                        attn_apply_causal_mask(score_strip + r * Bk,
+                                                qi + ir + r, kj, Bk);
+                }
+                /* P = exp(score - L) into P_tile */
+                for (int64_t r = 0; r < mr; r++) {
+                    attn_bwd_softmax_row(score_strip + r * Bk, L[qi + ir + r],
+                                          P_tile + (ir + r) * Bk, Bk);
+                }
+            }
+
+            /* dV += P^T @ dO (full tile GEMM) */
+            pack_a_t(P_tile, Bk, Bk_p, Bq, Bk, pa);
+            pack_b(dO + qi * dk, dk, Bq, dk_np, dk, pb);
+            for (int64_t ir = 0; ir < Bk_p; ir += GEMM_MR) {
+                int64_t mr = (ir + GEMM_MR <= Bk) ? GEMM_MR : (Bk > ir ? Bk - ir : 0);
+                if (mr <= 0) break;
+                for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
+                    int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
+                    if (nr <= 0) break;
+                    micro_kernel(Bq, pa + ir * Bq, pb + jr * Bq,
+                                 dV + (kj + ir) * dk + jr, dk, mr, nr);
+                }
+            }
+
+            /* dP = dO @ V^T (full tile GEMM) */
+            pack_a(dO + qi * dk, dk, Bq_p, dk, Bq, pa);
+            memset(dP_tile, 0, (size_t)(Bq * Bk) * sizeof(float));
+            for (int64_t ir = 0; ir < Bq_p; ir += GEMM_MR) {
+                int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq > ir ? Bq - ir : 0);
+                if (mr <= 0) break;
+                for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
+                    int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
+                    if (nr <= 0) break;
+                    micro_kernel(dk, pa + ir * dk, Vt_packed + jr * dk,
+                                 dP_tile + ir * Bk + jr, Bk, mr, nr);
+                }
+            }
+
+            /* dS = P * (dP - Di) * scale (element-wise) */
+            for (int64_t r = 0; r < Bq; r++) {
+                float di = Di[qi + r];
+                float *pr = P_tile + r * Bk;
+                float *dpr = dP_tile + r * Bk;
+                float *dsr = dS_tile + r * Bk;
+                int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+                ax_vf32 vdi = ax_vf32_set1(di), vsc = ax_vf32_set1(scale);
+                int64_t bve = Bk - (Bk % AX_VF32_WIDTH);
+                for (; j < bve; j += AX_VF32_WIDTH) {
+                    ax_vf32 p = ax_vf32_loadu(pr + j), dp = ax_vf32_loadu(dpr + j);
+                    ax_vf32_storeu(dsr + j, ax_vf32_mul(ax_vf32_mul(p, ax_vf32_sub(dp, vdi)), vsc));
+                }
+#endif
+                for (; j < Bk; j++) dsr[j] = pr[j] * (dpr[j] - di) * scale;
+            }
+
+            /* dQ += dS @ K */
+            pack_a(dS_tile, Bk, Bq_p, Bk, Bq, pa);
+            for (int64_t ir = 0; ir < Bq_p; ir += GEMM_MR) {
+                int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq > ir ? Bq - ir : 0);
+                if (mr <= 0) break;
+                for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
+                    int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
+                    if (nr <= 0) break;
+                    micro_kernel(Bk, pa + ir * Bk, K_packed + jr * Bk,
+                                 dQ + (qi + ir) * dk + jr, dk, mr, nr);
+                }
+            }
+
+            /* dK += dS^T @ Q */
+            pack_a_t(dS_tile, Bk, Bk_p, Bq, Bk, pa);
+            pack_b(Q + qi * dk, dk, Bq, dk_np, dk, pb);
+            for (int64_t ir = 0; ir < Bk_p; ir += GEMM_MR) {
+                int64_t mr = (ir + GEMM_MR <= Bk) ? GEMM_MR : (Bk > ir ? Bk - ir : 0);
+                if (mr <= 0) break;
+                for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
+                    int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
+                    if (nr <= 0) break;
+                    micro_kernel(Bq, pa + ir * Bq, pb + jr * Bq,
+                                 dK + (kj + ir) * dk + jr, dk, mr, nr);
+                }
+            }
+        }
+    }
+
+cleanup:
+    free(Kt_packed); free(Vt_packed); free(K_packed);
+    free(P_tile); free(dP_tile); free(dS_tile);
+    free(pa); free(pb);
+}
+
+void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
+                              const float *O, const float *dO, const float *L,
+                              float *dQ, float *dK, float *dV,
+                              int64_t BH, int64_t S, int64_t dk, float scale,
+                              bool causal)
+{
+    int64_t head_sz = S * dk;
+
+    /* zero output grads (caller may pass accumulating buffers;
+       in the MHA layer path we zero for a fresh backward) */
+    memset(dQ, 0, (size_t)(BH * head_sz) * sizeof(float));
+    memset(dK, 0, (size_t)(BH * head_sz) * sizeof(float));
+    memset(dV, 0, (size_t)(BH * head_sz) * sizeof(float));
+
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        float *Di = (float *)malloc((size_t)S * sizeof(float));
+        if (!Di) goto done;
+
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for (int64_t h = 0; h < BH; h++) {
+            const float *dOh = dO + h * head_sz;
+            const float *Oh = O + h * head_sz;
+            /* Di[i] = dot(dO[i], O[i]) */
+            for (int64_t i = 0; i < S; i++) {
+                const float *do_r = dOh + i * dk;
+                const float *o_r  = Oh  + i * dk;
+                float dot = 0;
+                int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+                ax_vf32 vd = ax_vf32_zero();
+                int64_t ve = dk - (dk % AX_VF32_WIDTH);
+                for (; d < ve; d += AX_VF32_WIDTH)
+                    vd = ax_vf32_fmadd(ax_vf32_loadu(do_r + d),
+                                       ax_vf32_loadu(o_r + d), vd);
+                dot = ax_vf32_hsum(vd);
+#endif
+                for (; d < dk; d++) dot += do_r[d] * o_r[d];
+                Di[i] = dot;
+            }
+            attn_bwd_head(Q + h * head_sz, K + h * head_sz, V + h * head_sz,
+                           dOh, L + h * S, Di,
+                           dQ + h * head_sz, dK + h * head_sz, dV + h * head_sz,
+                           S, dk, scale, causal);
+        }
+        free(Di);
+    done:;
+    }
+}
+
+/* ================================================================
+   Rotary Position Embeddings (RoPE)
+
+   applies rotation by angle θ_{i,k} to dimension pair (2k, 2k+1) at
+   token position i, where θ_{i,k} = i / theta_base^(2k/dk).
+   θ_{i,k} is the inverse frequency — long-wavelength for early dim
+   pairs, short-wavelength for later ones.
+
+   for each token position i and each dim pair (2k, 2k+1):
+     x'[2k]   = x[2k] * cos(θ) - x[2k+1] * sin(θ)
+     x'[2k+1] = x[2k] * sin(θ) + x[2k+1] * cos(θ)
+
+   applied in-place to Q and K (but NOT V — V is position-independent). */
+void AX_SYM(ax_cpu_rope_apply)(float *Q, float *K, const int64_t *positions,
+                                int64_t BH, int64_t S, int64_t dk, float theta_base)
+{
+    if (dk % 2 != 0) return; /* RoPE requires even dk */
+    int64_t half = dk / 2;
+
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int64_t h = 0; h < BH; h++) {
+        for (int64_t i = 0; i < S; i++) {
+            int64_t pos = positions ? positions[i] : i;
+            float *q_row = Q + h * S * dk + i * dk;
+            float *k_row = K + h * S * dk + i * dk;
+            for (int64_t d = 0; d < half; d++) {
+                float inv_freq = 1.0f / powf(theta_base, (float)(2 * d) / (float)dk);
+                float theta = (float)pos * inv_freq;
+                float c = cosf(theta), s = sinf(theta);
+                float q0 = q_row[d],       q1 = q_row[d + half];
+                float k0 = k_row[d],       k1 = k_row[d + half];
+                q_row[d]        = q0 * c - q1 * s;
+                q_row[d + half] = q0 * s + q1 * c;
+                k_row[d]        = k0 * c - k1 * s;
+                k_row[d + half] = k0 * s + k1 * c;
+            }
+        }
+    }
+}
+
+/* ================================================================
+   KV cache attention: rank-1 attention for single-token inference.
+   Q_new is [BH, dk], attending against cached K/V [BH, cur_len, dk].
+   out is [BH, dk]. this is a GEMV, not a GEMM — much faster than
+   going through the full SDPA path for a single new query.
+   ================================================================ */
+void AX_SYM(ax_cpu_kv_cache_attend)(const float *K_cache, const float *V_cache,
+                                      const float *Q_new, float *out,
+                                      int64_t BH, int64_t cur_len, int64_t max_seq,
+                                      int64_t dk, float scale)
+{
+    (void)max_seq;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int64_t h = 0; h < BH; h++) {
+        const float *K_h = K_cache + h * max_seq * dk;
+        const float *V_h = V_cache + h * max_seq * dk;
+        const float *q = Q_new + h * dk;
+        float *o = out + h * dk;
+
+        /* allocate scores on stack (bounded by cur_len which is reasonable) */
+        float scores_buf[8192];
+        float *scores = scores_buf;
+        float *heap_scores = NULL;
+        if (cur_len > 8192) {
+            heap_scores = (float *)malloc((size_t)cur_len * sizeof(float));
+            if (!heap_scores) continue;
+            scores = heap_scores;
+        }
+
+        /* 1. compute scores[j] = dot(Q, K[j]) * scale  — this is a [cur_len, dk] @ [dk] GEMV */
+        float mx = -FLT_MAX;
+        for (int64_t j = 0; j < cur_len; j++) {
+            const float *kj = K_h + j * dk;
+            float dot = 0;
+            int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+            ax_vf32 vd = ax_vf32_zero();
+            int64_t ve = dk - (dk % AX_VF32_WIDTH);
+            for (; d < ve; d += AX_VF32_WIDTH)
+                vd = ax_vf32_fmadd(ax_vf32_loadu(q + d), ax_vf32_loadu(kj + d), vd);
+            dot = ax_vf32_hsum(vd);
+#endif
+            for (; d < dk; d++) dot += q[d] * kj[d];
+            scores[j] = dot * scale;
+            if (scores[j] > mx) mx = scores[j];
+        }
+
+        /* 2. softmax */
+        float sum = 0;
+        for (int64_t j = 0; j < cur_len; j++) {
+            scores[j] = expf(scores[j] - mx);
+            sum += scores[j];
+        }
+        float inv = 1.0f / sum;
+
+        /* 3. out = sum_j scores[j] * V[j]  — GEMV */
+        memset(o, 0, (size_t)dk * sizeof(float));
+        for (int64_t j = 0; j < cur_len; j++) {
+            float w = scores[j] * inv;
+            const float *vj = V_h + j * dk;
+            int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+            ax_vf32 vw = ax_vf32_set1(w);
+            int64_t ve = dk - (dk % AX_VF32_WIDTH);
+            for (; d < ve; d += AX_VF32_WIDTH)
+                ax_vf32_storeu(o + d, ax_vf32_fmadd(vw, ax_vf32_loadu(vj + d), ax_vf32_loadu(o + d)));
+#endif
+            for (; d < dk; d++) o[d] += w * vj[d];
+        }
+
+        free(heap_scores);
+    }
+}

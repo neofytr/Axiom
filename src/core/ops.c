@@ -299,53 +299,93 @@ ax_tensor_t *ax_matmul_bias(ax_tensor_t *a, ax_tensor_t *b, ax_tensor_t *bias)
         ax_err_set(AX_ERR_NULL_ARG, "matmul: NULL tensor");
         return NULL;
     }
-    if (a->ndim != 2 || b->ndim != 2)
+    /* accept 2D [M, K] or 3D [B, S, K] on the left — transformer encoders
+       feed [B, S, d_model] through dense layers. when 3D, we auto-reshape
+       to [B*S, K], run the fused gemm+bias, then reshape back to [B, S, N].
+       weight B must stay 2D (shared across B/S). */
+    if ((a->ndim != 2 && a->ndim != 3) || b->ndim != 2)
     {
-        ax_err_set(AX_ERR_SHAPE_MISMATCH, "matmul needs 2d tensors");
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "matmul needs a:[M,K] or [B,S,K] and b:[K,N]");
         return NULL;
     }
-    if (a->shape[1] != b->shape[0])
+    int64_t inner_a = (a->ndim == 2) ? a->shape[1] : a->shape[2];
+    if (inner_a != b->shape[0])
     {
         ax_err_set(AX_ERR_SHAPE_MISMATCH,
-                   "matmul: [%" PRId64 ",%" PRId64 "] @ [%" PRId64 ",%" PRId64 "] inner dims don't match",
-                   a->shape[0], a->shape[1], b->shape[0], b->shape[1]);
+                   "matmul: inner dims don't match (a_inner=%" PRId64 " b_outer=%" PRId64 ")",
+                   inner_a, b->shape[0]);
         return NULL;
     }
 
-    int64_t out_shape[] = {a->shape[0], b->shape[1]};
-    /* use create (uninit) instead of zeros — the gemm's internal memset(0)
-       will zero the output before the tiled computation starts. saves one
-       redundant 1 MB memset per dense layer. */
-    ax_tensor_t *out = ax_tensor_create(out_shape, 2, a->dtype);
-    if (!out) return NULL;
+    /* 3D fast-path: temporarily view input as [B*S, K] for the gemm,
+       then set the output shape back to [B, S, N]. the gemm only sees
+       a flat [rows, K], and matmul_bias_backward was already written
+       to handle the flat case; it uses saved pointers rather than
+       ndim-specific indexing. */
+    int64_t M, N, K;
+    int out_ndim;
+    int64_t out_shape[3];
+    ax_tensor_t *a_flat = a;
+    bool a_viewed = false;
+    if (a->ndim == 3) {
+        int64_t flat_sh[] = {a->shape[0] * a->shape[1], a->shape[2]};
+        a_flat = ax_tensor_reshape(a, flat_sh, 2);
+        if (!a_flat) return NULL;
+        a_viewed = true;
+        M = flat_sh[0]; K = flat_sh[1]; N = b->shape[1];
+        out_shape[0] = a->shape[0]; out_shape[1] = a->shape[1]; out_shape[2] = N;
+        out_ndim = 3;
+    } else {
+        M = a->shape[0]; K = a->shape[1]; N = b->shape[1];
+        out_shape[0] = M; out_shape[1] = N;
+        out_ndim = 2;
+    }
+    /* temporary 2D view that the gemm+backward will see. */
+    int64_t flat_out_sh[] = {M, N};
+    /* allocate the flat 2D output first, run gemm+bias into it, then
+       reshape to 3D for the caller when applicable. */
+    ax_tensor_t *out_flat = ax_tensor_create(flat_out_sh, 2, a->dtype);
+    if (!out_flat) {
+        if (a_viewed) ax_tensor_destroy(a_flat);
+        return NULL;
+    }
 
-    ax_compute_gemm(a, b, out);
+    ax_compute_gemm(a_flat, b, out_flat);
 
-    /* fused bias add: single-pass broadcast-add along axis 0.
-       uses ax_compute_bias_add if available (one vectorised pass),
-       otherwise falls back to a scalar loop. either way, the result
-       is in `out` — no new tensor. */
     if (bias) {
         if (ax_compute_has_bias_add()) {
-            ax_compute_bias_add(out, bias, 0, out);
+            ax_compute_bias_add(out_flat, bias, 0, out_flat);
         } else {
-            /* scalar fallback: bias is [N], out is [M, N].
-               respects bias strides for non-contiguous views. */
-            float *od = (float *)out->storage->data + out->offset;
+            float *od = (float *)out_flat->storage->data + out_flat->offset;
             const float *bd = (const float *)bias->storage->data + bias->offset;
-            int64_t m = out->shape[0], n = out->shape[1];
             int64_t b_stride = (bias->ndim >= 1) ? bias->strides[bias->ndim - 1] : 1;
-            for (int64_t i = 0; i < m; i++)
-                for (int64_t j = 0; j < n; j++)
-                    od[i * n + j] += bd[j * b_stride];
+            for (int64_t i = 0; i < M; i++)
+                for (int64_t j = 0; j < N; j++)
+                    od[i * N + j] += bd[j * b_stride];
         }
+    }
+
+    /* if caller wants 3D shape, reshape the flat output (zero-copy — shares
+       storage, just rewrites shape/strides). */
+    ax_tensor_t *out = out_flat;
+    if (out_ndim == 3) {
+        out = ax_tensor_reshape(out_flat, out_shape, 3);
+        if (!out) {
+            ax_tensor_destroy(out_flat);
+            if (a_viewed) ax_tensor_destroy(a_flat);
+            return NULL;
+        }
+        ax_tensor_destroy(out_flat); /* view retained storage */
     }
 
     if (ax_grad_enabled() && (needs_grad(a, b) || (bias && bias->requires_grad)))
     {
         out->requires_grad = true;
+        /* pass the ORIGINAL a (not the reshape view) to backward so the
+           grad is routed back to the user-visible tensor shape. */
         out->grad_fn = ax_make_matmul_bias_backward(a, b, bias, out);
     }
+    if (a_viewed) ax_tensor_destroy(a_flat);
     return out;
 }
 

@@ -1,12 +1,16 @@
 name: Benchmarks vs TensorFlow
 
+# Rigorous comparison suite. each job runs one category end-to-end:
+# build Axiom, install TF, run the Axiom bench, run the TF sidecar, merge
+# results with benchmarks/summarize.py, upload artifacts and print a
+# markdown table in the job summary.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
   schedule:
-    # nightly benchmark run at 03:00 UTC
     - cron: '0 3 * * *'
   workflow_dispatch:
 
@@ -14,114 +18,235 @@ concurrency:
   group: bench-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CMAKE_BUILD_TYPE: Release
+  # gate for regressions — jobs fail when Axiom is >10% slower than TF on
+  # any case in the joined table.
+  REGRESSION_PCT: "10"
+
 jobs:
-  # GEMM throughput: Axiom vs TF oneDNN across sizes
-  gemm-throughput:
+  # ======================================================================
+  # 1. PARITY — correctness before speed. if Axiom's ops diverge from TF,
+  #    nothing else matters. this runs first and gates the whole suite.
+  # ======================================================================
+  parity:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: show hardware
-        run: |
-          lscpu | grep -E '(Model name|CPU\(s\)|Thread|Core|Cache|MHz)' | head -15
-          free -h
+        run: lscpu | grep -E '(Model name|CPU\(s\)|Thread|Core|Cache)' | head -10
 
       - name: build
         run: |
           mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release ..
-          cmake --build . -j$(nproc)
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc) --target bench_parity
 
-      - name: install tensorflow
-        run: pip install --quiet tensorflow-cpu
+      - name: install tensorflow + numpy
+        run: pip install --quiet tensorflow-cpu numpy
 
-      - name: build standalone gemm bench
-        run: |
-          cat > /tmp/bench_gemm.c << 'BENCH_EOF'
-          #include "axiom/tensor.h"
-          #include "axiom/compute.h"
-          #include <stdio.h>
-          #include <time.h>
-          static double ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
-          static void b(int M,int N,int K,int s){
-              ax_tensor_t *a=ax_tensor_ones((int64_t[]){M,K},2,AX_FLOAT32);
-              ax_tensor_t *bb=ax_tensor_ones((int64_t[]){K,N},2,AX_FLOAT32);
-              ax_tensor_t *c=ax_tensor_zeros((int64_t[]){M,N},2,AX_FLOAT32);
-              ax_compute_gemm(a,bb,c);
-              double t0=ms();
-              for(int i=0;i<s;i++)ax_compute_gemm(a,bb,c);
-              double dt=(ms()-t0)/s;
-              printf("%d %d %d %.4f %.1f\n",M,N,K,dt,2.0*M*N*K/dt/1e6);
-              ax_tensor_destroy(a);ax_tensor_destroy(bb);ax_tensor_destroy(c);
-          }
-          int main(void){ax_compute_init();
-              b(128,128,128,100);b(256,256,256,50);b(512,512,512,20);
-              b(1024,1024,1024,5);b(2048,2048,2048,2);b(4096,4096,4096,1);
-              return 0;}
-          BENCH_EOF
-          FLAGS="-O3 -fopenmp -I./include"
-          if lscpu | grep -q avx2; then FLAGS="$FLAGS -mavx2 -mfma"; fi
-          gcc $FLAGS -o /tmp/bench_gemm /tmp/bench_gemm.c ./build/libaxiom.a -lm -lpthread
+      - name: axiom writes .axt inputs/outputs
+        run: ./build/bench_parity | tee parity_axiom.txt
 
-      - name: run axiom gemm
-        run: |
-          echo "=== Axiom GEMM (autotuner enabled) ==="
-          /tmp/bench_gemm | tee axiom.txt
+      - name: tf reads + verifies
+        run: python3 benchmarks/tf_parity.py | tee parity_tf.txt
 
-      - name: run tensorflow gemm
-        run: |
-          python3 -c "
-          import os; os.environ['TF_CPP_MIN_LOG_LEVEL']='3'; os.environ['CUDA_VISIBLE_DEVICES']=''
-          import time, numpy as np, tensorflow as tf
-          tf.config.set_visible_devices([], 'GPU')
-          @tf.function
-          def mm(a,b): return tf.matmul(a,b)
-          for M in [128,256,512,1024,2048,4096]:
-              a=tf.random.normal((M,M)); b=tf.random.normal((M,M)); mm(a,b); mm(a,b)
-              s=max(1,1000//(M*M*M//1000000+1))
-              t0=time.perf_counter()
-              for _ in range(s): mm(a,b)
-              dt=(time.perf_counter()-t0)/s*1000
-              print(f'{M} {M} {M} {dt:.4f} {2.0*M*M*M/dt/1e6:.1f}')
-          " | tee tf.txt
-
-      - name: compare
-        run: |
-          echo ""
-          echo "=== Axiom vs TF (GFLOPS) ==="
-          printf "%-20s %-15s %-15s %s\n" "Size" "Axiom" "TF" "Winner"
-          paste axiom.txt tf.txt | while read m n k at agf m2 n2 k2 tt tgf; do
-              if awk -v a=$agf -v b=$tgf 'BEGIN{exit !(a>=b*0.98)}'; then
-                  pct=$(awk -v a=$agf -v b=$tgf 'BEGIN{printf "%.0f", (a/b-1)*100}')
-                  winner="Axiom +${pct}%"
-              else
-                  pct=$(awk -v a=$agf -v b=$tgf 'BEGIN{printf "%.0f", (b/a-1)*100}')
-                  winner="TF +${pct}%"
-              fi
-              printf "%-20s %-15s %-15s %s\n" "${m}x${m}x${m}" "${agf} GFLOPS" "${tgf} GFLOPS" "$winner"
-          done
-
-      - name: upload results
+      - name: upload
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gemm-results-x86
+          name: parity-results
           path: |
-            axiom.txt
-            tf.txt
+            parity_*.txt
+            build/parity_*.axt
 
-  # full training benchmarks: MLP on MNIST, deep MLP, large VGG
-  training-throughput:
+  # ======================================================================
+  # 2. GEMM MICRO-KERNEL — square, skinny, transposed variants.
+  # ======================================================================
+  gemm:
     runs-on: ubuntu-latest
+    needs: parity
     steps:
       - uses: actions/checkout@v4
-
       - name: show hardware
-        run: lscpu | grep -E '(Model name|CPU\(s\))' && free -h
+        run: lscpu | grep -E '(Model|CPU|Cache|MHz)' | head -10
 
       - name: build
         run: |
           mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc) --target bench_gemm_suite
+
+      - name: install tensorflow
+        run: pip install --quiet tensorflow-cpu numpy
+
+      - name: axiom
+        run: ./build/bench_gemm_suite | tee axiom_gemm.txt
+
+      - name: tf
+        run: python3 benchmarks/tf_gemm_suite.py | tee tf_gemm.txt
+
+      - name: summarize
+        run: |
+          {
+            echo "# GEMM suite vs TensorFlow"
+            echo ""
+            python3 benchmarks/summarize.py axiom_gemm.txt tf_gemm.txt --threshold $REGRESSION_PCT
+          } | tee gemm_summary.md
+          cat gemm_summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemm-results
+          path: |
+            axiom_gemm.txt
+            tf_gemm.txt
+            gemm_summary.md
+
+  # ======================================================================
+  # 3. OPS — elementwise, reductions, softmax, BN, LN.
+  # ======================================================================
+  ops:
+    runs-on: ubuntu-latest
+    needs: parity
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc) --target bench_ops_suite
+
+      - name: install tensorflow
+        run: pip install --quiet tensorflow-cpu numpy
+
+      - name: axiom
+        run: ./build/bench_ops_suite | tee axiom_ops.txt
+
+      - name: tf
+        run: python3 benchmarks/tf_ops_suite.py | tee tf_ops.txt
+
+      - name: summarize
+        run: |
+          {
+            echo "# Ops suite vs TensorFlow"
+            echo ""
+            python3 benchmarks/summarize.py axiom_ops.txt tf_ops.txt --threshold $REGRESSION_PCT
+          } | tee ops_summary.md
+          cat ops_summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ops-results
+          path: |
+            axiom_ops.txt
+            tf_ops.txt
+            ops_summary.md
+
+  # ======================================================================
+  # 4. CONV — conv2d across VGG-style shapes, pooling, fused ConvBNReLU.
+  # ======================================================================
+  conv:
+    runs-on: ubuntu-latest
+    needs: parity
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc) --target bench_conv_suite
+
+      - name: install tensorflow
+        run: pip install --quiet tensorflow-cpu numpy
+
+      - name: axiom
+        run: timeout 1200 ./build/bench_conv_suite | tee axiom_conv.txt
+
+      - name: tf
+        run: timeout 1200 python3 benchmarks/tf_conv_suite.py | tee tf_conv.txt
+
+      - name: summarize
+        run: |
+          {
+            echo "# Conv suite vs TensorFlow"
+            echo ""
+            python3 benchmarks/summarize.py axiom_conv.txt tf_conv.txt --threshold $REGRESSION_PCT
+          } | tee conv_summary.md
+          cat conv_summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conv-results
+          path: |
+            axiom_conv.txt
+            tf_conv.txt
+            conv_summary.md
+
+  # ======================================================================
+  # 5. MHA — scaled dot-product attention, full MHA layer, KV cache.
+  #    uses the existing bench_mha.c + benchmarks/tf_mha.py.
+  # ======================================================================
+  mha:
+    runs-on: ubuntu-latest
+    needs: parity
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc) --target bench_mha
+
+      - name: install tensorflow
+        run: pip install --quiet tensorflow-cpu numpy
+
+      - name: axiom
+        run: ./build/bench_mha 3 | tee axiom_mha.txt
+
+      - name: tf
+        run: python3 benchmarks/tf_mha.py 3 | tee tf_mha.txt
+
+      - name: summarize
+        run: |
+          {
+            echo "# MHA suite vs TensorFlow"
+            echo ""
+            python3 benchmarks/summarize.py axiom_mha.txt tf_mha.txt --threshold $REGRESSION_PCT
+          } | tee mha_summary.md
+          cat mha_summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mha-results
+          path: |
+            axiom_mha.txt
+            tf_mha.txt
+            mha_summary.md
+
+  # ======================================================================
+  # 6. MODEL TRAINING — MLP (small + wide), VGG, mini transformer.
+  # ======================================================================
+  training:
+    runs-on: ubuntu-latest
+    needs: parity
+    steps:
+      - uses: actions/checkout@v4
+      - name: show hardware
+        run: lscpu | grep -E '(Model|CPU\(s\))' && free -h
+
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
           cmake --build . -j$(nproc)
 
       - name: download mnist
@@ -133,101 +258,152 @@ jobs:
             curl -sL -O "https://storage.googleapis.com/cvdf-datasets/mnist/${f}.gz"
             gunzip "${f}.gz"
           done
-          ls -la
 
       - name: install tensorflow
         run: pip install --quiet tensorflow-cpu
 
-      - name: benchmark — small MLP (109K params)
+      - name: small MLP (109K)
         run: |
-          echo "=== MNIST small MLP: Axiom ==="
-          ./build/ax_mnist | tail -15 | tee axiom_small.txt
+          echo "=== Small MLP: Axiom ==="
+          ./build/ax_mnist | tee axiom_small.txt
           echo ""
-          echo "=== MNIST small MLP: TensorFlow ==="
-          python3 benchmarks/tf_mnist.py | tail -15 | tee tf_small.txt
+          echo "=== Small MLP: TensorFlow ==="
+          python3 benchmarks/tf_mnist.py | tee tf_small.txt
 
-      - name: benchmark — large wide MLP (14.4M params)
+      - name: wide MLP (14.4M)
         run: |
-          echo "=== Wide MLP (14.4M): Axiom ==="
-          timeout 1800 ./build/bench_wide train | tail -15 | tee axiom_wide.txt
+          echo "=== Wide MLP: Axiom ==="
+          timeout 1800 ./build/bench_wide train | tee axiom_wide.txt
           echo ""
-          echo "=== Wide MLP (14.4M): TensorFlow ==="
-          timeout 1800 python3 benchmarks/tf_wide.py | tail -15 | tee tf_wide.txt
+          echo "=== Wide MLP: TensorFlow ==="
+          timeout 1800 python3 benchmarks/tf_wide.py train | tee tf_wide.txt
 
-      - name: benchmark — VGG CNN (8M params)
+      - name: VGG CNN (8M)
         run: |
-          echo "=== VGG CNN (8M): Axiom ==="
-          timeout 3600 ./build/bench_vgg train | tail -15 | tee axiom_vgg.txt || echo "axiom_vgg failed"
+          echo "=== VGG: Axiom ==="
+          timeout 3600 ./build/bench_vgg train | tee axiom_vgg.txt || echo "axiom_vgg failed"
           echo ""
-          echo "=== VGG CNN (8M): TensorFlow ==="
-          timeout 3600 python3 benchmarks/tf_vgg.py | tail -15 | tee tf_vgg.txt || echo "tf_vgg failed"
+          echo "=== VGG: TensorFlow ==="
+          timeout 3600 python3 benchmarks/tf_vgg.py | tee tf_vgg.txt || echo "tf_vgg failed"
 
-      - name: summary
+      - name: mini Transformer
+        run: |
+          echo "=== Transformer: Axiom ==="
+          ./build/bench_transformer | tee axiom_tf.txt
+          echo ""
+          echo "=== Transformer: TensorFlow ==="
+          python3 benchmarks/tf_transformer.py | tee tf_tf.txt
+
+      - name: summarize
         if: always()
         run: |
-          echo "=== TRAINING BENCHMARK SUMMARY ==="
-          echo ""
-          echo "Small MLP (109K params):"
-          grep -h "total training time\|per-epoch\|test accuracy" axiom_small.txt tf_small.txt 2>/dev/null | head -10
-          echo ""
-          echo "Wide MLP (14.4M params):"
-          grep -h "total training time\|per-epoch\|test accuracy" axiom_wide.txt tf_wide.txt 2>/dev/null | head -10
-          echo ""
-          echo "VGG CNN (8M params):"
-          grep -h "total training time\|per-epoch\|test accuracy" axiom_vgg.txt tf_vgg.txt 2>/dev/null | head -10
+          {
+            echo "# Model training benchmarks"
+            echo ""
+            echo "## Small MLP"
+            grep -h "total training time\|per-epoch\|test accuracy" axiom_small.txt tf_small.txt 2>/dev/null || true
+            echo ""
+            echo "## Wide MLP (14.4M params)"
+            grep -h "total training time\|per-epoch\|test accuracy" axiom_wide.txt tf_wide.txt 2>/dev/null || true
+            echo ""
+            echo "## VGG CNN (8M params)"
+            grep -h "total training time\|per-epoch\|test accuracy" axiom_vgg.txt tf_vgg.txt 2>/dev/null || true
+            echo ""
+            echo "## Mini Transformer"
+            python3 benchmarks/summarize.py axiom_tf.txt tf_tf.txt --threshold $REGRESSION_PCT || true
+          } | tee training_summary.md
+          cat training_summary.md >> $GITHUB_STEP_SUMMARY
 
-      - name: upload results
+      - name: upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: training-results-cpu
+          name: training-results
           path: |
             axiom_*.txt
             tf_*.txt
+            training_summary.md
 
-  # huge GEMM stress test: catch regressions at sizes where cache + threading matter most
-  stress-huge:
+  # ======================================================================
+  # 7. STRESS — huge GEMMs, long-context attention, thread scaling, Adam.
+  # ======================================================================
+  stress:
     runs-on: ubuntu-latest
+    needs: parity
     steps:
       - uses: actions/checkout@v4
+      - name: show hardware
+        run: lscpu | grep -E '(Model|CPU|MHz)' | head -5 && free -h
+
       - name: build
-        run: mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . -j$(nproc)
-      - name: install tf
-        run: pip install --quiet tensorflow-cpu
-      - name: huge gemm comparison
         run: |
-          cat > /tmp/huge.c << 'EOF'
-          #include "axiom/tensor.h"
-          #include "axiom/compute.h"
-          #include <stdio.h>
-          #include <time.h>
-          static double ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
-          static void b(int M){
-              ax_tensor_t *a=ax_tensor_ones((int64_t[]){M,M},2,AX_FLOAT32);
-              ax_tensor_t *bb=ax_tensor_ones((int64_t[]){M,M},2,AX_FLOAT32);
-              ax_tensor_t *c=ax_tensor_zeros((int64_t[]){M,M},2,AX_FLOAT32);
-              if(!a||!bb||!c){printf("%dx%dx%d OOM\n",M,M,M);return;}
-              ax_compute_gemm(a,bb,c);
-              double t0=ms(); ax_compute_gemm(a,bb,c); double dt=ms()-t0;
-              printf("axiom %dx%dx%d  %.1fms  %.1f GFLOPS\n",M,M,M,dt,2.0*M*M*M/dt/1e6);
-              ax_tensor_destroy(a);ax_tensor_destroy(bb);ax_tensor_destroy(c);
-          }
-          int main(void){ax_compute_init(); b(3072); b(4096); b(6144); b(8192); return 0;}
-          EOF
-          FLAGS="-O3 -fopenmp -I./include"
-          if lscpu | grep -q avx2; then FLAGS="$FLAGS -mavx2 -mfma"; fi
-          gcc $FLAGS -o /tmp/huge /tmp/huge.c ./build/libaxiom.a -lm -lpthread
-          /tmp/huge
-          python3 -c "
-          import os; os.environ['TF_CPP_MIN_LOG_LEVEL']='3'; os.environ['CUDA_VISIBLE_DEVICES']=''
-          import time, tensorflow as tf
-          tf.config.set_visible_devices([], 'GPU')
-          @tf.function
-          def mm(a,b): return tf.matmul(a,b)
-          for M in [3072,4096,6144,8192]:
-            try:
-              a=tf.random.normal((M,M)); b=tf.random.normal((M,M)); mm(a,b)
-              t0=time.perf_counter(); mm(a,b); dt=(time.perf_counter()-t0)*1000
-              print(f'tf {M}x{M}x{M}  {dt:.1f}ms  {2.0*M*M*M/dt/1e6:.1f} GFLOPS')
-            except Exception as e:
-              print(f'tf {M}x{M}x{M}  OOM ({e})')"
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc) --target bench_stress
+
+      - name: install tensorflow
+        run: pip install --quiet tensorflow-cpu numpy
+
+      - name: axiom
+        run: timeout 1200 ./build/bench_stress | tee axiom_stress.txt
+
+      - name: tf
+        run: timeout 1200 python3 benchmarks/tf_stress.py | tee tf_stress.txt
+
+      - name: summarize
+        run: |
+          {
+            echo "# Stress suite vs TensorFlow"
+            echo ""
+            echo "_huge GEMMs, long-context SDPA, Adam at scale_"
+            echo ""
+            python3 benchmarks/summarize.py axiom_stress.txt tf_stress.txt --threshold $REGRESSION_PCT
+          } | tee stress_summary.md
+          cat stress_summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-results
+          path: |
+            axiom_stress.txt
+            tf_stress.txt
+            stress_summary.md
+
+  # ======================================================================
+  # 8. OVERALL — roll up all summaries into a single artifact for easy
+  #    PR-comment rendering. depends on all others.
+  # ======================================================================
+  overall:
+    runs-on: ubuntu-latest
+    needs: [parity, gemm, ops, conv, mha, training, stress]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: build combined report
+        run: |
+          {
+            echo "# Axiom benchmark report"
+            echo ""
+            echo "all suites below compare Axiom against TensorFlow (CPU, oneDNN)"
+            echo "on the same machine, same shapes, same iteration counts."
+            echo ""
+            for md in artifacts/*/gemm_summary.md artifacts/*/ops_summary.md \
+                      artifacts/*/conv_summary.md artifacts/*/mha_summary.md \
+                      artifacts/*/training_summary.md artifacts/*/stress_summary.md; do
+              [ -f "$md" ] || continue
+              cat "$md"
+              echo ""
+            done
+          } > REPORT.md
+          cat REPORT.md >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: full-report
+          path: REPORT.md

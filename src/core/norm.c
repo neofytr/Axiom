@@ -161,7 +161,10 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
     /* float eff_batch removed — unused */
     float *id = (float *)inp->storage->data;
 
-    ax_tensor_t *out = ax_tensor_zeros(inp->shape, inp->ndim, inp->dtype);
+    /* uninitialized output — every element is written by the normalize
+       loop below, so the memset in ax_tensor_zeros is wasted bandwidth.
+       BN on a [256, 4096] tensor is 4 MB of pointless zeroing per call. */
+    ax_tensor_t *out = ax_tensor_create(inp->shape, inp->ndim, inp->dtype);
     if (!out) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
     float *od = (float *)out->storage->data;
     float *gd = (float *)bn->gamma->storage->data;
@@ -177,11 +180,12 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
 
     if (record) {
         /* allocate from the forward arena — these live until ax_graph_cleanup
-           resets the arena after backward completes. */
+           resets the arena after backward completes. uninitialized: both are
+           fully overwritten by the normalize loop below. */
         ax_arena_t *fa = ax_forward_arena();
-        x_hat_save = ax_tensor_arena_zeros(fa, input->shape, input->ndim, input->dtype);
+        x_hat_save = ax_tensor_arena_create(fa, input->shape, input->ndim, input->dtype);
         int64_t is_shape[] = {feat};
-        inv_std_save = ax_tensor_arena_zeros(fa, is_shape, 1, input->dtype);
+        inv_std_save = ax_tensor_arena_create(fa, is_shape, 1, input->dtype);
         if (!x_hat_save || !inv_std_save) {
             if (x_hat_save) ax_tensor_destroy(x_hat_save);
             if (inv_std_save) ax_tensor_destroy(inv_std_save);
@@ -402,8 +406,15 @@ static void layernorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_tensor_t *inv_std_t = ctx->inv_std;
     ax_layernorm_t *ln = ctx->ln;
 
-    int64_t batch = grad_out->shape[0];
-    int64_t feat = grad_out->shape[1];
+    /* support 2D [N, D] and 3D [B, S, D] — collapse leading dims. */
+    int64_t batch, feat;
+    if (grad_out->ndim == 2) {
+        batch = grad_out->shape[0];
+        feat = grad_out->shape[1];
+    } else {
+        batch = grad_out->shape[0] * grad_out->shape[1];
+        feat = grad_out->shape[2];
+    }
     float *go = (float *)grad_out->storage->data;
     float *xh = (float *)x_hat_t->storage->data;
     float *istd = (float *)inv_std_t->storage->data;
@@ -473,17 +484,28 @@ static void ln_ctx_cleanup(void *p)
 static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_layernorm_t *ln = (ax_layernorm_t *)self;
-    if (!input || input->ndim != 2) return NULL;
+    /* accept 2D [N, D] or 3D [B, S, D] — transformer encoders feed 3D.
+       higher dims get collapsed into the leading "batch" dim; the last
+       dim is always the feature axis being normalized across. */
+    if (!input || (input->ndim != 2 && input->ndim != 3)) return NULL;
 
     /* ensure contiguous so flat indexing below is correct */
     ax_tensor_t *inp = ax_ensure_contiguous(input);
     if (!inp) return NULL;
 
-    int64_t batch = inp->shape[0];
-    int64_t feat = inp->shape[1];
+    int64_t batch, feat;
+    if (inp->ndim == 2) {
+        batch = inp->shape[0];
+        feat = inp->shape[1];
+    } else {
+        /* 3D: collapse leading dims */
+        batch = inp->shape[0] * inp->shape[1];
+        feat = inp->shape[2];
+    }
     float *id = (float *)inp->storage->data;
 
-    ax_tensor_t *out = ax_tensor_zeros(inp->shape, inp->ndim, inp->dtype);
+    /* uninitialized output — fully overwritten below. */
+    ax_tensor_t *out = ax_tensor_create(inp->shape, inp->ndim, inp->dtype);
     if (!out) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
     float *od = (float *)out->storage->data;
     float *gd = (float *)ln->gamma->storage->data;
@@ -495,9 +517,10 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_tensor_t *x_hat_save = NULL;
     ax_tensor_t *inv_std_save = NULL;
     if (record) {
-        x_hat_save = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+        /* these get fully filled in the normalize loop; skip the memset */
+        x_hat_save = ax_tensor_create(input->shape, input->ndim, input->dtype);
         int64_t is_shape[] = {batch};
-        inv_std_save = ax_tensor_zeros(is_shape, 1, input->dtype);
+        inv_std_save = ax_tensor_create(is_shape, 1, input->dtype);
         if (!x_hat_save || !inv_std_save) {
             if (x_hat_save) ax_tensor_destroy(x_hat_save);
             if (inv_std_save) ax_tensor_destroy(inv_std_save);

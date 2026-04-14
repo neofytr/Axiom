@@ -606,6 +606,27 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_tensor_t *b = self->saved[1];
     ax_arena_t *ar = ax_backward_arena();
 
+    /* 3D fast-path: when the forward saw a 3D input [B, S, K] (transformer
+       dense layers), grad_out is 3D [B, S, N]. the gemm kernels only accept
+       2D, so take zero-copy 2D views into the same storage. both dA and dB
+       accumulators will see them as 2D, and the resulting dA view shares
+       storage with the 3D a->grad so accumulation stays correct. */
+    ax_tensor_t *a_view = NULL;
+    ax_tensor_t *grad_out_view = NULL;
+    if (a && a->ndim == 3 && grad_out->ndim == 3) {
+        int64_t ra = a->shape[0] * a->shape[1];
+        int64_t aK = a->shape[2];
+        int64_t N = grad_out->shape[2];
+        int64_t flat_a_sh[]  = {ra, aK};
+        int64_t flat_go_sh[] = {ra, N};
+        a_view = ax_tensor_reshape(a, flat_a_sh, 2);
+        grad_out_view = ax_tensor_reshape(grad_out, flat_go_sh, 2);
+        if (a_view && grad_out_view) {
+            a = a_view;
+            grad_out = grad_out_view;
+        }
+    }
+
     /* d/da = grad_out @ b^T.
        direct-write optimisation: when input[0]->grad is freshly created
        (all zeros), we gemm directly into it (beta=0 semantics) and skip
@@ -617,22 +638,38 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
        when the grad already existed (residual connections, shared params),
        we fall back to the temp + accumulate path so += semantics are
        preserved. */
-    /* dA = grad_out @ b^T via gemm_nt. direct-write when fresh. */
+    /* dA = grad_out @ b^T via gemm_nt. direct-write when fresh.
+       when input[0] is 3D, use a flat view of its ->grad for the gemm. */
     if (self->inputs[0]->requires_grad)
     {
         bool fresh_a;
         if (!ensure_grad_ex(self->inputs[0], &fresh_a)) return;
 
+        ax_tensor_t *grad_target = self->inputs[0]->grad;
+        ax_tensor_t *grad_target_view = NULL;
+        if (a_view && grad_target && grad_target->ndim == 3) {
+            int64_t flat_g_sh[] = {grad_target->shape[0] * grad_target->shape[1],
+                                     grad_target->shape[2]};
+            grad_target_view = ax_tensor_reshape(grad_target, flat_g_sh, 2);
+            if (grad_target_view) grad_target = grad_target_view;
+        }
+
         if (fresh_a) {
-            ax_compute_gemm_nt(grad_out, b, self->inputs[0]->grad);
+            ax_compute_gemm_nt(grad_out, b, grad_target);
             ax_storage_touch(self->inputs[0]->grad->storage);
         } else {
             int64_t ga_shape[] = {grad_out->shape[0], b->shape[0]};
             ax_tensor_t *grad_a = ax_tensor_arena_create(ar, ga_shape, 2, grad_out->dtype);
-            if (!grad_a) return;
+            if (!grad_a) { if (grad_target_view) ax_tensor_destroy(grad_target_view); return; }
             ax_compute_gemm_nt(grad_out, b, grad_a);
-            accumulate_grad(self->inputs[0], grad_a);
+            /* accumulate into the flat view — same storage as 3D grad. */
+            int64_t n = ax_tensor_numel(grad_a);
+            float *src = (float *)grad_a->storage->data;
+            float *dst = (float *)grad_target->storage->data;
+            for (int64_t i = 0; i < n; i++) dst[i] += src[i];
+            ax_storage_touch(self->inputs[0]->grad->storage);
         }
+        if (grad_target_view) ax_tensor_destroy(grad_target_view);
     }
 
     /* dB = a^T @ grad_out. same pattern. */
@@ -670,6 +707,9 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             accumulate_grad(self->inputs[1], grad_b);
         }
     }
+
+    if (a_view) ax_tensor_destroy(a_view);
+    if (grad_out_view) ax_tensor_destroy(grad_out_view);
 }
 
 /* matmul_bias: fused matmul + bias backward. computes dA, dB (same as
@@ -678,7 +718,7 @@ static void matmul_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
    layer compared to separate matmul + add(bias) backwards. */
 static void matmul_bias_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
-    /* reuse matmul_backward for dA and dB */
+    /* reuse matmul_backward for dA and dB (handles 3D internally via views) */
     matmul_backward(self, grad_out);
 
     /* compute dBias if bias (saved[2]) is present and requires grad */
@@ -686,11 +726,20 @@ static void matmul_bias_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (bias && bias->requires_grad) {
         bool fresh_bias;
         if (!ensure_grad_ex(bias, &fresh_bias)) return;
-        /* dBias = sum(grad_out, axis=0). */
-        if (grad_out->storage->device != AX_DEVICE_CPU) {
+        /* dBias = sum(grad_out, axis=0). when grad_out is 3D, flatten the
+           leading two dims before summing so we always reduce "all rows". */
+        ax_tensor_t *go_view = NULL;
+        ax_tensor_t *go_ref = grad_out;
+        if (grad_out->ndim == 3) {
+            int64_t flat_sh[] = {grad_out->shape[0] * grad_out->shape[1],
+                                   grad_out->shape[2]};
+            go_view = ax_tensor_reshape(grad_out, flat_sh, 2);
+            if (go_view) go_ref = go_view;
+        }
+        if (go_ref->storage->device != AX_DEVICE_CPU) {
             ax_tensor_t *dbias_tmp = ax_tensor_create(bias->shape, bias->ndim, bias->dtype);
             if (dbias_tmp) {
-                ax_compute_sum(grad_out, 0, dbias_tmp);
+                ax_compute_sum(go_ref, 0, dbias_tmp);
                 if (fresh_bias)
                     ax_compute_copy(dbias_tmp, bias->grad);
                 else
@@ -698,8 +747,8 @@ static void matmul_bias_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 ax_tensor_destroy(dbias_tmp);
             }
         } else {
-            int64_t m = grad_out->shape[0], n = grad_out->shape[1];
-            const float *gd = (const float *)grad_out->storage->data + grad_out->offset;
+            int64_t m = go_ref->shape[0], n = go_ref->shape[1];
+            const float *gd = (const float *)go_ref->storage->data + go_ref->offset;
             float *bg = (float *)bias->grad->storage->data + bias->grad->offset;
             if (fresh_bias) {
                 for (int64_t j = 0; j < n; j++) {
@@ -715,6 +764,7 @@ static void matmul_bias_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 }
             }
         }
+        if (go_view) ax_tensor_destroy(go_view);
         ax_storage_touch(bias->grad->storage);
     }
 }

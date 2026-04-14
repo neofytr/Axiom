@@ -275,6 +275,18 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
     float bc1 = 1.0f - powf(opt->beta1, (float)t);
     float bc2 = 1.0f - powf(opt->beta2, (float)t);
 
+    /* algebraic simplification — eliminates two per-element divides.
+       original per-elem update (3 divs + 1 sqrt per element):
+           m_hat = m / bc1; v_hat = v / bc2
+           w -= lr * m_hat / (sqrt(v_hat) + eps)
+       rewrite using sqrt(v/bc2) = sqrt(v) / sqrt(bc2):
+           w -= (lr * sqrt(bc2) / bc1) * m / (sqrt(v) + eps * sqrt(bc2))
+       now 1 div + 1 sqrt per elem — a measurable win in the inner loop
+       since fdiv/sqrtss are 14-20 cycles vs 4 for mul/fma. */
+    float sqrt_bc2 = sqrtf(bc2);
+    float lr_eff = opt->lr * sqrt_bc2 / bc1;
+    float eps_eff = opt->eps * sqrt_bc2;
+
     /* serial pre-pass: lazily allocate moments for params that need them */
     for (int i = 0; i < opt->n_params; i++) {
         if (opt->params[i]->grad) {
@@ -308,10 +320,8 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
         ax_vf32 v_beta2   = ax_vf32_set1(opt->beta2);
         ax_vf32 v_1mb1    = ax_vf32_set1(1.0f - opt->beta1);
         ax_vf32 v_1mb2    = ax_vf32_set1(1.0f - opt->beta2);
-        ax_vf32 v_lr      = ax_vf32_set1(opt->lr);
-        ax_vf32 v_eps     = ax_vf32_set1(opt->eps);
-        ax_vf32 v_bc1     = ax_vf32_set1(bc1);
-        ax_vf32 v_bc2     = ax_vf32_set1(bc2);
+        ax_vf32 v_lr_eff  = ax_vf32_set1(lr_eff);
+        ax_vf32 v_eps_eff = ax_vf32_set1(eps_eff);
         ax_vf32 v_decay   = ax_vf32_set1(decay_scale);
         ax_vf32 v_wd_grad = ax_vf32_set1(wd_grad);
 
@@ -333,11 +343,9 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
             m = ax_vf32_fmadd(v_1mb1, g, ax_vf32_mul(v_beta1, m));
             v = ax_vf32_fmadd(v_1mb2, ax_vf32_mul(g, g), ax_vf32_mul(v_beta2, v));
 
-            /* bias-corrected update */
-            ax_vf32 m_hat = ax_vf32_div(m, v_bc1);
-            ax_vf32 v_hat = ax_vf32_div(v, v_bc2);
-            ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v_hat), v_eps);
-            w = ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(m_hat, denom)));
+            /* bias-corrected update (simplified: see comment above). */
+            ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v), v_eps_eff);
+            w = ax_vf32_sub(w, ax_vf32_mul(v_lr_eff, ax_vf32_div(m, denom)));
 
             ax_vf32_store(wd + wo + j, w);
             ax_vf32_store(md + j, m);
@@ -350,9 +358,7 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
             float g = gd[go + j] + wd_grad * w;
             md[j] = opt->beta1 * md[j] + (1.0f - opt->beta1) * g;
             vd[j] = opt->beta2 * vd[j] + (1.0f - opt->beta2) * g * g;
-            float m_hat = md[j] / bc1;
-            float v_hat = vd[j] / bc2;
-            wd[wo + j] = w - opt->lr * m_hat / (sqrtf(v_hat) + opt->eps);
+            wd[wo + j] = w - lr_eff * md[j] / (sqrtf(vd[j]) + eps_eff);
         }
         ax_storage_touch(p->storage);
     }
