@@ -255,12 +255,20 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     if (m->use_bias) {
         float *qd = (float *)qkv->storage->data;
         const float *bd = (const float *)m->bqkv_cache->storage->data;
+        int64_t cols = 3 * D;
+        int64_t ce = cols - (cols % AX_VF32_WIDTH);
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if (rows * cols >= ax_par_threshold_elems)
 #endif
         for (int64_t r = 0; r < rows; r++) {
-            float *row = qd + r * 3 * D;
-            for (int64_t c = 0; c < 3 * D; c++) row[c] += bd[c];
+            float *row = qd + r * cols;
+            int64_t c = 0;
+            for (; c < ce; c += AX_VF32_WIDTH) {
+                ax_vf32 v = ax_vf32_loadu(row + c);
+                ax_vf32 b = ax_vf32_loadu(bd + c);
+                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
+            }
+            for (; c < cols; c++) row[c] += bd[c];
         }
     }
 
