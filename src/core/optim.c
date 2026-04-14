@@ -142,9 +142,9 @@ static void sgd_step(ax_optimizer_t *opt)
         {
             int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
             for (; j < ve; j += AX_VF32_WIDTH) {
-                ax_vf32 g = ax_vf32_load(gd + go + j);
-                ax_vf32 w = ax_vf32_load(wd + wo + j);
-                ax_vf32_store(gd + go + j, ax_vf32_fmadd(v_wd, w, g));
+                ax_vf32 g = ax_vf32_loadu(gd + go + j);
+                ax_vf32 w = ax_vf32_loadu(wd + wo + j);
+                ax_vf32_storeu(gd + go + j, ax_vf32_fmadd(v_wd, w, g));
             }
             for (; j < n; j++)
                 gd[go + j] += opt->weight_decay * wd[wo + j];
@@ -159,13 +159,13 @@ static void sgd_step(ax_optimizer_t *opt)
             {
                 int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
                 for (; j < ve; j += AX_VF32_WIDTH) {
-                    ax_vf32 g = ax_vf32_load(gd + go + j);
-                    ax_vf32 v = ax_vf32_load(vd + j);
+                    ax_vf32 g = ax_vf32_loadu(gd + go + j);
+                    ax_vf32 v = ax_vf32_loadu(vd + j);
                     v = ax_vf32_fmadd(v_mom, v, g); /* v = mom*v + g */
-                    ax_vf32_store(vd + j, v);
+                    ax_vf32_storeu(vd + j, v);
                     ax_vf32 upd = ax_vf32_fmadd(v_mom, v, g); /* g + mom*v */
-                    ax_vf32 w = ax_vf32_load(wd + wo + j);
-                    ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, upd)));
+                    ax_vf32 w = ax_vf32_loadu(wd + wo + j);
+                    ax_vf32_storeu(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, upd)));
                 }
                 for (; j < n; j++) {
                     vd[j] = opt->momentum * vd[j] + gd[go + j];
@@ -176,11 +176,11 @@ static void sgd_step(ax_optimizer_t *opt)
             {
                 int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
                 for (; j < ve; j += AX_VF32_WIDTH) {
-                    ax_vf32 g = ax_vf32_load(gd + go + j);
-                    ax_vf32 v = ax_vf32_fmadd(v_mom, ax_vf32_load(vd + j), g);
-                    ax_vf32_store(vd + j, v);
-                    ax_vf32 w = ax_vf32_load(wd + wo + j);
-                    ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, v)));
+                    ax_vf32 g = ax_vf32_loadu(gd + go + j);
+                    ax_vf32 v = ax_vf32_fmadd(v_mom, ax_vf32_loadu(vd + j), g);
+                    ax_vf32_storeu(vd + j, v);
+                    ax_vf32 w = ax_vf32_loadu(wd + wo + j);
+                    ax_vf32_storeu(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, v)));
                 }
                 for (; j < n; j++) {
                     vd[j] = opt->momentum * vd[j] + gd[go + j];
@@ -192,9 +192,9 @@ static void sgd_step(ax_optimizer_t *opt)
         {
             int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
             for (; j < ve; j += AX_VF32_WIDTH) {
-                ax_vf32 w = ax_vf32_load(wd + wo + j);
-                ax_vf32 g = ax_vf32_load(gd + go + j);
-                ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, g)));
+                ax_vf32 w = ax_vf32_loadu(wd + wo + j);
+                ax_vf32 g = ax_vf32_loadu(gd + go + j);
+                ax_vf32_storeu(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, g)));
             }
             for (; j < n; j++)
                 wd[wo + j] -= opt->lr * gd[go + j];
@@ -329,10 +329,10 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
         int64_t vec_end = n - (n % AX_VF32_WIDTH);
         for (; j < vec_end; j += AX_VF32_WIDTH)
         {
-            ax_vf32 w = ax_vf32_load(wd + wo + j);
-            ax_vf32 g = ax_vf32_load(gd + go + j);
-            ax_vf32 m = ax_vf32_load(md + j);
-            ax_vf32 v = ax_vf32_load(vd + j);
+            ax_vf32 w = ax_vf32_loadu(wd + wo + j);
+            ax_vf32 g = ax_vf32_loadu(gd + go + j);
+            ax_vf32 m = ax_vf32_loadu(md + j);
+            ax_vf32 v = ax_vf32_loadu(vd + j);
 
             /* decoupled weight decay */
             w = ax_vf32_mul(w, v_decay);
@@ -347,9 +347,9 @@ static void adam_step(ax_optimizer_t *opt, bool decoupled_decay)
             ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v), v_eps_eff);
             w = ax_vf32_sub(w, ax_vf32_mul(v_lr_eff, ax_vf32_div(m, denom)));
 
-            ax_vf32_store(wd + wo + j, w);
-            ax_vf32_store(md + j, m);
-            ax_vf32_store(vd + j, v);
+            ax_vf32_storeu(wd + wo + j, w);
+            ax_vf32_storeu(md + j, m);
+            ax_vf32_storeu(vd + j, v);
         }
         /* scalar tail */
         for (; j < n; j++)
@@ -429,14 +429,14 @@ static void rmsprop_step(ax_optimizer_t *opt)
         int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
         for (; j < ve; j += AX_VF32_WIDTH)
         {
-            ax_vf32 g = ax_vf32_load(gd + go + j);
-            ax_vf32 w = ax_vf32_load(wd + wo + j);
+            ax_vf32 g = ax_vf32_loadu(gd + go + j);
+            ax_vf32 w = ax_vf32_loadu(wd + wo + j);
             if (opt->weight_decay > 0.0f)
                 g = ax_vf32_fmadd(v_wd, w, g);
-            ax_vf32 v = ax_vf32_fmadd(v_1mr, ax_vf32_mul(g, g), ax_vf32_mul(v_rho, ax_vf32_load(vd + j)));
-            ax_vf32_store(vd + j, v);
+            ax_vf32 v = ax_vf32_fmadd(v_1mr, ax_vf32_mul(g, g), ax_vf32_mul(v_rho, ax_vf32_loadu(vd + j)));
+            ax_vf32_storeu(vd + j, v);
             ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v), v_eps);
-            ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(g, denom))));
+            ax_vf32_storeu(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(g, denom))));
         }
         for (; j < n; j++)
         {
@@ -496,14 +496,14 @@ static void adagrad_step(ax_optimizer_t *opt)
         int64_t j = 0, ve = n - (n % AX_VF32_WIDTH);
         for (; j < ve; j += AX_VF32_WIDTH)
         {
-            ax_vf32 g = ax_vf32_load(gd + go + j);
-            ax_vf32 w = ax_vf32_load(wd + wo + j);
+            ax_vf32 g = ax_vf32_loadu(gd + go + j);
+            ax_vf32 w = ax_vf32_loadu(wd + wo + j);
             if (opt->weight_decay > 0.0f)
                 g = ax_vf32_fmadd(v_wd, w, g);
-            ax_vf32 v = ax_vf32_add(ax_vf32_load(vd + j), ax_vf32_mul(g, g));
-            ax_vf32_store(vd + j, v);
+            ax_vf32 v = ax_vf32_add(ax_vf32_loadu(vd + j), ax_vf32_mul(g, g));
+            ax_vf32_storeu(vd + j, v);
             ax_vf32 denom = ax_vf32_add(ax_vf32_sqrt(v), v_eps);
-            ax_vf32_store(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(g, denom))));
+            ax_vf32_storeu(wd + wo + j, ax_vf32_sub(w, ax_vf32_mul(v_lr, ax_vf32_div(g, denom))));
         }
         for (; j < n; j++)
         {

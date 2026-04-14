@@ -1632,6 +1632,35 @@ static inline float simd_row_sum(const float *d, int64_t n)
     return (float)total;
 }
 
+/* SIMD + OMP sum across a contiguous float array. for large n we split
+   into T equal chunks, each summed by simd_row_sum, then reduce. the
+   memory-bandwidth-bound region starts around n >= ~1M on typical
+   servers; below that the serial path wins because omp fork/join
+   dominates. */
+static inline float simd_row_sum_par(const float *d, int64_t n)
+{
+#ifdef _OPENMP
+    if (n >= 1048576) {
+        int T = omp_get_max_threads();
+        if (T > 16) T = 16;
+        if (T > 1) {
+            double partials[16];
+            int64_t chunk = (n + T - 1) / T;
+            #pragma omp parallel for num_threads(T) schedule(static)
+            for (int t = 0; t < T; t++) {
+                int64_t lo = (int64_t)t * chunk;
+                int64_t hi = lo + chunk; if (hi > n) hi = n;
+                partials[t] = (lo < hi) ? (double)simd_row_sum(d + lo, hi - lo) : 0.0;
+            }
+            double total = 0.0;
+            for (int t = 0; t < T; t++) total += partials[t];
+            return (float)total;
+        }
+    }
+#endif
+    return simd_row_sum(d, n);
+}
+
 /* helper: SIMD row max/min for a contiguous float array */
 static inline float simd_row_max(const float *d, int64_t n)
 {
@@ -1774,7 +1803,7 @@ static ax_status_t opt_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         int64_t n = validate_contig_f32(in);
         int64_t no = validate_contig_f32(out);
         if (n < 0 || no < 0 || no != 1) return ax_cpu_naive_ops.sum(in, axis, out);
-        raw_f32(out)[0] = simd_row_sum(raw_f32(in), n);
+        raw_f32(out)[0] = simd_row_sum_par(raw_f32(in), n);
         return AX_OK;
     }
 
@@ -1817,7 +1846,7 @@ static ax_status_t opt_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out) {
         int64_t n = validate_contig_f32(in);
         int64_t no = validate_contig_f32(out);
         if (n < 0 || no < 0 || no != 1) return ax_cpu_naive_ops.mean(in, axis, out);
-        raw_f32(out)[0] = simd_row_sum(raw_f32(in), n) / (float)n;
+        raw_f32(out)[0] = simd_row_sum_par(raw_f32(in), n) / (float)n;
         return AX_OK;
     }
 

@@ -629,7 +629,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             int64_t wn = C_out * K;
             int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
             for (; wi < wve; wi += AX_VF32_WIDTH)
-                ax_vf32_store(dwl + wi, ax_vf32_add(ax_vf32_load(dwl + wi), ax_vf32_load(dws + wi)));
+                ax_vf32_storeu(dwl + wi, ax_vf32_add(ax_vf32_loadu(dwl + wi), ax_vf32_loadu(dws + wi)));
             for (; wi < wn; wi++) dwl[wi] += dws[wi];
         }
 
@@ -658,7 +658,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             int64_t total = C_in * H * W;
             int64_t i = 0, ve = total - (total % AX_VF32_WIDTH);
             for (; i < ve; i += AX_VF32_WIDTH)
-                ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), ax_vf32_load(dimg_d + i)));
+                ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), ax_vf32_loadu(dimg_d + i)));
             for (; i < total; i++)
                 ig[i] += dimg_d[i];
         }
@@ -672,7 +672,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             float *dwl = (float *)s->dw_bufs[t]->storage->data;
             int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
             for (; wi < wve; wi += AX_VF32_WIDTH)
-                ax_vf32_store(wg + wi, ax_vf32_add(ax_vf32_load(wg + wi), ax_vf32_load(dwl + wi)));
+                ax_vf32_storeu(wg + wi, ax_vf32_add(ax_vf32_loadu(wg + wi), ax_vf32_loadu(dwl + wi)));
             for (; wi < wn; wi++) wg[wi] += dwl[wi];
         }
     }
@@ -891,7 +891,7 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             ax_vf32 vb = ax_vf32_set1(bias_val);
             int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
             for (; m < ve; m += AX_VF32_WIDTH)
-                ax_vf32_store(dst + m, ax_vf32_add(ax_vf32_load(src + m), vb));
+                ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), vb));
             for (; m < M; m++)
                 dst[m] = src[m] + bias_val;
         }
@@ -1206,7 +1206,7 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             int64_t wn = C_out * K;
             int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
             for (; wi < wve; wi += AX_VF32_WIDTH)
-                ax_vf32_store(dwl + wi, ax_vf32_add(ax_vf32_load(dwl + wi), ax_vf32_load(dws + wi)));
+                ax_vf32_storeu(dwl + wi, ax_vf32_add(ax_vf32_loadu(dwl + wi), ax_vf32_loadu(dws + wi)));
             for (; wi < wn; wi++) dwl[wi] += dws[wi];
         }
 
@@ -1230,7 +1230,7 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             int64_t total = C_in * H * W;
             int64_t i = 0, ve = total - (total % AX_VF32_WIDTH);
             for (; i < ve; i += AX_VF32_WIDTH)
-                ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), ax_vf32_load(dimg_d + i)));
+                ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), ax_vf32_loadu(dimg_d + i)));
             for (; i < total; i++) ig[i] += dimg_d[i];
         }
     }
@@ -1242,7 +1242,7 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             float *dwl = (float *)s->dw_bufs[t]->storage->data;
             int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
             for (; wi < wve; wi += AX_VF32_WIDTH)
-                ax_vf32_store(wg + wi, ax_vf32_add(ax_vf32_load(wg + wi), ax_vf32_load(dwl + wi)));
+                ax_vf32_storeu(wg + wi, ax_vf32_add(ax_vf32_loadu(wg + wi), ax_vf32_loadu(dwl + wi)));
             for (; wi < wn; wi++) wg[wi] += dwl[wi];
         }
     }
@@ -1374,7 +1374,7 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
             int64_t m = 0, me = M - (M % AX_VF32_WIDTH);
             ax_vf32 v_b = ax_vf32_set1(bias_val);
             for (; m < me; m += AX_VF32_WIDTH)
-                ax_vf32_store(dst + m, ax_vf32_add(ax_vf32_load(src + m), v_b));
+                ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), v_b));
             for (; m < M; m++) dst[m] = src[m] + bias_val;
         }
     }
@@ -1416,7 +1416,7 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
                 int64_t m = 0, me = spatial - (spatial % AX_VF32_WIDTH);
                 ax_vf32 vs = ax_vf32_zero();
                 for (; m < me; m += AX_VF32_WIDTH)
-                    vs = ax_vf32_add(vs, ax_vf32_load(od + base + m));
+                    vs = ax_vf32_add(vs, ax_vf32_loadu(od + base + m));
                 dsum += (double)ax_vf32_hsum(vs);
                 for (; m < spatial; m++) dsum += (double)od[base + m];
             }
@@ -1429,7 +1429,7 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
                 int64_t m = 0, me = spatial - (spatial % AX_VF32_WIDTH);
                 ax_vf32 vv = ax_vf32_zero();
                 for (; m < me; m += AX_VF32_WIDTH) {
-                    ax_vf32 d = ax_vf32_sub(ax_vf32_load(od + base + m), v_mean);
+                    ax_vf32 d = ax_vf32_sub(ax_vf32_loadu(od + base + m), v_mean);
                     vv = ax_vf32_fmadd(d, d, vv);
                 }
                 var_sum_d += (double)ax_vf32_hsum(vv);
@@ -1458,11 +1458,11 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
                 if (record) {
                     int64_t m = 0, me = spatial - (spatial % AX_VF32_WIDTH);
                     for (; m < me; m += AX_VF32_WIDTH) {
-                        ax_vf32 v_in = ax_vf32_load(od + base + m);
+                        ax_vf32 v_in = ax_vf32_loadu(od + base + m);
                         ax_vf32 xh = ax_vf32_mul(ax_vf32_sub(v_in, v_mn), v_is);
                         ax_vf32 bn = ax_vf32_fmadd(v_sc, v_in, v_bi);
-                        ax_vf32_store(od + base + m, ax_vf32_max(bn, v_zero));
-                        ax_vf32_store(xh_d + base + m, xh);
+                        ax_vf32_storeu(od + base + m, ax_vf32_max(bn, v_zero));
+                        ax_vf32_storeu(xh_d + base + m, xh);
                     }
                     for (; m < spatial; m++) {
                         float conv = od[base + m];
@@ -1474,8 +1474,8 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
                 } else {
                     int64_t m = 0, me = spatial - (spatial % AX_VF32_WIDTH);
                     for (; m < me; m += AX_VF32_WIDTH) {
-                        ax_vf32 bn = ax_vf32_fmadd(v_sc, ax_vf32_load(od + base + m), v_bi);
-                        ax_vf32_store(od + base + m, ax_vf32_max(bn, v_zero));
+                        ax_vf32 bn = ax_vf32_fmadd(v_sc, ax_vf32_loadu(od + base + m), v_bi);
+                        ax_vf32_storeu(od + base + m, ax_vf32_max(bn, v_zero));
                     }
                     for (; m < spatial; m++) {
                         float bn = scale * od[base + m] + bias_out;
@@ -1505,8 +1505,8 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
                 int64_t base = n * C_out * spatial + c * spatial;
                 int64_t m = 0, me = spatial - (spatial % AX_VF32_WIDTH);
                 for (; m < me; m += AX_VF32_WIDTH) {
-                    ax_vf32 bn = ax_vf32_fmadd(v_sc, ax_vf32_load(od + base + m), v_bi);
-                    ax_vf32_store(od + base + m, ax_vf32_max(bn, v_zero));
+                    ax_vf32 bn = ax_vf32_fmadd(v_sc, ax_vf32_loadu(od + base + m), v_bi);
+                    ax_vf32_storeu(od + base + m, ax_vf32_max(bn, v_zero));
                 }
                 for (; m < spatial; m++) {
                     float bn = scale * od[base + m] + bias_out;

@@ -110,7 +110,7 @@ static void accumulate_grad(ax_tensor_t *t, ax_tensor_t *grad_to_add)
                 } else {
                     int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
                     for (; i < ve; i += AX_VF32_WIDTH)
-                        ax_vf32_store(gd + i, ax_vf32_add(ax_vf32_load(gd + i), ax_vf32_load(ad + i)));
+                        ax_vf32_storeu(gd + i, ax_vf32_add(ax_vf32_loadu(gd + i), ax_vf32_loadu(ad + i)));
                     for (; i < n; i++)
                         gd[i] += ad[i];
                 }
@@ -942,7 +942,7 @@ static void mean_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             ax_vf32 vg = ax_vf32_set1(g);
             int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
             for (; i < ve; i += AX_VF32_WIDTH)
-                ax_vf32_store(gd + i, ax_vf32_add(ax_vf32_load(gd + i), vg));
+                ax_vf32_storeu(gd + i, ax_vf32_add(ax_vf32_loadu(gd + i), vg));
             for (; i < n; i++) gd[i] += g;
         } else {
             for (int64_t i = 0; i < n; i++) gd[goff + i] += g;
@@ -1033,9 +1033,9 @@ cuda_relu_cleanup:
         int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
         ax_vf32 vzero = ax_vf32_zero();
         for (; i < ve; i += AX_VF32_WIDTH) {
-            ax_vf32 mask = ax_vf32_cmpgt(ax_vf32_load(ad + i), vzero);
-            ax_vf32 dg = ax_vf32_mul(ax_vf32_load(god + i), mask);
-            ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), dg));
+            ax_vf32 mask = ax_vf32_cmpgt(ax_vf32_loadu(ad + i), vzero);
+            ax_vf32 dg = ax_vf32_mul(ax_vf32_loadu(god + i), mask);
+            ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), dg));
         }
         for (; i < n; i++)
             ig[i] += (ad[i] > 0.0f) ? god[i] : 0.0f;
@@ -1088,10 +1088,10 @@ static void sigmoid_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         ax_vf32 vone = ax_vf32_set1(1.0f);
         int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
         for (; i < ve; i += AX_VF32_WIDTH) {
-            ax_vf32 s = ax_vf32_load(sd + i);
-            ax_vf32 g = ax_vf32_load(god + i);
+            ax_vf32 s = ax_vf32_loadu(sd + i);
+            ax_vf32 g = ax_vf32_loadu(god + i);
             ax_vf32 dg = ax_vf32_mul(g, ax_vf32_mul(s, ax_vf32_sub(vone, s)));
-            ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), dg));
+            ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), dg));
         }
         for (; i < n; i++) {
             float s = sd[i];
@@ -1143,10 +1143,10 @@ static void tanh_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         ax_vf32 vone = ax_vf32_set1(1.0f);
         int64_t i = 0, ve = n - (n % AX_VF32_WIDTH);
         for (; i < ve; i += AX_VF32_WIDTH) {
-            ax_vf32 t = ax_vf32_load(td + i);
-            ax_vf32 g = ax_vf32_load(god + i);
+            ax_vf32 t = ax_vf32_loadu(td + i);
+            ax_vf32 g = ax_vf32_loadu(god + i);
             ax_vf32 dg = ax_vf32_mul(g, ax_vf32_sub(vone, ax_vf32_mul(t, t)));
-            ax_vf32_store(ig + i, ax_vf32_add(ax_vf32_load(ig + i), dg));
+            ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), dg));
         }
         for (; i < n; i++) {
             float t = td[i];

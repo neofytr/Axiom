@@ -588,55 +588,130 @@ ax_tensor_t *ax_softmax(ax_tensor_t *a, int axis)
     if (a->ndim == 1)
     {
         int64_t n = a->shape[0];
+        int64_t sa = a->strides[0];
+        int64_t so = out->strides[0];
+        const float *ap = ad + a->offset;
+        float *op = od + out->offset;
 
-        /* find max for stability */
-        float mx = -FLT_MAX;
-        for (int64_t i = 0; i < n; i++)
-        {
-            float v = ad[a->offset + i];
-            if (v > mx) mx = v;
+        /* pass 1: max. SIMD when contiguous, scalar otherwise. */
+        float mx;
+        if (sa == 1) {
+            int64_t i = 0, ie = n - (n % AX_VF32_WIDTH);
+            if (ie > 0) {
+                ax_vf32 vmax = ax_vf32_set1(-FLT_MAX);
+                for (; i < ie; i += AX_VF32_WIDTH)
+                    vmax = ax_vf32_max(vmax, ax_vf32_loadu(ap + i));
+                mx = ax_vf32_hmax(vmax);
+            } else mx = -FLT_MAX;
+            for (; i < n; i++) if (ap[i] > mx) mx = ap[i];
+        } else {
+            mx = -FLT_MAX;
+            for (int64_t i = 0; i < n; i++) {
+                float v = ap[i * sa]; if (v > mx) mx = v;
+            }
         }
 
-        /* exp and sum */
-        float total = 0.0f;
-        for (int64_t i = 0; i < n; i++)
-        {
-            float e = expf(ad[a->offset + i] - mx);
-            od[out->offset + i] = e;
-            total += e;
+        /* pass 2: exp(x - mx), write to out, accumulate sum. */
+        float total;
+        if (sa == 1 && so == 1) {
+            ax_vf32 vmx = ax_vf32_set1(mx), vsum = ax_vf32_zero();
+            int64_t i = 0, ie = n - (n % AX_VF32_WIDTH);
+            for (; i < ie; i += AX_VF32_WIDTH) {
+                ax_vf32 v = ax_vf32_exp(ax_vf32_sub(ax_vf32_loadu(ap + i), vmx));
+                ax_vf32_storeu(op + i, v);
+                vsum = ax_vf32_add(vsum, v);
+            }
+            total = ax_vf32_hsum(vsum);
+            for (; i < n; i++) { float e = expf(ap[i] - mx); op[i] = e; total += e; }
+        } else {
+            total = 0.0f;
+            for (int64_t i = 0; i < n; i++) {
+                float e = expf(ap[i * sa] - mx);
+                op[i * so] = e; total += e;
+            }
         }
 
-        /* normalize */
+        /* pass 3: normalize. */
         float inv = 1.0f / total;
-        for (int64_t i = 0; i < n; i++)
-            od[out->offset + i] *= inv;
+        if (so == 1) {
+            ax_vf32 vinv = ax_vf32_set1(inv);
+            int64_t i = 0, ie = n - (n % AX_VF32_WIDTH);
+            for (; i < ie; i += AX_VF32_WIDTH)
+                ax_vf32_storeu(op + i, ax_vf32_mul(ax_vf32_loadu(op + i), vinv));
+            for (; i < n; i++) op[i] *= inv;
+        } else {
+            for (int64_t i = 0; i < n; i++) op[i * so] *= inv;
+        }
     }
     else if (a->ndim == 2 && axis == 1)
     {
-        /* softmax along columns for each row (most common case: batch of logits) */
+        /* softmax along columns for each row (most common case: batch of logits).
+           SIMD fast-path when inner stride is contiguous; scalar fallback otherwise.
+           rows are independent so OMP parallel over them is safe. */
         int64_t rows = a->shape[0];
         int64_t cols = a->shape[1];
+        int64_t sa0 = a->strides[0], sa1 = a->strides[1];
+        int64_t so0 = out->strides[0], so1 = out->strides[1];
+        bool contig_in  = (sa1 == 1);
+        bool contig_out = (so1 == 1);
 
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if (rows > 1)
+        #endif
         for (int64_t r = 0; r < rows; r++)
         {
-            float mx = -FLT_MAX;
-            for (int64_t c = 0; c < cols; c++)
-            {
-                float v = ad[a->offset + r * a->strides[0] + c * a->strides[1]];
-                if (v > mx) mx = v;
+            const float *ap = ad + a->offset + r * sa0;
+            float *op = od + out->offset + r * so0;
+
+            /* pass 1: max */
+            float mx;
+            if (contig_in) {
+                int64_t c = 0, ce = cols - (cols % AX_VF32_WIDTH);
+                if (ce > 0) {
+                    ax_vf32 vmax = ax_vf32_set1(-FLT_MAX);
+                    for (; c < ce; c += AX_VF32_WIDTH)
+                        vmax = ax_vf32_max(vmax, ax_vf32_loadu(ap + c));
+                    mx = ax_vf32_hmax(vmax);
+                } else mx = -FLT_MAX;
+                for (; c < cols; c++) if (ap[c] > mx) mx = ap[c];
+            } else {
+                mx = -FLT_MAX;
+                for (int64_t c = 0; c < cols; c++) {
+                    float v = ap[c * sa1]; if (v > mx) mx = v;
+                }
             }
 
-            float total = 0.0f;
-            for (int64_t c = 0; c < cols; c++)
-            {
-                float e = expf(ad[a->offset + r * a->strides[0] + c * a->strides[1]] - mx);
-                od[out->offset + r * out->strides[0] + c * out->strides[1]] = e;
-                total += e;
+            /* pass 2: exp(x - mx), store, accumulate sum */
+            float total;
+            if (contig_in && contig_out) {
+                ax_vf32 vmx = ax_vf32_set1(mx), vsum = ax_vf32_zero();
+                int64_t c = 0, ce = cols - (cols % AX_VF32_WIDTH);
+                for (; c < ce; c += AX_VF32_WIDTH) {
+                    ax_vf32 v = ax_vf32_exp(ax_vf32_sub(ax_vf32_loadu(ap + c), vmx));
+                    ax_vf32_storeu(op + c, v);
+                    vsum = ax_vf32_add(vsum, v);
+                }
+                total = ax_vf32_hsum(vsum);
+                for (; c < cols; c++) { float e = expf(ap[c] - mx); op[c] = e; total += e; }
+            } else {
+                total = 0.0f;
+                for (int64_t c = 0; c < cols; c++) {
+                    float e = expf(ap[c * sa1] - mx);
+                    op[c * so1] = e; total += e;
+                }
             }
 
+            /* pass 3: normalize */
             float inv = 1.0f / total;
-            for (int64_t c = 0; c < cols; c++)
-                od[out->offset + r * out->strides[0] + c * out->strides[1]] *= inv;
+            if (contig_out) {
+                ax_vf32 vinv = ax_vf32_set1(inv);
+                int64_t c = 0, ce = cols - (cols % AX_VF32_WIDTH);
+                for (; c < ce; c += AX_VF32_WIDTH)
+                    ax_vf32_storeu(op + c, ax_vf32_mul(ax_vf32_loadu(op + c), vinv));
+                for (; c < cols; c++) op[c] *= inv;
+            } else {
+                for (int64_t c = 0; c < cols; c++) op[c * so1] *= inv;
+            }
         }
     }
     else
