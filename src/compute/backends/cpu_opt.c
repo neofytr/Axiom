@@ -537,6 +537,15 @@ void AX_SYM(ax_cpu_opt_tune_init)(void) {
     ax_cpu_opt_init_impl();
 }
 
+/* always-on: pre-allocate per-thread pack buffers on every omp worker.
+   lazy allocation per-thread inside ensure_tl_pack_bufs() otherwise
+   happens on the first gemm call that crosses the tile threshold,
+   which adds tens of ms of jitter to whichever benchmark catches it
+   first. paying the cost up-front makes first-call timings realistic.
+   cheap: ~2-10ms depending on thread count. definition deferred until
+   after ensure_tl_pack_bufs is defined; declaration only here. */
+void AX_SYM(ax_cpu_opt_prewarm)(void);
+
 /* measured tile-size calibration: opt-in via AX_GEMM_CALIBRATE=1.
    runs a small grid of (mc, nc, kc) candidates around the heuristic
    default on a 1024^3 gemm and keeps the fastest. budget ≈ 500ms. */
@@ -676,6 +685,15 @@ static bool ensure_tl_pack_bufs(void) {
         tl_pack_b_buf = (float *)ax_aligned_alloc(pb * sizeof(float), 64);
     }
     return tl_pack_a_buf && tl_pack_b_buf;
+}
+
+void AX_SYM(ax_cpu_opt_prewarm)(void) {
+#ifdef _OPENMP
+    #pragma omp parallel
+    { ensure_tl_pack_bufs(); }
+#else
+    ensure_tl_pack_bufs();
+#endif
 }
 
 /* forward decl — pack_b is defined further down */

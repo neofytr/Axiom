@@ -87,6 +87,9 @@ def bench_sdpa(s, iters, causal):
     gflops = flops / elapsed / 1e9
     tag = "SDPA-causal" if causal else "SDPA       "
     print(f"  {tag}  BH={BH:>4d} S={S:>4d} dk={dk:>3d} :  {elapsed*1e3:7.3f} ms  {gflops:8.2f} GFLOPS")
+    name = f"sdpa{'_causal' if causal else ''}_BH{BH}_S{S}_dk{dk}"
+    print(f"RESULT mha {name} lat_ms {elapsed*1e3:.6f}")
+    print(f"RESULT mha {name} gflops {gflops:.6f}")
 
 
 def bench_mha_forward(s, iters):
@@ -103,6 +106,9 @@ def bench_mha_forward(s, iters):
     flops = 4.0 * 2.0 * B * S * D * D + 4.0 * B * S * S * D
     gflops = flops / elapsed / 1e9
     print(f"  MHA-fwd      B={B:>2d} S={S:>4d} D={D:>4d} H={H:>2d} :  {elapsed*1e3:7.3f} ms  {gflops:8.2f} GFLOPS")
+    name = f"mha_fwd_B{B}_S{S}_D{D}_H{H}"
+    print(f"RESULT mha {name} lat_ms {elapsed*1e3:.6f}")
+    print(f"RESULT mha {name} gflops {gflops:.6f}")
 
 
 def bench_mha_train(s, iters):
@@ -123,6 +129,9 @@ def bench_mha_train(s, iters):
     fwd_flops = 4.0 * 2.0 * B * S * D * D + 4.0 * B * S * S * D
     gflops = 3.0 * fwd_flops / elapsed / 1e9
     print(f"  MHA-train    B={B:>2d} S={S:>4d} D={D:>4d} H={H:>2d} :  {elapsed*1e3:7.3f} ms  {gflops:8.2f} GFLOPS (est)")
+    name = f"mha_train_B{B}_S{S}_D{D}_H{H}"
+    print(f"RESULT mha {name} lat_ms {elapsed*1e3:.6f}")
+    print(f"RESULT mha {name} gflops {gflops:.6f}")
 
 
 def bench_kv_cache(s, iters):
@@ -148,6 +157,9 @@ def bench_kv_cache(s, iters):
     flops = 4.0 * BH * S * dk
     gflops = flops / elapsed / 1e9
     print(f"  KV-attend    BH={BH:>4d} S={S:>4d} dk={dk:>3d} :  {elapsed*1e3:7.3f} ms  {gflops:8.2f} GFLOPS")
+    name = f"kv_attend_BH{BH}_S{S}_dk{dk}"
+    print(f"RESULT mha {name} lat_ms {elapsed*1e3:.6f}")
+    print(f"RESULT mha {name} gflops {gflops:.6f}")
 
 
 def main():

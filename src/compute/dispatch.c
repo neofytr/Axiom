@@ -157,6 +157,24 @@ ax_status_t ax_compute_init(void) {
        systems where the barrier costs more than the speedup. */
     ax_calibrate_thresholds();
 
+    /* pre-allocate tls pack buffers on every omp worker. always on —
+       moves the lazy-alloc cost out of the first hot gemm call. */
+#ifdef AX_CPU_ISA_DISPATCH
+    if (active_ops == &ax_cpu_opt_ops_avx512) {
+        extern void ax_cpu_opt_prewarm_avx512(void);
+        ax_cpu_opt_prewarm_avx512();
+    } else if (active_ops == &ax_cpu_opt_ops_avx2) {
+        extern void ax_cpu_opt_prewarm_avx2(void);
+        ax_cpu_opt_prewarm_avx2();
+    } else {
+        extern void ax_cpu_opt_prewarm_scalar(void);
+        ax_cpu_opt_prewarm_scalar();
+    }
+#else
+    extern void ax_cpu_opt_prewarm(void);
+    ax_cpu_opt_prewarm();
+#endif
+
     /* optional gemm tile calibration: sweeps a grid of (mc, nc, kc)
        candidates on a representative 1024^3 gemm and picks the fastest.
        ~500ms startup cost, opt-in via AX_GEMM_CALIBRATE=1. */
