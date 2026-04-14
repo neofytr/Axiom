@@ -18,6 +18,10 @@
 #include <float.h>
 #include <stdlib.h>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 
 /* mse: mean((pred - target)^2)
    d/dpred = 2*(pred - target) / n */
@@ -475,6 +479,14 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
        sm is fresh from ax_tensor_zeros so its strides[1]==1 always. */
     bool inner_unit = pred->strides[1] == 1 && target->strides[1] == 1;
 
+    /* per-batch rows are independent: parallelize over b with a
+       reduction on total_loss. the threshold on batch*classes keeps omp
+       fork/join cost below the work in small-classes cases (mnist:
+       256*10=2560 is too little; imagenet: 256*1000=256k pays off). */
+    #ifdef _OPENMP
+    int64_t ce_work = batch * classes;
+    #pragma omp parallel for schedule(static) reduction(+:total_loss) if (ce_work >= 16384)
+    #endif
     for (int64_t b = 0; b < batch; b++)
     {
         int64_t p_row = pred->offset + b * pred->strides[0];
