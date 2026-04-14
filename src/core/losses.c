@@ -480,12 +480,12 @@ ax_tensor_t *ax_cross_entropy_loss(ax_tensor_t *pred, ax_tensor_t *target)
     bool inner_unit = pred->strides[1] == 1 && target->strides[1] == 1;
 
     /* per-batch rows are independent: parallelize over b with a
-       reduction on total_loss. the threshold on batch*classes keeps omp
-       fork/join cost below the work in small-classes cases (mnist:
-       256*10=2560 is too little; imagenet: 256*1000=256k pays off). */
+       reduction on total_loss. the threshold (calibrated from measured
+       omp fork/join overhead) keeps mnist-style cases serial and lets
+       imagenet-style cases parallelize. */
     #ifdef _OPENMP
     int64_t ce_work = batch * classes;
-    #pragma omp parallel for schedule(static) reduction(+:total_loss) if (ce_work >= 16384)
+    #pragma omp parallel for schedule(static) reduction(+:total_loss) if (ce_work >= ax_par_threshold_elems)
     #endif
     for (int64_t b = 0; b < batch; b++)
     {

@@ -656,7 +656,8 @@ ax_tensor_t *ax_softmax(ax_tensor_t *a, int axis)
         bool contig_out = (so1 == 1);
 
         #ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if (rows > 1)
+        int64_t softmax_work = rows * cols;
+        #pragma omp parallel for schedule(static) if (rows > 1 && softmax_work >= ax_par_threshold_elems)
         #endif
         for (int64_t r = 0; r < rows; r++)
         {

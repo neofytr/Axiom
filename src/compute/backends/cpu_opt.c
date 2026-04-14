@@ -29,6 +29,8 @@
 #include <float.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <stdatomic.h>
+#include <time.h>
 #ifndef AX_NO_STDIO
 #include <stdio.h>
 #endif
@@ -533,6 +535,112 @@ static void ax_cpu_opt_init_impl(void) {
    under AX_CPU_ISA_DISPATCH so both isa variants coexist. */
 void AX_SYM(ax_cpu_opt_tune_init)(void) {
     ax_cpu_opt_init_impl();
+}
+
+/* measured tile-size calibration: opt-in via AX_GEMM_CALIBRATE=1.
+   runs a small grid of (mc, nc, kc) candidates around the heuristic
+   default on a 1024^3 gemm and keeps the fastest. budget ≈ 500ms. */
+static double ax_tile_cal_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+/* forward decl — defined later in this file as a vtable entry */
+static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
+static bool ensure_tl_pack_bufs(void);
+
+void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
+#if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
+    return;
+#else
+    const char *calibrate = getenv("AX_GEMM_CALIBRATE");
+    if (!calibrate || calibrate[0] != '1') return;
+    if (getenv("AX_GEMM_MC") || getenv("AX_GEMM_NC") || getenv("AX_GEMM_KC")) return;
+
+    int64_t mc_orig = GEMM_MC, nc_orig = GEMM_NC, kc_orig = GEMM_KC;
+    struct { int64_t mc, nc, kc; } configs[] = {
+        { mc_orig,             nc_orig,           kc_orig      },
+        { mc_orig,             nc_orig,           kc_orig / 2  },
+        { mc_orig,             nc_orig / 2,       kc_orig      },
+        { (int64_t)GEMM_MR * 8,  nc_orig,         kc_orig      },
+        { (int64_t)GEMM_MR * 16, nc_orig,         kc_orig      },
+        { mc_orig,             (int64_t)GEMM_NR * 32, kc_orig  },
+    };
+    int nc_configs = (int)(sizeof(configs) / sizeof(configs[0]));
+
+    const int64_t M = 1024, N = 1024, K = 1024;
+    float *A = (float *)ax_aligned_alloc((size_t)M * (size_t)K * sizeof(float), 64);
+    float *B = (float *)ax_aligned_alloc((size_t)K * (size_t)N * sizeof(float), 64);
+    float *C = (float *)ax_aligned_alloc((size_t)M * (size_t)N * sizeof(float), 64);
+    if (!A || !B || !C) { ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C); return; }
+    uint32_t s = 2463534242u;
+    for (int64_t i = 0; i < M * K; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        A[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
+    }
+    for (int64_t i = 0; i < K * N; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        B[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
+    }
+
+    ax_storage_t sa, sb, sc;
+    atomic_init(&sa.refcount, 0); sa.data = A; sa.size_bytes = (size_t)M*K*sizeof(float); sa.device = AX_DEVICE_CPU; sa.is_arena_temp = true; sa.generation = 1;
+    atomic_init(&sb.refcount, 0); sb.data = B; sb.size_bytes = (size_t)K*N*sizeof(float); sb.device = AX_DEVICE_CPU; sb.is_arena_temp = true; sb.generation = 1;
+    atomic_init(&sc.refcount, 0); sc.data = C; sc.size_bytes = (size_t)M*N*sizeof(float); sc.device = AX_DEVICE_CPU; sc.is_arena_temp = true; sc.generation = 1;
+    ax_tensor_t ta = {0}, tb = {0}, tc = {0};
+    ta.storage = &sa; ta.ndim = 2; ta.dtype = AX_FLOAT32; ta.shape[0] = M; ta.shape[1] = K; ta.strides[0] = K; ta.strides[1] = 1;
+    tb.storage = &sb; tb.ndim = 2; tb.dtype = AX_FLOAT32; tb.shape[0] = K; tb.shape[1] = N; tb.strides[0] = N; tb.strides[1] = 1;
+    tc.storage = &sc; tc.ndim = 2; tc.dtype = AX_FLOAT32; tc.shape[0] = M; tc.shape[1] = N; tc.strides[0] = N; tc.strides[1] = 1;
+
+    /* pre-size the per-thread pack buffers for the MAX of all candidate
+       configs before the sweep. if we let each iteration's first gemm
+       allocate them lazily, a later iteration with larger MC/KC would
+       overflow the earlier-sized buffer. forcing max allocation up-front
+       keeps every iteration safe. */
+    int64_t max_mc = 0, max_nc = 0, max_kc = 0;
+    for (int i = 0; i < nc_configs; i++) {
+        if (configs[i].mc > max_mc) max_mc = configs[i].mc;
+        if (configs[i].nc > max_nc) max_nc = configs[i].nc;
+        if (configs[i].kc > max_kc) max_kc = configs[i].kc;
+    }
+    GEMM_MC = max_mc; GEMM_NC = max_nc; GEMM_KC = max_kc;
+    #pragma omp parallel
+    { ensure_tl_pack_bufs(); }
+
+    const int warm_iters = 3;
+    const int timed_iters = 8;
+    double best_ms = 1e30;
+    int best_i = 0;
+    double t_start = ax_tile_cal_now_ms();
+
+    for (int i = 0; i < nc_configs; i++) {
+        GEMM_MC = configs[i].mc;
+        GEMM_NC = configs[i].nc;
+        GEMM_KC = configs[i].kc;
+        /* pack_b cache keys on bptr+kc+jc+pc/ldb; any of those changing
+           between iterations invalidates automatically inside pack_b_cached.
+           no manual invalidation needed here. */
+        for (int w = 0; w < warm_iters; w++) opt_gemm(&ta, &tb, &tc);
+        double t0 = ax_tile_cal_now_ms();
+        for (int r = 0; r < timed_iters; r++) opt_gemm(&ta, &tb, &tc);
+        double avg = (ax_tile_cal_now_ms() - t0) / (double)timed_iters;
+        if (avg < best_ms) { best_ms = avg; best_i = i; }
+    }
+    GEMM_MC = configs[best_i].mc;
+    GEMM_NC = configs[best_i].nc;
+    GEMM_KC = configs[best_i].kc;
+    double total_ms = ax_tile_cal_now_ms() - t_start;
+
+#ifndef AX_NO_STDIO
+    double gflops = (2.0 * (double)M * (double)N * (double)K) / (best_ms * 1e-3) / 1e9;
+    fprintf(stderr,
+        "axiom: gemm calibrate MC=%ld NC=%ld KC=%ld (best %.3fms, %.1f gflops, sweep %.0fms)\n",
+        (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC, best_ms, gflops, total_ms);
+#endif
+
+    ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C);
+#endif
 }
 
 /* constructor: only emit under the single-build path. under
@@ -1632,15 +1740,15 @@ static inline float simd_row_sum(const float *d, int64_t n)
     return (float)total;
 }
 
-/* SIMD + OMP sum across a contiguous float array. for large n we split
-   into T equal chunks, each summed by simd_row_sum, then reduce. the
-   memory-bandwidth-bound region starts around n >= ~1M on typical
-   servers; below that the serial path wins because omp fork/join
-   dominates. */
+/* SIMD + OMP sum across a contiguous float array. the crossover point
+   between serial and parallel depends on measured omp fork/join cost,
+   set at init time via ax_par_threshold_elems. below that threshold
+   the serial simd_row_sum wins. */
+extern int64_t ax_par_threshold_elems;
 static inline float simd_row_sum_par(const float *d, int64_t n)
 {
 #ifdef _OPENMP
-    if (n >= 1048576) {
+    if (n >= ax_par_threshold_elems) {
         int T = omp_get_max_threads();
         if (T > 16) T = 16;
         if (T > 1) {

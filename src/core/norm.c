@@ -335,7 +335,8 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         /* pass 2: row-major SIMD normalize. out[n,f] = scale[f] * in[n,f] + bias_out[f]. */
         int64_t fe = feat - (feat % AX_VF32_WIDTH);
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if (batch > 1)
+        int64_t bn_work = batch * feat;
+        #pragma omp parallel for schedule(static) if (batch >= ax_par_threshold_batch && bn_work >= ax_par_threshold_elems)
 #endif
         for (int64_t n = 0; n < batch; n++) {
             const float *ip = id + n * feat;
@@ -519,7 +520,8 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
            across the HW slice; if recording for backward also store x_hat. */
         int64_t se2 = spatial - (spatial % AX_VF32_WIDTH);
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if (batch > 1)
+        int64_t bn4_work = batch * feat * spatial;
+        #pragma omp parallel for schedule(static) if (batch >= ax_par_threshold_batch && bn4_work >= ax_par_threshold_elems)
 #endif
         for (int64_t n = 0; n < batch; n++) {
             for (int64_t c = 0; c < feat; c++) {

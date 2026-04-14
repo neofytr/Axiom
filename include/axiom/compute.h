@@ -63,6 +63,27 @@ int ax_get_num_threads(void);
    returns the chosen thread count. */
 int ax_autotune_threads(void);
 
+/* calibrated parallelism thresholds. set by ax_calibrate_thresholds()
+   based on measured omp fork/join overhead at init time. kernels with
+   per-iteration work below the threshold skip omp and run serial
+   (fork-join barrier would dominate). */
+extern int64_t ax_par_threshold_elems;   /* reduction / elementwise */
+extern int64_t ax_par_threshold_batch;   /* per-sample loops (norm, loss) */
+extern int64_t ax_par_threshold_flops;   /* generic flop-count threshold */
+extern double  ax_omp_overhead_ms;       /* measured fork/join cost */
+
+/* measure omp fork/join overhead and derive the thresholds above.
+   cheap (<50ms). called lazily from ax_compute_init(). safe to call
+   multiple times (idempotent). no-op under AX_NO_AUTOTUNE=1 or
+   when compiled without openmp. */
+void ax_calibrate_thresholds(void);
+
+/* measure gemm tile (mc/nc/kc) performance across a small grid of
+   candidate configurations and pick the best. sweeps ~5 configs on a
+   representative shape; budget ~500ms. opt-in via AX_GEMM_CALIBRATE=1
+   env var because it adds startup cost. */
+void ax_calibrate_gemm_tiles(void);
+
 /* dispatch functions */
 /* these call through to the active backend's function pointers.
    tensor.c calls these; user code normally calls the tensor-level api instead. */

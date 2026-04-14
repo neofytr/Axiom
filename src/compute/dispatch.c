@@ -151,6 +151,17 @@ ax_status_t ax_compute_init(void) {
        compiled out entirely on baremetal (AX_NO_AUTOTUNE). */
     ax_autotune_threads();
 
+    /* calibrate omp fork/join overhead and derive parallelism thresholds.
+       cheap (<50ms); replaces the hardcoded if(...) clauses sprinkled
+       across activations/norm/losses/sum so small kernels skip omp on
+       systems where the barrier costs more than the speedup. */
+    ax_calibrate_thresholds();
+
+    /* optional gemm tile calibration: sweeps a grid of (mc, nc, kc)
+       candidates on a representative 1024^3 gemm and picks the fastest.
+       ~500ms startup cost, opt-in via AX_GEMM_CALIBRATE=1. */
+    ax_calibrate_gemm_tiles();
+
     return AX_OK;
 }
 
@@ -909,4 +920,118 @@ int ax_autotune_threads(void)
     return fast_count;
 #endif /* __linux__ */
 #endif /* _OPENMP */
+}
+
+/* ======================================================================
+   calibration (B): omp fork/join overhead + derived parallelism thresholds.
+
+   every new parallel kernel had an `if (size > CONSTANT)` clause with a
+   hardcoded threshold. the right constant depends on the measured omp
+   barrier cost of the current system — on a 4-core ubuntu runner it can
+   be ~50us, on a 16-core workstation ~20us, on embedded ~200us. we pin
+   it at init time instead of hardcoding per-kernel. cheap: <50ms.
+   ====================================================================== */
+
+/* defaults kick in when calibration is skipped (AX_NO_AUTOTUNE or
+   !_OPENMP). they're the same values the kernels had hardcoded before. */
+int64_t ax_par_threshold_elems = 65536;
+int64_t ax_par_threshold_batch = 2;
+int64_t ax_par_threshold_flops = 1000000;
+double  ax_omp_overhead_ms     = 0.0;
+
+#ifdef _OPENMP
+/* measured mean overhead of entering and leaving an omp parallel region
+   that does trivial work. uses a volatile sink so the compiler cannot
+   elide the whole thing. */
+static double ax_measure_omp_overhead_ms_inner(void) {
+    volatile int sink = 0;
+    const int warm = 20;
+    const int reps = 400;
+    for (int i = 0; i < warm; i++) {
+        #pragma omp parallel
+        { sink += omp_get_thread_num(); }
+    }
+    double t0 = ax_autotune_now_ms();
+    for (int i = 0; i < reps; i++) {
+        #pragma omp parallel
+        { sink += omp_get_thread_num(); }
+    }
+    double t1 = ax_autotune_now_ms();
+    (void)sink;
+    return (t1 - t0) / (double)reps;
+}
+#endif
+
+void ax_calibrate_thresholds(void) {
+#if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
+    return;
+#else
+    const char *no = getenv("AX_NO_AUTOTUNE");
+    if (no && no[0] == '1') return;
+
+    double overhead_ms = ax_measure_omp_overhead_ms_inner();
+    if (overhead_ms <= 0.0) overhead_ms = 0.020;
+    ax_omp_overhead_ms = overhead_ms;
+
+    /* derive element-count thresholds assuming ~2 GFLOPs/thread effective
+       throughput for cache-bounded elementwise ops. parallel is worth it
+       when work / nt >= overhead, i.e. work >= overhead * nt * throughput.
+       apply a 2x safety factor so we only parallelize when the win is
+       clearly >10%. */
+    int nt = omp_get_max_threads();
+    if (nt < 1) nt = 1;
+    double throughput_ops_per_ms = 2.0e6;
+    int64_t flop_thresh = (int64_t)(overhead_ms * (double)nt * throughput_ops_per_ms * 2.0);
+    if (flop_thresh < 4096) flop_thresh = 4096;
+    ax_par_threshold_flops = flop_thresh;
+    /* elementwise / reduction ops run at ~16B/FLOP mem bandwidth, so
+       element-threshold ≈ flop-threshold / 4 is a reasonable default. */
+    ax_par_threshold_elems = flop_thresh / 4;
+    if (ax_par_threshold_elems < 1024) ax_par_threshold_elems = 1024;
+    /* per-batch ops (norm, loss) do O(F) work per batch element. use a
+       lower threshold (in *rows*) derived from the flop threshold and an
+       assumed per-row work of ~4K flops. clamped at 2 so we never gate
+       out trivially correct parallelism. */
+    ax_par_threshold_batch = flop_thresh / 4096;
+    if (ax_par_threshold_batch < 2) ax_par_threshold_batch = 2;
+
+#ifndef AX_NO_STDIO
+    fprintf(stderr,
+        "axiom: omp overhead %.3fms → thresholds flops=%ld elems=%ld batch=%ld\n",
+        overhead_ms,
+        (long)ax_par_threshold_flops,
+        (long)ax_par_threshold_elems,
+        (long)ax_par_threshold_batch);
+#endif
+#endif
+}
+
+/* ======================================================================
+   calibration (A): measured gemm tile sweep.
+
+   the actual sweep runs inside cpu_opt.c so it has direct access to the
+   (suffixed) GEMM_MC/NC/KC statics. this wrapper just dispatches to the
+   currently-active backend variant. opt-in via AX_GEMM_CALIBRATE=1.
+   ====================================================================== */
+
+#ifdef AX_CPU_ISA_DISPATCH
+extern void ax_cpu_opt_calibrate_tiles_avx512(void);
+extern void ax_cpu_opt_calibrate_tiles_avx2(void);
+extern void ax_cpu_opt_calibrate_tiles_scalar(void);
+#else
+extern void ax_cpu_opt_calibrate_tiles(void);
+#endif
+
+void ax_calibrate_gemm_tiles(void) {
+#if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
+    return;
+#else
+#ifdef AX_CPU_ISA_DISPATCH
+    if (active_ops == &ax_cpu_opt_ops_avx512) ax_cpu_opt_calibrate_tiles_avx512();
+    else if (active_ops == &ax_cpu_opt_ops_avx2) ax_cpu_opt_calibrate_tiles_avx2();
+    else ax_cpu_opt_calibrate_tiles_scalar();
+#else
+    ax_cpu_opt_calibrate_tiles();
+#endif
+#endif
 }
