@@ -94,6 +94,23 @@ static inline int64_t ax_par_threshold(void) { return (int64_t)1 << 62; }
 AX_TLS float *tl_pack_a_buf = NULL;  /* GEMM_MC * GEMM_KC floats */
 AX_TLS float *tl_pack_b_buf = NULL;  /* GEMM_NC * GEMM_KC floats */
 
+/* per-thread scratch for SDPA softmax (row_max, row_sum) and attn packing
+   (Kt, V). reused across calls so sdpa forward doesn't malloc 128+ times
+   per invocation on a BH=64 workload. sized lazily to fit the largest
+   (S, dk) seen so far. */
+AX_TLS float *tl_sdpa_row_max = NULL; AX_TLS int64_t tl_sdpa_row_max_S = 0;
+AX_TLS float *tl_sdpa_row_sum = NULL; AX_TLS int64_t tl_sdpa_row_sum_S = 0;
+AX_TLS float *tl_sdpa_kt_packed = NULL; AX_TLS int64_t tl_sdpa_kt_bytes = 0;
+AX_TLS float *tl_sdpa_v_packed  = NULL; AX_TLS int64_t tl_sdpa_v_bytes = 0;
+
+static inline float *ax_tls_grow(float **p, int64_t *cap_bytes, int64_t want_bytes) {
+    if (*p && *cap_bytes >= want_bytes) return *p;
+    if (*p) { ax_aligned_free(*p); *p = NULL; *cap_bytes = 0; }
+    *p = (float *)ax_aligned_alloc((size_t)want_bytes, 64);
+    if (*p) *cap_bytes = want_bytes;
+    return *p;
+}
+
 /* pack_b cache: skip re-packing B when the same tile is requested back-to-
    back. hit path is typical in backward passes where the same weight
    matrix is used twice (e.g. dY @ W for dX, then X^T @ dY for dW). the
@@ -2957,10 +2974,14 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-    /* per-kj-block packed panels. Kt gets pre-scaled. */
-    float *Kt_packed = (float *)aligned_alloc(64, (size_t)(dk * Bk_np_max) * sizeof(float));
-    float *V_packed = (float *)aligned_alloc(64, (size_t)(ATTN_BK * dk_np) * sizeof(float));
-    if (!Kt_packed || !V_packed) { free(Kt_packed); free(V_packed); return; }
+    /* per-kj-block packed panels. Kt gets pre-scaled. TLS-backed so the
+       per-head loop doesn't allocate each iteration — on BH=64 each
+       thread would otherwise do 32 aligned_alloc + free round trips. */
+    int64_t kt_want = (int64_t)(dk * Bk_np_max) * (int64_t)sizeof(float);
+    int64_t v_want  = (int64_t)(ATTN_BK * dk_np) * (int64_t)sizeof(float);
+    float *Kt_packed = ax_tls_grow(&tl_sdpa_kt_packed, &tl_sdpa_kt_bytes, kt_want);
+    float *V_packed  = ax_tls_grow(&tl_sdpa_v_packed,  &tl_sdpa_v_bytes,  v_want);
+    if (!Kt_packed || !V_packed) return;
 
     for (int64_t i = 0; i < S; i++) { row_max[i] = -FLT_MAX; row_sum[i] = 0.0f; }
     memset(out, 0, (size_t)(S * dk) * sizeof(float));
@@ -3005,12 +3026,13 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
             L[i] = -FLT_MAX;
         }
     }
-
-    free(Kt_packed);
-    free(V_packed);
+    /* Kt_packed and V_packed are TLS, do not free */
 }
 
-/* batched SDPA forward. processes BH heads in parallel. */
+/* batched SDPA forward. processes BH heads in parallel. per-thread
+   scratch for row_max/row_sum is TLS so we don't malloc 2 * nthreads
+   times per call — sdpa_fwd ran on a hot training loop allocates
+   thousands of times per epoch otherwise. */
 void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
                               float *out, float *L,
                               int64_t BH, int64_t S, int64_t dk, float scale,
@@ -3022,10 +3044,11 @@ void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
     #pragma omp parallel
 #endif
     {
-        /* per-thread working buffers for row_max/row_sum */
-        float *row_max = (float *)malloc((size_t)S * sizeof(float));
-        float *row_sum = (float *)malloc((size_t)S * sizeof(float));
-        if (!row_max || !row_sum) { free(row_max); free(row_sum); goto done; }
+        /* grow per-thread row_max/row_sum lazily to fit this call's S. */
+        int64_t want = (int64_t)S * (int64_t)sizeof(float);
+        float *row_max = ax_tls_grow(&tl_sdpa_row_max, &tl_sdpa_row_max_S, want);
+        float *row_sum = ax_tls_grow(&tl_sdpa_row_sum, &tl_sdpa_row_sum_S, want);
+        if (!row_max || !row_sum) goto done;
 
 #ifdef _OPENMP
         #pragma omp for schedule(static)
@@ -3035,7 +3058,6 @@ void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
                            out + h * head_sz, L ? L + h * S : NULL,
                            row_max, row_sum, S, dk, scale, causal, pad_mask);
         }
-        free(row_max); free(row_sum);
     done:;
     }
 }
