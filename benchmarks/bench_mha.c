@@ -190,11 +190,22 @@ static void bench_kv_cache(const shape_t *s, int iters)
 
     ax_kv_cache_attend(c, Qnew, out, scale);  /* warm */
 
+    /* decoder-step kv_attend is microseconds-per-call; iters=3 is too
+       noisy on shared CI runners. scale iters until either the caller's
+       count is met OR at least ~50ms of wall time has accumulated. */
     double t0 = now_s();
-    for (int i = 0; i < iters; i++)
+    int i = 0;
+    int min_iters = (iters > 20) ? iters : 20;
+    double wall_floor = 0.050;
+    double t1;
+    for (;;) {
         ax_kv_cache_attend(c, Qnew, out, scale);
-    double t1 = now_s();
-    double elapsed = (t1 - t0) / iters;
+        i++;
+        t1 = now_s();
+        if (i >= min_iters && (t1 - t0) >= wall_floor) break;
+        if (i >= 10000) break;
+    }
+    double elapsed = (t1 - t0) / (double)i;
     double flops = 4.0 * BH * S * dk;  /* Q@K + weighted sum of V, each 2*S*dk */
     double gflops = flops / elapsed / 1e9;
 
