@@ -20,6 +20,7 @@
 #include "axiom/error.h"
 #include "../compute/backends/simd_defs.h"
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <math.h>
 
@@ -872,6 +873,36 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
                 .out_h = out_h, .out_w = out_w,
             };
             ax_compute_conv_gemm(w2d, &cp, res);
+        } else if (kh == 1 && kw == 1 && sh == 1 && sw == 1
+                   && ph == 0 && pw == 0 && H == out_h && W == out_w) {
+            /* 1x1 stride-1 pad-0 conv: im2col is the identity layout.
+               skip the copy entirely by constructing a stack tensor view
+               over the input slice and handing it straight to gemm. this
+               saves a C_in*H*W memcpy per sample (400kb+ on vgg shapes).
+               storage/tensor are stack-allocated so there's no refcount
+               bookkeeping; the parent input keeps the real storage alive
+               for the duration of this forward pass. */
+            ax_storage_t in_storage;
+            in_storage.data = (void *)(ind + n * C_in * H * W);
+            in_storage.size_bytes = (size_t)(C_in * H * W) * sizeof(float);
+            atomic_store(&in_storage.refcount, 0);
+            in_storage.device = AX_DEVICE_CPU;
+            in_storage.is_arena_temp = true;
+            in_storage.generation = 1;
+
+            ax_tensor_t in_slice;
+            memset(&in_slice, 0, sizeof(in_slice));
+            in_slice.storage = &in_storage;
+            in_slice.ndim = 2;
+            in_slice.dtype = AX_FLOAT32;
+            in_slice.offset = 0;
+            in_slice.shape[0] = C_in;
+            in_slice.shape[1] = M;
+            in_slice.strides[0] = M;
+            in_slice.strides[1] = 1;
+
+            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            ax_compute_gemm(w2d, &in_slice, res);
         } else {
             float *cd = (float *)col->storage->data;
             /* explicit im2col + dispatch gemm. fastest for medium K. */
