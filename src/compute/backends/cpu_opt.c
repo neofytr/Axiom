@@ -406,8 +406,41 @@ static void ax_cpu_opt_init_impl(void) {
     /* L1d auto-tune: pack_a (MC×KC) should fit in ~80% of L1d.
        when it doesn't, shrink MC (rounded to MR). this matters on
        neoverse-n2 (64KB L1d) where the desktop default MC=72 gives
-       pack_a=72KB > 64KB, and on zen3/4 (32KB L1d). */
+       pack_a=72KB > 64KB, and on zen3/4 (32KB L1d).
+
+       fallback to reading /sys when sysconf returns -1 (some ARM
+       containers don't expose cache info via sysconf but do via sysfs). */
     long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+    if (l1d <= 0) {
+        /* try /sys/devices/system/cpu/cpu0/cache/index0/size (usually L1d) */
+        for (int idx = 0; idx < 4 && l1d <= 0; idx++) {
+            char path[128];
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu0/cache/index%d/level", idx);
+            FILE *fl = fopen(path, "r");
+            if (!fl) continue;
+            int lvl = 0; fscanf(fl, "%d", &lvl); fclose(fl);
+            if (lvl != 1) continue;
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu0/cache/index%d/type", idx);
+            FILE *ft = fopen(path, "r");
+            if (!ft) continue;
+            char type[32] = {0};
+            fscanf(ft, "%31s", type); fclose(ft);
+            if (strcmp(type, "Data") != 0 && strcmp(type, "Unified") != 0) continue;
+            snprintf(path, sizeof(path),
+                     "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
+            FILE *fs = fopen(path, "r");
+            if (!fs) continue;
+            long sz = 0; char unit = 0;
+            if (fscanf(fs, "%ld%c", &sz, &unit) >= 1) {
+                if (unit == 'K' || unit == 'k') sz *= 1024;
+                else if (unit == 'M' || unit == 'm') sz *= 1024 * 1024;
+                l1d = sz;
+            }
+            fclose(fs);
+        }
+    }
     if (l1d > 0) {
         long l1_budget = (long)((double)l1d * 0.80);
         size_t pack_a_bytes = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);

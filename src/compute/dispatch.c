@@ -701,20 +701,19 @@ int ax_autotune_threads(void)
     double t_start = ax_autotune_now_ms();
 
     /* fast path for small uniform systems: if we have ≤ 4 logical cores,
-       there's no meaningful classification to do — use all of them.
-       this avoids running the 200ms fma microbench probe on containers
-       and VMs where sysfs frequency data is unavailable. the probe leaves
-       OMP thread affinity in a suboptimal state that hurts subsequent
-       GEMM throughput by 10-25%. on large systems (many cores, possible
-       hybrid topology) the probe still runs. */
+       do absolutely nothing — don't call omp_set_num_threads, don't run
+       the classification probe, don't pin. OpenMP's default behavior is
+       already optimal: lazy thread-pool init on first parallel region,
+       OS scheduler handles placement. calling omp_set_num_threads here
+       early-inits the pool and can place threads on "wrong" vCPUs on
+       virtualized runners, causing 5-15% GEMM regression.
+       ax_gemm_threads_for_shape falls back to omp_get_max_threads()
+       when ax_gemm_fast_threads == 0, so no downstream code is affected. */
     if (n_cpus <= 4) {
-        omp_set_num_threads(n_cpus);
-        ax_gemm_fast_threads = n_cpus;
-        ax_gemm_all_threads = n_cpus;
 #ifndef AX_NO_STDIO
-        fprintf(stderr, "axiom: small uniform system (%d cores), no calibration needed\n", n_cpus);
+        fprintf(stderr, "axiom: small uniform system (%d cores), using OMP defaults\n", n_cpus);
 #endif
-        return n_cpus;
+        return omp_get_max_threads();
     }
 
     /* primary path: classify cores by sysfs frequency. reads
