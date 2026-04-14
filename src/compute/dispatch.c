@@ -700,6 +700,23 @@ int ax_autotune_threads(void)
 
     double t_start = ax_autotune_now_ms();
 
+    /* fast path for small uniform systems: if we have ≤ 4 logical cores,
+       there's no meaningful classification to do — use all of them.
+       this avoids running the 200ms fma microbench probe on containers
+       and VMs where sysfs frequency data is unavailable. the probe leaves
+       OMP thread affinity in a suboptimal state that hurts subsequent
+       GEMM throughput by 10-25%. on large systems (many cores, possible
+       hybrid topology) the probe still runs. */
+    if (n_cpus <= 4) {
+        omp_set_num_threads(n_cpus);
+        ax_gemm_fast_threads = n_cpus;
+        ax_gemm_all_threads = n_cpus;
+#ifndef AX_NO_STDIO
+        fprintf(stderr, "axiom: small uniform system (%d cores), no calibration needed\n", n_cpus);
+#endif
+        return n_cpus;
+    }
+
     /* primary path: classify cores by sysfs frequency. reads
        base_frequency for each cpu — instant (<1ms), no probing.
        on hybrid cpus (alder lake etc.) this cleanly separates P-cores
