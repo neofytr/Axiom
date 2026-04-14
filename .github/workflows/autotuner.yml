@@ -1,0 +1,135 @@
+name: Autotuner Matrix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/compute/**'
+      - 'src/core/**'
+      - 'include/**'
+      - '.github/workflows/autotuner.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/compute/**'
+      - 'src/core/**'
+      - 'include/**'
+      - '.github/workflows/autotuner.yml'
+  schedule:
+    - cron: '0 4 * * 0'  # weekly sunday 04:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: autotuner-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # validate autotuner picks sensible values on different CPU classes.
+  # must be within 20% of no-autotune baseline (regression gate).
+  autotuner-validation:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            label: x86-avx2-small
+            expected_isa: avx2
+          - runner: ubuntu-24.04
+            label: x86-avx2-newer
+            expected_isa: avx2
+          - runner: ubuntu-24.04-arm
+            label: arm64-neon
+            expected_isa: neon
+    runs-on: ${{ matrix.runner }}
+    name: autotuner-${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: hardware profile
+        run: |
+          echo "=== CPU ==="
+          lscpu | grep -E '(Model name|CPU\(s\)|Thread|Core|Socket|L1d|L2|L3|MHz|BogoMIPS)' | head -20
+          echo ""
+          echo "=== memory ==="
+          free -h
+          echo ""
+          echo "=== cache topology ==="
+          for cpu in /sys/devices/system/cpu/cpu0/cache/index*; do
+              [ -f "$cpu/level" ] || continue
+              LVL=$(cat "$cpu/level")
+              TYPE=$(cat "$cpu/type" 2>/dev/null || echo "-")
+              SZ=$(cat "$cpu/size" 2>/dev/null || echo "-")
+              WAYS=$(cat "$cpu/ways_of_associativity" 2>/dev/null || echo "-")
+              echo "  L${LVL} (${TYPE}): ${SZ}, ${WAYS}-way"
+          done
+
+      - name: install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential cmake libomp-dev
+
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . -j$(nproc)
+
+      - name: capture autotuner decisions
+        run: |
+          cd build
+          echo "=== autotuner output ==="
+          ./test_compute 2>&1 | grep -E '(axiom:|auto|tiles|hybrid|pinned|fast|all|L1d|L2|L3)' | head -20
+
+      - name: run tests (must all pass)
+        run: cd build && ctest -j$(nproc) --output-on-failure
+
+      - name: build gemm microbench
+        run: |
+          cat > /tmp/bench_gemm.c << 'BENCH_EOF'
+          #include "axiom/tensor.h"
+          #include "axiom/compute.h"
+          #include <stdio.h>
+          #include <time.h>
+          static double ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
+          static void b(int M,int N,int K,int s){
+              ax_tensor_t *a=ax_tensor_ones((int64_t[]){M,K},2,AX_FLOAT32);
+              ax_tensor_t *bb=ax_tensor_ones((int64_t[]){K,N},2,AX_FLOAT32);
+              ax_tensor_t *c=ax_tensor_zeros((int64_t[]){M,N},2,AX_FLOAT32);
+              ax_compute_gemm(a,bb,c);
+              double t0=ms();
+              for(int i=0;i<s;i++)ax_compute_gemm(a,bb,c);
+              double dt=(ms()-t0)/s;
+              printf("%d %.1f\n",M,2.0*M*N*K/dt/1e6);
+              ax_tensor_destroy(a);ax_tensor_destroy(bb);ax_tensor_destroy(c);
+          }
+          int main(void){ax_compute_init();
+              b(256,256,256,50);b(512,512,512,20);b(1024,1024,1024,5);b(2048,2048,2048,2);
+              return 0;}
+          BENCH_EOF
+          FLAGS="-O3 -fopenmp -I./include"
+          if lscpu | grep -q avx2; then FLAGS="$FLAGS -mavx2 -mfma"; fi
+          gcc $FLAGS -o /tmp/bench_gemm /tmp/bench_gemm.c ./build/libaxiom.a -lm -lpthread
+
+      - name: compare autotuner vs baseline
+        run: |
+          echo "=== autotune enabled ==="
+          /tmp/bench_gemm 2>/dev/null | tee auto.txt
+          echo ""
+          echo "=== baseline (AX_NO_AUTOTUNE=1) ==="
+          AX_NO_AUTOTUNE=1 /tmp/bench_gemm 2>/dev/null | tee base.txt
+
+      - name: regression gate (must be within 20% of baseline)
+        run: |
+          fail=0
+          paste auto.txt base.txt | while read m a m2 b; do
+              result=$(python3 -c "
+          a = float('$a' or 0); b = float('$b' or 0)
+          if b > 0 and a < b * 0.80:
+              print(f'FAIL size=$m: autotune={a} < 80% of baseline={b}')
+          else:
+              print(f'OK   size=$m: autotune={a} (baseline={b})')
+          ")
+              echo "$result"
+              case "$result" in FAIL*) fail=1;; esac
+          done
+          if [ $fail -eq 1 ]; then exit 1; fi

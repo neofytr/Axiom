@@ -1,0 +1,233 @@
+name: Benchmarks vs TensorFlow
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # nightly benchmark run at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # GEMM throughput: Axiom vs TF oneDNN across sizes
+  gemm-throughput:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show hardware
+        run: |
+          lscpu | grep -E '(Model name|CPU\(s\)|Thread|Core|Cache|MHz)' | head -15
+          free -h
+
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . -j$(nproc)
+
+      - name: install tensorflow
+        run: pip install --quiet tensorflow-cpu
+
+      - name: build standalone gemm bench
+        run: |
+          cat > /tmp/bench_gemm.c << 'BENCH_EOF'
+          #include "axiom/tensor.h"
+          #include "axiom/compute.h"
+          #include <stdio.h>
+          #include <time.h>
+          static double ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
+          static void b(int M,int N,int K,int s){
+              ax_tensor_t *a=ax_tensor_ones((int64_t[]){M,K},2,AX_FLOAT32);
+              ax_tensor_t *bb=ax_tensor_ones((int64_t[]){K,N},2,AX_FLOAT32);
+              ax_tensor_t *c=ax_tensor_zeros((int64_t[]){M,N},2,AX_FLOAT32);
+              ax_compute_gemm(a,bb,c);
+              double t0=ms();
+              for(int i=0;i<s;i++)ax_compute_gemm(a,bb,c);
+              double dt=(ms()-t0)/s;
+              printf("%d %d %d %.4f %.1f\n",M,N,K,dt,2.0*M*N*K/dt/1e6);
+              ax_tensor_destroy(a);ax_tensor_destroy(bb);ax_tensor_destroy(c);
+          }
+          int main(void){ax_compute_init();
+              b(128,128,128,100);b(256,256,256,50);b(512,512,512,20);
+              b(1024,1024,1024,5);b(2048,2048,2048,2);b(4096,4096,4096,1);
+              return 0;}
+          BENCH_EOF
+          FLAGS="-O3 -fopenmp -I./include"
+          if lscpu | grep -q avx2; then FLAGS="$FLAGS -mavx2 -mfma"; fi
+          gcc $FLAGS -o /tmp/bench_gemm /tmp/bench_gemm.c ./build/libaxiom.a -lm -lpthread
+
+      - name: run axiom gemm
+        run: |
+          echo "=== Axiom GEMM (autotuner enabled) ==="
+          /tmp/bench_gemm | tee axiom.txt
+
+      - name: run tensorflow gemm
+        run: |
+          python3 -c "
+          import os; os.environ['TF_CPP_MIN_LOG_LEVEL']='3'; os.environ['CUDA_VISIBLE_DEVICES']=''
+          import time, numpy as np, tensorflow as tf
+          tf.config.set_visible_devices([], 'GPU')
+          @tf.function
+          def mm(a,b): return tf.matmul(a,b)
+          for M in [128,256,512,1024,2048,4096]:
+              a=tf.random.normal((M,M)); b=tf.random.normal((M,M)); mm(a,b); mm(a,b)
+              s=max(1,1000//(M*M*M//1000000+1))
+              t0=time.perf_counter()
+              for _ in range(s): mm(a,b)
+              dt=(time.perf_counter()-t0)/s*1000
+              print(f'{M} {M} {M} {dt:.4f} {2.0*M*M*M/dt/1e6:.1f}')
+          " | tee tf.txt
+
+      - name: compare
+        run: |
+          echo ""
+          echo "=== Axiom vs TF (GFLOPS) ==="
+          printf "%-20s %-15s %-15s %s\n" "Size" "Axiom" "TF" "Winner"
+          paste axiom.txt tf.txt | while read m n k at agf m2 n2 k2 tt tgf; do
+              if awk -v a=$agf -v b=$tgf 'BEGIN{exit !(a>=b*0.98)}'; then
+                  pct=$(awk -v a=$agf -v b=$tgf 'BEGIN{printf "%.0f", (a/b-1)*100}')
+                  winner="Axiom +${pct}%"
+              else
+                  pct=$(awk -v a=$agf -v b=$tgf 'BEGIN{printf "%.0f", (b/a-1)*100}')
+                  winner="TF +${pct}%"
+              fi
+              printf "%-20s %-15s %-15s %s\n" "${m}x${m}x${m}" "${agf} GFLOPS" "${tgf} GFLOPS" "$winner"
+          done
+
+      - name: upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemm-results-x86
+          path: |
+            axiom.txt
+            tf.txt
+
+  # full training benchmarks: MLP on MNIST, deep MLP, large VGG
+  training-throughput:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: show hardware
+        run: lscpu | grep -E '(Model name|CPU\(s\))' && free -h
+
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake --build . -j$(nproc)
+
+      - name: download mnist
+        run: |
+          mkdir -p examples/data && cd examples/data
+          for f in train-images-idx3-ubyte train-labels-idx1-ubyte \
+                   t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+            [ -f "$f" ] && continue
+            curl -sL -O "https://storage.googleapis.com/cvdf-datasets/mnist/${f}.gz"
+            gunzip "${f}.gz"
+          done
+          ls -la
+
+      - name: install tensorflow
+        run: pip install --quiet tensorflow-cpu
+
+      - name: benchmark — small MLP (109K params)
+        run: |
+          echo "=== MNIST small MLP: Axiom ==="
+          ./build/ax_mnist | tail -15 | tee axiom_small.txt
+          echo ""
+          echo "=== MNIST small MLP: TensorFlow ==="
+          python3 benchmarks/tf_mnist.py | tail -15 | tee tf_small.txt
+
+      - name: benchmark — large wide MLP (14.4M params)
+        run: |
+          echo "=== Wide MLP (14.4M): Axiom ==="
+          timeout 1800 ./build/bench_wide train | tail -15 | tee axiom_wide.txt
+          echo ""
+          echo "=== Wide MLP (14.4M): TensorFlow ==="
+          timeout 1800 python3 benchmarks/tf_wide.py | tail -15 | tee tf_wide.txt
+
+      - name: benchmark — VGG CNN (8M params)
+        run: |
+          echo "=== VGG CNN (8M): Axiom ==="
+          timeout 3600 ./build/bench_vgg train | tail -15 | tee axiom_vgg.txt || echo "axiom_vgg failed"
+          echo ""
+          echo "=== VGG CNN (8M): TensorFlow ==="
+          timeout 3600 python3 benchmarks/tf_vgg.py | tail -15 | tee tf_vgg.txt || echo "tf_vgg failed"
+
+      - name: summary
+        if: always()
+        run: |
+          echo "=== TRAINING BENCHMARK SUMMARY ==="
+          echo ""
+          echo "Small MLP (109K params):"
+          grep -h "total training time\|per-epoch\|test accuracy" axiom_small.txt tf_small.txt 2>/dev/null | head -10
+          echo ""
+          echo "Wide MLP (14.4M params):"
+          grep -h "total training time\|per-epoch\|test accuracy" axiom_wide.txt tf_wide.txt 2>/dev/null | head -10
+          echo ""
+          echo "VGG CNN (8M params):"
+          grep -h "total training time\|per-epoch\|test accuracy" axiom_vgg.txt tf_vgg.txt 2>/dev/null | head -10
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: training-results-cpu
+          path: |
+            axiom_*.txt
+            tf_*.txt
+
+  # huge GEMM stress test: catch regressions at sizes where cache + threading matter most
+  stress-huge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . -j$(nproc)
+      - name: install tf
+        run: pip install --quiet tensorflow-cpu
+      - name: huge gemm comparison
+        run: |
+          cat > /tmp/huge.c << 'EOF'
+          #include "axiom/tensor.h"
+          #include "axiom/compute.h"
+          #include <stdio.h>
+          #include <time.h>
+          static double ms(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
+          static void b(int M){
+              ax_tensor_t *a=ax_tensor_ones((int64_t[]){M,M},2,AX_FLOAT32);
+              ax_tensor_t *bb=ax_tensor_ones((int64_t[]){M,M},2,AX_FLOAT32);
+              ax_tensor_t *c=ax_tensor_zeros((int64_t[]){M,M},2,AX_FLOAT32);
+              if(!a||!bb||!c){printf("%dx%dx%d OOM\n",M,M,M);return;}
+              ax_compute_gemm(a,bb,c);
+              double t0=ms(); ax_compute_gemm(a,bb,c); double dt=ms()-t0;
+              printf("axiom %dx%dx%d  %.1fms  %.1f GFLOPS\n",M,M,M,dt,2.0*M*M*M/dt/1e6);
+              ax_tensor_destroy(a);ax_tensor_destroy(bb);ax_tensor_destroy(c);
+          }
+          int main(void){ax_compute_init(); b(3072); b(4096); b(6144); b(8192); return 0;}
+          EOF
+          FLAGS="-O3 -fopenmp -I./include"
+          if lscpu | grep -q avx2; then FLAGS="$FLAGS -mavx2 -mfma"; fi
+          gcc $FLAGS -o /tmp/huge /tmp/huge.c ./build/libaxiom.a -lm -lpthread
+          /tmp/huge
+          python3 -c "
+          import os; os.environ['TF_CPP_MIN_LOG_LEVEL']='3'; os.environ['CUDA_VISIBLE_DEVICES']=''
+          import time, tensorflow as tf
+          tf.config.set_visible_devices([], 'GPU')
+          @tf.function
+          def mm(a,b): return tf.matmul(a,b)
+          for M in [3072,4096,6144,8192]:
+            try:
+              a=tf.random.normal((M,M)); b=tf.random.normal((M,M)); mm(a,b)
+              t0=time.perf_counter(); mm(a,b); dt=(time.perf_counter()-t0)*1000
+              print(f'tf {M}x{M}x{M}  {dt:.1f}ms  {2.0*M*M*M/dt/1e6:.1f} GFLOPS')
+            except Exception as e:
+              print(f'tf {M}x{M}x{M}  OOM ({e})')"

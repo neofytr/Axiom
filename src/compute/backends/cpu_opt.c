@@ -67,6 +67,15 @@
    overhead of ~5us on modern x86. */
 #define AX_PAR_THRESHOLD_PER_THREAD 8192
 
+/* hybrid cpu thread counts from dispatch.c. large GEMMs use all_threads
+   (P+E cores), small ops use fast_threads (P-cores only). both are 0
+   until ax_autotune_threads runs, after which they're set. */
+extern int ax_gemm_fast_threads;
+extern int ax_gemm_all_threads;
+
+/* forward declaration — definition after GEMM_MC/NC are declared */
+static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k);
+
 #ifdef _OPENMP
 static inline int64_t ax_par_threshold(void) {
     int nt = omp_in_parallel() ? 1 : omp_get_max_threads();
@@ -331,6 +340,38 @@ static int64_t GEMM_MC = AX_GEMM_DEFAULT_MC;
 static int64_t GEMM_NC = AX_GEMM_DEFAULT_NC;
 static int64_t GEMM_KC = AX_GEMM_DEFAULT_KC;
 
+/* pick thread count for a GEMM. strategy is 3-tier:
+   - tiny GEMMs (< 1M FLOPs): serial, fork-join cost exceeds compute
+   - small-medium (< ~100M FLOPs): fast cores only, E-cores add latency
+   - large (>= ~100M FLOPs): all cores, parallelism dominates latency
+   the thresholds scale with number of fast cores (more cores = higher
+   absolute throughput = larger crossover point). */
+static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
+#ifdef _OPENMP
+    if (omp_in_parallel()) return 1;
+
+    int fast = ax_gemm_fast_threads > 0 ? ax_gemm_fast_threads : omp_get_max_threads();
+    int all  = ax_gemm_all_threads  > 0 ? ax_gemm_all_threads  : fast;
+
+    int64_t total_flops = 2 * m * n * k;
+
+    /* tiny: fork-join amortization threshold */
+    if (total_flops < 1000000) return 1;
+
+    /* if non-hybrid, just return all (fast == all) */
+    if (all == fast) return all;
+
+    /* crossover from fast-only to all-cores. scales with fast thread
+       count: more P-cores means their throughput is higher, pushing the
+       crossover higher before E-cores help. ~25M FLOPs per fast thread. */
+    int64_t crossover = (int64_t)fast * 25000000LL;
+    return (total_flops >= crossover) ? all : fast;
+#else
+    (void)m; (void)n; (void)k;
+    return 1;
+#endif
+}
+
 static void ax_gemm_read_env(const char *name, int64_t *slot, int64_t multiple_of) {
     const char *s = getenv(name);
     if (!s || !*s) return;
@@ -406,6 +447,50 @@ static void ax_cpu_opt_init_impl(void) {
             }
         }
     }
+
+    /* L3 detection + NC bound for multi-threaded JC parallel.
+       each JC thread owns a pack_b panel (NC×KC×4 bytes). when all
+       threads' panels exceed 80% of shared L3, shrink NC. */
+    long l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+    if (l3 > 0 && !getenv("AX_GEMM_NC")) {
+        int nt = 1;
+#ifdef _OPENMP
+        nt = omp_get_max_threads();
+#endif
+        if (nt > 1) {
+            long l3_budget = (long)((double)l3 * 0.80);
+            long total_pb = (long)nt * (long)GEMM_NC * (long)GEMM_KC * (long)sizeof(float);
+            if (total_pb > l3_budget) {
+                int64_t new_nc = l3_budget / ((int64_t)nt * (int64_t)GEMM_KC * (int64_t)sizeof(float));
+                new_nc = (new_nc / GEMM_NR) * GEMM_NR;
+                if (new_nc >= GEMM_NR && new_nc < GEMM_NC) {
+                    AX_LOG("axiom: auto-tuned NC from %ld to %ld for L3 (%ld kB, %d threads)\n",
+                           (long)GEMM_NC, (long)new_nc, l3 / 1024, nt);
+                    GEMM_NC = new_nc;
+                }
+            }
+        }
+    }
+
+    /* KC auto-tune: if combined panels (MC+NC)×KC×4 exceed L2, shrink KC.
+       this triggers on avx-512 configs (MC=168, NC=512) with smaller L2. */
+    if (l2 > 0 && !getenv("AX_GEMM_KC")) {
+        long budget = (long)((double)l2 * 0.80);
+        long panels = (long)(GEMM_MC + GEMM_NC) * (long)GEMM_KC * (long)sizeof(float);
+        if (panels > budget) {
+            int64_t new_kc = budget / ((int64_t)(GEMM_MC + GEMM_NC) * (int64_t)sizeof(float));
+            new_kc = (new_kc / 8) * 8;
+            if (new_kc >= 64 && new_kc < GEMM_KC) {
+                AX_LOG("axiom: auto-tuned KC from %ld to %ld to fit L2\n",
+                       (long)GEMM_KC, (long)new_kc);
+                GEMM_KC = new_kc;
+            }
+        }
+    }
+
+    AX_LOG("axiom: tiles MC=%ld NC=%ld KC=%ld (L1d=%ld kB, L2=%ld kB, L3=%ld kB)\n",
+           (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC,
+           l1d > 0 ? l1d/1024 : -1, l2 > 0 ? l2/1024 : -1, l3 > 0 ? l3/1024 : -1);
 #endif
 }
 
@@ -1095,12 +1180,11 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         return AX_OK;
     }
 
-    /* per-thread pack buffers — guarded against nested parallel regions
-       (conv2d batch loop already runs in a parallel region). */
-    int max_threads = 1;
-    #ifdef _OPENMP
-    if (!omp_in_parallel()) max_threads = omp_get_max_threads();
-    #endif
+    /* per-thread pack buffers — guarded against nested parallel regions.
+       on hybrid cpus, large GEMMs use all cores (P+E), small ones use
+       only P-cores for lower latency. */
+    int64_t total_flops_est = 2 * m * n * k;
+    int max_threads = ax_gemm_threads_for_shape(m, n, k);
 
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
@@ -1122,13 +1206,10 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 
     bool use_jc_par = (max_threads > 1) && (n_jc_tiles >= 2);
     bool use_ic_par = !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
-    /* fine-grained parallel is only worth it when there's enough total work to
-       amortize OMP fork-join overhead AND enough work units per thread. ~1M
-       FLOPs is a conservative threshold (< 50us serial). */
-    int64_t total_flops = m * n * k;
+    /* fine-grained parallel: ~1M FLOPs threshold for fork-join amortization */
     bool use_fine_par = !use_jc_par && !use_ic_par && (max_threads > 1)
                         && (m <= GEMM_MC) && (fine_units >= 4)
-                        && (total_flops > 1000000);
+                        && (total_flops_est > 1000000);
 
     int gemm_threads = 1;
     if (use_jc_par) {
@@ -1926,13 +2007,8 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    /* JC parallelism when there's enough compute to justify OMP overhead
-       (~1M FLOPs threshold matches the standard gemm heuristic). */
-    int max_threads = 1;
-    int64_t total_flops = m * n * k;
-    #ifdef _OPENMP
-    if (!omp_in_parallel() && total_flops > 1000000) max_threads = omp_get_max_threads();
-    #endif
+    int64_t total_flops = 2 * m * n * k;
+    int max_threads = ax_gemm_threads_for_shape(m, n, k);
     int64_t nc_eff_nt = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff_nt - 1) / nc_eff_nt;
     int gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
@@ -2024,11 +2100,8 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
     memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    int max_threads = 1;
-    int64_t total_flops = m * n * k;
-    #ifdef _OPENMP
-    if (!omp_in_parallel() && total_flops > 1000000) max_threads = omp_get_max_threads();
-    #endif
+    int64_t total_flops = 2 * m * n * k;
+    int max_threads = ax_gemm_threads_for_shape(m, n, k);
     int64_t nc_eff_tn = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff_tn - 1) / nc_eff_tn;
     int gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);

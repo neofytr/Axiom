@@ -15,6 +15,12 @@
 #include <string.h>
 #include <time.h>
 
+/* thread counts for hybrid cpu awareness. on hybrid cpus (P+E cores),
+   large GEMMs use all_threads (P+E) while small ops use fast_threads
+   (P-cores only). on non-hybrid, both are equal. set by ax_autotune_threads. */
+int ax_gemm_fast_threads = 0;
+int ax_gemm_all_threads = 0;
+
 #ifdef __linux__
 #include <sched.h>
 #include <unistd.h>
@@ -813,15 +819,33 @@ int ax_autotune_threads(void)
     if (fc == 0) { fast_cpus[fc++] = fast_cpus_all[0]; }
 
     int fast_count = fc;
+    bool is_hybrid = (fast_all < n_cpus);
 
     double total_ms = ax_autotune_now_ms() - t_start;
 
-    omp_set_num_threads(fast_count);
+    if (is_hybrid) {
+        /* hybrid cpu (e.g., alder lake): P-cores are "fast", E-cores are slower.
+           for GEMM, E-cores contribute meaningful throughput through JC-parallel
+           column strips. strategy: set default thread count to all cores (no pinning),
+           and export both counts so the GEMM path can pick per-call.
+           no sched_setaffinity — let the OS scheduler handle hybrid placement. */
+        omp_set_num_threads(n_cpus);
+        ax_gemm_fast_threads = fast_count;
+        ax_gemm_all_threads = n_cpus;
+#ifndef AX_NO_STDIO
+        fprintf(stderr, "axiom: hybrid cpu detected: %d fast + %d slow = %d total (%.1fms)\n",
+                fast_count, n_cpus - fast_count, n_cpus, total_ms);
+        fprintf(stderr, "axiom: GEMM will use %d threads (large) or %d threads (small)\n",
+                n_cpus, fast_count);
+#endif
+        return n_cpus;
+    }
 
-    /* pin each omp worker to one fast core. without this step
-       omp_set_num_threads alone lets the scheduler drop workers onto
-       slow cores and nullifies the calibration. best-effort: failures
-       are logged but not fatal. */
+    /* non-hybrid: pin to fast (physical) cores as before */
+    omp_set_num_threads(fast_count);
+    ax_gemm_fast_threads = fast_count;
+    ax_gemm_all_threads = fast_count;
+
     int pin_failures = 0;
     #pragma omp parallel num_threads(fast_count) reduction(+:pin_failures)
     {
@@ -835,7 +859,6 @@ int ax_autotune_threads(void)
         }
     }
 
-    /* build a short "a,b,c" list of pinned cpus for the log line */
     char cpu_list[128];
     size_t off = 0;
     for (int i = 0; i < fc && off + 8 < sizeof(cpu_list); i++) {
@@ -851,10 +874,6 @@ int ax_autotune_threads(void)
     fprintf(stderr, "axiom: pinned %d omp workers to cores [%s]%s\n",
             fast_count, cpu_list,
             pin_failures ? " (some pins failed)" : "");
-    if (pin_failures) {
-        fprintf(stderr, "axiom: sched_setaffinity failed for %d/%d workers\n",
-                pin_failures, fast_count);
-    }
 #else
     (void)total_ms; (void)cpu_list; (void)pin_failures;
 #endif
