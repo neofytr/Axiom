@@ -361,126 +361,189 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
 
         free(chan_buf);
     }
-    else if (self->training)
+    else
     {
+        /* 4D BN row-major path: shape [N, C, H, W], spatial = H*W.
+
+           the old per-channel-outer loop strode between batch elements
+           by C*H*W floats every iteration (400KB+ in VGG shapes), blowing
+           past L2 on every step. rewrite as row-major: walk (n, c, spatial)
+           in natural layout order so the hw prefetcher can track both the
+           within-channel run of HW floats and the channel-to-channel jumps
+           of HW floats (both cache-friendly when HW fits in L1).
+
+           training: one fused pass computes per-channel sum and sum^2 via
+           per-thread C-sized accumulators reduced at the end. this halves
+           the memory bandwidth of the old mean-then-variance two-pass.
+
+           eval: running stats go straight into scale/biasout so the hot
+           pass is a single fused FMA per element. */
         float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
         float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
-        #ifdef _OPENMP
-        /* dynamic-1 for hybrid P/E core load balancing: fast cores steal from slow ones */
-        #pragma omp parallel for schedule(dynamic, 1)
-        #endif
-        for (int64_t c = 0; c < feat; c++)
-        {
-            /* pass 1: compute mean with SIMD reduction */
-            float mean;
+        size_t chan_scratch = 4 * (size_t)feat * sizeof(float);
+        float *chan_buf = (float *)aligned_alloc(64, (chan_scratch + 63u) & ~(size_t)63u);
+        if (!chan_buf) {
+            ax_tensor_destroy(out);
+            if (inp != input) ax_tensor_destroy(inp);
+            return NULL;
+        }
+        float *mean_arr    = chan_buf;
+        float *invstd_arr  = chan_buf + feat;
+        float *scale_arr   = chan_buf + 2 * feat;
+        float *biasout_arr = chan_buf + 3 * feat;
+
+        if (self->training) {
+#ifdef _OPENMP
+            int n_threads = omp_get_max_threads();
+#else
+            int n_threads = 1;
+#endif
+            size_t per_thread = (size_t)feat;
+            size_t total = 2u * (size_t)n_threads * per_thread * sizeof(float);
+            float *redbuf = (float *)aligned_alloc(64, (total + 63u) & ~(size_t)63u);
+            if (!redbuf) {
+                free(chan_buf);
+                ax_tensor_destroy(out);
+                if (inp != input) ax_tensor_destroy(inp);
+                return NULL;
+            }
+            memset(redbuf, 0, total);
+            float *sum_all  = redbuf;
+            float *sum2_all = redbuf + (size_t)n_threads * per_thread;
+
+            /* pass 1: row-major walk. each thread takes a contiguous slice
+               of batch elements and, for every (n, c) slice of `spatial`
+               contiguous floats, runs a SIMD sum+sum^2 reduction into its
+               local sum_l[c] / sum2_l[c]. spatial is HW which is almost
+               always a multiple of AX_VF32_WIDTH (e.g. 196, 784, 3136). */
+#ifdef _OPENMP
+            #pragma omp parallel
+#endif
             {
-                double dsum = 0.0;
+#ifdef _OPENMP
+                int tid = omp_get_thread_num();
+#else
+                int tid = 0;
+#endif
+                float *sum_l  = sum_all  + (size_t)tid * per_thread;
+                float *sum2_l = sum2_all + (size_t)tid * per_thread;
+                int64_t se = spatial - (spatial % AX_VF32_WIDTH);
+#ifdef _OPENMP
+                #pragma omp for schedule(static)
+#endif
                 for (int64_t n = 0; n < batch; n++) {
-                    int64_t base = n * feat * spatial + c * spatial;
-                    int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
-                    ax_vf32 vs = ax_vf32_zero();
-                    for (; s < se; s += AX_VF32_WIDTH)
-                        vs = ax_vf32_add(vs, ax_vf32_loadu(id + base + s));
-                    dsum += (double)ax_vf32_hsum(vs);
-                    for (; s < spatial; s++) dsum += (double)id[base + s];
+                    for (int64_t c = 0; c < feat; c++) {
+                        const float *p = id + (n * feat + c) * spatial;
+                        ax_vf32 vs = ax_vf32_zero(), vs2 = ax_vf32_zero();
+                        int64_t s = 0;
+                        for (; s < se; s += AX_VF32_WIDTH) {
+                            ax_vf32 x = ax_vf32_loadu(p + s);
+                            vs  = ax_vf32_add(vs, x);
+                            vs2 = ax_vf32_fmadd(x, x, vs2);
+                        }
+                        float s_tail = 0.0f, s2_tail = 0.0f;
+                        for (; s < spatial; s++) {
+                            float x = p[s];
+                            s_tail  += x;
+                            s2_tail += x * x;
+                        }
+                        sum_l[c]  += ax_vf32_hsum(vs)  + s_tail;
+                        sum2_l[c] += ax_vf32_hsum(vs2) + s2_tail;
+                    }
                 }
-                mean = (float)(dsum / (double)(batch * spatial));
             }
 
-            /* pass 2: compute variance with SIMD */
-            ax_vf32 v_mean = ax_vf32_set1(mean);
-            double var_sum_d = 0.0;
-            for (int64_t n = 0; n < batch; n++)
+            /* reduce per-thread scratch into thread-0 slot via SIMD adds. */
             {
-                int64_t base = n * feat * spatial + c * spatial;
-                int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
-                ax_vf32 vv = ax_vf32_zero();
-                for (; s < se; s += AX_VF32_WIDTH) {
-                    ax_vf32 d = ax_vf32_sub(ax_vf32_loadu(id + base + s), v_mean);
-                    vv = ax_vf32_fmadd(d, d, vv);
+                int64_t fe_r = feat - (feat % AX_VF32_WIDTH);
+                for (int t = 1; t < n_threads; t++) {
+                    float *sp  = sum_all  + (size_t)t * per_thread;
+                    float *s2p = sum2_all + (size_t)t * per_thread;
+                    int64_t f = 0;
+                    for (; f < fe_r; f += AX_VF32_WIDTH) {
+                        ax_vf32_storeu(sum_all + f,
+                            ax_vf32_add(ax_vf32_loadu(sum_all + f),
+                                        ax_vf32_loadu(sp + f)));
+                        ax_vf32_storeu(sum2_all + f,
+                            ax_vf32_add(ax_vf32_loadu(sum2_all + f),
+                                        ax_vf32_loadu(s2p + f)));
+                    }
+                    for (; f < feat; f++) {
+                        sum_all[f]  += sp[f];
+                        sum2_all[f] += s2p[f];
+                    }
                 }
-                var_sum_d += (double)ax_vf32_hsum(vv);
+            }
+
+            /* per-channel stats + running stats update. eff_count is the
+               number of elements aggregated per channel (batch * spatial). */
+            float Nf = (float)(batch * spatial);
+            float inv_N = 1.0f / Nf;
+            float denom = (Nf > 1.0f) ? 1.0f / (Nf - 1.0f) : 1.0f;
+            float mom = bn->momentum;
+            float one_minus_mom = 1.0f - mom;
+            float eps = bn->eps;
+            for (int64_t c = 0; c < feat; c++) {
+                float s  = sum_all[c];
+                float s2 = sum2_all[c];
+                float mean = s * inv_N;
+                float var  = s2 * inv_N - mean * mean;
+                if (var < 0.0f) var = 0.0f;
+                float inv_std = 1.0f / sqrtf(var + eps);
+                mean_arr[c]    = mean;
+                invstd_arr[c]  = inv_std;
+                scale_arr[c]   = gd[c] * inv_std;
+                biasout_arr[c] = bd[c] - gd[c] * mean * inv_std;
+                if (is_d) is_d[c] = inv_std;
+
+                float var_sum  = s2 - Nf * mean * mean;
+                float unbiased = (Nf > 1.0f) ? var_sum * denom : var;
+                rm[c] = one_minus_mom * rm[c] + mom * mean;
+                rv[c] = one_minus_mom * rv[c] + mom * unbiased;
+            }
+            free(redbuf);
+        } else {
+            /* eval path: fold running stats into scale/biasout. */
+            float eps = bn->eps;
+            for (int64_t c = 0; c < feat; c++) {
+                float inv_std = 1.0f / sqrtf(rv[c] + eps);
+                mean_arr[c]    = rm[c];
+                invstd_arr[c]  = inv_std;
+                scale_arr[c]   = gd[c] * inv_std;
+                biasout_arr[c] = bd[c] - gd[c] * rm[c] * inv_std;
+            }
+        }
+
+        /* pass 2: row-major normalize. broadcast scale[c] and biasout[c]
+           across the HW slice; if recording for backward also store x_hat. */
+        int64_t se2 = spatial - (spatial % AX_VF32_WIDTH);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if (batch > 1)
+#endif
+        for (int64_t n = 0; n < batch; n++) {
+            for (int64_t c = 0; c < feat; c++) {
+                const float *ip = id + (n * feat + c) * spatial;
+                float *op = od + (n * feat + c) * spatial;
+                float *xhp = xh_d ? xh_d + (n * feat + c) * spatial : NULL;
+                ax_vf32 v_sc = ax_vf32_set1(scale_arr[c]);
+                ax_vf32 v_bo = ax_vf32_set1(biasout_arr[c]);
+                ax_vf32 v_mn = xhp ? ax_vf32_set1(mean_arr[c])   : v_sc;
+                ax_vf32 v_is = xhp ? ax_vf32_set1(invstd_arr[c]) : v_sc;
+                int64_t s = 0;
+                for (; s < se2; s += AX_VF32_WIDTH) {
+                    ax_vf32 x = ax_vf32_loadu(ip + s);
+                    ax_vf32_storeu(op + s, ax_vf32_fmadd(v_sc, x, v_bo));
+                    if (xhp) ax_vf32_storeu(xhp + s, ax_vf32_mul(ax_vf32_sub(x, v_mn), v_is));
+                }
                 for (; s < spatial; s++) {
-                    float d = id[base + s] - mean;
-                    var_sum_d += (double)d * (double)d;
+                    op[s] = scale_arr[c] * ip[s] + biasout_arr[c];
+                    if (xhp) xhp[s] = (ip[s] - mean_arr[c]) * invstd_arr[c];
                 }
             }
-            float var = (float)(var_sum_d / (double)(batch * spatial));
-            float var_sum = (float)var_sum_d;
-            float inv_std = 1.0f / sqrtf(var + bn->eps);
-
-            if (record) is_d[c] = inv_std;
-
-            /* pass 2: normalize and apply affine.
-               fuse to single FMA: out = scale * input + bias_out */
-            float scale = gd[c] * inv_std;
-            float bias_out = bd[c] - gd[c] * mean * inv_std;
-            ax_vf32 v_sc = ax_vf32_set1(scale);
-            ax_vf32 v_bi = ax_vf32_set1(bias_out);
-            ax_vf32 v_is = ax_vf32_set1(inv_std);
-            ax_vf32 v_mn = ax_vf32_set1(mean);
-
-            for (int64_t n = 0; n < batch; n++)
-            {
-                int64_t base = n * feat * spatial + c * spatial;
-                if (record) {
-                    int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
-                    for (; s < se; s += AX_VF32_WIDTH) {
-                        ax_vf32 inp_val = ax_vf32_loadu(id + base + s); (void)inp_val;
-                        ax_vf32 xh = ax_vf32_mul(ax_vf32_sub(inp_val, v_mn), v_is);
-                        ax_vf32_storeu(od + base + s, ax_vf32_fmadd(v_sc, ax_vf32_loadu(id + base + s), v_bi));
-                        ax_vf32_storeu(xh_d + base + s, xh);
-                    }
-                    for (; s < spatial; s++) {
-                        float xh = (id[base + s] - mean) * inv_std;
-                        od[base + s] = scale * id[base + s] + bias_out;
-                        xh_d[base + s] = xh;
-                    }
-                } else {
-                    int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
-                    for (; s < se; s += AX_VF32_WIDTH)
-                        ax_vf32_storeu(od + base + s,
-                            ax_vf32_fmadd(v_sc, ax_vf32_loadu(id + base + s), v_bi));
-                    for (; s < spatial; s++)
-                        od[base + s] = scale * id[base + s] + bias_out;
-                }
-            }
-
-            rm[c] = (1.0f - bn->momentum) * rm[c] + bn->momentum * mean;
-            int64_t eff_count = batch * spatial;
-            float unbiased_var = (eff_count > 1) ? var_sum / (float)(eff_count - 1) : var;
-            rv[c] = (1.0f - bn->momentum) * rv[c] + bn->momentum * unbiased_var;
         }
-    }
-    else
-    {
-        /* eval path: fused scale+shift per channel.
-           precompute scale = gamma * inv_std, bias_out = beta - gamma * mean * inv_std
-           then out[idx] = scale * input[idx] + bias_out (single FMA per element) */
-        #ifdef _OPENMP
-        /* dynamic-1 for hybrid P/E core load balancing: fast cores steal from slow ones */
-        #pragma omp parallel for schedule(dynamic, 1)
-        #endif
-        for (int64_t c = 0; c < feat; c++)
-        {
-            float inv_std = 1.0f / sqrtf(rv[c] + bn->eps);
-            float scale = gd[c] * inv_std;
-            float bias_out = bd[c] - gd[c] * rm[c] * inv_std;
-            ax_vf32 v_scale = ax_vf32_set1(scale);
-            ax_vf32 v_bias = ax_vf32_set1(bias_out);
 
-            for (int64_t n = 0; n < batch; n++)
-            {
-                int64_t base = n * feat * spatial + c * spatial;
-                int64_t s = 0, se = spatial - (spatial % AX_VF32_WIDTH);
-                for (; s < se; s += AX_VF32_WIDTH)
-                    ax_vf32_storeu(od + base + s,
-                        ax_vf32_fmadd(v_scale, ax_vf32_loadu(id + base + s), v_bias));
-                for (; s < spatial; s++)
-                    od[base + s] = scale * id[base + s] + bias_out;
-            }
-        }
+        free(chan_buf);
     }
 
     /* hook up backward */
