@@ -973,26 +973,31 @@ void ax_calibrate_thresholds(void) {
     if (overhead_ms <= 0.0) overhead_ms = 0.020;
     ax_omp_overhead_ms = overhead_ms;
 
-    /* derive element-count thresholds assuming ~2 GFLOPs/thread effective
-       throughput for cache-bounded elementwise ops. parallel is worth it
-       when work / nt >= overhead, i.e. work >= overhead * nt * throughput.
-       apply a 2x safety factor so we only parallelize when the win is
-       clearly >10%. */
+    /* derive thresholds from the crossover point where parallel matches
+       serial: serial_time = work / throughput; parallel_time = work /
+       (throughput * nt) + overhead. parallel wins when
+         overhead < work * (nt - 1) / (nt * throughput)
+       so work_threshold = overhead * nt * throughput / (nt - 1).
+       for nt>=2 this simplifies to ~overhead * throughput * (1 + 1/(nt-1)).
+
+       throughput picked for a cache-resident simd loop: ~2e6 ops/ms per
+       thread is realistic for softmax/norm-style work with expf + load/
+       store. 2x safety factor so we don't flip-flop near the crossover. */
     int nt = omp_get_max_threads();
     if (nt < 1) nt = 1;
-    double throughput_ops_per_ms = 2.0e6;
-    int64_t flop_thresh = (int64_t)(overhead_ms * (double)nt * throughput_ops_per_ms * 2.0);
-    if (flop_thresh < 4096) flop_thresh = 4096;
-    ax_par_threshold_flops = flop_thresh;
-    /* elementwise / reduction ops run at ~16B/FLOP mem bandwidth, so
-       element-threshold ≈ flop-threshold / 4 is a reasonable default. */
-    ax_par_threshold_elems = flop_thresh / 4;
-    if (ax_par_threshold_elems < 1024) ax_par_threshold_elems = 1024;
-    /* per-batch ops (norm, loss) do O(F) work per batch element. use a
-       lower threshold (in *rows*) derived from the flop threshold and an
-       assumed per-row work of ~4K flops. clamped at 2 so we never gate
-       out trivially correct parallelism. */
-    ax_par_threshold_batch = flop_thresh / 4096;
+    double throughput_ops_per_ms_single = 2.0e6;
+    double denom = (nt > 1) ? ((double)(nt - 1) / (double)nt) : 1.0;
+    double work_cross = overhead_ms * throughput_ops_per_ms_single / denom;
+    int64_t work_thresh = (int64_t)(work_cross * 2.0);
+    if (work_thresh < 4096) work_thresh = 4096;
+
+    ax_par_threshold_flops = work_thresh;
+    ax_par_threshold_elems = work_thresh;
+    /* batch threshold: per-batch work is usually F or classes, so the
+       right answer is work_thresh/F. without a specific F, use 256 as a
+       mid-range dense-layer width. clamped at 2 so we still parallelize
+       whenever the batch-loop body is non-trivial. */
+    ax_par_threshold_batch = work_thresh / 256;
     if (ax_par_threshold_batch < 2) ax_par_threshold_batch = 2;
 
 #ifndef AX_NO_STDIO
