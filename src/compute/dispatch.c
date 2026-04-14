@@ -841,21 +841,29 @@ int ax_autotune_threads(void)
         return n_cpus;
     }
 
-    /* non-hybrid: pin to fast (physical) cores as before */
+    /* non-hybrid: set thread count to fast cores. only pin when we're
+       NOT using every available cpu — pinning when fast_count == n_cpus
+       provides no benefit (no slow cores to avoid) and can hurt in
+       virtualized / containerized environments where vCPU→pCPU mapping
+       is managed by the hypervisor. pinning to specific vCPUs can force
+       suboptimal physical core placement. */
     omp_set_num_threads(fast_count);
     ax_gemm_fast_threads = fast_count;
     ax_gemm_all_threads = fast_count;
 
     int pin_failures = 0;
-    #pragma omp parallel num_threads(fast_count) reduction(+:pin_failures)
-    {
-        int w = omp_get_thread_num();
-        int cpu = fast_cpus[w % fc];
-        cpu_set_t one;
-        CPU_ZERO(&one);
-        CPU_SET((size_t)cpu, &one);
-        if (sched_setaffinity(0, sizeof(one), &one) != 0) {
-            pin_failures += 1;
+    bool should_pin = (fast_count < n_cpus);
+    if (should_pin) {
+        #pragma omp parallel num_threads(fast_count) reduction(+:pin_failures)
+        {
+            int w = omp_get_thread_num();
+            int cpu = fast_cpus[w % fc];
+            cpu_set_t one;
+            CPU_ZERO(&one);
+            CPU_SET((size_t)cpu, &one);
+            if (sched_setaffinity(0, sizeof(one), &one) != 0) {
+                pin_failures += 1;
+            }
         }
     }
 
@@ -871,9 +879,13 @@ int ax_autotune_threads(void)
 #ifndef AX_NO_STDIO
     fprintf(stderr, "axiom: autotune chose %d fast cores (%.1fms calibration)\n",
             fast_count, total_ms);
-    fprintf(stderr, "axiom: pinned %d omp workers to cores [%s]%s\n",
-            fast_count, cpu_list,
-            pin_failures ? " (some pins failed)" : "");
+    if (should_pin) {
+        fprintf(stderr, "axiom: pinned %d omp workers to cores [%s]%s\n",
+                fast_count, cpu_list,
+                pin_failures ? " (some pins failed)" : "");
+    } else {
+        fprintf(stderr, "axiom: using all %d cores, no pinning needed\n", fast_count);
+    }
 #else
     (void)total_ms; (void)cpu_list; (void)pin_failures;
 #endif
