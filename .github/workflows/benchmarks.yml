@@ -26,6 +26,72 @@ env:
 
 jobs:
   # ======================================================================
+  # 0. CALIBRATE — measure omp fork/join overhead, derive parallel
+  #    thresholds, and run the opt-in gemm tile sweep. surfaces the
+  #    calibrated numbers to the job summary so regressions in runtime
+  #    cost are visible. runs in parallel with parity; does not gate.
+  # ======================================================================
+  calibrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: show hardware
+        run: lscpu | grep -E '(Model name|CPU\(s\)|Thread|Core|Cache|MHz)' | head -10
+
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc) --target bench_gemm_suite
+
+      - name: capture calibration lines
+        run: |
+          # default calibration (B) always runs at init; (A) opt-in.
+          AX_GEMM_CALIBRATE=1 ./build/bench_gemm_suite 2>calib_stderr.log 1>/dev/null
+          grep -E '^axiom:' calib_stderr.log | tee calib.txt
+
+      - name: baseline vs calibrated gemm
+        run: |
+          # baseline: default tiles, default thresholds
+          ./build/bench_gemm_suite 2>&1 > gemm_default.txt
+          # with gemm tile sweep enabled
+          AX_GEMM_CALIBRATE=1 ./build/bench_gemm_suite 2>&1 > gemm_calibrated.txt
+
+      - name: summarize
+        run: |
+          {
+            echo "# Calibration report"
+            echo ""
+            echo "## Measured"
+            echo '```'
+            cat calib.txt
+            echo '```'
+            echo ""
+            echo "## GEMM defaults vs calibrated"
+            echo ""
+            echo "| case | default | calibrated |"
+            echo "|---|---|---|"
+            for case in nn_512x512x512 nn_1024x1024x1024 nn_2048x2048x2048 \
+                        nn_256x1024x2048 nn_256x4096x1024 nn_4096x4096x4096; do
+              d=$(grep "^RESULT gemm $case gflops" gemm_default.txt | awk '{printf "%.1f", $5}')
+              c=$(grep "^RESULT gemm $case gflops" gemm_calibrated.txt | awk '{printf "%.1f", $5}')
+              echo "| $case | $d GFLOPS | $c GFLOPS |"
+            done
+          } | tee calibrate_summary.md
+          cat calibrate_summary.md >> $GITHUB_STEP_SUMMARY
+
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibrate-results
+          path: |
+            calib.txt
+            gemm_default.txt
+            gemm_calibrated.txt
+            calibrate_summary.md
+
+  # ======================================================================
   # 1. PARITY — correctness before speed. if Axiom's ops diverge from TF,
   #    nothing else matters. this runs first and gates the whole suite.
   # ======================================================================
@@ -377,7 +443,7 @@ jobs:
   # ======================================================================
   overall:
     runs-on: ubuntu-latest
-    needs: [parity, gemm, ops, conv, mha, training, stress]
+    needs: [calibrate, parity, gemm, ops, conv, mha, training, stress]
     if: always()
     steps:
       - uses: actions/checkout@v4
@@ -393,7 +459,8 @@ jobs:
             echo "all suites below compare Axiom against TensorFlow (CPU, oneDNN)"
             echo "on the same machine, same shapes, same iteration counts."
             echo ""
-            for md in artifacts/*/gemm_summary.md artifacts/*/ops_summary.md \
+            for md in artifacts/*/calibrate_summary.md artifacts/*/gemm_summary.md \
+                      artifacts/*/ops_summary.md \
                       artifacts/*/conv_summary.md artifacts/*/mha_summary.md \
                       artifacts/*/training_summary.md artifacts/*/stress_summary.md; do
               [ -f "$md" ] || continue
