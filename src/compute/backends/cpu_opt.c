@@ -558,6 +558,7 @@ static double ax_tile_cal_now_ms(void) {
 /* forward decl — defined later in this file as a vtable entry */
 static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 static bool ensure_tl_pack_bufs(void);
+static inline void pack_b_cache_invalidate(void);
 
 void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
 #if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
@@ -606,12 +607,21 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
        configs before the sweep. if we let each iteration's first gemm
        allocate them lazily, a later iteration with larger MC/KC would
        overflow the earlier-sized buffer. forcing max allocation up-front
-       keeps every iteration safe. */
-    int64_t max_mc = 0, max_nc = 0, max_kc = 0;
+       keeps every iteration safe. the prewarm step at init may have
+       allocated tl buffers at the default MC/NC/KC; since our candidates
+       can be larger, free them in every thread first so they get
+       re-allocated at the max candidate size. */
+    int64_t max_mc = mc_orig, max_nc = nc_orig, max_kc = kc_orig;
     for (int i = 0; i < nc_configs; i++) {
         if (configs[i].mc > max_mc) max_mc = configs[i].mc;
         if (configs[i].nc > max_nc) max_nc = configs[i].nc;
         if (configs[i].kc > max_kc) max_kc = configs[i].kc;
+    }
+    #pragma omp parallel
+    {
+        if (tl_pack_a_buf) { ax_aligned_free(tl_pack_a_buf); tl_pack_a_buf = NULL; }
+        if (tl_pack_b_buf) { ax_aligned_free(tl_pack_b_buf); tl_pack_b_buf = NULL; }
+        pack_b_cache_invalidate();
     }
     GEMM_MC = max_mc; GEMM_NC = max_nc; GEMM_KC = max_kc;
     #pragma omp parallel
