@@ -653,48 +653,95 @@ static void layernorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *istd = (float *)inv_std_t->storage->data;
     float *gd = (float *)ln->gamma->storage->data;
 
-    /* dgamma = sum(grad_out * x_hat, axis=0) */
-    if (ln->gamma->requires_grad) {
-        if (!ln->gamma->grad)
-            ln->gamma->grad = ax_tensor_zeros(ln->gamma->shape, ln->gamma->ndim, ln->gamma->dtype);
-        if (!ln->gamma->grad) goto cleanup;
-        float *dg = (float *)ln->gamma->grad->storage->data;
-        for (int64_t f = 0; f < feat; f++)
-            for (int64_t b = 0; b < batch; b++)
-                dg[f] += go[b * feat + f] * xh[b * feat + f];
-    }
-    /* dbeta = sum(grad_out, axis=0) */
-    if (ln->beta->requires_grad) {
-        if (!ln->beta->grad)
-            ln->beta->grad = ax_tensor_zeros(ln->beta->shape, ln->beta->ndim, ln->beta->dtype);
-        if (!ln->beta->grad) goto cleanup;
-        float *db = (float *)ln->beta->grad->storage->data;
-        for (int64_t f = 0; f < feat; f++)
-            for (int64_t b = 0; b < batch; b++)
-                db[f] += go[b * feat + f];
+    int64_t fe = feat - (feat % AX_VF32_WIDTH);
+
+    /* dgamma = sum(grad_out * x_hat, axis=0), dbeta = sum(grad_out, axis=0).
+       rewrite with feat as the outer loop so the reduction accumulator
+       is 1d (no contention across threads) and the inner batch loop
+       can be simd across feat. actually simpler: walk row-major with
+       simd fmadd into per-thread [feat] accumulators, then reduce. */
+    bool need_dg = ln->gamma->requires_grad;
+    bool need_db = ln->beta->requires_grad;
+    if (need_dg && !ln->gamma->grad)
+        ln->gamma->grad = ax_tensor_zeros(ln->gamma->shape, ln->gamma->ndim, ln->gamma->dtype);
+    if (need_db && !ln->beta->grad)
+        ln->beta->grad = ax_tensor_zeros(ln->beta->shape, ln->beta->ndim, ln->beta->dtype);
+    if ((need_dg && !ln->gamma->grad) || (need_db && !ln->beta->grad)) goto cleanup;
+
+    if (need_dg || need_db) {
+        float *dg = need_dg ? (float *)ln->gamma->grad->storage->data : NULL;
+        float *db = need_db ? (float *)ln->beta->grad->storage->data : NULL;
+#ifdef _OPENMP
+        int64_t dgdb_work = batch * feat;
+        #pragma omp parallel for schedule(static) if (dgdb_work >= ax_par_threshold_elems)
+#endif
+        for (int64_t f = 0; f < feat; f++) {
+            float sum_g = 0, sum_gx = 0;
+            for (int64_t b = 0; b < batch; b++) {
+                float g = go[b * feat + f];
+                sum_g += g;
+                if (dg) sum_gx += g * xh[b * feat + f];
+            }
+            if (dg) dg[f] += sum_gx;
+            if (db) db[f] += sum_g;
+        }
     }
 
-    /* dx: same simplified formula as batchnorm but per-sample across features */
+    /* dx: per-sample, SIMD over feat. each sample is independent so
+       parallelize over batch with a reduction on nothing (each writes
+       disjoint rows). */
     if (input->requires_grad) {
         if (!input->grad)
             input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
         if (!input->grad) goto cleanup;
         float *ig = (float *)input->grad->storage->data;
         float D = (float)feat;
+        float inv_D = 1.0f / D;
 
+#ifdef _OPENMP
+        int64_t dx_work = batch * feat;
+        #pragma omp parallel for schedule(static) if (batch >= ax_par_threshold_batch && dx_work >= ax_par_threshold_elems)
+#endif
         for (int64_t b = 0; b < batch; b++) {
+            const float *gp = go + b * feat;
+            const float *xp = xh + b * feat;
             float is = istd[b];
-            float sum_go = 0, sum_go_xh = 0;
-            for (int64_t f = 0; f < feat; f++) {
-                float g = go[b * feat + f] * gd[f]; /* dx_hat component */
-                sum_go += g;
-                sum_go_xh += g * xh[b * feat + f];
+            /* pass 1: sum_go, sum_go_xh via simd fmadd. */
+            ax_vf32 v_sg = ax_vf32_zero();
+            ax_vf32 v_sgx = ax_vf32_zero();
+            int64_t f = 0;
+            for (; f < fe; f += AX_VF32_WIDTH) {
+                ax_vf32 g = ax_vf32_mul(ax_vf32_loadu(gp + f), ax_vf32_loadu(gd + f));
+                ax_vf32 x = ax_vf32_loadu(xp + f);
+                v_sg  = ax_vf32_add(v_sg, g);
+                v_sgx = ax_vf32_fmadd(g, x, v_sgx);
             }
-            for (int64_t f = 0; f < feat; f++) {
-                float dx_hat = go[b * feat + f] * gd[f];
-                float dx = (1.0f / D) * is *
-                    (D * dx_hat - sum_go - xh[b * feat + f] * sum_go_xh);
-                ig[b * feat + f] += dx;
+            float sum_g  = ax_vf32_hsum(v_sg);
+            float sum_gx = ax_vf32_hsum(v_sgx);
+            for (; f < feat; f++) {
+                float g = gp[f] * gd[f];
+                sum_g  += g;
+                sum_gx += g * xp[f];
+            }
+            /* pass 2: dx = inv_D * inv_std * (D*dx_hat - sum_go - x_hat*sum_go_xh) */
+            float *ip = ig + b * feat;
+            ax_vf32 v_coeff = ax_vf32_set1(inv_D * is);
+            ax_vf32 v_D     = ax_vf32_set1(D);
+            ax_vf32 v_sg_b  = ax_vf32_set1(sum_g);
+            ax_vf32 v_sgx_b = ax_vf32_set1(sum_gx);
+            f = 0;
+            for (; f < fe; f += AX_VF32_WIDTH) {
+                ax_vf32 dx_hat = ax_vf32_mul(ax_vf32_loadu(gp + f), ax_vf32_loadu(gd + f));
+                ax_vf32 x      = ax_vf32_loadu(xp + f);
+                ax_vf32 inner  = ax_vf32_sub(ax_vf32_sub(ax_vf32_mul(v_D, dx_hat), v_sg_b),
+                                             ax_vf32_mul(x, v_sgx_b));
+                ax_vf32 dx     = ax_vf32_mul(v_coeff, inner);
+                ax_vf32_storeu(ip + f, ax_vf32_add(ax_vf32_loadu(ip + f), dx));
+            }
+            for (; f < feat; f++) {
+                float dx_hat = gp[f] * gd[f];
+                float dx = inv_D * is * (D * dx_hat - sum_g - xp[f] * sum_gx);
+                ip[f] += dx;
             }
         }
     }
