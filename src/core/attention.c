@@ -376,12 +376,19 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     if (m->use_bias) {
         float *od = (float *)out_flat_view->storage->data;
         const float *bd = (const float *)m->bo->storage->data;
+        int64_t de = D - (D % AX_VF32_WIDTH);
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static) if (rows * D >= ax_par_threshold_elems)
 #endif
         for (int64_t r = 0; r < rows; r++) {
             float *row = od + r * D;
-            for (int64_t c = 0; c < D; c++) row[c] += bd[c];
+            int64_t c = 0;
+            for (; c < de; c += AX_VF32_WIDTH) {
+                ax_vf32 v = ax_vf32_loadu(row + c);
+                ax_vf32 b = ax_vf32_loadu(bd + c);
+                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
+            }
+            for (; c < D; c++) row[c] += bd[c];
         }
     }
     ax_storage_touch(out->storage);
