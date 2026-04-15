@@ -119,6 +119,34 @@ static void head_interleave_from_slot(const float *src, float *dst,
     }
 }
 
+/* fused variant: read one [rows, 3D] qkv buffer, split into three
+   [BH, S, dk] tensors in one parallel pass. replaces three back-to-back
+   head_interleave_from_slot calls, saving 2 omp fork/join barriers and
+   giving each thread better cache reuse since the same src row is read
+   for Qh, Kh, and Vh. */
+static void head_interleave_qkv_split(const float *src,
+                                       float *dstQ, float *dstK, float *dstV,
+                                       int64_t B, int64_t S, int64_t H, int64_t dk,
+                                       int64_t D)
+{
+    int64_t src_cols = 3 * D;
+    size_t dk_bytes = (size_t)dk * sizeof(float);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t h = 0; h < H; h++) {
+            for (int64_t s = 0; s < S; s++) {
+                const float *src_row = src + ((b * S) + s) * src_cols + h * dk;
+                int64_t dst_off = (((b * H) + h) * S + s) * dk;
+                memcpy(dstQ + dst_off, src_row,           dk_bytes);
+                memcpy(dstK + dst_off, src_row + D,       dk_bytes);
+                memcpy(dstV + dst_off, src_row + 2 * D,   dk_bytes);
+            }
+        }
+    }
+}
+
 /* rebuild Wqkv_cache [D, 3D] and bqkv_cache [3D] from Wq/Wk/Wv/bq/bk/bv
    if any of the source generations have changed since last call. */
 static void refresh_fused_qkv(ax_mha_t *m)
@@ -282,12 +310,11 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     ALLOC_SHAPE(Vh, head_sh, 3);
     if (!Qh || !Kh || !Vh) goto fail;
 
-    head_interleave_from_slot((const float *)qkv->storage->data,
-                              (float *)Qh->storage->data, B, S, H, dk, 3 * D, 0);
-    head_interleave_from_slot((const float *)qkv->storage->data,
-                              (float *)Kh->storage->data, B, S, H, dk, 3 * D, D);
-    head_interleave_from_slot((const float *)qkv->storage->data,
-                              (float *)Vh->storage->data, B, S, H, dk, 3 * D, 2 * D);
+    head_interleave_qkv_split((const float *)qkv->storage->data,
+                               (float *)Qh->storage->data,
+                               (float *)Kh->storage->data,
+                               (float *)Vh->storage->data,
+                               B, S, H, dk, D);
 
     /* qkv no longer needed (non-recorded path); arena reclaims it otherwise */
     if (!record) ax_tensor_destroy(qkv);
