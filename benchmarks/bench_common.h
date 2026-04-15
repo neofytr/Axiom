@@ -22,8 +22,10 @@ static inline double bench_now_s(void) {
 
 static inline double bench_now_ms(void) { return bench_now_s() * 1000.0; }
 
-#define BENCH_EMIT(suite, case_, metric, value) \
-    printf("RESULT %s %s %s %.6f\n", (suite), (case_), (metric), (double)(value))
+#define BENCH_EMIT(suite, case_, metric, value) do { \
+    printf("RESULT %s %s %s %.6f\n", (suite), (case_), (metric), (double)(value)); \
+    fflush(stdout); \
+} while (0)
 
 #define BENCH_EMIT_FLOPS(suite, case_, lat_ms, total_flops) do { \
     double _lat = (lat_ms); \
