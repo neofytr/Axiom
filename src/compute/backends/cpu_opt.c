@@ -103,6 +103,19 @@ AX_TLS float *tl_sdpa_row_sum = NULL; AX_TLS int64_t tl_sdpa_row_sum_S = 0;
 AX_TLS float *tl_sdpa_kt_packed = NULL; AX_TLS int64_t tl_sdpa_kt_bytes = 0;
 AX_TLS float *tl_sdpa_v_packed  = NULL; AX_TLS int64_t tl_sdpa_v_bytes = 0;
 
+/* sdpa backward scratch. attn_bwd_head has 8 aligned_alloc per head
+   call; at BH=64 a single sdpa_bwd hit malloc ~128 times. move all
+   eight to tls with grow-on-demand. */
+AX_TLS float *tl_bwd_kt_packed  = NULL; AX_TLS int64_t tl_bwd_kt_bytes  = 0;
+AX_TLS float *tl_bwd_vt_packed  = NULL; AX_TLS int64_t tl_bwd_vt_bytes  = 0;
+AX_TLS float *tl_bwd_k_packed   = NULL; AX_TLS int64_t tl_bwd_k_bytes   = 0;
+AX_TLS float *tl_bwd_p_tile     = NULL; AX_TLS int64_t tl_bwd_p_bytes   = 0;
+AX_TLS float *tl_bwd_dp_tile    = NULL; AX_TLS int64_t tl_bwd_dp_bytes  = 0;
+AX_TLS float *tl_bwd_ds_tile    = NULL; AX_TLS int64_t tl_bwd_ds_bytes  = 0;
+AX_TLS float *tl_bwd_pa         = NULL; AX_TLS int64_t tl_bwd_pa_bytes  = 0;
+AX_TLS float *tl_bwd_pb         = NULL; AX_TLS int64_t tl_bwd_pb_bytes  = 0;
+AX_TLS float *tl_bwd_di         = NULL; AX_TLS int64_t tl_bwd_di_bytes  = 0;
+
 static inline float *ax_tls_grow(float **p, int64_t *cap_bytes, int64_t want_bytes) {
     if (*p && *cap_bytes >= want_bytes) return *p;
     if (*p) { ax_aligned_free(*p); *p = NULL; *cap_bytes = 0; }
@@ -3104,30 +3117,35 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
     int64_t Bq_p_max = ((ATTN_BQ + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
     int64_t Bk_p_max = ((ATTN_BK + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
-    /* packed panels per kj block: Kt (scaled), V^T, K */
-    float *Kt_packed = (float *)aligned_alloc(64, (size_t)(dk * Bk_np_max) * sizeof(float));
-    float *Vt_packed = (float *)aligned_alloc(64, (size_t)(dk * Bk_np_max) * sizeof(float));
-    float *K_packed  = (float *)aligned_alloc(64, (size_t)(ATTN_BK * dk_np) * sizeof(float));
-
-    /* per-qi-tile buffers for score/P/dP/dS (one tile worth) */
+    /* packed panels + per-tile scratch — all TLS so we don't malloc 8
+       times per head invocation (BH=64 → 128 mallocs per sdpa_bwd call
+       without this). each grow-on-demand based on this call's shape. */
+    int64_t kt_want  = (int64_t)(dk * Bk_np_max) * (int64_t)sizeof(float);
+    int64_t vt_want  = (int64_t)(dk * Bk_np_max) * (int64_t)sizeof(float);
+    int64_t k_want   = (int64_t)(ATTN_BK * dk_np) * (int64_t)sizeof(float);
     int64_t tile_scores_sz = ATTN_BQ * ATTN_BK;
-    float *P_tile  = (float *)aligned_alloc(64, (size_t)tile_scores_sz * sizeof(float));
-    float *dP_tile = (float *)aligned_alloc(64, (size_t)tile_scores_sz * sizeof(float));
-    float *dS_tile = (float *)aligned_alloc(64, (size_t)tile_scores_sz * sizeof(float));
-
-    /* pack scratch for the full-tile GEMMs (dV accumulation etc.) */
+    int64_t p_want   = (int64_t)tile_scores_sz * (int64_t)sizeof(float);
     int64_t pa_sz = Bq_p_max * ATTN_MAX_DK;
     if (Bk_p_max * ATTN_BQ > pa_sz) pa_sz = Bk_p_max * ATTN_BQ;
     if (Bq_p_max * ATTN_BK > pa_sz) pa_sz = Bq_p_max * ATTN_BK;
-    float *pa = (float *)aligned_alloc(64, (size_t)pa_sz * sizeof(float));
-    float *pb = (float *)aligned_alloc(64, (size_t)(ATTN_BQ * dk_np) * sizeof(float));
+    int64_t pa_want  = pa_sz * (int64_t)sizeof(float);
+    int64_t pb_want  = (int64_t)(ATTN_BQ * dk_np) * (int64_t)sizeof(float);
+
+    float *Kt_packed = ax_tls_grow(&tl_bwd_kt_packed, &tl_bwd_kt_bytes, kt_want);
+    float *Vt_packed = ax_tls_grow(&tl_bwd_vt_packed, &tl_bwd_vt_bytes, vt_want);
+    float *K_packed  = ax_tls_grow(&tl_bwd_k_packed,  &tl_bwd_k_bytes,  k_want);
+    float *P_tile    = ax_tls_grow(&tl_bwd_p_tile,    &tl_bwd_p_bytes,  p_want);
+    float *dP_tile   = ax_tls_grow(&tl_bwd_dp_tile,   &tl_bwd_dp_bytes, p_want);
+    float *dS_tile   = ax_tls_grow(&tl_bwd_ds_tile,   &tl_bwd_ds_bytes, p_want);
+    float *pa        = ax_tls_grow(&tl_bwd_pa,        &tl_bwd_pa_bytes, pa_want);
+    float *pb        = ax_tls_grow(&tl_bwd_pb,        &tl_bwd_pb_bytes, pb_want);
 
     /* MR-strip score scratch for the forward-recompute pass */
     float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
     float a_q[GEMM_MR * ATTN_MAX_DK] __attribute__((aligned(64)));
 
     if (!Kt_packed || !Vt_packed || !K_packed || !P_tile || !dP_tile ||
-        !dS_tile || !pa || !pb) { goto cleanup; }
+        !dS_tile || !pa || !pb) { return; }
 
     for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
         int64_t Bk = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
@@ -3258,10 +3276,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
         }
     }
 
-cleanup:
-    free(Kt_packed); free(Vt_packed); free(K_packed);
-    free(P_tile); free(dP_tile); free(dS_tile);
-    free(pa); free(pb);
+    /* all packs are TLS; nothing to free */
 }
 
 void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
@@ -3282,7 +3297,9 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
     #pragma omp parallel
 #endif
     {
-        float *Di = (float *)malloc((size_t)S * sizeof(float));
+        /* Di is TLS + grow-on-demand; lives for thread lifetime. */
+        float *Di = ax_tls_grow(&tl_bwd_di, &tl_bwd_di_bytes,
+                                (int64_t)S * (int64_t)sizeof(float));
         if (!Di) goto done;
 
 #ifdef _OPENMP
@@ -3313,7 +3330,6 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
                            dQ + h * head_sz, dK + h * head_sz, dV + h * head_sz,
                            S, dk, scale, causal);
         }
-        free(Di);
     done:;
     }
 }

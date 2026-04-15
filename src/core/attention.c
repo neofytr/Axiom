@@ -97,6 +97,33 @@ static void head_deinterleave_slot(const float *src, float *dst,
     }
 }
 
+/* fused variant: merge dQh/dKh/dVh into one [rows, 3D] buffer in a
+   single parallel pass. replaces three back-to-back head_deinterleave_slot
+   calls, cutting fork/join overhead to 1/3 and giving each thread
+   sequential writes into the destination row (better store coalescing). */
+static void head_deinterleave_qkv_merge(const float *srcQ, const float *srcK, const float *srcV,
+                                          float *dst,
+                                          int64_t B, int64_t S, int64_t H, int64_t dk,
+                                          int64_t D)
+{
+    int64_t dst_cols = 3 * D;
+    size_t dk_bytes = (size_t)dk * sizeof(float);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t s = 0; s < S; s++) {
+            for (int64_t h = 0; h < H; h++) {
+                int64_t src_off = (((b * H) + h) * S + s) * dk;
+                int64_t dst_base = ((b * S) + s) * dst_cols + h * dk;
+                memcpy(dst + dst_base,         srcQ + src_off, dk_bytes);
+                memcpy(dst + dst_base + D,     srcK + src_off, dk_bytes);
+                memcpy(dst + dst_base + 2*D,   srcV + src_off, dk_bytes);
+            }
+        }
+    }
+}
+
 /* head-interleave FROM a specific column slot of a wider [rows, src_cols]
    buffer. fuses the extract+interleave steps so the QKV fused-projection
    output can feed SDPA in a single pass instead of going through the
@@ -578,12 +605,11 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t qkv_sh[] = {rows, 3 * D};
     ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
     if (!dQKV) return;
-    head_deinterleave_slot((const float *)dQh->storage->data,
-                           (float *)dQKV->storage->data, B, S, H, dk, 3 * D, 0);
-    head_deinterleave_slot((const float *)dKh->storage->data,
-                           (float *)dQKV->storage->data, B, S, H, dk, 3 * D, D);
-    head_deinterleave_slot((const float *)dVh->storage->data,
-                           (float *)dQKV->storage->data, B, S, H, dk, 3 * D, 2 * D);
+    head_deinterleave_qkv_merge((const float *)dQh->storage->data,
+                                 (const float *)dKh->storage->data,
+                                 (const float *)dVh->storage->data,
+                                 (float *)dQKV->storage->data,
+                                 B, S, H, dk, D);
 
     /* ================================================================
        step 4 — FUSED weight grad: dWqkv = x_flat^T @ dQKV → [D, 3D].
