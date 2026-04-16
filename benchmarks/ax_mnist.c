@@ -115,6 +115,7 @@ static float eval_accuracy(ax_layer_t *model, ax_tensor_t *images, const uint8_t
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     ax_init();
     ax_set_seed(42);
 

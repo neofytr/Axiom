@@ -349,6 +349,7 @@ static void run_infer(void) {
 }
 
 int main(int argc, char **argv) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     ax_init();
     const char *mode = argc > 1 ? argv[1] : "train";
     if (strcmp(mode, "train") == 0) run_train();

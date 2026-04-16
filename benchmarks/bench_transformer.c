@@ -55,6 +55,7 @@ static ax_layer_t *build_model(void)
 
 int main(void)
 {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     ax_init();
     ax_set_seed(42);
 

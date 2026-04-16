@@ -37,7 +37,7 @@ static void bench_conv(int N, int C_in, int H, int W, int C_out, int K, int stri
     ax_enable_grad();
 
     char cs[96];
-    snprintf(cs, sizeof(cs), "conv_%dx%dx%dx%d_%dx%d_k%d_s%d", N, C_in, H, W, C_out, K, stride, stride);
+    snprintf(cs, sizeof(cs), "conv_%dx%dx%dx%d_%dx%d_k%d_s%d", N, C_in, H, W, C_out, K, K, stride);
     BENCH_EMIT_FLOPS("conv", cs, lat, conv_flops(N, C_in, C_out, H_out, W_out, K));
 
     ax_tensor_destroy(x); ax_layer_destroy(conv);
@@ -73,7 +73,7 @@ static void bench_conv_bn_relu(int N, int C_in, int H, int W, int C_out, int K, 
     ax_enable_grad();
 
     char cs[96];
-    snprintf(cs, sizeof(cs), "cbr_%dx%dx%dx%d_%dx%d_k%d_s%d", N, C_in, H, W, C_out, K, stride, stride);
+    snprintf(cs, sizeof(cs), "cbr_%dx%dx%dx%d_%dx%d_k%d_s%d", N, C_in, H, W, C_out, K, K, stride);
     BENCH_EMIT_FLOPS("conv", cs, lat, conv_flops(N, C_in, C_out, H_out, W_out, K));
 
     ax_tensor_destroy(x); ax_layer_destroy(cbr);

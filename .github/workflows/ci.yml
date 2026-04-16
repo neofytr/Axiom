@@ -68,6 +68,64 @@ jobs:
       - name: verify NEON micro-kernel
         run: cd build && ./test_compute 2>&1 | head -5
 
+      - name: per-op micro-benchmarks (NEON baseline)
+        run: |
+          cd build
+          ./bench_gemm_suite 2>&1 | head -40
+          ./bench_ops_suite  2>&1 | head -40
+
+  # scalar-only build: no SIMD, no OpenMP — ensures scalar fallback paths compile
+  # and all tests pass without vector extensions. catches regressions where a
+  # new code path accidentally requires AVX/NEON without a scalar fallback.
+  test-scalar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build scalar-only (no AVX, no OMP)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DAX_OPENMP=OFF \
+                -DCMAKE_C_FLAGS="-mno-avx2 -mno-avx -mno-fma -mno-sse4.1 -mno-sse4.2 -mno-avx512f" \
+                ..
+          cmake --build . -j$(nproc)
+
+      - name: run test suite (scalar paths)
+        run: cd build && ctest -j$(nproc) --output-on-failure
+
+      - name: per-op micro-benchmarks (scalar baseline)
+        run: |
+          cd build
+          ./bench_gemm_suite 2>&1 | head -40
+          ./bench_ops_suite  2>&1 | head -40
+
+  # embedded/baremetal build: AX_SINGLE_THREADED + AX_NO_STDIO — ensures the
+  # library builds cleanly for targets with no OS threads and no stdio.
+  # only compiles; does not run (no execution environment to run on).
+  test-embedded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build embedded profile (single-threaded, no stdio)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DAX_OPENMP=OFF \
+                -DAX_SINGLE_THREADED=ON \
+                -DAX_NO_STDIO=ON \
+                -DAX_NO_AUTOTUNE=ON \
+                ..
+          cmake --build . -j$(nproc) --target axiom
+
+      - name: check for stdio leaks in library object
+        run: |
+          # verify no printf/fprintf/fopen symbol references snuck into the lib
+          nm build/libaxiom.a 2>/dev/null | grep -E ' U (printf|fprintf|fopen|fwrite)' \
+            && echo "FAIL: stdio symbols found" && exit 1 \
+            || echo "ok: no stdio symbols in embedded build"
+
   # static analysis / lint
   lint:
     runs-on: ubuntu-latest
