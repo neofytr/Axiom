@@ -2398,7 +2398,11 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     pack_b_cache_invalidate();
 
     /* small-path: straight vectorized inner loop. b[j, p] is accessed
-       column-wise by j for each p — strided. scalar fallback is simplest. */
+       column-wise by j for each p — strided. scalar fallback is simplest.
+       honor skip_init by accumulating: pre-zero (or skip pre-zero), then
+       always += into oi[j]. without this, callers using skip_init=true to
+       accumulate across multiple gemm_nt invocations get only the LAST
+       call's output instead of the sum. */
     if (m * n * k < 100000) {
         if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
         for (int64_t i = 0; i < m; i++) {
@@ -2413,7 +2417,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
                     acc = ax_vf32_fmadd(ax_vf32_loadu(ai + p), ax_vf32_loadu(bj + p), acc);
                 float s = ax_vf32_hsum(acc);
                 for (; p < k; p++) s += ai[p] * bj[p];
-                oi[j] = s;
+                oi[j] += s;
             }
         }
         return AX_OK;
@@ -2566,6 +2570,10 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     pack_b_cache_invalidate();
 
     if (m * n * k < 100000) {
+        /* honor skip_init: pre-zero only when not accumulating; then ALWAYS
+           accumulate into oi (no p==0 overwrite branch). otherwise callers
+           that use skip_init=true to add multiple gemm_tn results into one
+           buffer get only the LAST call's output. */
         if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
         /* scalar-simd inner: out[i,j] = sum_p a[p,i] * b[p,j].
            iterate p outer, (i,j) inner to keep b[p,:] contiguous. */
@@ -2578,16 +2586,9 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
                 ax_vf32 va = ax_vf32_set1(ai);
                 int64_t j = 0;
                 int64_t vec_end = n - (n % AX_VF32_WIDTH);
-                if (p == 0) {
-                    /* first pass: initialize oi to ai * bp */
-                    for (; j < vec_end; j += AX_VF32_WIDTH)
-                        ax_vf32_storeu(oi + j, ax_vf32_mul(va, ax_vf32_loadu(bp + j)));
-                    for (; j < n; j++) oi[j] = ai * bp[j];
-                } else {
-                    for (; j < vec_end; j += AX_VF32_WIDTH)
-                        ax_vf32_storeu(oi + j, ax_vf32_fmadd(va, ax_vf32_loadu(bp + j), ax_vf32_loadu(oi + j)));
-                    for (; j < n; j++) oi[j] += ai * bp[j];
-                }
+                for (; j < vec_end; j += AX_VF32_WIDTH)
+                    ax_vf32_storeu(oi + j, ax_vf32_fmadd(va, ax_vf32_loadu(bp + j), ax_vf32_loadu(oi + j)));
+                for (; j < n; j++) oi[j] += ai * bp[j];
             }
         }
         return AX_OK;
