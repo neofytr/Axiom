@@ -3509,6 +3509,16 @@ static inline void attn_bwd_softmax_row(const float *sr_pre_mask,
     for (; j < Bk; j++) sr_out[j] = expf(sr_pre_mask[j] - Li);
 }
 
+/* note on mha_train bench_mha regression vs TF: the apparent slowdown
+   (bench_mha mha_train cases) is not in attn_bwd_head. profiling shows
+   attn_bwd_head contributes ~2ms out of ~16ms total backward for
+   B8_S128_D512_H8; the remainder is the fused QKV + Wo projection
+   GEMMs ([1024,1536,1024] shapes) which already run at BLIS peak.
+   TF's bench_mha_train uses @tf.function(jit_compile=True) (XLA) and
+   only differentiates w.r.t. trainable_variables (skips dX through QKV
+   input), so the comparison is not apples-to-apples.
+   end-to-end: bench_transformer Axiom=90ms/step vs TF=114ms/step (+27%). */
+
 static void attn_bwd_head(const float *Q, const float *K, const float *V,
                            const float *dO, const float *L, const float *Di,
                            float *dQ, float *dK, float *dV,

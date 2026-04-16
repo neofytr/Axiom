@@ -375,8 +375,9 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     int64_t bh = B * H;
     int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
     bool save_enabled = (record && p_save_bytes <= (int64_t)8 * 1024 * 1024);
-    /* heuristic: skip when both S and dk are small — the recompute GEMM is
-       so cheap that the save-write overhead in forward eats the gains. */
+    /* heuristic: skip when both S and dk are small — with the BLIS path
+       the recompute GEMM is cheap enough that the save-write overhead
+       in forward eats the gains. */
     if (save_enabled && S <= 128 && dk <= 64) save_enabled = false;
     const char *env = getenv("AX_MHA_SAVE_P");
     if (env) save_enabled = (env[0] == '1');
