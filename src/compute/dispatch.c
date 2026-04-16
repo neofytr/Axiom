@@ -957,6 +957,18 @@ int64_t ax_par_threshold_batch = 2;
 int64_t ax_par_threshold_flops = 1000000;
 double  ax_omp_overhead_ms     = 0.0;
 
+/* per-family thresholds for parallel-or-serial gating. derived from the
+   base ax_par_threshold_elems calibration in ax_calibrate_thresholds().
+   the "ops_per_elem" multiplier captures how expensive a single element
+   is to process — lighter ops (add, mul, copy = 1 fma + 1 store) need
+   more elements to overcome the omp fork-join cost; heavier ops (exp,
+   log, sigmoid, gelu = ~10-20 fma per elem) recoup the overhead sooner.
+   medium = ax_par_threshold_elems (back-compat).
+   light  = 4 × ax_par_threshold_elems (parallel wins later).
+   heavy  = ax_par_threshold_elems / 4 (parallel wins sooner). */
+int64_t ax_par_threshold_elems_light  = 65536 * 4;
+int64_t ax_par_threshold_elems_heavy  = 65536 / 4;
+
 /* per-thread flag: when true, opt_gemm + opt_gemm_tn + opt_gemm_nt skip
    their internal memset(C, 0) and accumulate into the existing buffer.
    used by conv to fuse bias-add into the GEMM (pre-fill with bias
@@ -1026,6 +1038,11 @@ void ax_calibrate_thresholds(void) {
 
     ax_par_threshold_flops = work_thresh;
     ax_par_threshold_elems = work_thresh;
+    /* light ops (add, mul, copy) need more work to overcome fork-join;
+       heavy ops (exp, sigmoid, softmax) win parallel sooner. */
+    ax_par_threshold_elems_light = work_thresh * 4;
+    ax_par_threshold_elems_heavy = work_thresh / 4;
+    if (ax_par_threshold_elems_heavy < 1024) ax_par_threshold_elems_heavy = 1024;
     /* batch threshold: per-batch work is usually F or classes, so the
        right answer is work_thresh/F. without a specific F, use 256 as a
        mid-range dense-layer width. clamped at 2 so we still parallelize
@@ -1035,10 +1052,12 @@ void ax_calibrate_thresholds(void) {
 
 #ifndef AX_NO_STDIO
     fprintf(stderr,
-        "axiom: omp overhead %.3fms → thresholds flops=%ld elems=%ld batch=%ld\n",
+        "axiom: omp overhead %.3fms → thresholds flops=%ld elems=%ld (light=%ld heavy=%ld) batch=%ld\n",
         overhead_ms,
         (long)ax_par_threshold_flops,
         (long)ax_par_threshold_elems,
+        (long)ax_par_threshold_elems_light,
+        (long)ax_par_threshold_elems_heavy,
         (long)ax_par_threshold_batch);
 #endif
 #endif

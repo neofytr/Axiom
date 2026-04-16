@@ -1881,6 +1881,8 @@ static inline float simd_row_sum(const float *d, int64_t n)
    set at init time via ax_par_threshold_elems. below that threshold
    the serial simd_row_sum wins. */
 extern int64_t ax_par_threshold_elems;
+extern int64_t ax_par_threshold_elems_light;  /* 4× elems — for cheap-per-elem kernels */
+extern int64_t ax_par_threshold_elems_heavy;  /* elems/4  — for expensive-per-elem kernels */
 static inline float simd_row_sum_par(const float *d, int64_t n)
 {
 #ifdef _OPENMP
@@ -2799,10 +2801,11 @@ static ax_status_t opt_softmax_rowwise(const ax_tensor_t *in, ax_tensor_t *out)
     const float *id = raw_f32(in);
     float *od = raw_f32(out);
 
-    /* parallel over rows — each row is an independent softmax. threshold
-       avoids omp fork-join overhead for tiny batches. */
+    /* parallel over rows — each row is an independent softmax. softmax is
+       a heavy per-elem op (max + exp + sum + div = ~4 cycles per fma+exp);
+       use the calibrated heavy threshold so parallel kicks in earlier. */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if(rows * cols > ax_par_threshold() / 2)
+    #pragma omp parallel for schedule(static) if(rows * cols > ax_par_threshold_elems_heavy)
     #endif
     for (int64_t r = 0; r < rows; r++) {
         const float *irow = id + r * cols;
