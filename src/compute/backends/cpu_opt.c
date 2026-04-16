@@ -153,6 +153,18 @@ AX_TLS int64_t tl_pack_b_cache_ncp = 0;
 /* reference backend for fallback */
 extern const ax_backend_ops_t ax_cpu_naive_ops;
 
+/* TLS flag — declared in dispatch.c so the suffixed cpu_opt.c variants
+   share one slot. when true, opt_gemm and the transposed variants skip
+   their internal memset of C and accumulate into the existing buffer.
+   used by conv to fuse bias-add into the GEMM (pre-fill C with bias
+   broadcast, then GEMM accumulates: C = bias + A @ B in one pass). */
+#ifdef AX_SINGLE_THREADED
+extern bool ax_gemm_skip_init;
+#else
+extern _Thread_local bool ax_gemm_skip_init;
+#endif
+#define tl_gemm_skip_init ax_gemm_skip_init
+
 /* validation helpers */
 
 static inline int64_t fast_numel(const ax_tensor_t *t) {
@@ -1422,7 +1434,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         const float *ad = a_raw;
         const float *bd = b_raw;
         float *od = o_raw;
-        memset(od, 0, (size_t)(m * n) * sizeof(float));
+        if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
         int64_t vec_end = n - (n % AX_VF32_WIDTH);
         for (int64_t i = 0; i < m; i++) {
             float *oi = od + i * n;
@@ -1493,7 +1505,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     const float *ad = a_raw;
     const float *bd = b_raw;
     float *od = o_raw;
-    memset(od, 0, (size_t)(m * n) * sizeof(float));
+    if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 
     if (use_jc_par) {
         /* JC parallel: each thread owns a column strip of C and its own pack buffers.
@@ -2279,7 +2291,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     /* small-path: straight vectorized inner loop. b[j, p] is accessed
        column-wise by j for each p — strided. scalar fallback is simplest. */
     if (m * n * k < 100000) {
-        memset(od, 0, (size_t)(m * n) * sizeof(float));
+        if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
         for (int64_t i = 0; i < m; i++) {
             const float *ai = ad + i * k;
             float *oi = od + i * n;
@@ -2299,7 +2311,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
 
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
-    memset(od, 0, (size_t)(m * n) * sizeof(float));
+    if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
@@ -2445,7 +2457,7 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     pack_b_cache_invalidate();
 
     if (m * n * k < 100000) {
-        memset(od, 0, (size_t)(m * n) * sizeof(float));
+        if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
         /* scalar-simd inner: out[i,j] = sum_p a[p,i] * b[p,j].
            iterate p outer, (i,j) inner to keep b[p,:] contiguous. */
         for (int64_t p = 0; p < k; p++) {
@@ -2473,7 +2485,7 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
 
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
-    memset(od, 0, (size_t)(m * n) * sizeof(float));
+    if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);

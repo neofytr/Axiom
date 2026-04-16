@@ -957,6 +957,21 @@ int64_t ax_par_threshold_batch = 2;
 int64_t ax_par_threshold_flops = 1000000;
 double  ax_omp_overhead_ms     = 0.0;
 
+/* per-thread flag: when true, opt_gemm + opt_gemm_tn + opt_gemm_nt skip
+   their internal memset(C, 0) and accumulate into the existing buffer.
+   used by conv to fuse bias-add into the GEMM (pre-fill with bias
+   broadcast, then GEMM accumulates: C = bias + A @ B in one pass). lives
+   here so the suffixed cpu_opt.c variants share one TLS slot.
+   API: ax_gemm_set_skip_init(true), ..., ax_gemm_set_skip_init(false). */
+#ifdef AX_SINGLE_THREADED
+bool ax_gemm_skip_init = false;
+#else
+_Thread_local bool ax_gemm_skip_init = false;
+#endif
+
+void ax_gemm_set_skip_init(bool v) { ax_gemm_skip_init = v; }
+bool ax_gemm_get_skip_init(void)   { return ax_gemm_skip_init; }
+
 #ifdef _OPENMP
 /* measured mean overhead of entering and leaving an omp parallel region
    that does trivial work. uses a volatile sink so the compiler cannot
