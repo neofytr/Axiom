@@ -453,6 +453,99 @@ static void test_mha_causal_masking(void)
     ax_layer_destroy(mha);
 }
 
+/* ================================================================
+   test: save-aware bwd matches recompute bwd numerically.
+   Phase 1.3 added ax_fused_attention_fwd_save / _bwd_use that skips the
+   QK^T recompute in backward. this verifies the two paths produce
+   identical dQ/dK/dV (within float32 round-off).
+   ================================================================ */
+static void test_sdpa_save_path_parity(void)
+{
+    const int64_t BH = 4;
+    const int64_t S = 16;
+    const int64_t dk = 8;
+    int64_t elems = BH * S * dk;
+    float scale = 1.0f / sqrtf((float)dk);
+
+    float *Q  = (float *)malloc(elems * sizeof(float));
+    float *K  = (float *)malloc(elems * sizeof(float));
+    float *V  = (float *)malloc(elems * sizeof(float));
+    float *dO = (float *)malloc(elems * sizeof(float));
+    for (int64_t i = 0; i < elems; i++) {
+        Q[i]  = 0.1f * ((float)rand() / RAND_MAX - 0.5f);
+        K[i]  = 0.1f * ((float)rand() / RAND_MAX - 0.5f);
+        V[i]  = 0.1f * ((float)rand() / RAND_MAX - 0.5f);
+        dO[i] = ((float)rand() / RAND_MAX - 0.5f);
+    }
+
+    /* path A: recompute */
+    float *O_a  = (float *)calloc(elems, sizeof(float));
+    float *L_a  = (float *)calloc(BH * S, sizeof(float));
+    float *dQ_a = (float *)calloc(elems, sizeof(float));
+    float *dK_a = (float *)calloc(elems, sizeof(float));
+    float *dV_a = (float *)calloc(elems, sizeof(float));
+    ax_fused_attention_fwd(Q, K, V, O_a, L_a, BH, S, dk, scale);
+    ax_fused_attention_bwd(Q, K, V, O_a, dO, L_a, dQ_a, dK_a, dV_a, BH, S, dk, scale);
+
+    /* path B: save P then bwd_use */
+    float *O_b  = (float *)calloc(elems, sizeof(float));
+    float *L_b  = (float *)calloc(BH * S, sizeof(float));
+    float *Psave = (float *)calloc(BH * S * S, sizeof(float));
+    float *dQ_b = (float *)calloc(elems, sizeof(float));
+    float *dK_b = (float *)calloc(elems, sizeof(float));
+    float *dV_b = (float *)calloc(elems, sizeof(float));
+    ax_fused_attention_fwd_save(Q, K, V, O_b, L_b, Psave, BH, S, dk, scale, false);
+    ax_fused_attention_bwd_use(Q, K, V, O_b, dO, L_b, Psave,
+                                dQ_b, dK_b, dV_b, BH, S, dk, scale, false);
+
+    /* outputs must match (forward is the same algorithm, just with P_save
+       sidechannel) */
+    float maxO = 0;
+    for (int64_t i = 0; i < elems; i++) {
+        float e = fabsf(O_a[i] - O_b[i]);
+        if (e > maxO) maxO = e;
+    }
+    AX_TEST_ASSERT(maxO < 1e-5f, "fwd_save output matches plain fwd");
+
+    /* gradients must match (backward uses different code paths) */
+    float maxQ = 0, maxK = 0, maxV = 0;
+    for (int64_t i = 0; i < elems; i++) {
+        float eq = fabsf(dQ_a[i] - dQ_b[i]); if (eq > maxQ) maxQ = eq;
+        float ek = fabsf(dK_a[i] - dK_b[i]); if (ek > maxK) maxK = ek;
+        float ev = fabsf(dV_a[i] - dV_b[i]); if (ev > maxV) maxV = ev;
+    }
+    AX_TEST_ASSERT(maxQ < 1e-4f, "dQ matches across paths");
+    AX_TEST_ASSERT(maxK < 1e-4f, "dK matches across paths");
+    AX_TEST_ASSERT(maxV < 1e-4f, "dV matches across paths");
+
+    /* same for causal */
+    for (int64_t i = 0; i < elems; i++) {
+        dQ_a[i] = dK_a[i] = dV_a[i] = 0;
+        dQ_b[i] = dK_b[i] = dV_b[i] = 0;
+        O_a[i] = O_b[i] = 0;
+    }
+    for (int64_t i = 0; i < BH * S; i++) L_a[i] = L_b[i] = 0;
+    memset(Psave, 0, BH * S * S * sizeof(float));
+    ax_fused_attention_fwd_causal(Q, K, V, O_a, L_a, BH, S, dk, scale);
+    ax_fused_attention_bwd_causal(Q, K, V, O_a, dO, L_a, dQ_a, dK_a, dV_a, BH, S, dk, scale);
+    ax_fused_attention_fwd_save(Q, K, V, O_b, L_b, Psave, BH, S, dk, scale, true);
+    ax_fused_attention_bwd_use(Q, K, V, O_b, dO, L_b, Psave,
+                                dQ_b, dK_b, dV_b, BH, S, dk, scale, true);
+    maxO = maxQ = maxK = maxV = 0;
+    for (int64_t i = 0; i < elems; i++) {
+        float eo = fabsf(O_a[i] - O_b[i]); if (eo > maxO) maxO = eo;
+        float eq = fabsf(dQ_a[i] - dQ_b[i]); if (eq > maxQ) maxQ = eq;
+        float ek = fabsf(dK_a[i] - dK_b[i]); if (ek > maxK) maxK = ek;
+        float ev = fabsf(dV_a[i] - dV_b[i]); if (ev > maxV) maxV = ev;
+    }
+    AX_TEST_ASSERT(maxO < 1e-5f && maxQ < 1e-4f && maxK < 1e-4f && maxV < 1e-4f,
+                   "causal save path matches recompute path");
+
+    free(Q); free(K); free(V); free(dO);
+    free(O_a); free(L_a); free(dQ_a); free(dK_a); free(dV_a);
+    free(O_b); free(L_b); free(Psave); free(dQ_b); free(dK_b); free(dV_b);
+}
+
 int main(void)
 {
     ax_init();
@@ -467,6 +560,7 @@ int main(void)
     AX_RUN_TEST(test_rope_isometry);
     AX_RUN_TEST(test_mha_backward_smoke);
     AX_RUN_TEST(test_mha_causal_masking);
+    AX_RUN_TEST(test_sdpa_save_path_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();

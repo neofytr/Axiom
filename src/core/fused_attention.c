@@ -24,28 +24,31 @@
 extern void ax_cpu_sdpa_fwd_avx512(const float *, const float *, const float *,
                                     float *, float *,
                                     int64_t, int64_t, int64_t, float,
-                                    bool, const int8_t *);
+                                    bool, const int8_t *, float *);
 extern void ax_cpu_sdpa_fwd_avx2  (const float *, const float *, const float *,
                                     float *, float *,
                                     int64_t, int64_t, int64_t, float,
-                                    bool, const int8_t *);
+                                    bool, const int8_t *, float *);
 extern void ax_cpu_sdpa_fwd_scalar(const float *, const float *, const float *,
                                     float *, float *,
                                     int64_t, int64_t, int64_t, float,
-                                    bool, const int8_t *);
+                                    bool, const int8_t *, float *);
 
 extern void ax_cpu_sdpa_bwd_avx512(const float *, const float *, const float *,
                                     const float *, const float *, const float *,
                                     float *, float *, float *,
-                                    int64_t, int64_t, int64_t, float, bool);
+                                    int64_t, int64_t, int64_t, float, bool,
+                                    const float *);
 extern void ax_cpu_sdpa_bwd_avx2  (const float *, const float *, const float *,
                                     const float *, const float *, const float *,
                                     float *, float *, float *,
-                                    int64_t, int64_t, int64_t, float, bool);
+                                    int64_t, int64_t, int64_t, float, bool,
+                                    const float *);
 extern void ax_cpu_sdpa_bwd_scalar(const float *, const float *, const float *,
                                     const float *, const float *, const float *,
                                     float *, float *, float *,
-                                    int64_t, int64_t, int64_t, float, bool);
+                                    int64_t, int64_t, int64_t, float, bool,
+                                    const float *);
 
 extern void ax_cpu_rope_apply_avx512(float *, float *, const int64_t *,
                                       int64_t, int64_t, int64_t, float);
@@ -69,11 +72,12 @@ extern void ax_cpu_kv_cache_attend_scalar(const float *, const float *,
 extern void ax_cpu_sdpa_fwd(const float *, const float *, const float *,
                              float *, float *,
                              int64_t, int64_t, int64_t, float,
-                             bool, const int8_t *);
+                             bool, const int8_t *, float *);
 extern void ax_cpu_sdpa_bwd(const float *, const float *, const float *,
                              const float *, const float *, const float *,
                              float *, float *, float *,
-                             int64_t, int64_t, int64_t, float, bool);
+                             int64_t, int64_t, int64_t, float, bool,
+                             const float *);
 extern void ax_cpu_rope_apply(float *, float *, const int64_t *,
                                int64_t, int64_t, int64_t, float);
 extern void ax_cpu_kv_cache_attend(const float *, const float *,
@@ -91,11 +95,12 @@ extern void ax_cpu_kv_cache_attend(const float *, const float *,
 typedef void (*sdpa_fwd_fn_t)(const float *, const float *, const float *,
                                float *, float *,
                                int64_t, int64_t, int64_t, float,
-                               bool, const int8_t *);
+                               bool, const int8_t *, float *);
 typedef void (*sdpa_bwd_fn_t)(const float *, const float *, const float *,
                                const float *, const float *, const float *,
                                float *, float *, float *,
-                               int64_t, int64_t, int64_t, float, bool);
+                               int64_t, int64_t, int64_t, float, bool,
+                               const float *);
 typedef void (*rope_fn_t)(float *, float *, const int64_t *,
                            int64_t, int64_t, int64_t, float);
 typedef void (*kv_attend_fn_t)(const float *, const float *,
@@ -145,7 +150,7 @@ void ax_fused_attention_fwd(const float *Q, const float *K, const float *V,
                              int64_t BH, int64_t S, int64_t dk, float scale)
 {
     resolve_once();
-    g_sdpa_fwd(Q, K, V, out, L, BH, S, dk, scale, false, NULL);
+    g_sdpa_fwd(Q, K, V, out, L, BH, S, dk, scale, false, NULL, NULL);
 }
 
 void ax_fused_attention_fwd_causal(const float *Q, const float *K, const float *V,
@@ -153,7 +158,7 @@ void ax_fused_attention_fwd_causal(const float *Q, const float *K, const float *
                                     int64_t BH, int64_t S, int64_t dk, float scale)
 {
     resolve_once();
-    g_sdpa_fwd(Q, K, V, out, L, BH, S, dk, scale, true, NULL);
+    g_sdpa_fwd(Q, K, V, out, L, BH, S, dk, scale, true, NULL, NULL);
 }
 
 void ax_fused_attention_bwd(const float *Q, const float *K, const float *V,
@@ -162,7 +167,7 @@ void ax_fused_attention_bwd(const float *Q, const float *K, const float *V,
                              int64_t BH, int64_t S, int64_t dk, float scale)
 {
     resolve_once();
-    g_sdpa_bwd(Q, K, V, O, dO, L, dQ, dK, dV, BH, S, dk, scale, false);
+    g_sdpa_bwd(Q, K, V, O, dO, L, dQ, dK, dV, BH, S, dk, scale, false, NULL);
 }
 
 void ax_fused_attention_bwd_causal(const float *Q, const float *K, const float *V,
@@ -171,7 +176,30 @@ void ax_fused_attention_bwd_causal(const float *Q, const float *K, const float *
                                     int64_t BH, int64_t S, int64_t dk, float scale)
 {
     resolve_once();
-    g_sdpa_bwd(Q, K, V, O, dO, L, dQ, dK, dV, BH, S, dk, scale, true);
+    g_sdpa_bwd(Q, K, V, O, dO, L, dQ, dK, dV, BH, S, dk, scale, true, NULL);
+}
+
+/* save-aware variants — used by the MHA training path. when P_save / P_saved
+   is non-NULL, layout is [BH, S, S] row-major. fwd writes post-mask
+   pre-softmax scores; bwd reads them and skips the QK^T recompute. */
+void ax_fused_attention_fwd_save(const float *Q, const float *K, const float *V,
+                                  float *out, float *L, float *P_save,
+                                  int64_t BH, int64_t S, int64_t dk, float scale,
+                                  bool causal)
+{
+    resolve_once();
+    g_sdpa_fwd(Q, K, V, out, L, BH, S, dk, scale, causal, NULL, P_save);
+}
+
+void ax_fused_attention_bwd_use(const float *Q, const float *K, const float *V,
+                                 const float *O, const float *dO, const float *L,
+                                 const float *P_saved,
+                                 float *dQ, float *dK, float *dV,
+                                 int64_t BH, int64_t S, int64_t dk, float scale,
+                                 bool causal)
+{
+    resolve_once();
+    g_sdpa_bwd(Q, K, V, O, dO, L, dQ, dK, dV, BH, S, dk, scale, causal, P_saved);
 }
 
 /* ================================================================

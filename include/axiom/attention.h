@@ -109,6 +109,23 @@ void ax_fused_attention_bwd_causal(const float *Q, const float *K, const float *
                                     float *dQ, float *dK, float *dV,
                                     int64_t BH, int64_t S, int64_t dk, float scale);
 
+/* save-aware variants — opt-in materialized P[BH, S, S] for backward reuse.
+   forward writes the post-mask pre-softmax scores into P_save; backward
+   reads them via P_saved instead of recomputing Q @ K^T. cuts the bwd
+   per-head work by ~25-30% (skipped GEMM). costs BH*S*S floats memory.
+   only worthwhile when the buffer fits in cache (small S). */
+void ax_fused_attention_fwd_save(const float *Q, const float *K, const float *V,
+                                  float *out, float *L, float *P_save,
+                                  int64_t BH, int64_t S, int64_t dk, float scale,
+                                  bool causal);
+
+void ax_fused_attention_bwd_use(const float *Q, const float *K, const float *V,
+                                 const float *O, const float *dO, const float *L,
+                                 const float *P_saved,
+                                 float *dQ, float *dK, float *dV,
+                                 int64_t BH, int64_t S, int64_t dk, float scale,
+                                 bool causal);
+
 /* ================================================================
    KV CACHE — for autoregressive inference
    ================================================================ */

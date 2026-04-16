@@ -3165,7 +3165,8 @@ static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
                                       float *out_qi, float *row_max_qi, float *row_sum_qi,
                                       int64_t Bq, int64_t Bk, int64_t dk_np,
                                       int64_t qi_base, int64_t kj_base,
-                                      bool causal, const int8_t *pad_mask)
+                                      bool causal, const int8_t *pad_mask,
+                                      float *P_save_head, int64_t P_save_S)
 {
     int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
@@ -3180,7 +3181,11 @@ static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
         int64_t qi_abs_start = qi_base + ir;
         int64_t qi_abs_end = qi_abs_start + mr - 1;
 
-        if (causal && qi_abs_end < kj_base) continue; /* entire strip is future */
+        if (causal && qi_abs_end < kj_base) {
+            /* entire strip is future. when saving for backward, leave
+               P_save zero (caller pre-zeroed the head buffer). */
+            continue;
+        }
 
         int64_t mr_p = ((mr + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
         /* need masking iff ANY row in the strip has a future key in this
@@ -3211,6 +3216,17 @@ static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
                                         qi_base + ir + r, kj_base, Bk);
         }
 
+        /* 2b. save post-mask pre-softmax scores for backward.
+           layout per head: P_save_head[i, j] for i in [0, S), j in [0, S).
+           when set, backward computes P[i,j] = exp(saved[i,j] - L[i]) and
+           skips the Q@Kt recompute + masking. */
+        if (P_save_head) {
+            for (int64_t r = 0; r < mr; r++) {
+                memcpy(P_save_head + (qi_base + ir + r) * P_save_S + kj_base,
+                       score_strip + r * Bk, (size_t)Bk * sizeof(float));
+            }
+        }
+
         /* 3. online softmax + output correction (fused per row) */
         for (int64_t r = 0; r < mr; r++) {
             attn_fwd_softmax_row(score_strip + r * Bk,
@@ -3238,7 +3254,8 @@ static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
 static void attn_fwd_head(const float *Q, const float *K, const float *V,
                            float *out, float *L, float *row_max, float *row_sum,
                            int64_t S, int64_t dk, float scale,
-                           bool causal, const int8_t *pad_mask)
+                           bool causal, const int8_t *pad_mask,
+                           float *P_save_head)
 {
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -3254,6 +3271,9 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
 
     for (int64_t i = 0; i < S; i++) { row_max[i] = -FLT_MAX; row_sum[i] = 0.0f; }
     memset(out, 0, (size_t)(S * dk) * sizeof(float));
+    /* zero P_save head buffer once: causal-masked tiles skip the inner
+       store, and unmasked future regions need to read 0 in backward. */
+    if (P_save_head) memset(P_save_head, 0, (size_t)(S * S) * sizeof(float));
 
     for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
         int64_t Bk = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
@@ -3272,7 +3292,8 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
 
             attn_fwd_tile_mr(Q + qi * dk, dk, Kt_packed, V_packed,
                               out + qi * dk, row_max + qi, row_sum + qi,
-                              Bq, Bk, dk_np, qi, kj, causal, pad_mask);
+                              Bq, Bk, dk_np, qi, kj, causal, pad_mask,
+                              P_save_head, S);
         }
     }
 
@@ -3305,9 +3326,11 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
 void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
                               float *out, float *L,
                               int64_t BH, int64_t S, int64_t dk, float scale,
-                              bool causal, const int8_t *pad_mask)
+                              bool causal, const int8_t *pad_mask,
+                              float *P_save)
 {
     int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;  /* per-head P_save stride */
 
 #ifdef _OPENMP
     #pragma omp parallel
@@ -3325,7 +3348,8 @@ void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
         for (int64_t h = 0; h < BH; h++) {
             attn_fwd_head(Q + h * head_sz, K + h * head_sz, V + h * head_sz,
                            out + h * head_sz, L ? L + h * S : NULL,
-                           row_max, row_sum, S, dk, scale, causal, pad_mask);
+                           row_max, row_sum, S, dk, scale, causal, pad_mask,
+                           P_save ? P_save + h * pscale_sz : NULL);
         }
     done:;
     }
@@ -3366,7 +3390,8 @@ static inline void attn_bwd_softmax_row(const float *sr_pre_mask,
 static void attn_bwd_head(const float *Q, const float *K, const float *V,
                            const float *dO, const float *L, const float *Di,
                            float *dQ, float *dK, float *dV,
-                           int64_t S, int64_t dk, float scale, bool causal)
+                           int64_t S, int64_t dk, float scale, bool causal,
+                           const float *P_saved_head)
 {
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -3408,8 +3433,11 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
         int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
         int64_t Bk_p = ((Bk + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
-        pack_b_t(K + kj * dk, dk, dk, Bk_np, Bk, Kt_packed);
-        attn_scale_packed(Kt_packed, dk * Bk_np, scale);
+        /* Kt_packed only needed for the recompute path; skip when saved. */
+        if (!P_saved_head) {
+            pack_b_t(K + kj * dk, dk, dk, Bk_np, Bk, Kt_packed);
+            attn_scale_packed(Kt_packed, dk * Bk_np, scale);
+        }
         pack_b_t(V + kj * dk, dk, dk, Bk_np, Bk, Vt_packed);
         pack_b(K + kj * dk, dk, Bk, dk_np, dk, K_packed);
 
@@ -3420,40 +3448,56 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
             /* causal: skip this (qi, kj) if entire block is in future */
             if (causal && qi + Bq - 1 < kj) continue;
 
-            /* recompute P[Bq, Bk] via MR-strip fused score+softmax.
-               the score uses Kt_packed (scaled), so P = exp(score - L). */
-            for (int64_t ir = 0; ir < Bq; ir += GEMM_MR) {
-                int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq - ir);
-                int64_t mr_p = ((mr + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+            /* P_saved fast path: read post-mask pre-softmax scores from
+               the forward-saved buffer, apply softmax (P = exp(s - L[i]))
+               into P_tile. saves the QK^T recompute GEMM and the masking
+               step. enabled when forward provided P_save. */
+            if (P_saved_head) {
+                for (int64_t ir = 0; ir < Bq; ir++) {
+                    if (causal && qi + ir < kj) {
+                        memset(P_tile + ir * Bk, 0, (size_t)Bk * sizeof(float));
+                        continue;
+                    }
+                    attn_bwd_softmax_row(P_saved_head + (qi + ir) * S + kj,
+                                         L[qi + ir],
+                                         P_tile + ir * Bk, Bk);
+                }
+            } else {
+                /* recompute P[Bq, Bk] via MR-strip fused score+softmax.
+                   the score uses Kt_packed (scaled), so P = exp(score - L). */
+                for (int64_t ir = 0; ir < Bq; ir += GEMM_MR) {
+                    int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq - ir);
+                    int64_t mr_p = ((mr + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
-                if (causal && qi + ir + mr - 1 < kj) {
-                    /* entire strip in future — write zeros to P */
-                    for (int64_t r = 0; r < mr; r++)
-                        memset(P_tile + (ir + r) * Bk, 0, (size_t)Bk * sizeof(float));
-                    continue;
-                }
-                /* need masking iff ANY row in the strip has a future key —
-                   gated by the EARLIEST row's absolute position (qi+ir),
-                   not the latest. see fwd path for the same invariant. */
-                bool need_mask = causal && (qi + ir < kj + Bk - 1);
+                    if (causal && qi + ir + mr - 1 < kj) {
+                        /* entire strip in future — write zeros to P */
+                        for (int64_t r = 0; r < mr; r++)
+                            memset(P_tile + (ir + r) * Bk, 0, (size_t)Bk * sizeof(float));
+                        continue;
+                    }
+                    /* need masking iff ANY row in the strip has a future key —
+                       gated by the EARLIEST row's absolute position (qi+ir),
+                       not the latest. see fwd path for the same invariant. */
+                    bool need_mask = causal && (qi + ir < kj + Bk - 1);
 
-                pack_a(Q + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
-                memset(score_strip, 0, (size_t)(mr * Bk) * sizeof(float));
-                for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
-                    int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
-                    if (nr <= 0) break;
-                    micro_kernel(dk, a_q, Kt_packed + jr * dk,
-                                 score_strip + jr, Bk, mr, nr);
-                }
-                if (need_mask) {
-                    for (int64_t r = 0; r < mr; r++)
-                        attn_apply_causal_mask(score_strip + r * Bk,
-                                                qi + ir + r, kj, Bk);
-                }
-                /* P = exp(score - L) into P_tile */
-                for (int64_t r = 0; r < mr; r++) {
-                    attn_bwd_softmax_row(score_strip + r * Bk, L[qi + ir + r],
-                                          P_tile + (ir + r) * Bk, Bk);
+                    pack_a(Q + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
+                    memset(score_strip, 0, (size_t)(mr * Bk) * sizeof(float));
+                    for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
+                        int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
+                        if (nr <= 0) break;
+                        micro_kernel(dk, a_q, Kt_packed + jr * dk,
+                                     score_strip + jr, Bk, mr, nr);
+                    }
+                    if (need_mask) {
+                        for (int64_t r = 0; r < mr; r++)
+                            attn_apply_causal_mask(score_strip + r * Bk,
+                                                    qi + ir + r, kj, Bk);
+                    }
+                    /* P = exp(score - L) into P_tile */
+                    for (int64_t r = 0; r < mr; r++) {
+                        attn_bwd_softmax_row(score_strip + r * Bk, L[qi + ir + r],
+                                              P_tile + (ir + r) * Bk, Bk);
+                    }
                 }
             }
 
@@ -3539,9 +3583,10 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
                               const float *O, const float *dO, const float *L,
                               float *dQ, float *dK, float *dV,
                               int64_t BH, int64_t S, int64_t dk, float scale,
-                              bool causal)
+                              bool causal, const float *P_saved)
 {
     int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;
 
     /* zero output grads (caller may pass accumulating buffers;
        in the MHA layer path we zero for a fresh backward) */
@@ -3584,7 +3629,8 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
             attn_bwd_head(Q + h * head_sz, K + h * head_sz, V + h * head_sz,
                            dOh, L + h * S, Di,
                            dQ + h * head_sz, dK + h * head_sz, dV + h * head_sz,
-                           S, dk, scale, causal);
+                           S, dk, scale, causal,
+                           P_saved ? P_saved + h * pscale_sz : NULL);
         }
     done:;
     }

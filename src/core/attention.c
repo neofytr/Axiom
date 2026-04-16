@@ -243,6 +243,9 @@ typedef struct {
     ax_tensor_t *O_head;       /* [BH, S, dk]  SDPA output             */
     ax_tensor_t *attn_flat;    /* [B*S, D]     after head_deinterleave */
     ax_tensor_t *L_tensor;     /* [BH, S]      logsumexp per row       */
+    /* optional: post-mask pre-softmax scores [BH, S, S] from forward.
+       NULL when S is large (would thrash L3) or training wasn't on. */
+    ax_tensor_t *P_save_tensor;
 } mha_ctx_t;
 
 static void mha_ctx_cleanup(void *p) { free(p); }
@@ -358,24 +361,41 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
         if (!L_t) goto fail;
     }
 
-    float scale = 1.0f / sqrtf((float)dk);
-    if (m->causal) {
-        ax_fused_attention_fwd_causal(
-            (const float *)Qh->storage->data,
-            (const float *)Kh->storage->data,
-            (const float *)Vh->storage->data,
-            (float *)Oh->storage->data,
-            L_t ? (float *)L_t->storage->data : NULL,
-            B * H, S, dk, scale);
-    } else {
-        ax_fused_attention_fwd(
-            (const float *)Qh->storage->data,
-            (const float *)Kh->storage->data,
-            (const float *)Vh->storage->data,
-            (float *)Oh->storage->data,
-            L_t ? (float *)L_t->storage->data : NULL,
-            B * H, S, dk, scale);
+    /* P_save (post-mask pre-softmax scores) speeds up backward by skipping
+       the QK^T recompute. cost is BH*S*S floats (~4 MB on B8 H8 S128).
+       only allocate when:
+       1. P fits comfortably in cache (≤ ~half L3, threshold 8 MB),
+       2. recompute cost dominates per-head fixed overhead — i.e. dk is
+          large enough that the saved Q@Kt GEMM is non-trivial relative to
+          the softmax-from-saved scan. for very small workloads (S ≤ 128
+          AND dk ≤ 64), the fixed bwd overhead (5 GEMMs per head + the
+          memory write of 4 MB in fwd) outweighs the saved GEMM, so skip.
+       AX_MHA_SAVE_P=1 forces save on (debug); AX_MHA_SAVE_P=0 forces off. */
+    ax_tensor_t *P_save_t = NULL;
+    int64_t bh = B * H;
+    int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
+    bool save_enabled = (record && p_save_bytes <= (int64_t)8 * 1024 * 1024);
+    /* heuristic: skip when both S and dk are small — the recompute GEMM is
+       so cheap that the save-write overhead in forward eats the gains. */
+    if (save_enabled && S <= 128 && dk <= 64) save_enabled = false;
+    const char *env = getenv("AX_MHA_SAVE_P");
+    if (env) save_enabled = (env[0] == '1');
+    if (save_enabled) {
+        int64_t P_sh[] = {bh, S, S};
+        ALLOC_SHAPE(P_save_t, P_sh, 3);
+        /* not fatal if alloc fails — backward will recompute */
     }
+
+    float scale = 1.0f / sqrtf((float)dk);
+    float *P_save_ptr = P_save_t ? (float *)P_save_t->storage->data : NULL;
+    ax_fused_attention_fwd_save(
+        (const float *)Qh->storage->data,
+        (const float *)Kh->storage->data,
+        (const float *)Vh->storage->data,
+        (float *)Oh->storage->data,
+        L_t ? (float *)L_t->storage->data : NULL,
+        P_save_ptr,
+        bh, S, dk, scale, m->causal);
 
     /* ---- merge heads back to [rows, D] ---- */
     int64_t attn_sh[] = {rows, D};
@@ -438,6 +458,7 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
         ctx->O_head    = Oh;
         ctx->attn_flat = attn_flat;
         ctx->L_tensor  = L_t;
+        ctx->P_save_tensor = P_save_t;  /* may be NULL if S too large */
 
         ax_grad_fn_t *gf = ax_grad_fn_create(mha_backward);
         gf->inputs[0] = input;
@@ -571,31 +592,20 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (!dQh || !dKh || !dVh) return;
 
     float scale = 1.0f / sqrtf((float)dk);
-    if (m->causal) {
-        ax_fused_attention_bwd_causal(
-            (const float *)ctx->Q_head->storage->data,
-            (const float *)ctx->K_head->storage->data,
-            (const float *)ctx->V_head->storage->data,
-            (const float *)ctx->O_head->storage->data,
-            (const float *)dO_head->storage->data,
-            (const float *)ctx->L_tensor->storage->data,
-            (float *)dQh->storage->data,
-            (float *)dKh->storage->data,
-            (float *)dVh->storage->data,
-            B * H, S, dk, scale);
-    } else {
-        ax_fused_attention_bwd(
-            (const float *)ctx->Q_head->storage->data,
-            (const float *)ctx->K_head->storage->data,
-            (const float *)ctx->V_head->storage->data,
-            (const float *)ctx->O_head->storage->data,
-            (const float *)dO_head->storage->data,
-            (const float *)ctx->L_tensor->storage->data,
-            (float *)dQh->storage->data,
-            (float *)dKh->storage->data,
-            (float *)dVh->storage->data,
-            B * H, S, dk, scale);
-    }
+    const float *P_saved = ctx->P_save_tensor
+        ? (const float *)ctx->P_save_tensor->storage->data : NULL;
+    ax_fused_attention_bwd_use(
+        (const float *)ctx->Q_head->storage->data,
+        (const float *)ctx->K_head->storage->data,
+        (const float *)ctx->V_head->storage->data,
+        (const float *)ctx->O_head->storage->data,
+        (const float *)dO_head->storage->data,
+        (const float *)ctx->L_tensor->storage->data,
+        P_saved,
+        (float *)dQh->storage->data,
+        (float *)dKh->storage->data,
+        (float *)dVh->storage->data,
+        B * H, S, dk, scale, m->causal);
 
     /* ================================================================
        step 3 — FUSED de-interleave into a single dQKV [rows, 3D] buffer,
