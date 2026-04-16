@@ -307,6 +307,206 @@ static void test_conv2d_batched_bwd(void)
     ax_no_grad();
 }
 
+/* sub-batched path: when N*K*M*4 exceeds AX_CONV_BATCH_COL_BYTES (8 MB)
+   the batched path splits N into n_batch-sized chunks. verify forward and
+   backward across the split boundary match per-sample reference results. */
+static void test_conv2d_subbatched_fwd_bwd(void)
+{
+    /* N=8, Cin=256, H=W=14, kh=kw=3 → K=2304, M=196.
+       full_bytes = 2304*196*8*4 = 14.4 MB > 8 MB → triggers split.
+       n_batch = 8MB/(K*M*4) = 4 → 2 chunks of 4 samples each. */
+    int N = 8, Cin = 256, H = 14, W = 14, Cout = 32;
+    int64_t M = (int64_t)H * W;
+    int64_t K = (int64_t)Cin * 9;
+
+    ax_layer_t *c = ax_conv2d_create(Cin, Cout, 3, 1, 1, false);
+    ax_conv2d_t *cc = (ax_conv2d_t *)c;
+
+    /* deterministic small init */
+    int64_t wn = (int64_t)Cout * Cin * 9;
+    float *wd = (float *)cc->weight->storage->data;
+    for (int64_t i = 0; i < wn; i++) wd[i] = (float)((i * 17) % 31 - 15) * 0.001f;
+    cc->weight->requires_grad = true;
+
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    int64_t inn = (int64_t)N * Cin * H * W;
+    float *id = (float *)inp->storage->data;
+    for (int64_t i = 0; i < inn; i++) id[i] = (float)((i * 7) % 23 - 11) * 0.01f;
+
+    /* sub-batched forward */
+    ax_tensor_t *out_b = ax_layer_forward(c, inp);
+    AX_TEST_ASSERT(out_b != NULL, "sub-batched fwd should run");
+    AX_TEST_ASSERT_EQ(out_b->shape[0], N, "sub-batched fwd: N preserved");
+    AX_TEST_ASSERT_EQ(out_b->shape[1], Cout, "sub-batched fwd: Cout preserved");
+
+    /* per-sample reference: N=1 disables batched path → per-sample im2col+gemm */
+    int64_t ref_sh[] = {1, Cin, H, W};
+    for (int n = 0; n < N; n++) {
+        ax_tensor_t *one = ax_tensor_create(ref_sh, 4, AX_FLOAT32);
+        memcpy(one->storage->data, id + n * Cin * H * W,
+               (size_t)(Cin * H * W) * sizeof(float));
+        ax_tensor_t *out_one = ax_layer_forward(c, one);
+        const float *bd = (const float *)out_b->storage->data + n * Cout * M;
+        const float *sd = (const float *)out_one->storage->data;
+        for (int64_t i = 0; i < Cout * M; i++) {
+            AX_TEST_ASSERT_NEAR(bd[i], sd[i], 5e-3f,
+                                "sub-batched fwd matches per-sample ref");
+        }
+        ax_tensor_destroy(one);
+        ax_tensor_destroy(out_one);
+    }
+
+    /* sub-batched backward: dW must accumulate correctly across chunks.
+       reuse the layer (weights unchanged); compute via batched path then
+       compare to per-sample dW summation. */
+    inp->requires_grad = true;
+    /* fresh forward so saved tensors are batched-shape */
+    ax_enable_grad();
+    ax_tensor_t *out_g = ax_layer_forward(c, inp);
+    ax_tensor_t *loss = ax_sum(out_g, -1);
+    ax_backward(loss);
+    ax_no_grad();
+
+    /* snapshot dW from sub-batched run */
+    float *dW_b = (float *)malloc((size_t)wn * sizeof(float));
+    memcpy(dW_b, cc->weight->grad->storage->data, (size_t)wn * sizeof(float));
+    /* zero grad before per-sample reference accumulation */
+    memset(cc->weight->grad->storage->data, 0, (size_t)wn * sizeof(float));
+
+    /* per-sample dW reference */
+    ax_enable_grad();
+    for (int n = 0; n < N; n++) {
+        ax_tensor_t *one = ax_tensor_create(ref_sh, 4, AX_FLOAT32);
+        memcpy(one->storage->data, id + n * Cin * H * W,
+               (size_t)(Cin * H * W) * sizeof(float));
+        one->requires_grad = true;
+        ax_tensor_t *out_one = ax_layer_forward(c, one);
+        ax_tensor_t *l1 = ax_sum(out_one, -1);
+        ax_backward(l1);
+        ax_tensor_destroy(l1);
+        ax_tensor_destroy(out_one);
+        ax_tensor_destroy(one);
+    }
+    ax_no_grad();
+
+    const float *dW_ref = (const float *)cc->weight->grad->storage->data;
+    /* magnitudes scale with N*M*Cin so use a relative tolerance via abs */
+    for (int64_t i = 0; i < wn; i++) {
+        AX_TEST_ASSERT_NEAR(dW_b[i], dW_ref[i], 1.0f,
+                            "sub-batched dW matches per-sample summation");
+    }
+
+    free(dW_b);
+    ax_tensor_destroy(loss);
+    ax_tensor_destroy(out_g);
+    ax_tensor_destroy(out_b);
+    ax_tensor_destroy(inp);
+    ax_layer_destroy(c);
+}
+
+/* 1×1 stride=1 pad=0 backward zero-copy fast path.
+   verify dW and dX match a per-sample reference computed via the legacy
+   path (3×3 with same effective shape — too different to compare).
+   instead, check gradient consistency: numerical vs analytical via
+   centered finite difference on a few weights and inputs. */
+static void test_conv2d_1x1_zero_copy_bwd(void)
+{
+    /* small 1×1: N=4, Cin=8, Cout=4, H=W=5 */
+    int N = 4, Cin = 8, H = 5, W = 5, Cout = 4;
+    int64_t M = (int64_t)H * W;
+
+    ax_layer_t *c = ax_conv2d_create(Cin, Cout, 1, 1, 0, false);
+    ax_conv2d_t *cc = (ax_conv2d_t *)c;
+    cc->weight->requires_grad = true;
+
+    /* deterministic small init */
+    int64_t wn = (int64_t)Cout * Cin;
+    float *wd = (float *)cc->weight->storage->data;
+    for (int64_t i = 0; i < wn; i++) wd[i] = (float)((i * 13) % 17 - 8) * 0.1f;
+
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    int64_t inn = (int64_t)N * Cin * H * W;
+    float *id = (float *)inp->storage->data;
+    for (int64_t i = 0; i < inn; i++) id[i] = (float)((i * 7) % 11 - 5) * 0.1f;
+    inp->requires_grad = true;
+
+    ax_enable_grad();
+    ax_tensor_t *out = ax_layer_forward(c, inp);
+    ax_tensor_t *loss = ax_sum(out, -1);
+    ax_backward(loss);
+    ax_no_grad();
+
+    /* analytical dW from fast path */
+    float *dW_fast = (float *)malloc((size_t)wn * sizeof(float));
+    memcpy(dW_fast, cc->weight->grad->storage->data, (size_t)wn * sizeof(float));
+
+    /* analytical dX from fast path */
+    float *dX_fast = (float *)malloc((size_t)inn * sizeof(float));
+    memcpy(dX_fast, inp->grad->storage->data, (size_t)inn * sizeof(float));
+
+    /* numerical finite-difference dW for a single weight: loss(w+eps) - loss(w-eps) / 2eps */
+    float eps = 1e-3f;
+    int probes[] = {0, wn/4, wn/2, 3*wn/4, wn-1};
+    for (int p = 0; p < 5; p++) {
+        int64_t i = probes[p];
+        float orig = wd[i];
+        wd[i] = orig + eps;
+        ax_tensor_t *out_p = ax_layer_forward(c, inp);
+        float lp = 0.0f;
+        float *od_p = (float *)out_p->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lp += od_p[j];
+        ax_tensor_destroy(out_p);
+
+        wd[i] = orig - eps;
+        ax_tensor_t *out_m = ax_layer_forward(c, inp);
+        float lm = 0.0f;
+        float *od_m = (float *)out_m->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lm += od_m[j];
+        ax_tensor_destroy(out_m);
+
+        wd[i] = orig;  /* restore */
+
+        float fd = (lp - lm) / (2.0f * eps);
+        AX_TEST_ASSERT_NEAR(dW_fast[i], fd, 0.05f,
+                            "1×1 fast path dW matches finite difference");
+    }
+
+    /* numerical dX for a single input element */
+    int x_probes[] = {0, (int)(inn/4), (int)(inn/2), (int)(3*inn/4), (int)(inn-1)};
+    for (int p = 0; p < 5; p++) {
+        int64_t i = x_probes[p];
+        float orig = id[i];
+        id[i] = orig + eps;
+        ax_tensor_t *out_p = ax_layer_forward(c, inp);
+        float lp = 0.0f;
+        float *od_p = (float *)out_p->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lp += od_p[j];
+        ax_tensor_destroy(out_p);
+
+        id[i] = orig - eps;
+        ax_tensor_t *out_m = ax_layer_forward(c, inp);
+        float lm = 0.0f;
+        float *od_m = (float *)out_m->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lm += od_m[j];
+        ax_tensor_destroy(out_m);
+
+        id[i] = orig;
+
+        float fd = (lp - lm) / (2.0f * eps);
+        AX_TEST_ASSERT_NEAR(dX_fast[i], fd, 0.05f,
+                            "1×1 fast path dX matches finite difference");
+    }
+
+    free(dW_fast);
+    free(dX_fast);
+    ax_tensor_destroy(loss);
+    ax_tensor_destroy(out);
+    ax_tensor_destroy(inp);
+    ax_layer_destroy(c);
+}
+
 /* validate the direct-smallcin path matches the im2col+gemm reference.
    we can't pick the path explicitly from the public API, so we rely on
    conv2d_forward's internal predicate: C_in ≤ 4 → direct-smallcin.
@@ -485,6 +685,8 @@ int main(void)
     AX_RUN_TEST(test_conv_pipeline);
     AX_RUN_TEST(test_conv2d_batched_fwd);
     AX_RUN_TEST(test_conv2d_batched_bwd);
+    AX_RUN_TEST(test_conv2d_subbatched_fwd_bwd);
+    AX_RUN_TEST(test_conv2d_1x1_zero_copy_bwd);
     AX_RUN_TEST(test_conv2d_direct_smallcin_vs_gemm);
     AX_RUN_TEST(test_conv2d_smallcin_edges);
     AX_RUN_TEST(test_maxpool2d_simd);

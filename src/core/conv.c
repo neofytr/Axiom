@@ -35,6 +35,9 @@
 #include <inttypes.h>
 #include <float.h>
 
+/* from dispatch.c — accumulate-into-pre-filled-C flag for opt_gemm */
+extern void ax_gemm_set_skip_init(bool v);
+
 /* overflow-checked multiply. returns -1 on overflow. */
 static inline int64_t safe_mul(int64_t a, int64_t b)
 {
@@ -57,6 +60,30 @@ static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int p
 /* forward declarations for predicates used by ensure_scratch */
 static inline bool can_direct_3x3(int kh, int kw, int sh, int sw, int ph, int pw, int64_t C_in);
 static inline bool prefer_implicit_gemm(int64_t K, int64_t M);
+
+/* 1×1 stride=1 pad=0: im2col is the identity rearrangement.
+   the per-sample fast path uses a stack-tensor view to skip the copy
+   entirely (zero memcpy). batched path's wider GEMM doesn't help here
+   because the im2col-as-transpose cost (~12 MB per forward at vgg shapes)
+   exceeds any NC-utilization gain. forward AND backward should route to
+   per-sample. */
+static inline bool is_1x1_pad0_stride1(int kh, int kw, int sh, int sw, int ph, int pw)
+{
+    return kh == 1 && kw == 1 && sh == 1 && sw == 1 && ph == 0 && pw == 0;
+}
+
+/* batched conv heuristic thresholds. file-scope so forward and backward
+   share definitions without depending on translation-unit ordering.
+   AX_CONV_BATCH_COL_BYTES default is 256 MB so chunking effectively never
+   triggers for normal shapes — measurement showed chunking adds OMP setup
+   overhead and splits one big GEMM into many smaller ones with poor jc-parallel
+   utilization (e.g. nb=2 on N=32 gives 16 chunks of 2 jc tiles each, wasting
+   threads). embedded targets that need bounded scratch can override via
+   -DAX_CONV_BATCH_COL_BYTES at compile time. */
+#define AX_CONV_BATCH_M_THRESH 512
+#ifndef AX_CONV_BATCH_COL_BYTES
+#define AX_CONV_BATCH_COL_BYTES ((int64_t)(256 * 1024 * 1024))
+#endif
 
 /* per-thread scratch buffers cached on ax_conv2d_t.
    sized for the largest seen (N, H, W) signature; reallocated only when
@@ -81,8 +108,9 @@ struct ax_conv_scratch {
     ax_tensor_t *wt_contig; /* [K, C_out] transposed weight for backward dx */
 
     /* batched-GEMM buffers (allocated when M < AX_CONV_BATCH_M_THRESH && N > 1) */
-    ax_tensor_t *batch_col_buf; /* [K, N*M]: im2col in fwd; dcol_batch in bwd */
-    ax_tensor_t *batch_aux_buf; /* [C_out, N*M]: gemm result in fwd; go_batch in bwd */
+    ax_tensor_t *batch_col_buf; /* [K, n_batch*M]: im2col in fwd; dcol_batch in bwd */
+    ax_tensor_t *batch_aux_buf; /* [C_out, n_batch*M]: gemm result in fwd; go_batch in bwd */
+    int64_t n_batch;            /* samples per sub-batch; 0 or 1 = batched path disabled */
 };
 
 static void scratch_destroy(struct ax_conv_scratch *s)
@@ -124,6 +152,27 @@ static ax_tensor_t **alloc_buf_array(int T, const int64_t *shape, int ndim)
         }
     }
     return arr;
+}
+
+/* construct a zero-overhead 2-D stack tensor view over an existing float buffer.
+   storage and tensor must be caller-allocated locals; no heap touched. */
+static inline void make_stack_view(ax_tensor_t *tv, ax_storage_t *st,
+                                   float *data, int64_t rows, int64_t cols)
+{
+    st->data         = data;
+    st->size_bytes   = (size_t)(rows * cols) * sizeof(float);
+    atomic_store(&st->refcount, 0);
+    st->device       = AX_DEVICE_CPU;
+    st->is_arena_temp = true;
+    st->generation   = 1;
+    memset(tv, 0, sizeof(*tv));
+    tv->storage      = st;
+    tv->ndim         = 2;
+    tv->dtype        = AX_FLOAT32;
+    tv->shape[0]     = rows;
+    tv->shape[1]     = cols;
+    tv->strides[0]   = cols;
+    tv->strides[1]   = 1;
 }
 
 /* lazily allocate or reallocate scratch buffers if signature differs.
@@ -217,19 +266,33 @@ static struct ax_conv_scratch *ensure_scratch(ax_conv2d_t *conv,
         return NULL;
     }
 
-/* batch entire N samples into a single GEMM when M is narrow.
-   each per-sample GEMM [C_out,K]@[K,M] uses only M/NC columns,
-   wasting register tiles. merging → [C_out,K]@[K,N*M] fills NC. */
-#define AX_CONV_BATCH_M_THRESH 512
+    /* batch N samples into wide GEMMs when M is narrow. each per-sample GEMM
+       [C_out,K]@[K,M] wastes register tiles when M < NC=256. merging n_batch
+       samples → [C_out,K]@[K,n_batch*M] fills NC properly. each chunk capped
+       at AX_CONV_BATCH_COL_BYTES (file-scope) so it stays in L3.
+       1×1 stride=1 pad=0 is excluded — its im2col is just a transpose memcpy
+       which costs more than the NC-utilization gain. */
     bool is_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
     bool is_implicit = !is_direct && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
-    if (!is_direct && !is_implicit && N > 1 && M < AX_CONV_BATCH_M_THRESH) {
-        int64_t NM = N * M;
-        int64_t batch_col_shape[] = {K, NM};
-        int64_t batch_aux_shape[] = {C_out, NM};
-        s->batch_col_buf = ax_tensor_create(batch_col_shape, 2, AX_FLOAT32);
-        s->batch_aux_buf = ax_tensor_create(batch_aux_shape, 2, AX_FLOAT32);
-        /* failure is non-fatal: forward/backward fall back to per-sample path */
+    bool is_1x1 = is_1x1_pad0_stride1(kh, kw, sh, sw, ph, pw);
+    if (!is_direct && !is_implicit && !is_1x1 && N > 1 && M < AX_CONV_BATCH_M_THRESH) {
+        int64_t full_bytes = K * M * N * (int64_t)sizeof(float);
+        int64_t nb = N;
+        if (full_bytes > AX_CONV_BATCH_COL_BYTES) {
+            nb = AX_CONV_BATCH_COL_BYTES / (K * M * (int64_t)sizeof(float));
+            if (nb > N) nb = N;
+        }
+        s->n_batch = nb;
+        /* nb < 2: batched path degrades to sequential single-sample GEMMs,
+           which is worse than the OMP-parallel per-sample path. skip alloc
+           so forward/backward fall back naturally. */
+        if (nb >= 2) {
+            int64_t batch_col_shape[] = {K, nb * M};
+            int64_t batch_aux_shape[] = {C_out, nb * M};
+            s->batch_col_buf = ax_tensor_create(batch_col_shape, 2, AX_FLOAT32);
+            s->batch_aux_buf = ax_tensor_create(batch_aux_shape, 2, AX_FLOAT32);
+            /* failure is non-fatal: forward/backward fall back to per-sample path */
+        }
     }
 
     conv->scratch = s;
@@ -690,75 +753,100 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *ind = (float *)input_data->storage->data;
     float *grd = (float *)grad_out->storage->data;
 
-    bool use_batched_bwd = N > 1 && M < AX_CONV_BATCH_M_THRESH
+    /* same 1×1 carve-out as forward: per-sample backward will use the 1×1
+       zero-copy fast path (skip im2col, accumulate dW/dX with skip_init). */
+    bool is_1x1_fast_bwd = is_1x1_pad0_stride1(kh, kw, sh, sw, ph, pw)
+                           && (H == out_h) && (W == out_w);
+    bool use_batched_bwd = N > 1 && M < AX_CONV_BATCH_M_THRESH && !is_1x1_fast_bwd
                            && s->batch_col_buf && s->batch_aux_buf;
 
     if (use_batched_bwd) {
-        /* batched backward: one large gemm_nt for dW, one large gemm_tn for dX.
-           eliminates N separate launches and fills NC tiles properly. */
+        /* sub-batched backward: loop over n_batch-sample chunks.
+           dW accumulates across chunks via skip_init; dX processes per chunk. */
         float *bcd = (float *)s->batch_col_buf->storage->data;
         float *gbd = (float *)s->batch_aux_buf->storage->data;
-        int64_t NM = N * M;
+        int64_t nb = s->n_batch;
 
-        /* parallel im2col → batch_col_buf [K, N*M]
-           parallel go copy → batch_aux_buf [C_out, N*M] */
-        #ifdef _OPENMP
-        #pragma omp parallel for num_threads(T) schedule(static)
-        #endif
-        for (int64_t n = 0; n < N; n++) {
-            im2col_into_strided(ind + n * C_in * H * W, C_in, H, W,
-                                 kh, kw, sh, sw, ph, pw, out_h, out_w,
-                                 bcd, NM, n * M);
-            /* scatter go[n, co, *] → gbd[co, n*M : (n+1)*M] */
-            for (int64_t co = 0; co < C_out; co++)
-                memcpy(gbd + co * NM + n * M, grd + n * C_out * M + co * M,
-                       (size_t)M * sizeof(float));
+        ax_tensor_t *dw_total = s->dw_bufs[0];
+        /* dw_total is already zeroed at line 684-688 above; chunks accumulate into it. */
+
+        for (int64_t n_start = 0; n_start < N; n_start += nb) {
+            int64_t n_b   = (n_start + nb <= N) ? nb : (N - n_start);
+            int64_t NM_b  = n_b * M;
+            int threads_b = (int)(n_b < T ? n_b : T);
+
+            /* im2col → bcd [K, NM_b] and scatter go → gbd [C_out, NM_b] */
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(threads_b) schedule(static)
+            #endif
+            for (int64_t n = 0; n < n_b; n++) {
+                im2col_into_strided(ind + (n_start + n) * C_in * H * W, C_in, H, W,
+                                     kh, kw, sh, sw, ph, pw, out_h, out_w,
+                                     bcd, NM_b, n * M);
+                for (int64_t co = 0; co < C_out; co++)
+                    memcpy(gbd + co * NM_b + n * M,
+                           grd + (n_start + n) * C_out * M + co * M,
+                           (size_t)M * sizeof(float));
+            }
+
+            /* stack views for this chunk */
+            ax_storage_t col_st, aux_st;
+            ax_tensor_t  col_tv, aux_tv;
+            make_stack_view(&col_tv, &col_st, bcd, K,     NM_b);
+            make_stack_view(&aux_tv, &aux_st, gbd, C_out, NM_b);
+
+            /* dW += go_chunk @ col_chunk^T: use skip_init to accumulate across chunks
+               without zeroing dw_total between iterations. */
+            if (weight->requires_grad) {
+                ax_gemm_set_skip_init(true);
+                ax_compute_gemm_nt(&aux_tv, &col_tv, dw_total);
+                ax_gemm_set_skip_init(false);
+            }
+
+            /* dcol_chunk = w^T @ go_chunk: reuse bcd (im2col already consumed).
+               opt_gemm_tn zeros bcd internally; explicit memset not needed. */
+            if (input_orig->requires_grad && (wt_contig || have_gemm_tn)) {
+                if (have_gemm_tn)
+                    ax_compute_gemm_tn(w2d, &aux_tv, &col_tv);
+                else {
+                    /* wt_contig path: need a [K, NM_b] view for output */
+                    ax_compute_gemm(wt_contig, &aux_tv, &col_tv);
+                }
+
+                /* parallel col2im per sample from dcol_chunk [K, NM_b].
+                   threads_b = min(n_b, T) avoids spawning idle workers. */
+                #ifdef _OPENMP
+                #pragma omp parallel for num_threads(threads_b) schedule(static)
+                #endif
+                for (int64_t n = 0; n < n_b; n++) {
+                    int tid = AX_OMP_THREAD_NUM();
+                    if (tid >= T) tid = 0;
+                    ax_tensor_t *dcol_buf = s->dcol_bufs[tid];
+                    ax_tensor_t *dimg_buf = s->dimg_bufs[tid];
+                    float *dcol_d = (float *)dcol_buf->storage->data;
+                    /* gather dcol for sample n: dcol[k, m] = bcd[k*NM_b + n*M + m] */
+                    for (int64_t k = 0; k < K; k++)
+                        memcpy(dcol_d + k * M, bcd + k * NM_b + n * M, (size_t)M * sizeof(float));
+                    float *dimg_d = (float *)dimg_buf->storage->data;
+                    memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));
+                    col2im_into(dcol_d, C_in, H, W, kh, kw, sh, sw, ph, pw, out_h, out_w, dimg_d);
+                    float *ig = (float *)input_orig->grad->storage->data + (n_start + n) * C_in * H * W;
+                    int64_t total = C_in * H * W, i = 0, ve = total - (total % AX_VF32_WIDTH);
+                    for (; i < ve; i += AX_VF32_WIDTH)
+                        ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), ax_vf32_loadu(dimg_d + i)));
+                    for (; i < total; i++) ig[i] += dimg_d[i];
+                }
+            }
         }
 
-        /* dW = go_batch @ col_batch^T via gemm_nt: [C_out, N*M] @ [K, N*M]^T → [C_out, K] */
+        /* accumulate dw_total into weight->grad */
         if (weight->requires_grad) {
-            ax_tensor_t *dw_total = s->dw_bufs[0];
-            memset(dw_total->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
-            ax_compute_gemm_nt(s->batch_aux_buf, s->batch_col_buf, dw_total);
             float *wg  = (float *)weight->grad->storage->data;
             float *dwl = (float *)dw_total->storage->data;
             int64_t wn = C_out * K, wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
             for (; wi < wve; wi += AX_VF32_WIDTH)
                 ax_vf32_storeu(wg + wi, ax_vf32_add(ax_vf32_loadu(wg + wi), ax_vf32_loadu(dwl + wi)));
             for (; wi < wn; wi++) wg[wi] += dwl[wi];
-        }
-
-        /* dcol_batch = w^T @ go_batch via gemm_tn: [K, C_out] @ [C_out, N*M] → [K, N*M]
-           reuse batch_col_buf as output (im2col data already consumed above). */
-        if (input_orig->requires_grad && (wt_contig || have_gemm_tn)) {
-            memset(bcd, 0, (size_t)(K * NM) * sizeof(float));
-            if (have_gemm_tn)
-                ax_compute_gemm_tn(w2d, s->batch_aux_buf, s->batch_col_buf);
-            else
-                ax_compute_gemm(wt_contig, s->batch_aux_buf, s->batch_col_buf);
-
-            /* parallel col2im per sample from dcol_batch [K, N*M] */
-            #ifdef _OPENMP
-            #pragma omp parallel for num_threads(T) schedule(static)
-            #endif
-            for (int64_t n = 0; n < N; n++) {
-                int tid = AX_OMP_THREAD_NUM();
-                if (tid >= T) tid = 0;
-                ax_tensor_t *dcol_buf = s->dcol_bufs[tid];
-                ax_tensor_t *dimg_buf = s->dimg_bufs[tid];
-                float *dcol_d = (float *)dcol_buf->storage->data;
-                /* gather dcol for sample n: dcol[k, m] = bcd[k*NM + n*M + m] */
-                for (int64_t k = 0; k < K; k++)
-                    memcpy(dcol_d + k * M, bcd + k * NM + n * M, (size_t)M * sizeof(float));
-                float *dimg_d = (float *)dimg_buf->storage->data;
-                memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));
-                col2im_into(dcol_d, C_in, H, W, kh, kw, sh, sw, ph, pw, out_h, out_w, dimg_d);
-                float *ig = (float *)input_orig->grad->storage->data + n * C_in * H * W;
-                int64_t total = C_in * H * W, i = 0, ve = total - (total % AX_VF32_WIDTH);
-                for (; i < ve; i += AX_VF32_WIDTH)
-                    ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), ax_vf32_loadu(dimg_d + i)));
-                for (; i < total; i++) ig[i] += dimg_d[i];
-            }
         }
     } else {
     /* num_threads(T) prevents oversubscription of per-thread scratch slots
@@ -770,6 +858,46 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     {
         int tid = AX_OMP_THREAD_NUM();
         if (tid >= T) tid = 0;
+
+        /* 1×1 stride=1 pad=0 zero-copy backward: skip im2col, go memcpy,
+           dw_sample temp + add, and dcol_buf + col2im + add. dW accumulates
+           directly into dw_bufs[tid] via skip_init; dX accumulates directly
+           into input_grad slice via skip_init. eliminates ~4 memory
+           operations per sample (significant for 1×1-heavy networks like
+           ResNet bottlenecks). */
+        if (is_1x1_fast_bwd) {
+            ax_storage_t in_st, go_st;
+            ax_tensor_t  in_tv, go_tv;
+            make_stack_view(&in_tv, &in_st, ind + n * C_in * H * W, C_in, M);
+            make_stack_view(&go_tv, &go_st, grd + n * C_out * M, C_out, M);
+
+            if (weight->requires_grad) {
+                /* dW += go @ in^T: gemm_nt with skip_init accumulates into
+                   dw_bufs[tid] (per-thread, sequential within a thread). */
+                ax_tensor_t *dw_local = s->dw_bufs[tid];
+                ax_gemm_set_skip_init(true);
+                ax_compute_gemm_nt(&go_tv, &in_tv, dw_local);
+                ax_gemm_set_skip_init(false);
+            }
+
+            if (input_orig->requires_grad && (wt_contig || have_gemm_tn)) {
+                /* dX += w^T @ go: gemm_tn with skip_init accumulates into the
+                   input_grad slice for sample n (disjoint across samples). */
+                ax_storage_t ig_st;
+                ax_tensor_t  ig_tv;
+                float *ig_slice = (float *)input_orig->grad->storage->data
+                                + n * C_in * H * W;
+                make_stack_view(&ig_tv, &ig_st, ig_slice, C_in, M);
+                ax_gemm_set_skip_init(true);
+                if (have_gemm_tn)
+                    ax_compute_gemm_tn(w2d, &go_tv, &ig_tv);
+                else
+                    ax_compute_gemm(wt_contig, &go_tv, &ig_tv);
+                ax_gemm_set_skip_init(false);
+            }
+            continue;
+        }
+
         float *cbd = (float *)s->col_bufs[tid]->storage->data;
         ax_tensor_t *col_buf = s->col_bufs[tid];
         ax_tensor_t *go_mat = s->go_bufs[tid];
@@ -858,16 +986,34 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         }
     }
 
-    /* serial reduction: sum all per-thread dW buffers into weight->grad */
+    /* parallel reduction: each thread owns a slice of [0, wn) and sums all T
+       per-thread dW buffers into weight->grad for that slice. wins for large
+       convs (e.g. 512×4608 = 9.4 MB per buffer × T=16 = 150 MB data to
+       reduce); the original serial loop streamed all of this through one
+       core's L1. */
     if (weight->requires_grad) {
         float *wg = (float *)weight->grad->storage->data;
         int64_t wn = C_out * K;
-        for (int t = 0; t < T; t++) {
-            float *dwl = (float *)s->dw_bufs[t]->storage->data;
-            int64_t wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
-            for (; wi < wve; wi += AX_VF32_WIDTH)
-                ax_vf32_storeu(wg + wi, ax_vf32_add(ax_vf32_loadu(wg + wi), ax_vf32_loadu(dwl + wi)));
-            for (; wi < wn; wi++) wg[wi] += dwl[wi];
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(T) schedule(static)
+        #endif
+        for (int64_t wi0 = 0; wi0 < wn; wi0 += AX_VF32_WIDTH) {
+            int64_t wend = (wi0 + AX_VF32_WIDTH <= wn) ? wi0 + AX_VF32_WIDTH : wn;
+            if (wend - wi0 == AX_VF32_WIDTH) {
+                ax_vf32 acc = ax_vf32_loadu(wg + wi0);
+                for (int t = 0; t < T; t++) {
+                    float *dwl = (float *)s->dw_bufs[t]->storage->data;
+                    acc = ax_vf32_add(acc, ax_vf32_loadu(dwl + wi0));
+                }
+                ax_vf32_storeu(wg + wi0, acc);
+            } else {
+                for (int64_t wi = wi0; wi < wend; wi++) {
+                    float sum = wg[wi];
+                    for (int t = 0; t < T; t++)
+                        sum += ((float *)s->dw_bufs[t]->storage->data)[wi];
+                    wg[wi] = sum;
+                }
+            }
         }
     }
     } /* end use_batched_bwd else */
@@ -1285,9 +1431,20 @@ static inline bool can_direct_smallcin(int kh, int kw, int sh, int sw,
 
 /* implicit gemm: useful when K is large (typically C_in >= 64 with 3x3+ kernels)
    AND M is large enough that the gemm dominates over the gather overhead. */
+/* implicit GEMM (gather-on-the-fly into pack_b) wins when:
+   (a) both K and M are large enough to amortize the per-element gather
+       overhead (the original heuristic), OR
+   (b) explicit im2col would materialize >8 MB per sample and K is at least
+       moderate (≥512). avoiding the full im2col write+read saves ~2× the
+       buffer's bytes of memory traffic; for cbr_64x112x112_128x3 this is
+       ~58 MB per sample (28.9 MB im2col write + 28.9 MB pack_b read of
+       the same data). K threshold of 512 keeps gather overhead ≤ ~25%
+       of inner loop time. */
 static inline bool prefer_implicit_gemm(int64_t K, int64_t M)
 {
-    return K >= 1024 && M >= 256;
+    if (K >= 1024 && M >= 256) return true;
+    int64_t im2col_bytes = K * M * (int64_t)sizeof(float);
+    return im2col_bytes > (int64_t)(8 * 1024 * 1024) && K >= 512 && M >= 256;
 }
 
 static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
@@ -1366,47 +1523,59 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     bool use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
     bool use_smallcin = !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
     bool use_implicit = !use_direct && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
-    bool use_batched = !use_direct && !use_smallcin && !use_implicit && N > 1 && M < AX_CONV_BATCH_M_THRESH
+    /* 1×1 stride=1 pad=0 routes to per-sample (zero-copy stack tensor),
+       not batched (which pays an im2col-as-transpose cost for no GEMM gain). */
+    bool is_1x1_fast = is_1x1_pad0_stride1(kh, kw, sh, sw, ph, pw) && (H == out_h) && (W == out_w);
+    bool use_batched = !use_direct && !use_smallcin && !use_implicit && !is_1x1_fast
+                       && N > 1 && M < AX_CONV_BATCH_M_THRESH
                        && s->batch_col_buf && s->batch_aux_buf;
 
     if (use_batched) {
-        /* batch all N im2cols into [K, N*M], do one GEMM, scatter with bias.
-           eliminates N separate GEMM launches and gives full NC utilization
-           when M (per sample) is too small to fill register tiles alone. */
+        /* sub-batched: loop over n_batch-sample chunks, each fitting ≤8 MB.
+           im2col → wide GEMM → scatter-with-bias per chunk.
+           for the common case (N ≤ n_batch, no splitting), this is a
+           single iteration identical to the original whole-N path. */
         float *bcd = (float *)s->batch_col_buf->storage->data;
         float *brd = (float *)s->batch_aux_buf->storage->data;
-        int64_t NM = N * M;
+        int64_t nb = s->n_batch;
 
-        #ifdef _OPENMP
-        #pragma omp parallel for num_threads(T) schedule(static)
-        #endif
-        for (int64_t n = 0; n < N; n++)
-            im2col_into_strided(ind + n * C_in * H * W, C_in, H, W,
-                                 kh, kw, sh, sw, ph, pw, out_h, out_w,
-                                 bcd, NM, n * M);
+        for (int64_t n_start = 0; n_start < N; n_start += nb) {
+            int64_t n_b   = (n_start + nb <= N) ? nb : (N - n_start);
+            int64_t NM_b  = n_b * M;
+            int threads_b = (int)(n_b < T ? n_b : T);
 
-        /* opt_gemm zero-fills C internally before accumulating; no need
-           to memset brd here. saves ~12.8 MB on the conv_512x1 batched case. */
-        ax_compute_gemm(w2d, s->batch_col_buf, s->batch_aux_buf);
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(threads_b) schedule(static)
+            #endif
+            for (int64_t n = 0; n < n_b; n++)
+                im2col_into_strided(ind + (n_start + n) * C_in * H * W, C_in, H, W,
+                                     kh, kw, sh, sw, ph, pw, out_h, out_w,
+                                     bcd, NM_b, n * M);
 
-        /* scatter brd[C_out, N, M] → od[N, C_out, M] with bias add.
-           co-outer reads brd contiguously per channel; the original
-           n-outer/co-inner pattern jumped NM*4 = 25 KB per inner step
-           (1×1 conv at C_out=512 thrashed L1). */
-        #ifdef _OPENMP
-        #pragma omp parallel for num_threads(T) schedule(static)
-        #endif
-        for (int64_t co = 0; co < C_out; co++) {
-            float bias_val = bias_data ? bias_data[co] : 0.0f;
-            ax_vf32 vb = ax_vf32_set1(bias_val);
-            const float *src_co = brd + co * NM;
-            for (int64_t n = 0; n < N; n++) {
-                float *dst = od + (n * C_out + co) * M;
-                const float *src = src_co + n * M;
-                int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
-                for (; m < ve; m += AX_VF32_WIDTH)
-                    ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), vb));
-                for (; m < M; m++) dst[m] = src[m] + bias_val;
+            /* stack tensor views sized to this chunk; opt_gemm zero-fills brd. */
+            ax_storage_t col_st, aux_st;
+            ax_tensor_t  col_tv, aux_tv;
+            make_stack_view(&col_tv, &col_st, bcd,  K,     NM_b);
+            make_stack_view(&aux_tv, &aux_st, brd,  C_out, NM_b);
+            ax_compute_gemm(w2d, &col_tv, &aux_tv);
+
+            /* scatter brd[C_out, n_b, M] → od[n_start+n, C_out, M] with bias.
+               co-outer keeps brd access contiguous per channel. */
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(T) schedule(static)
+            #endif
+            for (int64_t co = 0; co < C_out; co++) {
+                float bias_val = bias_data ? bias_data[co] : 0.0f;
+                ax_vf32 vb = ax_vf32_set1(bias_val);
+                const float *src_co = brd + co * NM_b;
+                for (int64_t n = 0; n < n_b; n++) {
+                    float *dst = od + ((n_start + n) * C_out + co) * M;
+                    const float *src = src_co + n * M;
+                    int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
+                    for (; m < ve; m += AX_VF32_WIDTH)
+                        ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), vb));
+                    for (; m < M; m++) dst[m] = src[m] + bias_val;
+                }
             }
         }
     } else {
@@ -1455,36 +1624,15 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
                 .out_h = out_h, .out_w = out_w,
             };
             ax_compute_conv_gemm(w2d, &cp, res);
-        } else if (kh == 1 && kw == 1 && sh == 1 && sw == 1
-                   && ph == 0 && pw == 0 && H == out_h && W == out_w) {
-            /* 1x1 stride-1 pad-0 conv: im2col is the identity layout.
-               skip the copy entirely by constructing a stack tensor view
-               over the input slice and handing it straight to gemm. this
-               saves a C_in*H*W memcpy per sample (400kb+ on vgg shapes).
-               storage/tensor are stack-allocated so there's no refcount
-               bookkeeping; the parent input keeps the real storage alive
-               for the duration of this forward pass. */
-            ax_storage_t in_storage;
-            in_storage.data = (void *)(ind + n * C_in * H * W);
-            in_storage.size_bytes = (size_t)(C_in * H * W) * sizeof(float);
-            atomic_store(&in_storage.refcount, 0);
-            in_storage.device = AX_DEVICE_CPU;
-            in_storage.is_arena_temp = true;
-            in_storage.generation = 1;
-
-            ax_tensor_t in_slice;
-            memset(&in_slice, 0, sizeof(in_slice));
-            in_slice.storage = &in_storage;
-            in_slice.ndim = 2;
-            in_slice.dtype = AX_FLOAT32;
-            in_slice.offset = 0;
-            in_slice.shape[0] = C_in;
-            in_slice.shape[1] = M;
-            in_slice.strides[0] = M;
-            in_slice.strides[1] = 1;
-
-            /* opt_gemm zero-fills C internally; skip our memset. */
-            ax_compute_gemm(w2d, &in_slice, res);
+        } else if (is_1x1_fast) {
+            /* 1×1 stride=1 pad=0: im2col is the identity layout. zero-copy
+               stack view over the input slice [C_in, M] saves a C_in*H*W
+               memcpy per sample (400 kb+ on vgg shapes). opt_gemm zero-fills
+               C internally; no explicit memset needed. */
+            ax_storage_t in_st;
+            ax_tensor_t  in_tv;
+            make_stack_view(&in_tv, &in_st, ind + n * C_in * H * W, C_in, M);
+            ax_compute_gemm(w2d, &in_tv, res);
         } else {
             float *cd = (float *)col->storage->data;
             /* explicit im2col + dispatch gemm. fastest for medium K. */
