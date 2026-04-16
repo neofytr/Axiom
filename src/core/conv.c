@@ -1385,18 +1385,24 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
                                  kh, kw, sh, sw, ph, pw, out_h, out_w,
                                  bcd, NM, n * M);
 
-        memset(brd, 0, (size_t)(C_out * NM) * sizeof(float));
+        /* opt_gemm zero-fills C internally before accumulating; no need
+           to memset brd here. saves ~12.8 MB on the conv_512x1 batched case. */
         ax_compute_gemm(w2d, s->batch_col_buf, s->batch_aux_buf);
 
+        /* scatter brd[C_out, N, M] → od[N, C_out, M] with bias add.
+           co-outer reads brd contiguously per channel; the original
+           n-outer/co-inner pattern jumped NM*4 = 25 KB per inner step
+           (1×1 conv at C_out=512 thrashed L1). */
         #ifdef _OPENMP
         #pragma omp parallel for num_threads(T) schedule(static)
         #endif
-        for (int64_t n = 0; n < N; n++) {
-            for (int64_t co = 0; co < C_out; co++) {
-                float bias_val = bias_data ? bias_data[co] : 0.0f;
+        for (int64_t co = 0; co < C_out; co++) {
+            float bias_val = bias_data ? bias_data[co] : 0.0f;
+            ax_vf32 vb = ax_vf32_set1(bias_val);
+            const float *src_co = brd + co * NM;
+            for (int64_t n = 0; n < N; n++) {
                 float *dst = od + (n * C_out + co) * M;
-                const float *src = brd + co * NM + n * M;
-                ax_vf32 vb = ax_vf32_set1(bias_val);
+                const float *src = src_co + n * M;
                 int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
                 for (; m < ve; m += AX_VF32_WIDTH)
                     ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), vb));
@@ -1477,14 +1483,14 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             in_slice.strides[0] = M;
             in_slice.strides[1] = 1;
 
-            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            /* opt_gemm zero-fills C internally; skip our memset. */
             ax_compute_gemm(w2d, &in_slice, res);
         } else {
             float *cd = (float *)col->storage->data;
             /* explicit im2col + dispatch gemm. fastest for medium K. */
             im2col_into(ind + n * C_in * H * W, C_in, H, W,
                          kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
-            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            /* opt_gemm zero-fills C internally; skip our memset. */
             ax_compute_gemm(w2d, col, res);
         }
 
@@ -2049,18 +2055,21 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
                                  kh, kw, sh, sw, ph, pw, out_h, out_w,
                                  bcd, NM, n * M);
 
-        memset(brd, 0, (size_t)(C_out * NM) * sizeof(float));
+        /* opt_gemm zero-fills C internally; skip our memset. */
         ax_compute_gemm(w2d, s->batch_col_buf, s->batch_aux_buf);
 
+        /* scatter brd[C_out, N, M] → od[N, C_out, M] with bias add (co-outer
+           = contiguous brd reads; see conv2d_forward batched path). */
         #ifdef _OPENMP
         #pragma omp parallel for num_threads(T) schedule(static)
         #endif
-        for (int64_t n = 0; n < N; n++) {
-            for (int64_t co = 0; co < C_out; co++) {
-                float bias_val = bias_data ? bias_data[co] : 0.0f;
+        for (int64_t co = 0; co < C_out; co++) {
+            float bias_val = bias_data ? bias_data[co] : 0.0f;
+            ax_vf32 v_b = ax_vf32_set1(bias_val);
+            const float *src_co = brd + co * NM;
+            for (int64_t n = 0; n < N; n++) {
                 float *dst = od + (n * C_out + co) * M;
-                const float *src = brd + co * NM + n * M;
-                ax_vf32 v_b = ax_vf32_set1(bias_val);
+                const float *src = src_co + n * M;
                 int64_t m = 0, me = M - (M % AX_VF32_WIDTH);
                 for (; m < me; m += AX_VF32_WIDTH)
                     ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), v_b));
@@ -2132,13 +2141,13 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
             in_slice.strides[0] = M;
             in_slice.strides[1] = 1;
 
-            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            /* opt_gemm zero-fills C internally; skip our memset. */
             ax_compute_gemm(w2d, &in_slice, res);
         } else {
             float *cd = (float *)col->storage->data;
             im2col_into(ind + n * C_in * H * W, C_in, H, W,
                          kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
-            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            /* opt_gemm zero-fills C internally; skip our memset. */
             ax_compute_gemm(w2d, col, res);
         }
 
