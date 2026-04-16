@@ -60,6 +60,9 @@ static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int p
 /* forward declarations for predicates used by ensure_scratch */
 static inline bool can_direct_3x3(int kh, int kw, int sh, int sw, int ph, int pw, int64_t C_in);
 static inline bool prefer_implicit_gemm(int64_t K, int64_t M);
+static inline bool prefer_winograd_f23(int kh, int kw, int sh, int sw, int ph, int pw,
+                                        int64_t N, int64_t C_in, int64_t C_out,
+                                        int64_t out_h, int64_t out_w);
 
 /* 1×1 stride=1 pad=0: im2col is the identity rearrangement.
    the per-sample fast path uses a stack-tensor view to skip the copy
@@ -111,6 +114,15 @@ struct ax_conv_scratch {
     ax_tensor_t *batch_col_buf; /* [K, n_batch*M]: im2col in fwd; dcol_batch in bwd */
     ax_tensor_t *batch_aux_buf; /* [C_out, n_batch*M]: gemm result in fwd; go_batch in bwd */
     int64_t n_batch;            /* samples per sub-batch; 0 or 1 = batched path disabled */
+
+    /* winograd F(2,3) buffers (allocated when prefer_winograd_f23 returns true).
+       U: [16, C_out, C_in] transformed kernel (re-filled each forward; weights change).
+       V: [16, C_in, num_tiles] transformed input (per forward).
+       Mout: [16, C_out, num_tiles] gemm result, then output-transform to od. */
+    ax_tensor_t *wino_U;
+    ax_tensor_t *wino_V;
+    ax_tensor_t *wino_M;
+    int64_t wino_num_tiles;     /* N * Ty * Tx; 0 if winograd not allocated */
 };
 
 static void scratch_destroy(struct ax_conv_scratch *s)
@@ -135,6 +147,9 @@ static void scratch_destroy(struct ax_conv_scratch *s)
     if (s->wt_contig) ax_tensor_destroy(s->wt_contig);
     if (s->batch_col_buf) ax_tensor_destroy(s->batch_col_buf);
     if (s->batch_aux_buf) ax_tensor_destroy(s->batch_aux_buf);
+    if (s->wino_U) ax_tensor_destroy(s->wino_U);
+    if (s->wino_V) ax_tensor_destroy(s->wino_V);
+    if (s->wino_M) ax_tensor_destroy(s->wino_M);
     free(s);
 }
 
@@ -293,6 +308,23 @@ static struct ax_conv_scratch *ensure_scratch(ax_conv2d_t *conv,
             s->batch_aux_buf = ax_tensor_create(batch_aux_shape, 2, AX_FLOAT32);
             /* failure is non-fatal: forward/backward fall back to per-sample path */
         }
+    }
+
+    /* winograd F(2,3) scratch: U [16, C_out, C_in], V [16, C_in, num_tiles],
+       M [16, C_out, num_tiles]. allocated when the layer matches the
+       winograd predicate (3x3 stride=1 pad=1, Cin/Cout >= 32, out >= 4x4).
+       failure is non-fatal: forward falls back to im2col+gemm. */
+    if (prefer_winograd_f23(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)) {
+        const int64_t Ty = (out_h + 1) / 2;
+        const int64_t Tx = (out_w + 1) / 2;
+        const int64_t num_tiles = N * Ty * Tx;
+        s->wino_num_tiles = num_tiles;
+        int64_t U_shape[] = {16, C_out, C_in};
+        int64_t V_shape[] = {16, C_in,  num_tiles};
+        int64_t M_shape[] = {16, C_out, num_tiles};
+        s->wino_U = ax_tensor_create(U_shape, 3, AX_FLOAT32);
+        s->wino_V = ax_tensor_create(V_shape, 3, AX_FLOAT32);
+        s->wino_M = ax_tensor_create(M_shape, 3, AX_FLOAT32);
     }
 
     conv->scratch = s;
@@ -1102,6 +1134,110 @@ static inline bool can_direct_3x3(int kh, int kw, int sh, int sw, int ph, int pw
 #endif
 }
 
+/* winograd F(2x2, 3x3): 2x2 output tile from 3x3 kernel using a 4x4 input tile.
+   16 muls per output tile per (Cout, Cin) pair vs 36 for direct conv —
+   theoretical 2.25x speedup on the multiply count. wins when Cin/Cout are
+   large enough to amortize the input/kernel/output transforms (~32+) and
+   when out_h/out_w are >= 4. only handles 3x3 stride=1 pad=1 — F(2,3) doesn't
+   apply to 1x1, 5x5, 7x7 (different variants), nor stride=2 (different algo).
+
+   the V buffer ([16, C_in, num_tiles]) caps shape eligibility: at large
+   num_tiles the per-tile scatter spans Cin*num_tiles*sizeof(float) of memory
+   per ij stride, thrashing all cache levels. measured: 51 MB V (conv_512x14)
+   wins +38%, 102 MB V (conv_256x28) wins +15%, 205 MB V (conv_128x56) loses
+   ~6%, 411 MB V (conv_64x112) loses ~34%. cap at ~128 MB (about L3 × 7).
+   small-Cin cases (e.g. C_in=3 first layer) also lose to direct-smallcin
+   because 16-muls-per-tile vs 9-FMAs-per-output can't pay back the
+   per-tile transform cost. */
+static inline bool prefer_winograd_f23(int kh, int kw, int sh, int sw, int ph, int pw,
+                                        int64_t N, int64_t C_in, int64_t C_out,
+                                        int64_t out_h, int64_t out_w)
+{
+    if (!(kh == 3 && kw == 3 && sh == 1 && sw == 1 && ph == 1 && pw == 1)) return false;
+    if (C_in < 32 || C_out < 32) return false;
+    if (out_h < 4 || out_w < 4) return false;
+    /* V buffer size: 16 * C_in * num_tiles floats, with num_tiles = N * Ty * Tx.
+       cap at ~32 MB worth of slots (8M floats) so the input-transform scatter
+       stays manageable. measured: V=51 MB wins +38%, V=102 MB wins +15%, but
+       V=205 MB loses -6% and V=411 MB loses -34% as cache thrashing dominates. */
+    int64_t Ty = (out_h + 1) / 2;
+    int64_t Tx = (out_w + 1) / 2;
+    int64_t v_slots = 16 * C_in * N * Ty * Tx;
+    if (v_slots > (int64_t)(32 * 1024 * 1024)) return false;
+    return true;
+}
+
+/* winograd F(2,3) transform matrices (precomputed constants):
+     B^T (input transform, 4x4):       G (kernel transform, 4x3):    A^T (output xform, 2x4):
+       [ 1,  0, -1,  0]                 [  1,    0,    0 ]            [ 1,  1,  1,  0]
+       [ 0,  1,  1,  0]                 [ 1/2,  1/2,  1/2]            [ 0,  1, -1, -1]
+       [ 0, -1,  1,  0]                 [ 1/2, -1/2,  1/2]
+       [ 0,  1,  0, -1]                 [  0,    0,    1 ]
+   each transform is small enough that the constants are unrolled below as
+   straight-line code (no matrix multiply at runtime). */
+
+/* per-tile input transform: V = B^T * d * B. d and v are 4x4 row-major. */
+static inline void wino_input_transform_tile(const float *d, float *v)
+{
+    /* t = B^T * d (4 rows × 4 cols) */
+    float t[16];
+    for (int j = 0; j < 4; j++) {
+        const float d0j = d[0*4+j], d1j = d[1*4+j], d2j = d[2*4+j], d3j = d[3*4+j];
+        t[0*4+j] =  d0j - d2j;
+        t[1*4+j] =  d1j + d2j;
+        t[2*4+j] = -d1j + d2j;
+        t[3*4+j] =  d1j - d3j;
+    }
+    /* v = t * B (B = (B^T)^T). same row pattern applied per row of t. */
+    for (int i = 0; i < 4; i++) {
+        const float t0 = t[i*4+0], t1 = t[i*4+1], t2 = t[i*4+2], t3 = t[i*4+3];
+        v[i*4+0] =  t0 - t2;
+        v[i*4+1] =  t1 + t2;
+        v[i*4+2] = -t1 + t2;
+        v[i*4+3] =  t1 - t3;
+    }
+}
+
+/* per-filter kernel transform: U = G * g * G^T. g is 3x3, u is 4x4. */
+static inline void wino_kernel_transform_filter(const float *g, float *u)
+{
+    /* t = G * g (4 rows × 3 cols) */
+    float t[12];
+    for (int j = 0; j < 3; j++) {
+        const float g0j = g[0*3+j], g1j = g[1*3+j], g2j = g[2*3+j];
+        t[0*3+j] = g0j;
+        t[1*3+j] = 0.5f * ( g0j + g1j + g2j);
+        t[2*3+j] = 0.5f * ( g0j - g1j + g2j);
+        t[3*3+j] = g2j;
+    }
+    /* u = t * G^T (4 rows × 4 cols) */
+    for (int i = 0; i < 4; i++) {
+        const float t0 = t[i*3+0], t1 = t[i*3+1], t2 = t[i*3+2];
+        u[i*4+0] = t0;
+        u[i*4+1] = 0.5f * ( t0 + t1 + t2);
+        u[i*4+2] = 0.5f * ( t0 - t1 + t2);
+        u[i*4+3] = t2;
+    }
+}
+
+/* per-tile output transform: y = A^T * m * A. m is 4x4, y is 2x2. */
+static inline void wino_output_transform_tile(const float *m, float *y)
+{
+    /* t = A^T * m (2 rows × 4 cols) */
+    float t[8];
+    for (int j = 0; j < 4; j++) {
+        const float m0j = m[0*4+j], m1j = m[1*4+j], m2j = m[2*4+j], m3j = m[3*4+j];
+        t[0*4+j] = m0j + m1j + m2j;
+        t[1*4+j] = m1j - m2j - m3j;
+    }
+    /* y = t * A (2 rows × 2 cols) */
+    for (int i = 0; i < 2; i++) {
+        const float t0 = t[i*4+0], t1 = t[i*4+1], t2 = t[i*4+2], t3 = t[i*4+3];
+        y[i*2+0] = t0 + t1 + t2;
+        y[i*2+1] = t1 - t2 - t3;
+    }
+}
+
 /* direct conv for very-small input channels (typical first layer: C_in=3 RGB).
    im2col would copy 9× the input for K=3, then run a GEMM with K_gemm=27 too
    small to amortize pack overhead. tf has a specialized first-layer kernel
@@ -1447,6 +1583,142 @@ static inline bool prefer_implicit_gemm(int64_t K, int64_t M)
     return im2col_bytes > (int64_t)(8 * 1024 * 1024) && K >= 512 && M >= 256;
 }
 
+/* winograd F(2,3) forward kernel for the whole batch.
+   layout of scratch:
+     U (kernel transformed): [16, C_out, C_in], filled fresh from current weights
+       (weights change every train step; cheap relative to input transform).
+     V (input transformed):  [16, C_in, num_tiles] where num_tiles = N * Ty * Tx,
+       Ty = ceil(out_h/2), Tx = ceil(out_w/2).
+     M (gemm output):        [16, C_out, num_tiles]
+   pipeline:
+     1. transform kernel:    G * g[co,ci] * G^T  → U[*,*, co, ci]   (small matmul × 16 entries)
+     2. transform input:     B^T * d[n,ci, ty*2-1:+3, tx*2-1:+3] * B → V[*,*, ci, tile]
+     3. 16 gemms:            U[ij,*,*] @ V[ij,*,*]  → M[ij,*,*]
+     4. transform output:    A^T * m[*,*, co, tile] * A → 2x2 output, plus bias.
+   bounds: tiles at the right/bottom edge may map a 2x2 output that extends
+   past out_h/out_w; the writeback masks those positions. */
+static int conv2d_winograd_f23_forward(
+    struct ax_conv_scratch *s,
+    const float *id,    /* [N, C_in, H, W] */
+    const float *wd,    /* [C_out, C_in, 3, 3] */
+    const float *bias,  /* [C_out] or NULL */
+    float *od,          /* [N, C_out, out_h, out_w] */
+    int64_t N, int64_t C_in, int64_t H, int64_t W,
+    int64_t C_out, int64_t out_h, int64_t out_w, int T)
+{
+    const int64_t Ty = (out_h + 1) / 2;
+    const int64_t Tx = (out_w + 1) / 2;
+    const int64_t num_tiles = N * Ty * Tx;
+    if (num_tiles != s->wino_num_tiles || !s->wino_U || !s->wino_V || !s->wino_M)
+        return -1;  /* scratch shape mismatch — caller falls back */
+
+    float *U = (float *)s->wino_U->storage->data;  /* [16, C_out, C_in] */
+    float *V = (float *)s->wino_V->storage->data;  /* [16, C_in, num_tiles] */
+    float *M = (float *)s->wino_M->storage->data;  /* [16, C_out, num_tiles] */
+
+    const int64_t U_stride_ij = C_out * C_in;
+    const int64_t V_stride_ij = C_in * num_tiles;
+    const int64_t M_stride_ij = C_out * num_tiles;
+
+    /* 1. kernel transform: U[ij, co, ci] from weight[co, ci, 3x3].
+       parallel over (co, ci); each filter is 9 inputs → 16 outputs. */
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(T) schedule(static) collapse(2)
+    #endif
+    for (int64_t co = 0; co < C_out; co++) {
+        for (int64_t ci = 0; ci < C_in; ci++) {
+            float u[16];
+            wino_kernel_transform_filter(wd + (co * C_in + ci) * 9, u);
+            for (int ij = 0; ij < 16; ij++)
+                U[ij * U_stride_ij + co * C_in + ci] = u[ij];
+        }
+    }
+
+    /* 2. input transform: V[ij, ci, tile] from input 4x4 patch.
+       tile (n, ty, tx) → input rows [ty*2-1 : ty*2+3], cols [tx*2-1 : tx*2+3].
+       pad=1 means out-of-bound reads are zero. parallel over (n, ci, ty, tx). */
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(T) schedule(static) collapse(3)
+    #endif
+    for (int64_t n = 0; n < N; n++) {
+        for (int64_t ci = 0; ci < C_in; ci++) {
+            for (int64_t ty = 0; ty < Ty; ty++) {
+                const float *ic_plane = id + (n * C_in + ci) * H * W;
+                for (int64_t tx = 0; tx < Tx; tx++) {
+                    float d[16];
+                    /* extract 4x4 patch with implicit zero-pad */
+                    for (int di = 0; di < 4; di++) {
+                        const int64_t ih = ty * 2 + di - 1;  /* pad=1 → -1 origin */
+                        if (ih < 0 || ih >= H) {
+                            d[di*4+0] = d[di*4+1] = d[di*4+2] = d[di*4+3] = 0.0f;
+                            continue;
+                        }
+                        const float *irow = ic_plane + ih * W;
+                        for (int dj = 0; dj < 4; dj++) {
+                            const int64_t iw = tx * 2 + dj - 1;
+                            d[di*4+dj] = (iw >= 0 && iw < W) ? irow[iw] : 0.0f;
+                        }
+                    }
+                    float v[16];
+                    wino_input_transform_tile(d, v);
+                    /* scatter v[ij] to V[ij, ci, tile_idx] */
+                    const int64_t tile_idx = (n * Ty + ty) * Tx + tx;
+                    for (int ij = 0; ij < 16; ij++)
+                        V[ij * V_stride_ij + ci * num_tiles + tile_idx] = v[ij];
+                }
+            }
+        }
+    }
+
+    /* 3. 16 GEMMs: M[ij] = U[ij] @ V[ij] using stack tensor views.
+       each gemm is [C_out, C_in] @ [C_in, num_tiles] → [C_out, num_tiles].
+       opt_gemm zero-fills the output internally; no per-call memset. */
+    for (int ij = 0; ij < 16; ij++) {
+        ax_storage_t a_st, b_st, c_st;
+        ax_tensor_t  a_tv, b_tv, c_tv;
+        make_stack_view(&a_tv, &a_st, U + ij * U_stride_ij, C_out, C_in);
+        make_stack_view(&b_tv, &b_st, V + ij * V_stride_ij, C_in,  num_tiles);
+        make_stack_view(&c_tv, &c_st, M + ij * M_stride_ij, C_out, num_tiles);
+        ax_compute_gemm(&a_tv, &b_tv, &c_tv);
+    }
+
+    /* 4. output transform: y = A^T * m_tile * A → 2x2 + bias, write to od.
+       parallel over (n, co, ty, tx); each tile writes a disjoint 2x2 region.
+       last-row/last-col tiles may have ty*2+1 == out_h or tx*2+1 == out_w
+       (i.e. the 2x2 falls partly outside the valid output) — masked below. */
+    #ifdef _OPENMP
+    #pragma omp parallel for num_threads(T) schedule(static) collapse(3)
+    #endif
+    for (int64_t n = 0; n < N; n++) {
+        for (int64_t co = 0; co < C_out; co++) {
+            for (int64_t ty = 0; ty < Ty; ty++) {
+                const float bias_val = bias ? bias[co] : 0.0f;
+                float *oc_plane = od + (n * C_out + co) * out_h * out_w;
+                for (int64_t tx = 0; tx < Tx; tx++) {
+                    float m[16];
+                    const int64_t tile_idx = (n * Ty + ty) * Tx + tx;
+                    for (int ij = 0; ij < 16; ij++)
+                        m[ij] = M[ij * M_stride_ij + co * num_tiles + tile_idx];
+                    float y[4];
+                    wino_output_transform_tile(m, y);
+                    /* writeback with bounds check (last partial tile). */
+                    for (int oi = 0; oi < 2; oi++) {
+                        const int64_t oh = ty * 2 + oi;
+                        if (oh >= out_h) break;
+                        for (int oj = 0; oj < 2; oj++) {
+                            const int64_t ow = tx * 2 + oj;
+                            if (ow >= out_w) break;
+                            oc_plane[oh * out_w + ow] = y[oi*2+oj] + bias_val;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_conv2d_t *conv = (ax_conv2d_t *)self;
@@ -1515,22 +1787,43 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     const float *bias_data = (conv->use_bias && conv->bias)
         ? (const float *)conv->bias->storage->data : NULL;
 
-    /* shape-aware path selection. direct 3x3 wins for small kernels (mnist:
-       both convs hit this). small-C_in direct beats im2col+gemm on the
-       first layer of image nets (C_in=3, K=27 too small for GEMM). implicit
-       gemm wins for large K + large M. otherwise fall back to explicit
-       im2col + gemm. */
-    bool use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
-    bool use_smallcin = !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
-    bool use_implicit = !use_direct && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+    /* shape-aware path selection. winograd F(2,3) wins on 3x3 stride=1 pad=1
+       with mid-large Cin/Cout (16 muls per 2x2 output tile vs 36 for direct).
+       direct 3x3 wins for small kernels (mnist: both convs hit this).
+       small-C_in direct beats im2col+gemm on the first layer of image nets
+       (C_in=3, K=27 too small for GEMM). implicit gemm wins for large K +
+       large M. otherwise fall back to explicit im2col + gemm. */
+    bool use_winograd = prefer_winograd_f23(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)
+                        && s->wino_U && s->wino_V && s->wino_M;
+    bool use_direct = !use_winograd && can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
+    bool use_smallcin = !use_winograd && !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
+    bool use_implicit = !use_winograd && !use_direct && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
     /* 1×1 stride=1 pad=0 routes to per-sample (zero-copy stack tensor),
        not batched (which pays an im2col-as-transpose cost for no GEMM gain). */
     bool is_1x1_fast = is_1x1_pad0_stride1(kh, kw, sh, sw, ph, pw) && (H == out_h) && (W == out_w);
-    bool use_batched = !use_direct && !use_smallcin && !use_implicit && !is_1x1_fast
+    bool use_batched = !use_winograd && !use_direct && !use_smallcin && !use_implicit && !is_1x1_fast
                        && N > 1 && M < AX_CONV_BATCH_M_THRESH
                        && s->batch_col_buf && s->batch_aux_buf;
 
-    if (use_batched) {
+    if (use_winograd) {
+        int rc = conv2d_winograd_f23_forward(s, ind, wd, bias_data, od,
+                                              N, C_in, H, W, C_out, out_h, out_w, T);
+        if (rc != 0) {
+            /* shape mismatch (e.g. resized between forward calls) — fall back */
+            use_winograd = false;
+            use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
+            use_smallcin = !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
+            use_implicit = !use_direct && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+            use_batched = !use_direct && !use_smallcin && !use_implicit && !is_1x1_fast
+                          && N > 1 && M < AX_CONV_BATCH_M_THRESH
+                          && s->batch_col_buf && s->batch_aux_buf;
+        }
+    }
+
+    if (use_winograd) {
+        /* output already filled by conv2d_winograd_f23_forward; skip the
+           im2col+gemm + scatter paths below. */
+    } else if (use_batched) {
         /* sub-batched: loop over n_batch-sample chunks, each fitting ≤8 MB.
            im2col → wide GEMM → scatter-with-bias per chunk.
            for the common case (N ≤ n_batch, no splitting), this is a

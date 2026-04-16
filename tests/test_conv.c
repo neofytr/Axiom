@@ -307,6 +307,77 @@ static void test_conv2d_batched_bwd(void)
     ax_no_grad();
 }
 
+/* winograd F(2,3) correctness: compute conv with shape large enough to trigger
+   the Winograd path (3x3 stride=1 pad=1, Cin/Cout >= 32, out >= 4x4) and
+   compare to a scalar reference direct conv computed in the test. tolerates
+   ulp-level differences from F23 transform's 0.5x scale factors. */
+static void test_conv2d_winograd_f23_correctness(void)
+{
+    /* small enough to compute reference by scalar loop, large enough to trigger
+       winograd: N=2, Cin=32, H=W=8, Cout=32. Predicate: tiles_per_sample = 4*4=16,
+       slots = 16 * 32 * 2 * 4 * 4 = 16384 < 32M → enabled. */
+    int N = 2, Cin = 32, H = 8, W = 8, Cout = 32;
+    int64_t M = (int64_t)H * W;
+
+    ax_layer_t *c = ax_conv2d_create(Cin, Cout, 3, 1, 1, false);
+    ax_conv2d_t *cc = (ax_conv2d_t *)c;
+
+    /* deterministic small init */
+    int64_t wn = (int64_t)Cout * Cin * 9;
+    float *wd = (float *)cc->weight->storage->data;
+    for (int64_t i = 0; i < wn; i++) wd[i] = (float)((i * 13) % 17 - 8) * 0.05f;
+
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    int64_t inn = (int64_t)N * Cin * H * W;
+    float *id = (float *)inp->storage->data;
+    for (int64_t i = 0; i < inn; i++) id[i] = (float)((i * 7) % 11 - 5) * 0.05f;
+
+    ax_tensor_t *out_w = ax_layer_forward(c, inp);
+    AX_TEST_ASSERT(out_w != NULL, "winograd fwd should run");
+    AX_TEST_ASSERT_EQ(out_w->shape[0], N, "N preserved");
+    AX_TEST_ASSERT_EQ(out_w->shape[1], Cout, "Cout preserved");
+    AX_TEST_ASSERT_EQ(out_w->shape[2], H, "out_h = H (pad=1, k=3, s=1)");
+
+    /* scalar reference direct conv: out[n,co,h,w] = sum_ci sum_kh sum_kw input[n,ci,h+kh-1,w+kw-1] * weight[co,ci,kh,kw] */
+    float *out_ref = (float *)calloc((size_t)(N * Cout * M), sizeof(float));
+    for (int n = 0; n < N; n++) {
+        for (int co = 0; co < Cout; co++) {
+            for (int h = 0; h < H; h++) {
+                for (int w = 0; w < W; w++) {
+                    float sum = 0.0f;
+                    for (int ci = 0; ci < Cin; ci++) {
+                        for (int kh = 0; kh < 3; kh++) {
+                            for (int kw = 0; kw < 3; kw++) {
+                                int ih = h + kh - 1;
+                                int iw = w + kw - 1;
+                                if (ih < 0 || ih >= H || iw < 0 || iw >= W) continue;
+                                float in_val = id[((n * Cin + ci) * H + ih) * W + iw];
+                                float w_val = wd[((co * Cin + ci) * 3 + kh) * 3 + kw];
+                                sum += in_val * w_val;
+                            }
+                        }
+                    }
+                    out_ref[((n * Cout + co) * H + h) * W + w] = sum;
+                }
+            }
+        }
+    }
+
+    /* compare */
+    const float *od = (const float *)out_w->storage->data;
+    int64_t total = N * Cout * M;
+    for (int64_t i = 0; i < total; i++) {
+        AX_TEST_ASSERT_NEAR(od[i], out_ref[i], 1e-3f,
+                            "winograd output matches direct reference");
+    }
+
+    free(out_ref);
+    ax_tensor_destroy(out_w);
+    ax_tensor_destroy(inp);
+    ax_layer_destroy(c);
+}
+
 /* sub-batched path: when N*K*M*4 exceeds AX_CONV_BATCH_COL_BYTES (8 MB)
    the batched path splits N into n_batch-sized chunks. verify forward and
    backward across the split boundary match per-sample reference results. */
@@ -687,6 +758,7 @@ int main(void)
     AX_RUN_TEST(test_conv2d_batched_bwd);
     AX_RUN_TEST(test_conv2d_subbatched_fwd_bwd);
     AX_RUN_TEST(test_conv2d_1x1_zero_copy_bwd);
+    AX_RUN_TEST(test_conv2d_winograd_f23_correctness);
     AX_RUN_TEST(test_conv2d_direct_smallcin_vs_gemm);
     AX_RUN_TEST(test_conv2d_smallcin_edges);
     AX_RUN_TEST(test_maxpool2d_simd);
