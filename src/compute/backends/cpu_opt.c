@@ -969,16 +969,29 @@ static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
 static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc,
                       int64_t m_remain, float *packed)
 {
+    /* Phase 2.4: pack_a_t reads MR contiguous floats per (i, p) inner iter
+       (the row of A^T at column p starting at row i). the original scalar
+       per-element loop with `if (ii < mr)` defeats compiler vectorization;
+       branch out the common mr == GEMM_MR case to a memcpy of GEMM_MR
+       floats. compiler unrolls the small constant-size memcpy to register
+       moves (GEMM_MR ∈ {6, 14, 8, 4} depending on ISA). measurable on
+       gemm_tn paths where pack_a_t is ~10% of total time. */
     for (int64_t i = 0; i < mc; i += GEMM_MR) {
         int64_t mr = (i + GEMM_MR <= m_remain) ? GEMM_MR : (m_remain > i ? m_remain - i : 0);
-        for (int64_t p = 0; p < kc; p++) {
-            for (int64_t ii = 0; ii < GEMM_MR; ii++) {
-                if (ii < mr)
-                    packed[ii] = a_src[p * lda_src + (i + ii)];
-                else
-                    packed[ii] = 0.0f;
+        if (mr == GEMM_MR) {
+            for (int64_t p = 0; p < kc; p++) {
+                memcpy(packed, a_src + p * lda_src + i, GEMM_MR * sizeof(float));
+                packed += GEMM_MR;
             }
-            packed += GEMM_MR;
+        } else {
+            /* edge strip: scalar with zero-padding for ii >= mr */
+            for (int64_t p = 0; p < kc; p++) {
+                for (int64_t ii = 0; ii < GEMM_MR; ii++) {
+                    if (ii < mr) packed[ii] = a_src[p * lda_src + (i + ii)];
+                    else         packed[ii] = 0.0f;
+                }
+                packed += GEMM_MR;
+            }
         }
     }
 }
