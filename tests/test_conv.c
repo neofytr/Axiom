@@ -382,6 +382,56 @@ static void test_conv2d_direct_smallcin_vs_gemm(void)
     ax_enable_grad();
 }
 
+/* exercise the SIMD-vectorized maxpool k=2 s=2 path with deterministic
+   inputs wide enough to trigger the SIMD branch (ow > AX_VF32_WIDTH).
+   reference computed with the trivial 4-element scalar max. */
+static void test_maxpool2d_simd(void)
+{
+    /* 1×2×4×24 input → 1×2×2×12 output. ow=12 > AX_VF32_WIDTH=8 so SIMD
+       runs once + scalar tail covers the rest, exercising both branches. */
+    const int N = 1, C = 2, H = 4, W = 24;
+    int64_t in_sh[] = {N, C, H, W};
+    ax_tensor_t *inp = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    float *id = (float *)inp->storage->data;
+    /* deterministic values: id[n,c,h,w] = c*1000 + h*100 + w + 1 */
+    for (int c = 0; c < C; c++)
+        for (int h = 0; h < H; h++)
+            for (int w = 0; w < W; w++)
+                id[(c * H + h) * W + w] = (float)(c * 1000 + h * 100 + w + 1);
+
+    ax_layer_t *pool = ax_maxpool2d_create(2, 2, 0);
+    ax_no_grad();
+    ax_tensor_t *out = ax_layer_forward(pool, inp);
+    AX_TEST_ASSERT(out != NULL, "maxpool simd forward");
+
+    float *od = (float *)out->storage->data;
+    int64_t oh = out->shape[2], ow = out->shape[3];
+    AX_TEST_ASSERT_EQ(oh, 2, "out_h");
+    AX_TEST_ASSERT_EQ(ow, 12, "out_w");
+
+    /* reference: scalar pairwise max over 2×2 windows */
+    for (int c = 0; c < C; c++) {
+        for (int y = 0; y < oh; y++) {
+            for (int x = 0; x < ow; x++) {
+                int iy = y * 2, ix = x * 2;
+                float a = id[(c * H + iy)     * W + ix];
+                float b = id[(c * H + iy)     * W + ix + 1];
+                float p = id[(c * H + iy + 1) * W + ix];
+                float q = id[(c * H + iy + 1) * W + ix + 1];
+                float ref = a; if (b > ref) ref = b;
+                                if (p > ref) ref = p;
+                                if (q > ref) ref = q;
+                float got = od[(c * oh + y) * ow + x];
+                AX_TEST_ASSERT_NEAR(got, ref, 1e-5, "simd maxpool value");
+            }
+        }
+    }
+    ax_tensor_destroy(out);
+    ax_tensor_destroy(inp);
+    ax_layer_destroy(pool);
+    ax_enable_grad();
+}
+
 /* exercise edge cases: very small W (just below SIMD threshold), pad=0,
    stride=2, asymmetric kernel. all should fall into either smallcin or
    im2col cleanly without crashing. */
@@ -437,6 +487,7 @@ int main(void)
     AX_RUN_TEST(test_conv2d_batched_bwd);
     AX_RUN_TEST(test_conv2d_direct_smallcin_vs_gemm);
     AX_RUN_TEST(test_conv2d_smallcin_edges);
+    AX_RUN_TEST(test_maxpool2d_simd);
 
     ax_shutdown();
     AX_TEST_SUMMARY();

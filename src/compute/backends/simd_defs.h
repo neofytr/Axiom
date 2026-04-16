@@ -152,6 +152,25 @@ static inline ax_vf32 ax_vf32_cmpeq(ax_vf32 a, ax_vf32 b) {
     return _mm512_mask_blend_ps(m, _mm512_setzero_ps(), _mm512_set1_ps(1.0f));
 }
 
+/* paired horizontal max/sum: takes 2 vectors of WIDTH floats and returns
+   1 vector of WIDTH floats where output[i] = max/sum(input[2i], input[2i+1])
+   treating (a, b) concatenated as a single 2*WIDTH input. used by maxpool
+   and avgpool k=2 fast paths. */
+static inline ax_vf32 ax_vf32_pmax_pack(ax_vf32 a, ax_vf32 b) {
+    __m512i idx_evens = _mm512_setr_epi32(0,2,4,6,8,10,12,14, 16,18,20,22,24,26,28,30);
+    __m512i idx_odds  = _mm512_setr_epi32(1,3,5,7,9,11,13,15, 17,19,21,23,25,27,29,31);
+    __m512 evens = _mm512_permutex2var_ps(a, idx_evens, b);
+    __m512 odds  = _mm512_permutex2var_ps(a, idx_odds, b);
+    return _mm512_max_ps(evens, odds);
+}
+static inline ax_vf32 ax_vf32_padd_pack(ax_vf32 a, ax_vf32 b) {
+    __m512i idx_evens = _mm512_setr_epi32(0,2,4,6,8,10,12,14, 16,18,20,22,24,26,28,30);
+    __m512i idx_odds  = _mm512_setr_epi32(1,3,5,7,9,11,13,15, 17,19,21,23,25,27,29,31);
+    __m512 evens = _mm512_permutex2var_ps(a, idx_evens, b);
+    __m512 odds  = _mm512_permutex2var_ps(a, idx_odds, b);
+    return _mm512_add_ps(evens, odds);
+}
+
 
 /* ================================================================
    AVX2 tier: 8-wide float vectors using YMM registers.
@@ -339,6 +358,23 @@ static inline float ax_vf32_hmin(ax_vf32 v) {
     return _mm_cvtss_f32(m);
 }
 
+/* paired horizontal max/sum: out[i] = max/sum(in[2i], in[2i+1])
+   over the 16-element concatenation of (a, b). avx2 shuffle works
+   per-128-bit-lane so we need a final cross-lane permutevar to fix
+   the resulting layout into [a01,a23,a45,a67,b01,b23,b45,b67]. */
+static inline ax_vf32 ax_vf32_pmax_pack(ax_vf32 a, ax_vf32 b) {
+    __m256 evens = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+    __m256 odds  = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
+    __m256 m = _mm256_max_ps(evens, odds);
+    return _mm256_permutevar8x32_ps(m, _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7));
+}
+static inline ax_vf32 ax_vf32_padd_pack(ax_vf32 a, ax_vf32 b) {
+    __m256 evens = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+    __m256 odds  = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
+    __m256 s = _mm256_add_ps(evens, odds);
+    return _mm256_permutevar8x32_ps(s, _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7));
+}
+
 
 #elif defined(AX_SIMD_NEON)
 
@@ -480,6 +516,14 @@ static inline float ax_vf32_hmin(ax_vf32 v) {
     return vget_lane_f32(s, 0);
 }
 
+/* paired horizontal max/sum: native ARMv8 intrinsics. */
+static inline ax_vf32 ax_vf32_pmax_pack(ax_vf32 a, ax_vf32 b) {
+    return vpmaxq_f32(a, b);
+}
+static inline ax_vf32 ax_vf32_padd_pack(ax_vf32 a, ax_vf32 b) {
+    return vpaddq_f32(a, b);
+}
+
 
 #else
 
@@ -518,6 +562,9 @@ static inline ax_vf32 ax_vf32_cmpeq(ax_vf32 a, ax_vf32 b) { return a == b ? 1.0f
 static inline float   ax_vf32_hsum(ax_vf32 v)          { return v; }
 static inline float   ax_vf32_hmax(ax_vf32 v)          { return v; }
 static inline float   ax_vf32_hmin(ax_vf32 v)          { return v; }
+/* paired pack: with WIDTH=1 the pair is just (a, b) → max/sum. */
+static inline ax_vf32 ax_vf32_pmax_pack(ax_vf32 a, ax_vf32 b) { return a > b ? a : b; }
+static inline ax_vf32 ax_vf32_padd_pack(ax_vf32 a, ax_vf32 b) { return a + b; }
 
 #endif
 

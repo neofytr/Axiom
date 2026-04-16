@@ -2543,7 +2543,14 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     int64_t NC = N * C;
 
     /* fast path: k=2, s=2, p=0 (most common maxpool config).
-       no boundary checks needed, unrolled 2x2 window comparison. */
+       SIMD over the output-width dim using ax_vf32_pmax_pack to do the
+       horizontal pair-reduce in one ISA-generic intrinsic (vpmaxq_f32 on
+       NEON, _mm512_permutex2var+max on AVX-512, shuffle-permute on AVX2,
+       scalar fallback). per inner iter: 4 contiguous SIMD loads (2 from
+       each of 2 input rows), 2 elementwise vmax across rows, 2 horizontal
+       pair-max → 2 SIMD output vectors (= 2*WIDTH outputs). the index
+       record path stays scalar; backward needs the exact picked argmax
+       and SIMD branchless tracking is more code than it's worth. */
     if (k == 2 && s == 2 && p == 0)
     {
         #ifdef _OPENMP
@@ -2562,8 +2569,53 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
                 int64_t iy = y * 2;
                 const float *row0 = ic + iy * W;
                 const float *row1 = ic + (iy + 1) * W;
+                float *oc_row = oc + y * ow;
 
-                for (int64_t x = 0; x < ow; x++)
+                int64_t x = 0;
+
+                /* SIMD path: only when not recording argmax (backward needs
+                   exact picked argmax index per output, scalar branch is
+                   simpler than tracking through the SIMD pair-max). */
+                if (!record) {
+                    /* each iter consumes 2*TW input columns and writes TW
+                       output columns. step = TW. */
+                    int64_t TW = AX_VF32_WIDTH;
+                    int64_t vend = ow - (ow % TW);
+                    for (; x < vend; x += TW) {
+                        int64_t ix2 = x * 2;
+                        ax_vf32 a0 = ax_vf32_loadu(row0 + ix2);
+                        ax_vf32 a1 = ax_vf32_loadu(row0 + ix2 + TW);
+                        ax_vf32 b0 = ax_vf32_loadu(row1 + ix2);
+                        ax_vf32 b1 = ax_vf32_loadu(row1 + ix2 + TW);
+                        ax_vf32 m_lo = ax_vf32_max(a0, b0);  /* row-wise max, lo halves */
+                        ax_vf32 m_hi = ax_vf32_max(a1, b1);  /* row-wise max, hi halves */
+                        /* horizontal pair-max across the 2*TW elems → TW outputs */
+                        ax_vf32 out = ax_vf32_pmax_pack(m_lo, m_hi);
+                        ax_vf32_storeu(oc_row + x, out);
+                    }
+                    /* overlapping-last-tile trick: when (ow % TW) != 0, do one
+                       more SIMD iter starting at ow-TW. it overlaps the previous
+                       iter's writes but recomputes the same values, so the final
+                       state is correct. avoids 4-element scalar tail on shapes
+                       like ow=28 (= 3 SIMD iters + 4 scalar = 86% SIMD); this
+                       way the same row finishes in 4 SIMD iters with overlap. */
+                    if (x < ow && ow >= TW) {
+                        x = ow - TW;
+                        int64_t ix2 = x * 2;
+                        ax_vf32 a0 = ax_vf32_loadu(row0 + ix2);
+                        ax_vf32 a1 = ax_vf32_loadu(row0 + ix2 + TW);
+                        ax_vf32 b0 = ax_vf32_loadu(row1 + ix2);
+                        ax_vf32 b1 = ax_vf32_loadu(row1 + ix2 + TW);
+                        ax_vf32 m_lo = ax_vf32_max(a0, b0);
+                        ax_vf32 m_hi = ax_vf32_max(a1, b1);
+                        ax_vf32 out = ax_vf32_pmax_pack(m_lo, m_hi);
+                        ax_vf32_storeu(oc_row + x, out);
+                        x = ow;  /* skip scalar tail */
+                    }
+                }
+
+                /* scalar tail (or full row when recording argmax) */
+                for (; x < ow; x++)
                 {
                     int64_t ix2 = x * 2;
                     float a = row0[ix2], b = row0[ix2 + 1];
@@ -2572,7 +2624,7 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
                     float m01 = a > b ? a : b;
                     float m23 = c2 > d ? c2 : d;
                     float mx = m01 > m23 ? m01 : m23;
-                    oc[y * ow + x] = mx;
+                    oc_row[x] = mx;
 
                     if (record) {
                         int64_t mi;
@@ -2746,7 +2798,67 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     float *od = (float *)output->storage->data;
     int64_t NC = N * C;
 
-    /* parallelize over (n,c) — disjoint output regions */
+    /* fast path: k=2 s=2 p=0 with SIMD (mirror of maxpool fast path).
+       per inner iter: 4 loads + 2 vadd across rows + 1 horizontal pair-sum
+       + 1 multiply by 0.25 → TW outputs. */
+    if (k == 2 && s == 2 && p == 0)
+    {
+        const ax_vf32 v_quarter = ax_vf32_set1(0.25f);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t nc = 0; nc < NC; nc++)
+        {
+            int64_t n = nc / C;
+            int64_t c = nc % C;
+            const float *ic = id + (n * C + c) * H * W;
+            float *oc = od + (n * C + c) * oh * ow;
+            for (int64_t y = 0; y < oh; y++) {
+                int64_t iy = y * 2;
+                const float *row0 = ic + iy * W;
+                const float *row1 = ic + (iy + 1) * W;
+                float *oc_row = oc + y * ow;
+                int64_t x = 0;
+                int64_t TW = AX_VF32_WIDTH;
+                int64_t vend = ow - (ow % TW);
+                for (; x < vend; x += TW) {
+                    int64_t ix2 = x * 2;
+                    ax_vf32 a0 = ax_vf32_loadu(row0 + ix2);
+                    ax_vf32 a1 = ax_vf32_loadu(row0 + ix2 + TW);
+                    ax_vf32 b0 = ax_vf32_loadu(row1 + ix2);
+                    ax_vf32 b1 = ax_vf32_loadu(row1 + ix2 + TW);
+                    ax_vf32 s_lo = ax_vf32_add(a0, b0);
+                    ax_vf32 s_hi = ax_vf32_add(a1, b1);
+                    ax_vf32 sum = ax_vf32_padd_pack(s_lo, s_hi);
+                    ax_vf32_storeu(oc_row + x, ax_vf32_mul(sum, v_quarter));
+                }
+                /* overlapping last tile (see maxpool comment) */
+                if (x < ow && ow >= TW) {
+                    x = ow - TW;
+                    int64_t ix2 = x * 2;
+                    ax_vf32 a0 = ax_vf32_loadu(row0 + ix2);
+                    ax_vf32 a1 = ax_vf32_loadu(row0 + ix2 + TW);
+                    ax_vf32 b0 = ax_vf32_loadu(row1 + ix2);
+                    ax_vf32 b1 = ax_vf32_loadu(row1 + ix2 + TW);
+                    ax_vf32 s_lo = ax_vf32_add(a0, b0);
+                    ax_vf32 s_hi = ax_vf32_add(a1, b1);
+                    ax_vf32 sum = ax_vf32_padd_pack(s_lo, s_hi);
+                    ax_vf32_storeu(oc_row + x, ax_vf32_mul(sum, v_quarter));
+                    x = ow;
+                }
+                /* scalar tail (only when ow < TW) */
+                for (; x < ow; x++) {
+                    int64_t ix2 = x * 2;
+                    float a = row0[ix2], b = row0[ix2 + 1];
+                    float c2 = row1[ix2], d = row1[ix2 + 1];
+                    oc_row[x] = (a + b + c2 + d) * 0.25f;
+                }
+            }
+        }
+    }
+    else
+    {
+    /* general path: bounds-checked window sum + count. */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -2776,6 +2888,7 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
                 od[((n * C + c) * oh + y) * ow + x] = count > 0 ? sum / (float)count : 0.0f;
             }
         }
+    }
     }
 
     if (inp != input) ax_tensor_destroy(inp);
