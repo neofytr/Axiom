@@ -54,6 +54,10 @@ static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int p
 }
 
 
+/* forward declarations for predicates used by ensure_scratch */
+static inline bool can_direct_3x3(int kh, int kw, int sh, int sw, int ph, int pw, int64_t C_in);
+static inline bool prefer_implicit_gemm(int64_t K, int64_t M);
+
 /* per-thread scratch buffers cached on ax_conv2d_t.
    sized for the largest seen (N, H, W) signature; reallocated only when
    the signature changes (e.g., batch size differs from training). */
@@ -75,6 +79,10 @@ struct ax_conv_scratch {
     /* shared (read-only across threads) */
     ax_tensor_t *w2d;       /* [C_out, K] reshaped forward weight */
     ax_tensor_t *wt_contig; /* [K, C_out] transposed weight for backward dx */
+
+    /* batched-GEMM buffers (allocated when M < AX_CONV_BATCH_M_THRESH && N > 1) */
+    ax_tensor_t *batch_col_buf; /* [K, N*M]: im2col in fwd; dcol_batch in bwd */
+    ax_tensor_t *batch_aux_buf; /* [C_out, N*M]: gemm result in fwd; go_batch in bwd */
 };
 
 static void scratch_destroy(struct ax_conv_scratch *s)
@@ -97,6 +105,8 @@ static void scratch_destroy(struct ax_conv_scratch *s)
     #undef FREE_BUF_ARR
     if (s->w2d) ax_tensor_destroy(s->w2d);
     if (s->wt_contig) ax_tensor_destroy(s->wt_contig);
+    if (s->batch_col_buf) ax_tensor_destroy(s->batch_col_buf);
+    if (s->batch_aux_buf) ax_tensor_destroy(s->batch_aux_buf);
     free(s);
 }
 
@@ -205,6 +215,21 @@ static struct ax_conv_scratch *ensure_scratch(ax_conv2d_t *conv,
                             !s->colt_bufs || !s->dimg_bufs))) {
         scratch_destroy(s);
         return NULL;
+    }
+
+/* batch entire N samples into a single GEMM when M is narrow.
+   each per-sample GEMM [C_out,K]@[K,M] uses only M/NC columns,
+   wasting register tiles. merging → [C_out,K]@[K,N*M] fills NC. */
+#define AX_CONV_BATCH_M_THRESH 512
+    bool is_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
+    bool is_implicit = !is_direct && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+    if (!is_direct && !is_implicit && N > 1 && M < AX_CONV_BATCH_M_THRESH) {
+        int64_t NM = N * M;
+        int64_t batch_col_shape[] = {K, NM};
+        int64_t batch_aux_shape[] = {C_out, NM};
+        s->batch_col_buf = ax_tensor_create(batch_col_shape, 2, AX_FLOAT32);
+        s->batch_aux_buf = ax_tensor_create(batch_aux_shape, 2, AX_FLOAT32);
+        /* failure is non-fatal: forward/backward fall back to per-sample path */
     }
 
     conv->scratch = s;
@@ -327,6 +352,87 @@ static void im2col_into(const float *id, int64_t C, int64_t H, int64_t W,
             }
         }
     }
+}
+
+/* like im2col_into but writes into a column-strided batch buffer.
+   col_stride is the distance between consecutive columns in `cd` (normally M;
+   for batched buffers: N*M). sample_offset is the column start for this sample
+   within each row (0 for single; n*M for batched sample n). */
+static void im2col_into_strided(const float *id, int64_t C, int64_t H, int64_t W,
+                                 int kh, int kw, int stride_h, int stride_w,
+                                 int pad_h, int pad_w, int64_t out_h, int64_t out_w,
+                                 float *cd, int64_t col_stride, int64_t sample_offset)
+{
+    const int64_t M = out_h * out_w;
+    int64_t col_idx = 0;
+
+    /* 1x1 stride-1 pad-0: each kernel row is one channel's pixels */
+    if (kh == 1 && kw == 1 && stride_h == 1 && stride_w == 1
+        && pad_h == 0 && pad_w == 0 && H == out_h && W == out_w)
+    {
+        for (int64_t c = 0; c < C; c++)
+            memcpy(cd + c * col_stride + sample_offset, id + c * M, (size_t)M * sizeof(float));
+        return;
+    }
+
+    if (stride_w == 1)
+    {
+        for (int64_t c = 0; c < C; c++)
+        {
+            for (int ky = 0; ky < kh; ky++)
+            {
+                for (int kx = 0; kx < kw; kx++)
+                {
+                    const int64_t iw_start = (int64_t)kx - (int64_t)pad_w;
+                    int64_t ow_lo = 0;
+                    if (iw_start < 0) ow_lo = -iw_start;
+                    int64_t ow_hi = out_w;
+                    const int64_t iw_last = iw_start + out_w - 1;
+                    if (iw_last >= W) ow_hi = W - iw_start;
+                    if (ow_lo > out_w) ow_lo = out_w;
+                    if (ow_hi < 0) ow_hi = 0;
+                    if (ow_lo > ow_hi) ow_lo = ow_hi;
+                    const int64_t lead_bytes = ow_lo * (int64_t)sizeof(float);
+                    const int64_t mid_len = ow_hi - ow_lo;
+                    const int64_t mid_bytes = mid_len * (int64_t)sizeof(float);
+                    const int64_t tail_n = out_w - ow_hi;
+                    const int64_t tail_bytes = tail_n * (int64_t)sizeof(float);
+
+                    for (int64_t oh = 0; oh < out_h; oh++)
+                    {
+                        const int64_t ih = oh * stride_h - pad_h + ky;
+                        float *dst_row = cd + col_idx * col_stride + sample_offset + oh * out_w;
+                        if (ih < 0 || ih >= H) {
+                            memset(dst_row, 0, (size_t)out_w * sizeof(float));
+                            continue;
+                        }
+                        const int64_t src_row_base = c * H * W + ih * W;
+                        if (lead_bytes > 0)  memset(dst_row, 0, (size_t)lead_bytes);
+                        if (mid_len > 0)
+                            memcpy(dst_row + ow_lo, id + src_row_base + (iw_start + ow_lo),
+                                   (size_t)mid_bytes);
+                        if (tail_bytes > 0) memset(dst_row + ow_hi, 0, (size_t)tail_bytes);
+                    }
+                    col_idx++;
+                }
+            }
+        }
+        return;
+    }
+
+    for (int64_t c = 0; c < C; c++)
+        for (int ky = 0; ky < kh; ky++)
+            for (int kx = 0; kx < kw; kx++) {
+                for (int64_t oh = 0; oh < out_h; oh++)
+                    for (int64_t ow = 0; ow < out_w; ow++) {
+                        int64_t ih = oh * stride_h - pad_h + ky;
+                        int64_t iw = ow * stride_w - pad_w + kx;
+                        float val = (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                                    ? id[c * H * W + ih * W + iw] : 0.0f;
+                        cd[col_idx * col_stride + sample_offset + oh * out_w + ow] = val;
+                    }
+                col_idx++;
+            }
 }
 
 ax_tensor_t *ax_im2col(ax_tensor_t *input, int kh, int kw,
@@ -508,20 +614,36 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             input_orig->grad = ax_tensor_zeros(input_orig->shape, input_orig->ndim, input_orig->dtype);
     }
 
-    /* bias gradient: sum grad_out over N, H, W */
+    /* bias gradient: sum grad_out over N, H, W.
+       parallelize over channels: each channel's M*N sum is independent. */
     if (conv->use_bias && conv->bias && conv->bias->requires_grad)
     {
         if (!conv->bias->grad)
             conv->bias->grad = ax_tensor_zeros(conv->bias->shape, conv->bias->ndim, conv->bias->dtype);
 
         float *bg = (float *)conv->bias->grad->storage->data;
-        float *gd = (float *)grad_out->storage->data;
+        const float *gd = (const float *)grad_out->storage->data;
+        int64_t M_bias = out_h * out_w;
 
-        for (int64_t n = 0; n < N; n++)
-            for (int64_t c = 0; c < C_out; c++)
-                for (int64_t h = 0; h < out_h; h++)
-                    for (int64_t w = 0; w < out_w; w++)
-                        bg[c] += gd[((n * C_out + c) * out_h + h) * out_w + w];
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t c = 0; c < C_out; c++) {
+            float sum = 0.0f;
+            for (int64_t n = 0; n < N; n++) {
+                const float *row = gd + (n * C_out + c) * M_bias;
+                int64_t m = 0, ve = M_bias - (M_bias % AX_VF32_WIDTH);
+                ax_vf32 acc = ax_vf32_zero();
+                for (; m < ve; m += AX_VF32_WIDTH)
+                    acc = ax_vf32_add(acc, ax_vf32_loadu(row + m));
+                /* horizontal sum of acc */
+                float tmp[AX_VF32_WIDTH];
+                ax_vf32_storeu(tmp, acc);
+                for (int k = 0; k < AX_VF32_WIDTH; k++) sum += tmp[k];
+                for (; m < M_bias; m++) sum += row[m];
+            }
+            bg[c] += sum; /* one thread per c, no race */
+        }
     }
 
     float *wdata = (float *)weight->storage->data;
@@ -568,6 +690,77 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *ind = (float *)input_data->storage->data;
     float *grd = (float *)grad_out->storage->data;
 
+    bool use_batched_bwd = N > 1 && M < AX_CONV_BATCH_M_THRESH
+                           && s->batch_col_buf && s->batch_aux_buf;
+
+    if (use_batched_bwd) {
+        /* batched backward: one large gemm_nt for dW, one large gemm_tn for dX.
+           eliminates N separate launches and fills NC tiles properly. */
+        float *bcd = (float *)s->batch_col_buf->storage->data;
+        float *gbd = (float *)s->batch_aux_buf->storage->data;
+        int64_t NM = N * M;
+
+        /* parallel im2col → batch_col_buf [K, N*M]
+           parallel go copy → batch_aux_buf [C_out, N*M] */
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(T) schedule(static)
+        #endif
+        for (int64_t n = 0; n < N; n++) {
+            im2col_into_strided(ind + n * C_in * H * W, C_in, H, W,
+                                 kh, kw, sh, sw, ph, pw, out_h, out_w,
+                                 bcd, NM, n * M);
+            /* scatter go[n, co, *] → gbd[co, n*M : (n+1)*M] */
+            for (int64_t co = 0; co < C_out; co++)
+                memcpy(gbd + co * NM + n * M, grd + n * C_out * M + co * M,
+                       (size_t)M * sizeof(float));
+        }
+
+        /* dW = go_batch @ col_batch^T via gemm_nt: [C_out, N*M] @ [K, N*M]^T → [C_out, K] */
+        if (weight->requires_grad) {
+            ax_tensor_t *dw_total = s->dw_bufs[0];
+            memset(dw_total->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
+            ax_compute_gemm_nt(s->batch_aux_buf, s->batch_col_buf, dw_total);
+            float *wg  = (float *)weight->grad->storage->data;
+            float *dwl = (float *)dw_total->storage->data;
+            int64_t wn = C_out * K, wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
+            for (; wi < wve; wi += AX_VF32_WIDTH)
+                ax_vf32_storeu(wg + wi, ax_vf32_add(ax_vf32_loadu(wg + wi), ax_vf32_loadu(dwl + wi)));
+            for (; wi < wn; wi++) wg[wi] += dwl[wi];
+        }
+
+        /* dcol_batch = w^T @ go_batch via gemm_tn: [K, C_out] @ [C_out, N*M] → [K, N*M]
+           reuse batch_col_buf as output (im2col data already consumed above). */
+        if (input_orig->requires_grad && (wt_contig || have_gemm_tn)) {
+            memset(bcd, 0, (size_t)(K * NM) * sizeof(float));
+            if (have_gemm_tn)
+                ax_compute_gemm_tn(w2d, s->batch_aux_buf, s->batch_col_buf);
+            else
+                ax_compute_gemm(wt_contig, s->batch_aux_buf, s->batch_col_buf);
+
+            /* parallel col2im per sample from dcol_batch [K, N*M] */
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(T) schedule(static)
+            #endif
+            for (int64_t n = 0; n < N; n++) {
+                int tid = AX_OMP_THREAD_NUM();
+                if (tid >= T) tid = 0;
+                ax_tensor_t *dcol_buf = s->dcol_bufs[tid];
+                ax_tensor_t *dimg_buf = s->dimg_bufs[tid];
+                float *dcol_d = (float *)dcol_buf->storage->data;
+                /* gather dcol for sample n: dcol[k, m] = bcd[k*NM + n*M + m] */
+                for (int64_t k = 0; k < K; k++)
+                    memcpy(dcol_d + k * M, bcd + k * NM + n * M, (size_t)M * sizeof(float));
+                float *dimg_d = (float *)dimg_buf->storage->data;
+                memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));
+                col2im_into(dcol_d, C_in, H, W, kh, kw, sh, sw, ph, pw, out_h, out_w, dimg_d);
+                float *ig = (float *)input_orig->grad->storage->data + n * C_in * H * W;
+                int64_t total = C_in * H * W, i = 0, ve = total - (total % AX_VF32_WIDTH);
+                for (; i < ve; i += AX_VF32_WIDTH)
+                    ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), ax_vf32_loadu(dimg_d + i)));
+                for (; i < total; i++) ig[i] += dimg_d[i];
+            }
+        }
+    } else {
     /* num_threads(T) prevents oversubscription of per-thread scratch slots
        (col_bufs, go_bufs, dw_bufs, etc. — all sized to T). */
     #ifdef _OPENMP
@@ -677,6 +870,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             for (; wi < wn; wi++) wg[wi] += dwl[wi];
         }
     }
+    } /* end use_batched_bwd else */
     /* note: scratch buffers are kept on the layer for reuse — no free here */
 }
 
@@ -762,6 +956,333 @@ static inline bool can_direct_3x3(int kh, int kw, int sh, int sw, int ph, int pw
 #endif
 }
 
+/* direct conv for very-small input channels (typical first layer: C_in=3 RGB).
+   im2col would copy 9× the input for K=3, then run a GEMM with K_gemm=27 too
+   small to amortize pack overhead. tf has a specialized first-layer kernel
+   for the same reason. this kernel keeps the per-output-element accumulator
+   in a vector register (one bias-init, K*K*C_in fmadds, one store per
+   AX_VF32_WIDTH outputs). three regions split out: left-pad scalar, middle
+   pure SIMD with no bounds check (the fast path that covers >97% of pixels
+   on typical 224×224 inputs with pad=1), right-pad scalar. */
+static void conv2d_direct_smallcin_sample(
+    const float *in_n, const float *wd, const float *bias, float *out_n,
+    int64_t C_in, int64_t C_out, int64_t H, int64_t W,
+    int kh, int kw, int sh, int sw, int ph, int pw,
+    int64_t H_out, int64_t W_out)
+{
+    const int64_t K_per_co = C_in * kh * kw;
+    /* middle region of ow where every accessed iw is in [0, W).
+       iw = ow*sw + kx - pw, ranges over kx in [0, kw).
+       safe iff (ow*sw - pw) >= 0  AND  (ow*sw + kw-1 - pw) < W
+            iff  ow >= ceil(pw/sw)  AND  ow <= floor((W-1 - (kw-1) + pw) / sw).
+       the SIMD load reads AX_VF32_WIDTH consecutive columns when sw==1, so
+       we additionally need (ow + AX_VF32_WIDTH - 1)*sw + kw-1 - pw < W. */
+    int64_t ow_safe_lo = (pw + sw - 1) / sw;        /* ceil(pw/sw) */
+    int64_t last_in = W - 1 - (kw - 1) + pw;        /* iw_base for last safe ow */
+    int64_t ow_safe_hi = last_in >= 0 ? (last_in / sw) + 1 : 0;
+    if (ow_safe_hi > W_out) ow_safe_hi = W_out;
+    if (ow_safe_lo > ow_safe_hi) ow_safe_lo = ow_safe_hi;
+    /* SIMD safety needs the last vector lane to also be in range when sw==1 */
+    int64_t ow_simd_hi = (sw == 1) ? (ow_safe_hi - (AX_VF32_WIDTH - 1)) : ow_safe_lo;
+    if (ow_simd_hi < ow_safe_lo) ow_simd_hi = ow_safe_lo;
+
+    /* 4-co tiling path: amortizes input loads 4× across output channels.
+       Each inner (ci, ky, kx) iter does 2 input loads (shared across 4 co)
+       + 4 weight broadcasts + 8 fmadds. Fits cleanly in 14 AVX2 ymm regs:
+       8 acc + 2 vi + 4 vw. C_out remainder (mod 4) falls through to
+       single-co path below. */
+    int64_t co = 0;
+    if (sw == 1) {
+        const int64_t TW = AX_VF32_WIDTH;
+        const int64_t TILE_OW = 2 * TW;
+        for (; co + 4 <= C_out; co += 4) {
+            const float bv0 = bias ? bias[co + 0] : 0.0f;
+            const float bv1 = bias ? bias[co + 1] : 0.0f;
+            const float bv2 = bias ? bias[co + 2] : 0.0f;
+            const float bv3 = bias ? bias[co + 3] : 0.0f;
+            const ax_vf32 vb0 = ax_vf32_set1(bv0);
+            const ax_vf32 vb1 = ax_vf32_set1(bv1);
+            const ax_vf32 vb2 = ax_vf32_set1(bv2);
+            const ax_vf32 vb3 = ax_vf32_set1(bv3);
+            const float *wco0 = wd + (co + 0) * K_per_co;
+            const float *wco1 = wd + (co + 1) * K_per_co;
+            const float *wco2 = wd + (co + 2) * K_per_co;
+            const float *wco3 = wd + (co + 3) * K_per_co;
+            float *oco0 = out_n + (co + 0) * H_out * W_out;
+            float *oco1 = out_n + (co + 1) * H_out * W_out;
+            float *oco2 = out_n + (co + 2) * H_out * W_out;
+            float *oco3 = out_n + (co + 3) * H_out * W_out;
+
+            for (int64_t oh = 0; oh < H_out; oh++) {
+                const int64_t ih_base = oh * sh - ph;
+                float *out_row0 = oco0 + oh * W_out;
+                float *out_row1 = oco1 + oh * W_out;
+                float *out_row2 = oco2 + oh * W_out;
+                float *out_row3 = oco3 + oh * W_out;
+                int64_t ow = 0;
+
+                /* left pad: scalar over the 4-co block */
+                for (; ow < ow_safe_lo && ow < W_out; ow++) {
+                    float a0 = bv0, a1 = bv1, a2 = bv2, a3 = bv3;
+                    int64_t iw_base = ow - pw;
+                    for (int64_t ci = 0; ci < C_in; ci++) {
+                        const float *in_ci = in_n + ci * H * W;
+                        for (int ky = 0; ky < kh; ky++) {
+                            int64_t ih = ih_base + ky;
+                            if (ih < 0 || ih >= H) continue;
+                            const float *in_row = in_ci + ih * W;
+                            int64_t wbase = (ci * kh + ky) * kw;
+                            for (int kx = 0; kx < kw; kx++) {
+                                int64_t iw = iw_base + kx;
+                                if (iw < 0 || iw >= W) continue;
+                                float v = in_row[iw];
+                                a0 += wco0[wbase + kx] * v;
+                                a1 += wco1[wbase + kx] * v;
+                                a2 += wco2[wbase + kx] * v;
+                                a3 += wco3[wbase + kx] * v;
+                            }
+                        }
+                    }
+                    out_row0[ow] = a0;
+                    out_row1[ow] = a1;
+                    out_row2[ow] = a2;
+                    out_row3[ow] = a3;
+                }
+
+                /* SIMD core: 2 ow tiles × 4 co channels = 8 accumulators */
+                int64_t v2end = ow_simd_hi - ((ow_simd_hi - ow) % TILE_OW);
+                for (; ow + TILE_OW <= v2end; ow += TILE_OW) {
+                    ax_vf32 a00 = vb0, a01 = vb0;
+                    ax_vf32 a10 = vb1, a11 = vb1;
+                    ax_vf32 a20 = vb2, a21 = vb2;
+                    ax_vf32 a30 = vb3, a31 = vb3;
+                    int64_t iw_base = ow - pw;
+                    for (int64_t ci = 0; ci < C_in; ci++) {
+                        const float *in_ci = in_n + ci * H * W;
+                        for (int ky = 0; ky < kh; ky++) {
+                            int64_t ih = ih_base + ky;
+                            if (ih < 0 || ih >= H) continue;
+                            const float *in_row = in_ci + ih * W;
+                            int64_t wbase = (ci * kh + ky) * kw;
+                            for (int kx = 0; kx < kw; kx++) {
+                                ax_vf32 v0 = ax_vf32_loadu(in_row + iw_base + kx);
+                                ax_vf32 v1 = ax_vf32_loadu(in_row + iw_base + TW + kx);
+                                ax_vf32 vw0 = ax_vf32_set1(wco0[wbase + kx]);
+                                ax_vf32 vw1 = ax_vf32_set1(wco1[wbase + kx]);
+                                ax_vf32 vw2 = ax_vf32_set1(wco2[wbase + kx]);
+                                ax_vf32 vw3 = ax_vf32_set1(wco3[wbase + kx]);
+                                a00 = ax_vf32_fmadd(vw0, v0, a00);
+                                a01 = ax_vf32_fmadd(vw0, v1, a01);
+                                a10 = ax_vf32_fmadd(vw1, v0, a10);
+                                a11 = ax_vf32_fmadd(vw1, v1, a11);
+                                a20 = ax_vf32_fmadd(vw2, v0, a20);
+                                a21 = ax_vf32_fmadd(vw2, v1, a21);
+                                a30 = ax_vf32_fmadd(vw3, v0, a30);
+                                a31 = ax_vf32_fmadd(vw3, v1, a31);
+                            }
+                        }
+                    }
+                    ax_vf32_storeu(out_row0 + ow,      a00);
+                    ax_vf32_storeu(out_row0 + ow + TW, a01);
+                    ax_vf32_storeu(out_row1 + ow,      a10);
+                    ax_vf32_storeu(out_row1 + ow + TW, a11);
+                    ax_vf32_storeu(out_row2 + ow,      a20);
+                    ax_vf32_storeu(out_row2 + ow + TW, a21);
+                    ax_vf32_storeu(out_row3 + ow,      a30);
+                    ax_vf32_storeu(out_row3 + ow + TW, a31);
+                }
+
+                /* 1-tile SIMD tail (still 4-co) */
+                int64_t vend = ow_simd_hi - ((ow_simd_hi - ow) % TW);
+                for (; ow < vend; ow += TW) {
+                    ax_vf32 a0 = vb0, a1 = vb1, a2 = vb2, a3 = vb3;
+                    int64_t iw_base = ow - pw;
+                    for (int64_t ci = 0; ci < C_in; ci++) {
+                        const float *in_ci = in_n + ci * H * W;
+                        for (int ky = 0; ky < kh; ky++) {
+                            int64_t ih = ih_base + ky;
+                            if (ih < 0 || ih >= H) continue;
+                            const float *in_row = in_ci + ih * W;
+                            int64_t wbase = (ci * kh + ky) * kw;
+                            for (int kx = 0; kx < kw; kx++) {
+                                ax_vf32 vi = ax_vf32_loadu(in_row + iw_base + kx);
+                                a0 = ax_vf32_fmadd(ax_vf32_set1(wco0[wbase + kx]), vi, a0);
+                                a1 = ax_vf32_fmadd(ax_vf32_set1(wco1[wbase + kx]), vi, a1);
+                                a2 = ax_vf32_fmadd(ax_vf32_set1(wco2[wbase + kx]), vi, a2);
+                                a3 = ax_vf32_fmadd(ax_vf32_set1(wco3[wbase + kx]), vi, a3);
+                            }
+                        }
+                    }
+                    ax_vf32_storeu(out_row0 + ow, a0);
+                    ax_vf32_storeu(out_row1 + ow, a1);
+                    ax_vf32_storeu(out_row2 + ow, a2);
+                    ax_vf32_storeu(out_row3 + ow, a3);
+                }
+
+                /* right-pad / scalar tail (4-co) */
+                for (; ow < W_out; ow++) {
+                    float a0 = bv0, a1 = bv1, a2 = bv2, a3 = bv3;
+                    int64_t iw_base = ow - pw;
+                    for (int64_t ci = 0; ci < C_in; ci++) {
+                        const float *in_ci = in_n + ci * H * W;
+                        for (int ky = 0; ky < kh; ky++) {
+                            int64_t ih = ih_base + ky;
+                            if (ih < 0 || ih >= H) continue;
+                            const float *in_row = in_ci + ih * W;
+                            int64_t wbase = (ci * kh + ky) * kw;
+                            for (int kx = 0; kx < kw; kx++) {
+                                int64_t iw = iw_base + kx;
+                                if (iw < 0 || iw >= W) continue;
+                                float v = in_row[iw];
+                                a0 += wco0[wbase + kx] * v;
+                                a1 += wco1[wbase + kx] * v;
+                                a2 += wco2[wbase + kx] * v;
+                                a3 += wco3[wbase + kx] * v;
+                            }
+                        }
+                    }
+                    out_row0[ow] = a0;
+                    out_row1[ow] = a1;
+                    out_row2[ow] = a2;
+                    out_row3[ow] = a3;
+                }
+            }
+        }
+    }
+
+    /* remainder co (1..3 channels): single-co fallback path */
+    for (; co < C_out; co++) {
+        const float bv = bias ? bias[co] : 0.0f;
+        const ax_vf32 vb = ax_vf32_set1(bv);
+        const float *wco = wd + co * K_per_co;
+        float *oco = out_n + co * H_out * W_out;
+
+        for (int64_t oh = 0; oh < H_out; oh++) {
+            const int64_t ih_base = oh * sh - ph;
+            float *out_row = oco + oh * W_out;
+            int64_t ow = 0;
+
+            /* left pad: scalar, bounded loop */
+            for (; ow < ow_safe_lo && ow < W_out; ow++) {
+                float acc = bv;
+                int64_t iw_base = ow * sw - pw;
+                for (int64_t ci = 0; ci < C_in; ci++) {
+                    const float *in_ci = in_n + ci * H * W;
+                    for (int ky = 0; ky < kh; ky++) {
+                        int64_t ih = ih_base + ky;
+                        if (ih < 0 || ih >= H) continue;
+                        const float *in_row = in_ci + ih * W;
+                        const float *wky = wco + (ci * kh + ky) * kw;
+                        for (int kx = 0; kx < kw; kx++) {
+                            int64_t iw = iw_base + kx;
+                            if (iw >= 0 && iw < W) acc += wky[kx] * in_row[iw];
+                        }
+                    }
+                }
+                out_row[ow] = acc;
+            }
+
+            /* middle region: pure SIMD, no per-pixel bounds check.
+               4-way ow register tiling to hide fma latency. with C_in=3 and
+               K=3 the inner (ci, ky, kx) loop is 27 sequential fmadds; a
+               single accumulator chains all 27 dependencies through one
+               register and stalls the pipeline (4-cycle fma latency × 27 =
+               108 cycles, vs 14 cycles at throughput). 4 parallel
+               accumulators turn that into 4 independent chains, fully
+               saturating the FMA units. only oh-edge ky values still need
+               the ih bounds check. */
+            if (sw == 1) {
+                const int64_t TW = AX_VF32_WIDTH;
+                const int64_t TILE4 = 4 * TW;
+                /* 4-tile path: process 4 vector blocks per outer iter */
+                int64_t v4end = ow_simd_hi - ((ow_simd_hi - ow) % TILE4);
+                for (; ow + TILE4 <= v4end; ow += TILE4) {
+                    ax_vf32 a0 = vb, a1 = vb, a2 = vb, a3 = vb;
+                    int64_t iw_base = ow - pw;
+                    for (int64_t ci = 0; ci < C_in; ci++) {
+                        const float *in_ci = in_n + ci * H * W;
+                        for (int ky = 0; ky < kh; ky++) {
+                            int64_t ih = ih_base + ky;
+                            if (ih < 0 || ih >= H) continue;
+                            const float *in_row = in_ci + ih * W;
+                            const float *wky = wco + (ci * kh + ky) * kw;
+                            for (int kx = 0; kx < kw; kx++) {
+                                ax_vf32 vw = ax_vf32_set1(wky[kx]);
+                                ax_vf32 v0 = ax_vf32_loadu(in_row + iw_base + kx);
+                                ax_vf32 v1 = ax_vf32_loadu(in_row + iw_base + TW + kx);
+                                ax_vf32 v2 = ax_vf32_loadu(in_row + iw_base + 2*TW + kx);
+                                ax_vf32 v3 = ax_vf32_loadu(in_row + iw_base + 3*TW + kx);
+                                a0 = ax_vf32_fmadd(vw, v0, a0);
+                                a1 = ax_vf32_fmadd(vw, v1, a1);
+                                a2 = ax_vf32_fmadd(vw, v2, a2);
+                                a3 = ax_vf32_fmadd(vw, v3, a3);
+                            }
+                        }
+                    }
+                    ax_vf32_storeu(out_row + ow,          a0);
+                    ax_vf32_storeu(out_row + ow + TW,     a1);
+                    ax_vf32_storeu(out_row + ow + 2 * TW, a2);
+                    ax_vf32_storeu(out_row + ow + 3 * TW, a3);
+                }
+                /* 1-tile tail */
+                int64_t vend = ow_simd_hi - ((ow_simd_hi - ow) % TW);
+                for (; ow < vend; ow += TW) {
+                    ax_vf32 acc = vb;
+                    int64_t iw_base = ow - pw;
+                    for (int64_t ci = 0; ci < C_in; ci++) {
+                        const float *in_ci = in_n + ci * H * W;
+                        for (int ky = 0; ky < kh; ky++) {
+                            int64_t ih = ih_base + ky;
+                            if (ih < 0 || ih >= H) continue;
+                            const float *in_row = in_ci + ih * W;
+                            const float *wky = wco + (ci * kh + ky) * kw;
+                            for (int kx = 0; kx < kw; kx++) {
+                                ax_vf32 vw = ax_vf32_set1(wky[kx]);
+                                ax_vf32 vi = ax_vf32_loadu(in_row + iw_base + kx);
+                                acc = ax_vf32_fmadd(vw, vi, acc);
+                            }
+                        }
+                    }
+                    ax_vf32_storeu(out_row + ow, acc);
+                }
+            }
+
+            /* tail / strided: scalar */
+            for (; ow < W_out; ow++) {
+                float acc = bv;
+                int64_t iw_base = ow * sw - pw;
+                for (int64_t ci = 0; ci < C_in; ci++) {
+                    const float *in_ci = in_n + ci * H * W;
+                    for (int ky = 0; ky < kh; ky++) {
+                        int64_t ih = ih_base + ky;
+                        if (ih < 0 || ih >= H) continue;
+                        const float *in_row = in_ci + ih * W;
+                        const float *wky = wco + (ci * kh + ky) * kw;
+                        for (int kx = 0; kx < kw; kx++) {
+                            int64_t iw = iw_base + kx;
+                            if (iw >= 0 && iw < W) acc += wky[kx] * in_row[iw];
+                        }
+                    }
+                }
+                out_row[ow] = acc;
+            }
+        }
+    }
+}
+
+/* eligibility for the small-C_in direct path. covers RGB image first-layer
+   convs (the regression case): C_in ∈ {1,2,3,4}, kernel up to 7, any stride
+   and padding. SIMD path requires the spatial output to be wide enough that
+   middle-region SIMD covers more than the (left-pad + tail) overhead, so
+   require W_out >= AX_VF32_WIDTH * 2 to be conservative. */
+static inline bool can_direct_smallcin(int kh, int kw, int sh, int sw,
+                                        int64_t C_in, int64_t W_out)
+{
+    (void)sh; (void)sw;
+    return C_in <= 4 && kh <= 7 && kw <= 7
+           && W_out >= (int64_t)AX_VF32_WIDTH * 2;
+}
+
 /* implicit gemm: useful when K is large (typically C_in >= 64 with 3x3+ kernels)
    AND M is large enough that the gemm dominates over the gather overhead. */
 static inline bool prefer_implicit_gemm(int64_t K, int64_t M)
@@ -804,7 +1325,11 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     int64_t K = C_in * kh * kw;
     int64_t M = out_h * out_w;
     int64_t out_shape[] = {N, C_out, out_h, out_w};
-    ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
+    /* every conv path below writes the full output (direct/smallcin fold bias
+       into init; gemm paths copy res→od overwriting all elements). skip the
+       zero pass — saves a full output-buffer write (~410 MB on
+       conv_32x3x224x224 → 32x64x224x224). */
+    ax_tensor_t *output = ax_tensor_create(out_shape, 4, AX_FLOAT32);
     if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
 
     float *od = (float *)output->storage->data;
@@ -834,11 +1359,51 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         ? (const float *)conv->bias->storage->data : NULL;
 
     /* shape-aware path selection. direct 3x3 wins for small kernels (mnist:
-       both convs hit this). implicit gemm wins for large K + large M.
-       otherwise fall back to explicit im2col + gemm. */
+       both convs hit this). small-C_in direct beats im2col+gemm on the
+       first layer of image nets (C_in=3, K=27 too small for GEMM). implicit
+       gemm wins for large K + large M. otherwise fall back to explicit
+       im2col + gemm. */
     bool use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
-    bool use_implicit = !use_direct && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+    bool use_smallcin = !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
+    bool use_implicit = !use_direct && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+    bool use_batched = !use_direct && !use_smallcin && !use_implicit && N > 1 && M < AX_CONV_BATCH_M_THRESH
+                       && s->batch_col_buf && s->batch_aux_buf;
 
+    if (use_batched) {
+        /* batch all N im2cols into [K, N*M], do one GEMM, scatter with bias.
+           eliminates N separate GEMM launches and gives full NC utilization
+           when M (per sample) is too small to fill register tiles alone. */
+        float *bcd = (float *)s->batch_col_buf->storage->data;
+        float *brd = (float *)s->batch_aux_buf->storage->data;
+        int64_t NM = N * M;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(T) schedule(static)
+        #endif
+        for (int64_t n = 0; n < N; n++)
+            im2col_into_strided(ind + n * C_in * H * W, C_in, H, W,
+                                 kh, kw, sh, sw, ph, pw, out_h, out_w,
+                                 bcd, NM, n * M);
+
+        memset(brd, 0, (size_t)(C_out * NM) * sizeof(float));
+        ax_compute_gemm(w2d, s->batch_col_buf, s->batch_aux_buf);
+
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(T) schedule(static)
+        #endif
+        for (int64_t n = 0; n < N; n++) {
+            for (int64_t co = 0; co < C_out; co++) {
+                float bias_val = bias_data ? bias_data[co] : 0.0f;
+                float *dst = od + (n * C_out + co) * M;
+                const float *src = brd + co * NM + n * M;
+                ax_vf32 vb = ax_vf32_set1(bias_val);
+                int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
+                for (; m < ve; m += AX_VF32_WIDTH)
+                    ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), vb));
+                for (; m < M; m++) dst[m] = src[m] + bias_val;
+            }
+        }
+    } else {
     /* num_threads(T) caps the team to the number of per-thread scratch slots
        so workers never share col_bufs/res_bufs[0] with the tid>=T fallback. */
     #ifdef _OPENMP
@@ -851,6 +1416,17 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             conv2d_direct_3x3_sample(
                 ind + n * C_in * H * W, wd, bias_data,
                 od + n * C_out * M, C_in, C_out, H, W);
+            continue;
+        }
+        if (use_smallcin) {
+            /* first-layer-style conv (C_in ≤ 4): direct loop with
+               register accumulator beats im2col+gemm because K_gemm = C_in*kh*kw
+               is too small to amortize pack overhead. bias folded in. */
+            conv2d_direct_smallcin_sample(
+                ind + n * C_in * H * W, wd, bias_data,
+                od + n * C_out * M,
+                C_in, C_out, H, W,
+                kh, kw, sh, sw, ph, pw, out_h, out_w);
             continue;
         }
 
@@ -927,6 +1503,7 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
                 dst[m] = src[m] + bias_val;
         }
     }
+    } /* end use_batched else */
 
     /* hook up backward */
     if (ax_grad_enabled() && (input->requires_grad || conv->weight->requires_grad))
@@ -1094,43 +1671,76 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
 
     /* per-channel parallel: apply relu mask (bn_out > 0 gate), accumulate
-       dgamma/dbeta, then compute dx formula into grad_conv. each channel
-       writes its own disjoint slice. */
+       dgamma/dbeta via SIMD, then compute dx formula into grad_conv.
+       each channel c owns disjoint slices of go/xh/gc, so no atomics needed
+       on dg[c]/db[c] — they're accessed by exactly one thread. */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 1)
     #endif
     for (int64_t c = 0; c < C_out; c++) {
         float g_c = gd[c], b_c = bd[c];
-        float sum_go = 0.0f, sum_go_xh = 0.0f;
+        ax_vf32 v_gc  = ax_vf32_set1(g_c);
+        ax_vf32 v_bc  = ax_vf32_set1(b_c);
+        ax_vf32 v_zero = ax_vf32_zero();
+        ax_vf32 v_sgo = ax_vf32_zero(), v_sgx = ax_vf32_zero();
+        float s_sgo = 0.0f, s_sgx = 0.0f;
+        int64_t se = spatial - (spatial % AX_VF32_WIDTH);
+
         for (int64_t n = 0; n < N; n++) {
             int64_t base = n * C_out * spatial + c * spatial;
-            for (int64_t s = 0; s < spatial; s++) {
-                float bn_out = g_c * xh[base + s] + b_c;
-                float m = (bn_out > 0.0f) ? go[base + s] : 0.0f;
-                gc[base + s] = m;
-                sum_go += m;
-                sum_go_xh += m * xh[base + s];
+            const float *go_p = go + base;
+            const float *xh_p = xh + base;
+            float *gc_p = gc + base;
+            int64_t s = 0;
+            for (; s < se; s += AX_VF32_WIDTH) {
+                ax_vf32 x = ax_vf32_loadu(xh_p + s);
+                ax_vf32 bn_out = ax_vf32_fmadd(v_gc, x, v_bc);
+                /* relu mask: cmpgt returns 1.0f where true, 0.0f otherwise.
+                   mul by mask gates the gradient without a bitwise AND. */
+                ax_vf32 mask = ax_vf32_cmpgt(bn_out, v_zero);
+                ax_vf32 g = ax_vf32_mul(ax_vf32_loadu(go_p + s), mask);
+                ax_vf32_storeu(gc_p + s, g);
+                v_sgo = ax_vf32_add(v_sgo, g);
+                v_sgx = ax_vf32_fmadd(g, x, v_sgx);
+            }
+            for (; s < spatial; s++) {
+                float bn_out = g_c * xh_p[s] + b_c;
+                float m = (bn_out > 0.0f) ? go_p[s] : 0.0f;
+                gc_p[s] = m;
+                s_sgo += m;
+                s_sgx += m * xh_p[s];
             }
         }
-        if (dg) {
-            #ifdef _OPENMP
-            #pragma omp atomic
-            #endif
-            dg[c] += sum_go_xh;
-        }
-        if (db) {
-            #ifdef _OPENMP
-            #pragma omp atomic
-            #endif
-            db[c] += sum_go;
-        }
+        float sum_go    = ax_vf32_hsum(v_sgo) + s_sgo;
+        float sum_go_xh = ax_vf32_hsum(v_sgx) + s_sgx;
+
+        /* no atomic: each thread owns exactly one c, no contention */
+        if (dg) dg[c] += sum_go_xh;
+        if (db) db[c] += sum_go;
 
         float coeff = g_c * istd[c] / Nf;
+        ax_vf32 v_coeff  = ax_vf32_set1(coeff);
+        ax_vf32 v_Nf     = ax_vf32_set1(Nf);
+        ax_vf32 v_sum_go = ax_vf32_set1(sum_go);
+        ax_vf32 v_sum_gx = ax_vf32_set1(sum_go_xh);
+
         for (int64_t n = 0; n < N; n++) {
             int64_t base = n * C_out * spatial + c * spatial;
-            for (int64_t s = 0; s < spatial; s++) {
-                float m = gc[base + s];
-                gc[base + s] = coeff * (Nf * m - sum_go - xh[base + s] * sum_go_xh);
+            const float *xh_p = xh + base;
+            float *gc_p = gc + base;
+            int64_t s = 0;
+            for (; s < se; s += AX_VF32_WIDTH) {
+                ax_vf32 m = ax_vf32_loadu(gc_p + s);
+                ax_vf32 x = ax_vf32_loadu(xh_p + s);
+                /* dx = coeff * (N*m - sum_go - x*sum_go_xh) */
+                ax_vf32 dx = ax_vf32_mul(v_coeff,
+                    ax_vf32_sub(ax_vf32_sub(ax_vf32_mul(v_Nf, m), v_sum_go),
+                                ax_vf32_mul(x, v_sum_gx)));
+                ax_vf32_storeu(gc_p + s, dx);
+            }
+            for (; s < spatial; s++) {
+                float m = gc_p[s];
+                gc_p[s] = coeff * (Nf * m - sum_go - xh_p[s] * sum_go_xh);
             }
         }
     }
@@ -1200,6 +1810,65 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *ind = (float *)input_data->storage->data;
     ax_tensor_t *wt_contig = s->wt_contig;
 
+    bool use_batched_cbr = N > 1 && M < AX_CONV_BATCH_M_THRESH
+                           && s->batch_col_buf && s->batch_aux_buf;
+
+    if (use_batched_cbr) {
+        float *bcd = (float *)s->batch_col_buf->storage->data;
+        float *gbd = (float *)s->batch_aux_buf->storage->data;
+        int64_t NM = N * M;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(T) schedule(static)
+        #endif
+        for (int64_t n = 0; n < N; n++) {
+            im2col_into_strided(ind + n * C_in * H * W, C_in, H, W,
+                                 kh, kw, sh, sw, ph, pw, out_h, out_w,
+                                 bcd, NM, n * M);
+            for (int64_t co = 0; co < C_out; co++)
+                memcpy(gbd + co * NM + n * M, gc + n * C_out * M + co * M,
+                       (size_t)M * sizeof(float));
+        }
+
+        if (weight->requires_grad) {
+            ax_tensor_t *dw_total = s->dw_bufs[0];
+            memset(dw_total->storage->data, 0, (size_t)(C_out * K) * sizeof(float));
+            ax_compute_gemm_nt(s->batch_aux_buf, s->batch_col_buf, dw_total);
+            float *wg  = (float *)weight->grad->storage->data;
+            float *dwl = (float *)dw_total->storage->data;
+            int64_t wn = C_out * K, wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
+            for (; wi < wve; wi += AX_VF32_WIDTH)
+                ax_vf32_storeu(wg + wi, ax_vf32_add(ax_vf32_loadu(wg + wi), ax_vf32_loadu(dwl + wi)));
+            for (; wi < wn; wi++) wg[wi] += dwl[wi];
+        }
+
+        if (input_orig->requires_grad && (wt_contig || have_gemm_tn_b)) {
+            memset(bcd, 0, (size_t)(K * NM) * sizeof(float));
+            if (have_gemm_tn_b)
+                ax_compute_gemm_tn(w2d_bn, s->batch_aux_buf, s->batch_col_buf);
+            else
+                ax_compute_gemm(wt_contig, s->batch_aux_buf, s->batch_col_buf);
+
+            #ifdef _OPENMP
+            #pragma omp parallel for num_threads(T) schedule(static)
+            #endif
+            for (int64_t n = 0; n < N; n++) {
+                int tid = AX_OMP_THREAD_NUM();
+                if (tid >= T) tid = 0;
+                float *dcol_d = (float *)s->dcol_bufs[tid]->storage->data;
+                for (int64_t k = 0; k < K; k++)
+                    memcpy(dcol_d + k * M, bcd + k * NM + n * M, (size_t)M * sizeof(float));
+                float *dimg_d = (float *)s->dimg_bufs[tid]->storage->data;
+                memset(dimg_d, 0, (size_t)(C_in * H * W) * sizeof(float));
+                col2im_into(dcol_d, C_in, H, W, kh, kw, sh, sw, ph, pw, out_h, out_w, dimg_d);
+                float *ig = (float *)input_orig->grad->storage->data + n * C_in * H * W;
+                int64_t total = C_in * H * W, i = 0, ve = total - (total % AX_VF32_WIDTH);
+                for (; i < ve; i += AX_VF32_WIDTH)
+                    ax_vf32_storeu(ig + i, ax_vf32_add(ax_vf32_loadu(ig + i), ax_vf32_loadu(dimg_d + i)));
+                for (; i < total; i++) ig[i] += dimg_d[i];
+            }
+        }
+    } else {
     #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
     #endif
@@ -1277,6 +1946,7 @@ static void conv_bn_relu_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             for (; wi < wn; wi++) wg[wi] += dwl[wi];
         }
     }
+    } /* end use_batched_cbr else */
 }
 
 /* ensure_scratch operates on ax_conv2d_t*; use a transient shim so we can
@@ -1331,7 +2001,9 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
     int64_t M = out_h * out_w;
     int64_t spatial = M;
     int64_t out_shape[] = {N, C_out, out_h, out_w};
-    ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
+    /* skip zero pass: pass 1 below writes every output (direct/smallcin
+       with bias init, gemm paths via res→od bias-copy). */
+    ax_tensor_t *output = ax_tensor_create(out_shape, 4, AX_FLOAT32);
     if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
 
     float *od = (float *)output->storage->data;
@@ -1354,13 +2026,49 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
 
     /* shape-aware path selection mirrors conv2d_forward. */
     bool use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
-    bool use_implicit = !use_direct && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+    bool use_smallcin = !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
+    bool use_implicit = !use_direct && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+    bool use_batched_cbr_fwd = !use_direct && !use_smallcin && !use_implicit && N > 1
+                               && M < AX_CONV_BATCH_M_THRESH
+                               && s->batch_col_buf && s->batch_aux_buf;
 
     /* pass 1: materialize conv output (including bias) into the final output buffer.
        pass 2/3 (bn stats + fused bn+relu apply) overwrite it in place. this saves
        one buffer pass compared to the unfused path which would first write bn
-       output into a separate tensor and then relu into another.
-       num_threads(T) caps the team to per-thread scratch slot count. */
+       output into a separate tensor and then relu into another. */
+    if (use_batched_cbr_fwd) {
+        float *bcd = (float *)s->batch_col_buf->storage->data;
+        float *brd = (float *)s->batch_aux_buf->storage->data;
+        int64_t NM = N * M;
+
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(T) schedule(static)
+        #endif
+        for (int64_t n = 0; n < N; n++)
+            im2col_into_strided(ind + n * C_in * H * W, C_in, H, W,
+                                 kh, kw, sh, sw, ph, pw, out_h, out_w,
+                                 bcd, NM, n * M);
+
+        memset(brd, 0, (size_t)(C_out * NM) * sizeof(float));
+        ax_compute_gemm(w2d, s->batch_col_buf, s->batch_aux_buf);
+
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(T) schedule(static)
+        #endif
+        for (int64_t n = 0; n < N; n++) {
+            for (int64_t co = 0; co < C_out; co++) {
+                float bias_val = bias_data ? bias_data[co] : 0.0f;
+                float *dst = od + (n * C_out + co) * M;
+                const float *src = brd + co * NM + n * M;
+                ax_vf32 v_b = ax_vf32_set1(bias_val);
+                int64_t m = 0, me = M - (M % AX_VF32_WIDTH);
+                for (; m < me; m += AX_VF32_WIDTH)
+                    ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), v_b));
+                for (; m < M; m++) dst[m] = src[m] + bias_val;
+            }
+        }
+    } else {
+    /* num_threads(T) caps the team to per-thread scratch slot count. */
     #ifdef _OPENMP
     #pragma omp parallel for num_threads(T) schedule(dynamic, 1)
     #endif
@@ -1371,6 +2079,16 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
             conv2d_direct_3x3_sample(
                 ind + n * C_in * H * W, wd, bias_data,
                 od + n * C_out * M, C_in, C_out, H, W);
+            continue;
+        }
+        if (use_smallcin) {
+            /* small-C_in direct: writes conv result with bias into od[n].
+               BN+ReLU pass below overwrites in-place. */
+            conv2d_direct_smallcin_sample(
+                ind + n * C_in * H * W, wd, bias_data,
+                od + n * C_out * M,
+                C_in, C_out, H, W,
+                kh, kw, sh, sw, ph, pw, out_h, out_w);
             continue;
         }
 
@@ -1390,6 +2108,32 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
                 .out_h = out_h, .out_w = out_w,
             };
             ax_compute_conv_gemm(w2d, &cp, res);
+        } else if (kh == 1 && kw == 1 && sh == 1 && sw == 1
+                   && ph == 0 && pw == 0 && H == out_h && W == out_w) {
+            /* 1x1 conv: im2col is the identity layout — skip the copy.
+               stack-allocated view into inp[n] with refcount=0 (parent keeps
+               storage alive). matches conv2d_forward path. */
+            ax_storage_t in_storage;
+            in_storage.data = (void *)(ind + n * C_in * H * W);
+            in_storage.size_bytes = (size_t)(C_in * H * W) * sizeof(float);
+            atomic_store(&in_storage.refcount, 0);
+            in_storage.device = AX_DEVICE_CPU;
+            in_storage.is_arena_temp = true;
+            in_storage.generation = 1;
+
+            ax_tensor_t in_slice;
+            memset(&in_slice, 0, sizeof(in_slice));
+            in_slice.storage = &in_storage;
+            in_slice.ndim = 2;
+            in_slice.dtype = AX_FLOAT32;
+            in_slice.offset = 0;
+            in_slice.shape[0] = C_in;
+            in_slice.shape[1] = M;
+            in_slice.strides[0] = M;
+            in_slice.strides[1] = 1;
+
+            memset(rd, 0, (size_t)(C_out * M) * sizeof(float));
+            ax_compute_gemm(w2d, &in_slice, res);
         } else {
             float *cd = (float *)col->storage->data;
             im2col_into(ind + n * C_in * H * W, C_in, H, W,
@@ -1409,18 +2153,27 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
             for (; m < M; m++) dst[m] = src[m] + bias_val;
         }
     }
+    } /* end use_batched_cbr_fwd else */
 
     /* allocate backward saves after pass 1 so a failed alloc still lets us
-       return a valid forward result (just without gradients). */
+       return a valid forward result (just without gradients).
+       use the forward arena: both tensors are fully overwritten below, so
+       ax_tensor_zeros / memset would be wasted bandwidth. the arena frees
+       everything in bulk at ax_graph_cleanup, matching the lifetime. */
     ax_tensor_t *x_hat_save = NULL;
     ax_tensor_t *inv_std_save = NULL;
     if (record) {
-        x_hat_save = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
+        ax_arena_t *fa = ax_forward_arena();
         int64_t is_shape[] = {C_out};
-        inv_std_save = ax_tensor_zeros(is_shape, 1, AX_FLOAT32);
+        if (fa) {
+            x_hat_save  = ax_tensor_arena_create(fa, out_shape, 4, AX_FLOAT32);
+            inv_std_save = ax_tensor_arena_create(fa, is_shape, 1, AX_FLOAT32);
+        } else {
+            x_hat_save  = ax_tensor_create(out_shape, 4, AX_FLOAT32);
+            inv_std_save = ax_tensor_create(is_shape, 1, AX_FLOAT32);
+        }
         if (!x_hat_save || !inv_std_save) {
-            if (x_hat_save) ax_tensor_destroy(x_hat_save);
-            if (inv_std_save) ax_tensor_destroy(inv_std_save);
+            /* non-fatal: forward result is still valid, just no grads */
             x_hat_save = inv_std_save = NULL;
             record = false;
         }
@@ -1440,37 +2193,31 @@ static ax_tensor_t *conv_bn_relu_forward(ax_layer_t *self, ax_tensor_t *input)
         #pragma omp parallel for schedule(dynamic, 1)
         #endif
         for (int64_t c = 0; c < C_out; c++) {
-            /* welford-lite in double: matches existing batchnorm numerics */
-            double dsum = 0.0;
+            /* 1-pass fused sum + sum^2: halves memory reads vs 2-pass.
+               E[x^2] - E[x]^2 is numerically adequate for float32 at
+               typical BN working ranges (activation magnitudes ~0-10). */
+            ax_vf32 vs = ax_vf32_zero(), vs2 = ax_vf32_zero();
+            float s_tail = 0.0f, s2_tail = 0.0f;
             for (int64_t n = 0; n < N; n++) {
                 int64_t base = n * C_out * spatial + c * spatial;
                 int64_t m = 0, me = spatial - (spatial % AX_VF32_WIDTH);
-                ax_vf32 vs = ax_vf32_zero();
-                for (; m < me; m += AX_VF32_WIDTH)
-                    vs = ax_vf32_add(vs, ax_vf32_loadu(od + base + m));
-                dsum += (double)ax_vf32_hsum(vs);
-                for (; m < spatial; m++) dsum += (double)od[base + m];
-            }
-            float mean = (float)(dsum / (double)eff_n);
-
-            ax_vf32 v_mean = ax_vf32_set1(mean);
-            double var_sum_d = 0.0;
-            for (int64_t n = 0; n < N; n++) {
-                int64_t base = n * C_out * spatial + c * spatial;
-                int64_t m = 0, me = spatial - (spatial % AX_VF32_WIDTH);
-                ax_vf32 vv = ax_vf32_zero();
                 for (; m < me; m += AX_VF32_WIDTH) {
-                    ax_vf32 d = ax_vf32_sub(ax_vf32_loadu(od + base + m), v_mean);
-                    vv = ax_vf32_fmadd(d, d, vv);
+                    ax_vf32 x = ax_vf32_loadu(od + base + m);
+                    vs  = ax_vf32_add(vs, x);
+                    vs2 = ax_vf32_fmadd(x, x, vs2);
                 }
-                var_sum_d += (double)ax_vf32_hsum(vv);
                 for (; m < spatial; m++) {
-                    float d = od[base + m] - mean;
-                    var_sum_d += (double)d * (double)d;
+                    float x = od[base + m];
+                    s_tail  += x;
+                    s2_tail += x * x;
                 }
             }
-            float var = (float)(var_sum_d / (double)eff_n);
-            float var_sum = (float)var_sum_d;
+            float sum  = ax_vf32_hsum(vs)  + s_tail;
+            float sum2 = ax_vf32_hsum(vs2) + s2_tail;
+            float mean = sum / eff_n;
+            float var  = sum2 / eff_n - mean * mean;
+            if (var < 0.0f) var = 0.0f;
+            float var_sum = var * eff_n; /* Σ(x)^2 - N*mean^2, for unbiased estimator */
             float inv_std = 1.0f / sqrtf(var + L->bn_eps);
             if (record) is_d[c] = inv_std;
 

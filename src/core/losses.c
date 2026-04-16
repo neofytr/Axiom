@@ -314,26 +314,33 @@ static void ce_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         softmax_out->strides[1] == 1 &&
         target->strides[1] == 1;
 
+    /* each batch row writes to a disjoint slice of pg — safe to parallelize.
+       threshold keeps tiny batches (mnist) serial while large batches go wide. */
+    int64_t ce_bwd_work = batch * classes;
     if (inner_unit) {
         ax_vf32 vs = ax_vf32_set1(scale);
+        int64_t ve = classes - (classes % AX_VF32_WIDTH);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if (ce_bwd_work >= ax_par_threshold_elems)
+        #endif
         for (int64_t b = 0; b < batch; b++) {
             float *pgb = pg + pred->grad->offset + b * pred->grad->strides[0];
             float *sdb = sd + softmax_out->offset + b * softmax_out->strides[0];
             float *tdb = td + target->offset + b * target->strides[0];
             int64_t c = 0;
-            int64_t ve = classes - (classes % AX_VF32_WIDTH);
             for (; c < ve; c += AX_VF32_WIDTH) {
-                ax_vf32 vsm = ax_vf32_loadu(sdb + c);
-                ax_vf32 vtg = ax_vf32_loadu(tdb + c);
-                ax_vf32 vg = ax_vf32_loadu(pgb + c);
-                /* pg += (sm - tg) * scale */
-                ax_vf32 vdiff = ax_vf32_sub(vsm, vtg);
-                ax_vf32_storeu(pgb + c, ax_vf32_fmadd(vdiff, vs, vg));
+                ax_vf32 vdiff = ax_vf32_sub(ax_vf32_loadu(sdb + c),
+                                             ax_vf32_loadu(tdb + c));
+                ax_vf32_storeu(pgb + c,
+                    ax_vf32_fmadd(vdiff, vs, ax_vf32_loadu(pgb + c)));
             }
             for (; c < classes; c++)
                 pgb[c] += (sdb[c] - tdb[c]) * scale;
         }
     } else {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if (ce_bwd_work >= ax_par_threshold_elems)
+        #endif
         for (int64_t b = 0; b < batch; b++)
         {
             for (int64_t c = 0; c < classes; c++)

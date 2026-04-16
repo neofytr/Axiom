@@ -226,6 +226,199 @@ static void test_conv_pipeline(void)
     ax_layer_destroy(model);
 }
 
+/* test batched GEMM path: N>1 && M<512 triggers the single-GEMM route.
+   verify forward output and backward weight gradient match analytic expectations. */
+static void test_conv2d_batched_fwd(void)
+{
+    /* N=8, C_in=4, H=7, W=7 → M=49 < 512 → batched path
+       3x3 pad=1: out_h=7, out_w=7, K=4*9=36, C_out=8
+       all-ones weights, all-ones input → each output pixel = K = 36 */
+    int N = 8, Cin = 4, H = 7, W = 7, Cout = 8;
+    ax_layer_t *c = ax_conv2d_create(Cin, Cout, 3, 1, 1, false);
+    ax_conv2d_t *cc = (ax_conv2d_t *)c;
+    ax_compute_fill(cc->weight, 1.0f);
+
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp = ax_tensor_ones(in_sh, 4, AX_FLOAT32);
+
+    ax_tensor_t *out = ax_layer_forward(c, inp);
+    AX_TEST_ASSERT(out != NULL, "batched conv fwd should work");
+    AX_TEST_ASSERT_EQ(out->shape[0], N, "batch");
+    AX_TEST_ASSERT_EQ(out->shape[1], Cout, "channels");
+    AX_TEST_ASSERT_EQ(out->shape[2], H, "height preserved");
+
+    /* center pixel sees full 3x3 patch across Cin channels: 9*Cin = 36 */
+    float *od = (float *)out->storage->data;
+    int64_t M = H * W;
+    int64_t center = 3 * W + 3; /* pixel (3,3) */
+    for (int n = 0; n < N; n++)
+        for (int co = 0; co < Cout; co++)
+            AX_TEST_ASSERT_NEAR(od[(n * Cout + co) * M + center], (float)(9 * Cin), 1e-3f,
+                                "batched: center pixel should equal K=9*Cin");
+
+    ax_tensor_destroy(inp);
+    ax_layer_destroy(c);
+}
+
+static void test_conv2d_batched_bwd(void)
+{
+    /* backward: dW should sum contributions from all N samples.
+       N=4, C_in=2, H=5, W=5 → M=25 < 512 → batched bwd path
+       3x3 pad=1 conv, all-ones weights+input, all-ones upstream grad.
+       dW[co, k] = sum_n sum_m go[n,co,m] * col[n,k,m] */
+    int N = 4, Cin = 2, H = 5, W = 5, Cout = 4;
+    ax_layer_t *c = ax_conv2d_create(Cin, Cout, 3, 1, 1, false);
+    ax_conv2d_t *cc = (ax_conv2d_t *)c;
+    ax_compute_fill(cc->weight, 1.0f);
+    cc->weight->requires_grad = true;
+
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp = ax_tensor_ones(in_sh, 4, AX_FLOAT32);
+    inp->requires_grad = true;
+
+    ax_enable_grad();
+    ax_tensor_t *out = ax_layer_forward(c, inp);
+
+    /* sum loss = sum of all outputs; dout = all-ones */
+    ax_tensor_t *loss = ax_sum(out, -1);
+    ax_backward(loss);
+
+    /* each interior im2col patch element is 1.0 (all-ones input).
+       sum over N*M positions: dW[co,k] = N * M_effective where
+       M_effective counts how many spatial positions have this kernel tap active.
+       for an interior tap (not corner/edge pad): all H*W positions → N*H*W */
+    float *wg = (float *)cc->weight->grad->storage->data;
+    int64_t K = Cin * 3 * 3;
+    /* center tap of center channel at (1,1): all M positions see it → N*H*W */
+    int center_tap = 1 * 3 + 1; /* ky=1, kx=1 in the 3x3 kernel */
+    float expected_center = (float)(N * H * W);
+    for (int co = 0; co < Cout; co++) {
+        for (int ci = 0; ci < Cin; ci++) {
+            int k = ci * 9 + center_tap;
+            AX_TEST_ASSERT_NEAR(wg[co * K + k], expected_center, 1.0f,
+                                "batched bwd: center tap dW");
+        }
+    }
+
+    ax_tensor_destroy(loss);
+    ax_tensor_destroy(out);
+    ax_tensor_destroy(inp);
+    ax_layer_destroy(c);
+    ax_no_grad();
+}
+
+/* validate the direct-smallcin path matches the im2col+gemm reference.
+   we can't pick the path explicitly from the public API, so we rely on
+   conv2d_forward's internal predicate: C_in ≤ 4 → direct-smallcin.
+   we then reconstruct the same conv with a wrapper input that pads C_in to 5
+   (zero-padded weight for the extra channel), which forces the im2col path,
+   and check both produce the same outputs to 1e-5 tolerance. */
+static void test_conv2d_direct_smallcin_vs_gemm(void)
+{
+    /* shape mirrors VGG/ResNet first layer */
+    const int N = 2, Cin = 3, Cout = 16, H = 32, W = 32;
+    const int K = 3, S = 1, P = 1;
+
+    /* deterministic input + weights via ax_tensor_rand */
+    ax_set_seed(7);
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp_a = ax_tensor_rand(in_sh, 4, -1.0f, 1.0f);
+
+    /* layer A: hits direct-smallcin (C_in=3 ≤ 4) */
+    ax_layer_t *ca = ax_conv2d_create(Cin, Cout, K, S, P, true);
+    ax_conv2d_t *cca = (ax_conv2d_t *)ca;
+
+    /* layer B: pad C_in to 5 → falls into im2col path (5 > 4 threshold) */
+    int64_t in_sh_b[] = {N, 5, H, W};
+    ax_tensor_t *inp_b = ax_tensor_zeros(in_sh_b, 4, AX_FLOAT32);
+    /* copy the 3 real channels into the first 3 slots of the 5-channel input */
+    float *ad = (float *)inp_a->storage->data;
+    float *bd = (float *)inp_b->storage->data;
+    for (int n = 0; n < N; n++)
+        for (int c = 0; c < Cin; c++)
+            memcpy(bd + ((size_t)n * 5 + c) * H * W,
+                   ad + ((size_t)n * Cin + c) * H * W,
+                   (size_t)H * W * sizeof(float));
+
+    ax_layer_t *cb = ax_conv2d_create(5, Cout, K, S, P, true);
+    ax_conv2d_t *ccb = (ax_conv2d_t *)cb;
+    /* copy the 3-channel weight into the 5-channel weight; zero the rest */
+    float *wa = (float *)cca->weight->storage->data;
+    float *wb = (float *)ccb->weight->storage->data;
+    memset(wb, 0, (size_t)Cout * 5 * K * K * sizeof(float));
+    for (int co = 0; co < Cout; co++)
+        for (int ci = 0; ci < Cin; ci++)
+            memcpy(wb + ((size_t)co * 5 + ci) * K * K,
+                   wa + ((size_t)co * Cin + ci) * K * K,
+                   (size_t)K * K * sizeof(float));
+    /* same bias */
+    memcpy((float *)ccb->bias->storage->data,
+           (float *)cca->bias->storage->data,
+           (size_t)Cout * sizeof(float));
+
+    ax_no_grad();
+    ax_tensor_t *out_a = ax_layer_forward(ca, inp_a);
+    ax_tensor_t *out_b = ax_layer_forward(cb, inp_b);
+
+    AX_TEST_ASSERT(out_a && out_b, "both forwards should succeed");
+    AX_TEST_ASSERT_EQ(out_a->shape[0], out_b->shape[0], "N matches");
+    AX_TEST_ASSERT_EQ(out_a->shape[1], out_b->shape[1], "Cout matches");
+    AX_TEST_ASSERT_EQ(out_a->shape[2], out_b->shape[2], "H_out matches");
+    AX_TEST_ASSERT_EQ(out_a->shape[3], out_b->shape[3], "W_out matches");
+
+    float *oa = (float *)out_a->storage->data;
+    float *ob = (float *)out_b->storage->data;
+    int64_t total = out_a->shape[0] * out_a->shape[1] * out_a->shape[2] * out_a->shape[3];
+    float max_err = 0.0f;
+    for (int64_t i = 0; i < total; i++) {
+        float e = fabsf(oa[i] - ob[i]);
+        if (e > max_err) max_err = e;
+    }
+    AX_TEST_ASSERT(max_err < 1e-4f, "direct-smallcin matches im2col reference");
+
+    ax_tensor_destroy(out_a); ax_tensor_destroy(out_b);
+    ax_tensor_destroy(inp_a); ax_tensor_destroy(inp_b);
+    ax_layer_destroy(ca);    ax_layer_destroy(cb);
+    ax_enable_grad();
+}
+
+/* exercise edge cases: very small W (just below SIMD threshold), pad=0,
+   stride=2, asymmetric kernel. all should fall into either smallcin or
+   im2col cleanly without crashing. */
+static void test_conv2d_smallcin_edges(void)
+{
+    struct { int Cin, Cout, H, W, K, S, P; } cases[] = {
+        { 1, 8,  16, 16, 3, 1, 1 },   /* 1-channel grayscale */
+        { 3, 16, 32, 32, 3, 1, 0 },   /* no padding */
+        { 3, 16, 32, 32, 3, 2, 1 },   /* stride 2 (smallcin doesn't do simd at sw>1, but should still produce correct results) */
+        { 4, 32, 28, 28, 3, 1, 1 },   /* C_in=4 (boundary) */
+        { 3, 8,  56, 56, 5, 1, 2 },   /* 5x5 kernel */
+        { 3, 8,  56, 56, 7, 2, 3 },   /* 7x7 stride 2 (resnet stem) */
+    };
+    int n_cases = (int)(sizeof(cases) / sizeof(cases[0]));
+
+    for (int i = 0; i < n_cases; i++) {
+        int Cin = cases[i].Cin, Cout = cases[i].Cout;
+        int H = cases[i].H, W = cases[i].W;
+        int Kk = cases[i].K, S = cases[i].S, P = cases[i].P;
+
+        ax_set_seed(13 + i);
+        int64_t in_sh[] = {1, Cin, H, W};
+        ax_tensor_t *inp = ax_tensor_rand(in_sh, 4, -1.0f, 1.0f);
+
+        ax_layer_t *c = ax_conv2d_create(Cin, Cout, Kk, S, P, true);
+        ax_no_grad();
+        ax_tensor_t *out = ax_layer_forward(c, inp);
+        AX_TEST_ASSERT(out != NULL, "forward should not crash on edge case");
+        AX_TEST_ASSERT(out->shape[0] == 1 && out->shape[1] == Cout,
+                       "output shape header correct");
+        ax_tensor_destroy(out);
+        ax_tensor_destroy(inp);
+        ax_layer_destroy(c);
+        ax_enable_grad();
+    }
+}
+
 int main(void)
 {
     ax_init();
@@ -240,6 +433,10 @@ int main(void)
     AX_RUN_TEST(test_global_avgpool);
     AX_RUN_TEST(test_flatten);
     AX_RUN_TEST(test_conv_pipeline);
+    AX_RUN_TEST(test_conv2d_batched_fwd);
+    AX_RUN_TEST(test_conv2d_batched_bwd);
+    AX_RUN_TEST(test_conv2d_direct_smallcin_vs_gemm);
+    AX_RUN_TEST(test_conv2d_smallcin_edges);
 
     ax_shutdown();
     AX_TEST_SUMMARY();

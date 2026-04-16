@@ -41,6 +41,7 @@ static inline ax_vf32 ax_vf32_load(const float *p)    { return _mm512_load_ps(p)
 static inline ax_vf32 ax_vf32_loadu(const float *p)   { return _mm512_loadu_ps(p); }
 static inline void    ax_vf32_store(float *p, ax_vf32 v)  { _mm512_store_ps(p, v); }
 static inline void    ax_vf32_storeu(float *p, ax_vf32 v) { _mm512_storeu_ps(p, v); }
+static inline void    ax_vf32_stream(float *p, ax_vf32 v) { _mm512_stream_ps(p, v); }
 static inline ax_vf32 ax_vf32_set1(float v)            { return _mm512_set1_ps(v); }
 static inline ax_vf32 ax_vf32_zero(void)               { return _mm512_setzero_ps(); }
 static inline ax_vf32 ax_vf32_add(ax_vf32 a, ax_vf32 b) { return _mm512_add_ps(a, b); }
@@ -165,6 +166,7 @@ static inline ax_vf32 ax_vf32_load(const float *p)    { return _mm256_load_ps(p)
 static inline ax_vf32 ax_vf32_loadu(const float *p)   { return _mm256_loadu_ps(p); }
 static inline void    ax_vf32_store(float *p, ax_vf32 v)  { _mm256_store_ps(p, v); }
 static inline void    ax_vf32_storeu(float *p, ax_vf32 v) { _mm256_storeu_ps(p, v); }
+static inline void    ax_vf32_stream(float *p, ax_vf32 v) { _mm256_stream_ps(p, v); }
 static inline ax_vf32 ax_vf32_set1(float v)            { return _mm256_set1_ps(v); }
 static inline ax_vf32 ax_vf32_zero(void)               { return _mm256_setzero_ps(); }
 static inline ax_vf32 ax_vf32_add(ax_vf32 a, ax_vf32 b) { return _mm256_add_ps(a, b); }
@@ -348,6 +350,7 @@ static inline ax_vf32 ax_vf32_load(const float *p)    { return vld1q_f32(p); }
 static inline ax_vf32 ax_vf32_loadu(const float *p)   { return vld1q_f32(p); }
 static inline void    ax_vf32_store(float *p, ax_vf32 v)  { vst1q_f32(p, v); }
 static inline void    ax_vf32_storeu(float *p, ax_vf32 v) { vst1q_f32(p, v); }
+static inline void    ax_vf32_stream(float *p, ax_vf32 v) { vst1q_f32(p, v); } /* no NT on neon */
 static inline ax_vf32 ax_vf32_set1(float v)            { return vdupq_n_f32(v); }
 static inline ax_vf32 ax_vf32_zero(void)               { return vdupq_n_f32(0.0f); }
 static inline ax_vf32 ax_vf32_add(ax_vf32 a, ax_vf32 b) { return vaddq_f32(a, b); }
@@ -488,6 +491,7 @@ static inline ax_vf32 ax_vf32_load(const float *p)    { return *p; }
 static inline ax_vf32 ax_vf32_loadu(const float *p)   { return *p; }
 static inline void    ax_vf32_store(float *p, ax_vf32 v)  { *p = v; }
 static inline void    ax_vf32_storeu(float *p, ax_vf32 v) { *p = v; }
+static inline void    ax_vf32_stream(float *p, ax_vf32 v) { *p = v; }
 static inline ax_vf32 ax_vf32_set1(float v)            { return v; }
 static inline ax_vf32 ax_vf32_zero(void)               { return 0.0f; }
 static inline ax_vf32 ax_vf32_add(ax_vf32 a, ax_vf32 b) { return a + b; }

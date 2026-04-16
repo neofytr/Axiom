@@ -537,35 +537,57 @@ static void softmax_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float *go = (float *)grad_out->storage->data;
     float *sd = (float *)softmax_out->storage->data;
 
+    /* helper: SIMD dot product over n contiguous elements at go_p, sd_p */
+    #define SOFTMAX_BWD_ROW(go_p, sd_p, ig_p, n) do { \
+        int64_t _ie = (n) - ((n) % AX_VF32_WIDTH); \
+        ax_vf32 _vd = ax_vf32_zero(); \
+        int64_t _i = 0; \
+        for (; _i < _ie; _i += AX_VF32_WIDTH) \
+            _vd = ax_vf32_fmadd(ax_vf32_loadu((go_p) + _i), ax_vf32_loadu((sd_p) + _i), _vd); \
+        float _dot = ax_vf32_hsum(_vd); \
+        for (; _i < (n); _i++) _dot += (go_p)[_i] * (sd_p)[_i]; \
+        ax_vf32 _vdot = ax_vf32_set1(_dot); \
+        _i = 0; \
+        for (; _i < _ie; _i += AX_VF32_WIDTH) { \
+            ax_vf32 _s  = ax_vf32_loadu((sd_p) + _i); \
+            ax_vf32 _g  = ax_vf32_loadu((go_p) + _i); \
+            ax_vf32 _ig = ax_vf32_loadu((ig_p) + _i); \
+            ax_vf32_storeu((ig_p) + _i, \
+                ax_vf32_add(_ig, ax_vf32_mul(_s, ax_vf32_sub(_g, _vdot)))); \
+        } \
+        for (; _i < (n); _i++) \
+            (ig_p)[_i] += (sd_p)[_i] * ((go_p)[_i] - _dot); \
+    } while (0)
+
     if (input->ndim == 1)
     {
         int64_t n = input->shape[0];
-        /* dot = sum(grad_out * s) */
-        float dot = 0;
-        for (int64_t i = 0; i < n; i++)
-            dot += go[grad_out->offset + i] * sd[softmax_out->offset + i];
-        for (int64_t i = 0; i < n; i++)
-            ig[input->grad->offset + i] +=
-                sd[softmax_out->offset + i] * (go[grad_out->offset + i] - dot);
+        float *go_p = go + grad_out->offset;
+        float *sd_p = sd + softmax_out->offset;
+        float *ig_p = ig + input->grad->offset;
+        SOFTMAX_BWD_ROW(go_p, sd_p, ig_p, n);
     }
     else if (input->ndim == 2)
     {
         int64_t rows = input->shape[0];
         int64_t cols = input->shape[1];
+        int64_t go_off = grad_out->offset;
+        int64_t sd_off = softmax_out->offset;
+        int64_t ig_off = input->grad->offset;
+        int64_t work = rows * cols;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if (rows > 1 && work >= ax_par_threshold_elems)
+        #endif
         for (int64_t r = 0; r < rows; r++)
         {
-            float dot = 0;
-            for (int64_t c = 0; c < cols; c++)
-                dot += go[grad_out->offset + r * cols + c] *
-                       sd[softmax_out->offset + r * cols + c];
-            for (int64_t c = 0; c < cols; c++) {
-                int64_t idx = r * cols + c;
-                ig[input->grad->offset + idx] +=
-                    sd[softmax_out->offset + idx] *
-                    (go[grad_out->offset + idx] - dot);
-            }
+            float *go_p = go + go_off + r * cols;
+            float *sd_p = sd + sd_off + r * cols;
+            float *ig_p = ig + ig_off + r * cols;
+            SOFTMAX_BWD_ROW(go_p, sd_p, ig_p, cols);
         }
     }
+
+    #undef SOFTMAX_BWD_ROW
 }
 
 

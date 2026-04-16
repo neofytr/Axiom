@@ -671,19 +671,92 @@ static void layernorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (need_dg || need_db) {
         float *dg = need_dg ? (float *)ln->gamma->grad->storage->data : NULL;
         float *db = need_db ? (float *)ln->beta->grad->storage->data : NULL;
+        /* fe already declared above; batch-outer, feat-inner: go[b*feat+f] is contiguous over f.
+           per-thread scratch (n_threads * feat floats each for sg and sgx)
+           lets OMP walk over batch rows without atomic writes.
+           same pattern as BN 4D forward. */
 #ifdef _OPENMP
-        int64_t dgdb_work = batch * feat;
-        #pragma omp parallel for schedule(static) if (dgdb_work >= ax_par_threshold_elems)
+        int n_threads = omp_get_max_threads();
+#else
+        int n_threads = 1;
 #endif
-        for (int64_t f = 0; f < feat; f++) {
-            float sum_g = 0, sum_gx = 0;
-            for (int64_t b = 0; b < batch; b++) {
-                float g = go[b * feat + f];
-                sum_g += g;
-                if (dg) sum_gx += g * xh[b * feat + f];
+        size_t per_thread = (size_t)feat;
+        float *redbuf = (float *)aligned_alloc(64,
+            (2u * (size_t)n_threads * per_thread * sizeof(float) + 63u) & ~(size_t)63u);
+        if (redbuf) {
+            memset(redbuf, 0, 2u * (size_t)n_threads * per_thread * sizeof(float));
+            float *sg_all  = redbuf;
+            float *sgx_all = redbuf + (size_t)n_threads * per_thread;
+
+#ifdef _OPENMP
+            int64_t dgdb_work = batch * feat;
+            #pragma omp parallel if (dgdb_work >= ax_par_threshold_elems)
+#endif
+            {
+#ifdef _OPENMP
+                int tid = omp_get_thread_num();
+#else
+                int tid = 0;
+#endif
+                float *sg_l  = sg_all  + (size_t)tid * per_thread;
+                float *sgx_l = sgx_all + (size_t)tid * per_thread;
+#ifdef _OPENMP
+                #pragma omp for schedule(static)
+#endif
+                for (int64_t b = 0; b < batch; b++) {
+                    const float *gop = go + b * feat;
+                    const float *xhp = xh + b * feat;
+                    int64_t f = 0;
+                    for (; f < fe; f += AX_VF32_WIDTH) {
+                        ax_vf32 g = ax_vf32_loadu(gop + f);
+                        ax_vf32_storeu(sg_l + f,
+                            ax_vf32_add(ax_vf32_loadu(sg_l + f), g));
+                        if (dg) ax_vf32_storeu(sgx_l + f,
+                            ax_vf32_fmadd(g, ax_vf32_loadu(xhp + f),
+                                          ax_vf32_loadu(sgx_l + f)));
+                    }
+                    for (; f < feat; f++) {
+                        sg_l[f] += gop[f];
+                        if (dg) sgx_l[f] += gop[f] * xhp[f];
+                    }
+                }
             }
-            if (dg) dg[f] += sum_gx;
-            if (db) db[f] += sum_g;
+
+            /* reduce per-thread slabs into dg/db */
+            for (int t = 1; t < n_threads; t++) {
+                float *sp  = sg_all  + (size_t)t * per_thread;
+                float *sxp = sgx_all + (size_t)t * per_thread;
+                int64_t f = 0;
+                for (; f < fe; f += AX_VF32_WIDTH) {
+                    ax_vf32_storeu(sg_all + f,
+                        ax_vf32_add(ax_vf32_loadu(sg_all + f),
+                                    ax_vf32_loadu(sp + f)));
+                    if (dg) ax_vf32_storeu(sgx_all + f,
+                        ax_vf32_add(ax_vf32_loadu(sgx_all + f),
+                                    ax_vf32_loadu(sxp + f)));
+                }
+                for (; f < feat; f++) {
+                    sg_all[f] += sp[f];
+                    if (dg) sgx_all[f] += sxp[f];
+                }
+            }
+            for (int64_t f = 0; f < feat; f++) {
+                if (dg) dg[f] += sgx_all[f];
+                if (db) db[f] += sg_all[f];
+            }
+            free(redbuf);
+        } else {
+            /* fallback: scalar strided (allocation failed) */
+            for (int64_t f = 0; f < feat; f++) {
+                float sum_g = 0, sum_gx = 0;
+                for (int64_t b = 0; b < batch; b++) {
+                    float g = go[b * feat + f];
+                    sum_g += g;
+                    if (dg) sum_gx += g * xh[b * feat + f];
+                }
+                if (dg) dg[f] += sum_gx;
+                if (db) db[f] += sum_g;
+            }
         }
     }
 
@@ -797,13 +870,19 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_tensor_t *x_hat_save = NULL;
     ax_tensor_t *inv_std_save = NULL;
     if (record) {
-        /* these get fully filled in the normalize loop; skip the memset */
-        x_hat_save = ax_tensor_create(input->shape, input->ndim, input->dtype);
+        /* allocate from forward arena: fully overwritten below, lifetime spans
+           forward+backward of one training step, freed in bulk at graph cleanup. */
+        ax_arena_t *fa = ax_forward_arena();
         int64_t is_shape[] = {batch};
-        inv_std_save = ax_tensor_create(is_shape, 1, input->dtype);
+        if (fa) {
+            x_hat_save  = ax_tensor_arena_create(fa, input->shape, input->ndim, input->dtype);
+            inv_std_save = ax_tensor_arena_create(fa, is_shape, 1, input->dtype);
+        } else {
+            x_hat_save  = ax_tensor_create(input->shape, input->ndim, input->dtype);
+            inv_std_save = ax_tensor_create(is_shape, 1, input->dtype);
+        }
         if (!x_hat_save || !inv_std_save) {
-            if (x_hat_save) ax_tensor_destroy(x_hat_save);
-            if (inv_std_save) ax_tensor_destroy(inv_std_save);
+            x_hat_save = inv_std_save = NULL;
             record = false;
         }
     }
@@ -811,12 +890,12 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
     float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
     float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
-    /* layernorm normalizes per-sample, so each sample is independent.
+    /* each sample is independent: parallelize over batch.
        dynamic-1 for hybrid P/E core load balancing.
 
-       SIMD 2-pass: pass 1 sums via ax_vf32, pass 2 sums squared deviations
-       via ax_vf32 fmadd, pass 3 fused normalize + affine.
-       double-accumulated hsum keeps the variance stable for feat up to ~1M. */
+       1-pass: compute sum and sum^2 simultaneously to halve memory reads.
+       E[x^2] - E[x]^2 is numerically adequate for LN's typical working
+       range (activations after embedding / attention, magnitudes < 10). */
     #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 1)
     #endif
@@ -828,32 +907,27 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
 
         int64_t fe = feat - (feat % AX_VF32_WIDTH);
 
-        /* pass 1: sum via SIMD, double hsum. */
-        double sum_d = 0.0;
+        /* 1-pass: fused sum + sum^2 via SIMD fmadd. */
+        ax_vf32 vs = ax_vf32_zero(), vs2 = ax_vf32_zero();
+        float s_tail = 0.0f, s2_tail = 0.0f;
         {
-            ax_vf32 vs = ax_vf32_zero();
-            int64_t f = 0;
-            for (; f < fe; f += AX_VF32_WIDTH)
-                vs = ax_vf32_add(vs, ax_vf32_loadu(ip + f));
-            sum_d += (double)ax_vf32_hsum(vs);
-            for (; f < feat; f++) sum_d += (double)ip[f];
-        }
-        float mean = (float)(sum_d / (double)feat);
-
-        /* pass 2: sum of (x - mean)^2 via SIMD fmadd. */
-        double var_d = 0.0;
-        {
-            ax_vf32 v_mean = ax_vf32_set1(mean);
-            ax_vf32 vv = ax_vf32_zero();
             int64_t f = 0;
             for (; f < fe; f += AX_VF32_WIDTH) {
-                ax_vf32 d = ax_vf32_sub(ax_vf32_loadu(ip + f), v_mean);
-                vv = ax_vf32_fmadd(d, d, vv);
+                ax_vf32 x = ax_vf32_loadu(ip + f);
+                vs  = ax_vf32_add(vs, x);
+                vs2 = ax_vf32_fmadd(x, x, vs2);
             }
-            var_d += (double)ax_vf32_hsum(vv);
-            for (; f < feat; f++) { float d = ip[f] - mean; var_d += (double)d * (double)d; }
+            for (; f < feat; f++) {
+                float x = ip[f];
+                s_tail  += x;
+                s2_tail += x * x;
+            }
         }
-        float var = (feat > 0) ? (float)(var_d / (double)feat) : 0.0f;
+        float sum  = ax_vf32_hsum(vs)  + s_tail;
+        float sum2 = ax_vf32_hsum(vs2) + s2_tail;
+        float mean = sum / (float)feat;
+        float var  = sum2 / (float)feat - mean * mean;
+        if (var < 0.0f) var = 0.0f;
         float inv_std = 1.0f / sqrtf(var + ln->eps);
 
         if (record) is_d[b] = inv_std;

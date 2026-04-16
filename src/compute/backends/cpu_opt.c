@@ -205,6 +205,18 @@ static inline int64_t validate_triple_same(const ax_tensor_t *a, const ax_tensor
 }
 
 
+/* non-temporal store threshold: arrays larger than half L3 benefit from
+   NT stores because they won't fit in L3 anyway (no cache pollution).
+   defaults to 2M floats (8MB) if L3 not detected. updated at init. */
+static int64_t AX_NT_ELEMS = 2 * 1024 * 1024;
+
+/* issue memory-ordering fence after a block of NT stores */
+static inline void ax_nt_fence(void) {
+#if defined(AX_SIMD_AVX2) || defined(AX_SIMD_AVX512)
+    _mm_sfence();
+#endif
+}
+
 /* element-wise binary ops (contiguous, no broadcast).
    separate SIMD and scalar expressions to avoid type conflicts. */
 
@@ -224,12 +236,15 @@ static ax_status_t opt_##name(const ax_tensor_t *a, const ax_tensor_t *b, ax_ten
     const float *bd = raw_f32(b); \
     float *od = raw_f32(out); \
     int64_t vec_end = n - (n % AX_VF32_WIDTH); \
+    int use_nt = (n >= AX_NT_ELEMS); \
     AX_OMP_PAR_FOR_IF(n) \
     for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH) { \
         ax_vf32 va = ax_vf32_load(ad + i); \
         ax_vf32 vb = ax_vf32_load(bd + i); \
-        ax_vf32_store(od + i, simd_expr); \
+        if (use_nt) ax_vf32_stream(od + i, simd_expr); \
+        else        ax_vf32_store(od + i, simd_expr); \
     } \
+    if (use_nt) ax_nt_fence(); \
     for (int64_t i = vec_end; i < n; i++) { \
         float sa = ad[i], sb = bd[i]; \
         od[i] = scalar_expr; \
@@ -254,11 +269,14 @@ static ax_status_t opt_##name(const ax_tensor_t *in, ax_tensor_t *out) { \
     float *od = raw_f32(out); \
     int64_t n = ni; \
     int64_t vec_end = n - (n % AX_VF32_WIDTH); \
+    int use_nt = (n >= AX_NT_ELEMS); \
     AX_OMP_PAR_FOR_IF(n) \
     for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH) { \
         ax_vf32 v = ax_vf32_load(id + i); \
-        ax_vf32_store(od + i, simd_expr); \
+        if (use_nt) ax_vf32_stream(od + i, simd_expr); \
+        else        ax_vf32_store(od + i, simd_expr); \
     } \
+    if (use_nt) ax_nt_fence(); \
     for (int64_t i = vec_end; i < n; i++) { \
         float sv = id[i]; \
         od[i] = scalar_expr; \
@@ -289,11 +307,15 @@ static ax_status_t opt_add_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     float *od = raw_f32(out);
     float s = (float)scalar;
     ax_vf32 vs = ax_vf32_set1(s);
-    int64_t n = ni; /* alias so AX_OMP_PAR_FOR_IF(n) resolves correctly */
+    int64_t n = ni;
     int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    int use_nt = (n >= AX_NT_ELEMS);
     AX_OMP_PAR_FOR_IF(n)
-    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH)
-        ax_vf32_store(od + i, ax_vf32_add(ax_vf32_load(id + i), vs));
+    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH) {
+        if (use_nt) ax_vf32_stream(od + i, ax_vf32_add(ax_vf32_load(id + i), vs));
+        else        ax_vf32_store(od + i, ax_vf32_add(ax_vf32_load(id + i), vs));
+    }
+    if (use_nt) ax_nt_fence();
     for (int64_t i = vec_end; i < n; i++)
         od[i] = id[i] + s;
     return AX_OK;
@@ -307,11 +329,15 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
     float *od = raw_f32(out);
     float s = (float)scalar;
     ax_vf32 vs = ax_vf32_set1(s);
-    int64_t n = ni; /* alias so AX_OMP_PAR_FOR_IF(n) resolves correctly */
+    int64_t n = ni;
     int64_t vec_end = n - (n % AX_VF32_WIDTH);
+    int use_nt = (n >= AX_NT_ELEMS);
     AX_OMP_PAR_FOR_IF(n)
-    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH)
-        ax_vf32_store(od + i, ax_vf32_mul(ax_vf32_load(id + i), vs));
+    for (int64_t i = 0; i < vec_end; i += AX_VF32_WIDTH) {
+        if (use_nt) ax_vf32_stream(od + i, ax_vf32_mul(ax_vf32_load(id + i), vs));
+        else        ax_vf32_store(od + i, ax_vf32_mul(ax_vf32_load(id + i), vs));
+    }
+    if (use_nt) ax_nt_fence();
     for (int64_t i = vec_end; i < n; i++)
         od[i] = id[i] * s;
     return AX_OK;
@@ -557,6 +583,13 @@ static void ax_cpu_opt_init_impl(void) {
            (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC,
            l1d > 0 ? l1d/1024 : -1, l2 > 0 ? l2/1024 : -1, l3 > 0 ? l3/1024 : -1);
 #endif
+
+    /* NT store threshold: half L3. arrays larger than this won't fit in L3
+       so NT stores avoid cache pollution without extra cost. */
+    if (l3 > 0) {
+        AX_NT_ELEMS = (int64_t)((l3 / 2) / (long)sizeof(float));
+        if (AX_NT_ELEMS < 256 * 1024) AX_NT_ELEMS = 256 * 1024; /* floor at 1MB */
+    }
 }
 
 /* public entry point — called from ax_compute_init() in dispatch.c so
@@ -609,29 +642,42 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     };
     int nc_configs = (int)(sizeof(configs) / sizeof(configs[0]));
 
-    const int64_t M = 1024, N = 1024, K = 1024;
-    float *A = (float *)ax_aligned_alloc((size_t)M * (size_t)K * sizeof(float), 64);
-    float *B = (float *)ax_aligned_alloc((size_t)K * (size_t)N * sizeof(float), 64);
-    float *C = (float *)ax_aligned_alloc((size_t)M * (size_t)N * sizeof(float), 64);
-    if (!A || !B || !C) { ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C); return; }
+    /* score each config on TWO shapes: a square 1024^3 and a skinny
+       256x1152x3136. the square exercises pack_b reuse and the JC parallel
+       loop; the skinny mirrors typical conv per-sample GEMM (small M, large
+       N). picking on the square alone biased toward configs that overfit
+       BLAS-style benchmarks but underperformed on conv layers. score is
+       the geometric mean of per-shape times so neither shape dominates. */
+    struct { int64_t M, N, K; float *A, *B, *C; ax_storage_t sa, sb, sc; ax_tensor_t ta, tb, tc; }
+        sh[2] = { { 1024, 1024, 1024, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+                  { 256,  3136, 1152, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} } };
     uint32_t s = 2463534242u;
-    for (int64_t i = 0; i < M * K; i++) {
-        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        A[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
+    for (int sh_i = 0; sh_i < 2; sh_i++) {
+        int64_t M = sh[sh_i].M, N = sh[sh_i].N, K = sh[sh_i].K;
+        sh[sh_i].A = (float *)ax_aligned_alloc((size_t)M * (size_t)K * sizeof(float), 64);
+        sh[sh_i].B = (float *)ax_aligned_alloc((size_t)K * (size_t)N * sizeof(float), 64);
+        sh[sh_i].C = (float *)ax_aligned_alloc((size_t)M * (size_t)N * sizeof(float), 64);
+        if (!sh[sh_i].A || !sh[sh_i].B || !sh[sh_i].C) {
+            for (int j = 0; j <= sh_i; j++) {
+                ax_aligned_free(sh[j].A); ax_aligned_free(sh[j].B); ax_aligned_free(sh[j].C);
+            }
+            return;
+        }
+        for (int64_t i = 0; i < M * K; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            sh[sh_i].A[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
+        }
+        for (int64_t i = 0; i < K * N; i++) {
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            sh[sh_i].B[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
+        }
+        atomic_init(&sh[sh_i].sa.refcount, 0); sh[sh_i].sa.data = sh[sh_i].A; sh[sh_i].sa.size_bytes = (size_t)M*K*sizeof(float); sh[sh_i].sa.device = AX_DEVICE_CPU; sh[sh_i].sa.is_arena_temp = true; sh[sh_i].sa.generation = 1;
+        atomic_init(&sh[sh_i].sb.refcount, 0); sh[sh_i].sb.data = sh[sh_i].B; sh[sh_i].sb.size_bytes = (size_t)K*N*sizeof(float); sh[sh_i].sb.device = AX_DEVICE_CPU; sh[sh_i].sb.is_arena_temp = true; sh[sh_i].sb.generation = 1;
+        atomic_init(&sh[sh_i].sc.refcount, 0); sh[sh_i].sc.data = sh[sh_i].C; sh[sh_i].sc.size_bytes = (size_t)M*N*sizeof(float); sh[sh_i].sc.device = AX_DEVICE_CPU; sh[sh_i].sc.is_arena_temp = true; sh[sh_i].sc.generation = 1;
+        sh[sh_i].ta.storage = &sh[sh_i].sa; sh[sh_i].ta.ndim = 2; sh[sh_i].ta.dtype = AX_FLOAT32; sh[sh_i].ta.shape[0] = M; sh[sh_i].ta.shape[1] = K; sh[sh_i].ta.strides[0] = K; sh[sh_i].ta.strides[1] = 1;
+        sh[sh_i].tb.storage = &sh[sh_i].sb; sh[sh_i].tb.ndim = 2; sh[sh_i].tb.dtype = AX_FLOAT32; sh[sh_i].tb.shape[0] = K; sh[sh_i].tb.shape[1] = N; sh[sh_i].tb.strides[0] = N; sh[sh_i].tb.strides[1] = 1;
+        sh[sh_i].tc.storage = &sh[sh_i].sc; sh[sh_i].tc.ndim = 2; sh[sh_i].tc.dtype = AX_FLOAT32; sh[sh_i].tc.shape[0] = M; sh[sh_i].tc.shape[1] = N; sh[sh_i].tc.strides[0] = N; sh[sh_i].tc.strides[1] = 1;
     }
-    for (int64_t i = 0; i < K * N; i++) {
-        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-        B[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
-    }
-
-    ax_storage_t sa, sb, sc;
-    atomic_init(&sa.refcount, 0); sa.data = A; sa.size_bytes = (size_t)M*K*sizeof(float); sa.device = AX_DEVICE_CPU; sa.is_arena_temp = true; sa.generation = 1;
-    atomic_init(&sb.refcount, 0); sb.data = B; sb.size_bytes = (size_t)K*N*sizeof(float); sb.device = AX_DEVICE_CPU; sb.is_arena_temp = true; sb.generation = 1;
-    atomic_init(&sc.refcount, 0); sc.data = C; sc.size_bytes = (size_t)M*N*sizeof(float); sc.device = AX_DEVICE_CPU; sc.is_arena_temp = true; sc.generation = 1;
-    ax_tensor_t ta = {0}, tb = {0}, tc = {0};
-    ta.storage = &sa; ta.ndim = 2; ta.dtype = AX_FLOAT32; ta.shape[0] = M; ta.shape[1] = K; ta.strides[0] = K; ta.strides[1] = 1;
-    tb.storage = &sb; tb.ndim = 2; tb.dtype = AX_FLOAT32; tb.shape[0] = K; tb.shape[1] = N; tb.strides[0] = N; tb.strides[1] = 1;
-    tc.storage = &sc; tc.ndim = 2; tc.dtype = AX_FLOAT32; tc.shape[0] = M; tc.shape[1] = N; tc.strides[0] = N; tc.strides[1] = 1;
 
     /* pre-size the per-thread pack buffers for the MAX of all candidate
        configs before the sweep. if we let each iteration's first gemm
@@ -657,9 +703,10 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     #pragma omp parallel
     { ensure_tl_pack_bufs(); }
 
-    const int warm_iters = 3;
-    const int timed_iters = 8;
-    double best_ms = 1e30;
+    const int warm_iters = 2;
+    const int timed_iters = 5;
+    double best_score = 1e30;
+    double best_sq_ms = 1e30, best_sk_ms = 1e30;
     int best_i = 0;
     double t_start = ax_tile_cal_now_ms();
 
@@ -670,11 +717,21 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
         /* pack_b cache keys on bptr+kc+jc+pc/ldb; any of those changing
            between iterations invalidates automatically inside pack_b_cached.
            no manual invalidation needed here. */
-        for (int w = 0; w < warm_iters; w++) opt_gemm(&ta, &tb, &tc);
-        double t0 = ax_tile_cal_now_ms();
-        for (int r = 0; r < timed_iters; r++) opt_gemm(&ta, &tb, &tc);
-        double avg = (ax_tile_cal_now_ms() - t0) / (double)timed_iters;
-        if (avg < best_ms) { best_ms = avg; best_i = i; }
+        double per_shape[2];
+        for (int sh_i = 0; sh_i < 2; sh_i++) {
+            for (int w = 0; w < warm_iters; w++)
+                opt_gemm(&sh[sh_i].ta, &sh[sh_i].tb, &sh[sh_i].tc);
+            double t0 = ax_tile_cal_now_ms();
+            for (int r = 0; r < timed_iters; r++)
+                opt_gemm(&sh[sh_i].ta, &sh[sh_i].tb, &sh[sh_i].tc);
+            per_shape[sh_i] = (ax_tile_cal_now_ms() - t0) / (double)timed_iters;
+        }
+        /* geometric mean: equal weight to each shape's relative slowdown */
+        double score = sqrt(per_shape[0] * per_shape[1]);
+        if (score < best_score) {
+            best_score = score; best_i = i;
+            best_sq_ms = per_shape[0]; best_sk_ms = per_shape[1];
+        }
     }
     GEMM_MC = configs[best_i].mc;
     GEMM_NC = configs[best_i].nc;
@@ -682,13 +739,16 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     double total_ms = ax_tile_cal_now_ms() - t_start;
 
 #ifndef AX_NO_STDIO
-    double gflops = (2.0 * (double)M * (double)N * (double)K) / (best_ms * 1e-3) / 1e9;
+    double sq_gflops = (2.0 * (double)sh[0].M * (double)sh[0].N * (double)sh[0].K) / (best_sq_ms * 1e-3) / 1e9;
+    double sk_gflops = (2.0 * (double)sh[1].M * (double)sh[1].N * (double)sh[1].K) / (best_sk_ms * 1e-3) / 1e9;
     fprintf(stderr,
-        "axiom: gemm calibrate MC=%ld NC=%ld KC=%ld (best %.3fms, %.1f gflops, sweep %.0fms)\n",
-        (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC, best_ms, gflops, total_ms);
+        "axiom: gemm calibrate MC=%ld NC=%ld KC=%ld (square %.1f gflops, skinny %.1f gflops, sweep %.0fms)\n",
+        (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC, sq_gflops, sk_gflops, total_ms);
 #endif
 
-    ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C);
+    for (int sh_i = 0; sh_i < 2; sh_i++) {
+        ax_aligned_free(sh[sh_i].A); ax_aligned_free(sh[sh_i].B); ax_aligned_free(sh[sh_i].C);
+    }
 #endif
 }
 
@@ -2504,11 +2564,14 @@ static ax_status_t opt_add_relu(const ax_tensor_t *a, const ax_tensor_t *b,
     float *od = raw_f32(out);
 
     int64_t i = 0, ve = na - (na % AX_VF32_WIDTH);
+    int use_nt = (na >= AX_NT_ELEMS);
     for (; i < ve; i += AX_VF32_WIDTH) {
         ax_vf32 va = ax_vf32_load(ad + i);
         ax_vf32 vb = ax_vf32_load(bd + i);
-        ax_vf32_store(od + i, ax_vf32_relu(ax_vf32_add(va, vb)));
+        if (use_nt) ax_vf32_stream(od + i, ax_vf32_relu(ax_vf32_add(va, vb)));
+        else        ax_vf32_store(od + i, ax_vf32_relu(ax_vf32_add(va, vb)));
     }
+    if (use_nt) ax_nt_fence();
     for (; i < na; i++) {
         float v = ad[i] + bd[i];
         od[i] = v > 0.0f ? v : 0.0f;
@@ -2526,6 +2589,9 @@ static ax_status_t opt_axpy(const ax_tensor_t *x, float alpha, ax_tensor_t *y)
     const float *xd = raw_f32(x);
     float *yd = raw_f32(y);
     ax_vf32 v_alpha = ax_vf32_set1(alpha);
+    /* axpy reads and writes yd, so nt stores aren't correct here
+       (we'd stream past cached yd values that other ops still read).
+       skip NT for axpy. */
     int64_t i = 0, ve = nx - (nx % AX_VF32_WIDTH);
     for (; i < ve; i += AX_VF32_WIDTH) {
         ax_vf32 vy = ax_vf32_load(yd + i);
@@ -2725,10 +2791,26 @@ static ax_status_t opt_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
 }
 
 
+/* free per-thread pack buffers so sanitizer runs come up clean.
+   called from ax_compute_shutdown via the vtable .shutdown hook. */
+static void opt_shutdown(void) {
+#ifdef _OPENMP
+    #pragma omp parallel
+    {
+        if (tl_pack_a_buf) { ax_aligned_free(tl_pack_a_buf); tl_pack_a_buf = NULL; }
+        if (tl_pack_b_buf) { ax_aligned_free(tl_pack_b_buf); tl_pack_b_buf = NULL; }
+    }
+#else
+    if (tl_pack_a_buf) { ax_aligned_free(tl_pack_a_buf); tl_pack_a_buf = NULL; }
+    if (tl_pack_b_buf) { ax_aligned_free(tl_pack_b_buf); tl_pack_b_buf = NULL; }
+#endif
+}
+
 /* vtable registration */
 
 const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .name       = "cpu_opt",
+    .shutdown   = opt_shutdown,
     .add        = opt_add,
     .sub        = opt_sub,
     .mul        = opt_mul,
