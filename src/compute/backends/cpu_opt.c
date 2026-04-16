@@ -410,12 +410,17 @@ static int64_t GEMM_MC = AX_GEMM_DEFAULT_MC;
 static int64_t GEMM_NC = AX_GEMM_DEFAULT_NC;
 static int64_t GEMM_KC = AX_GEMM_DEFAULT_KC;
 
+/* per-fast-thread crossover FLOPs. set by ax_calibrate_hybrid_crossover
+   when running on a hybrid CPU; defaults to 25M on miss. */
+static int64_t ax_hybrid_crossover_per_fast_thread = 25000000LL;
+
 /* pick thread count for a GEMM. strategy is 3-tier:
    - tiny GEMMs (< 1M FLOPs): serial, fork-join cost exceeds compute
-   - small-medium (< ~100M FLOPs): fast cores only, E-cores add latency
-   - large (>= ~100M FLOPs): all cores, parallelism dominates latency
-   the thresholds scale with number of fast cores (more cores = higher
-   absolute throughput = larger crossover point). */
+   - small-medium (< crossover): fast cores only, E-cores add latency
+   - large (>= crossover): all cores, parallelism dominates latency
+   crossover is calibrated at startup against actual fast vs all throughputs
+   on the running cpu (see ax_calibrate_hybrid_crossover); falls back to
+   a 25M FLOPs/fast-thread default when calibration is skipped. */
 static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
 #ifdef _OPENMP
     if (omp_in_parallel()) return 1;
@@ -431,10 +436,7 @@ static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
     /* if non-hybrid, just return all (fast == all) */
     if (all == fast) return all;
 
-    /* crossover from fast-only to all-cores. scales with fast thread
-       count: more P-cores means their throughput is higher, pushing the
-       crossover higher before E-cores help. ~25M FLOPs per fast thread. */
-    int64_t crossover = (int64_t)fast * 25000000LL;
+    int64_t crossover = (int64_t)fast * ax_hybrid_crossover_per_fast_thread;
     return (total_flops >= crossover) ? all : fast;
 #else
     (void)m; (void)n; (void)k;
@@ -761,6 +763,98 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     for (int sh_i = 0; sh_i < 2; sh_i++) {
         ax_aligned_free(sh[sh_i].A); ax_aligned_free(sh[sh_i].B); ax_aligned_free(sh[sh_i].C);
     }
+#endif
+}
+
+/* hybrid CPU calibration: measure actual fast vs all throughput at a
+   fixed shape and derive the crossover where their wall-times are equal.
+   no per-arch tuning — relies entirely on measured throughput. on
+   non-hybrid CPUs (fast == all) this is a no-op. */
+void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
+#if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
+    return;
+#else
+    int fast = ax_gemm_fast_threads;
+    int all  = ax_gemm_all_threads;
+    if (fast <= 0 || all <= 0 || fast >= all) return;  /* not hybrid */
+
+    /* probe shape: 256³ = ~33M FLOPs, large enough to amortize fork-join,
+       small enough to run several iterations cheaply. */
+    const int64_t M = 256, N = 256, K = 256;
+    float *A = (float *)ax_aligned_alloc((size_t)M * K * sizeof(float), 64);
+    float *B = (float *)ax_aligned_alloc((size_t)K * N * sizeof(float), 64);
+    float *C = (float *)ax_aligned_alloc((size_t)M * N * sizeof(float), 64);
+    if (!A || !B || !C) { ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C); return; }
+    uint32_t s = 1234567u;
+    for (int64_t i = 0; i < M * K; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        A[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
+    }
+    for (int64_t i = 0; i < K * N; i++) {
+        s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+        B[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
+    }
+
+    ax_storage_t sa, sb, sc;
+    atomic_init(&sa.refcount, 0); sa.data = A; sa.size_bytes = (size_t)M*K*sizeof(float); sa.device = AX_DEVICE_CPU; sa.is_arena_temp = true; sa.generation = 1;
+    atomic_init(&sb.refcount, 0); sb.data = B; sb.size_bytes = (size_t)K*N*sizeof(float); sb.device = AX_DEVICE_CPU; sb.is_arena_temp = true; sb.generation = 1;
+    atomic_init(&sc.refcount, 0); sc.data = C; sc.size_bytes = (size_t)M*N*sizeof(float); sc.device = AX_DEVICE_CPU; sc.is_arena_temp = true; sc.generation = 1;
+    ax_tensor_t ta = {0}, tb = {0}, tc = {0};
+    ta.storage = &sa; ta.ndim = 2; ta.dtype = AX_FLOAT32; ta.shape[0] = M; ta.shape[1] = K; ta.strides[0] = K; ta.strides[1] = 1;
+    tb.storage = &sb; tb.ndim = 2; tb.dtype = AX_FLOAT32; tb.shape[0] = K; tb.shape[1] = N; tb.strides[0] = N; tb.strides[1] = 1;
+    tc.storage = &sc; tc.ndim = 2; tc.dtype = AX_FLOAT32; tc.shape[0] = M; tc.shape[1] = N; tc.strides[0] = N; tc.strides[1] = 1;
+
+    /* force the threads_for_shape selector by overriding the per-fast crossover
+       to extreme values. set crossover to ∞ to force fast-only; to 0 to force
+       all. measure each. */
+    int64_t orig_xover = ax_hybrid_crossover_per_fast_thread;
+    const int warm = 2, reps = 5;
+
+    ax_hybrid_crossover_per_fast_thread = INT64_MAX / 64;  /* always fast */
+    for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
+    double t0 = ax_tile_cal_now_ms();
+    for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
+    double t_fast_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
+
+    ax_hybrid_crossover_per_fast_thread = 0;  /* always all */
+    for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
+    t0 = ax_tile_cal_now_ms();
+    for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
+    double t_all_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
+
+    ax_hybrid_crossover_per_fast_thread = orig_xover;
+
+    /* per-thread throughput (FLOPs/ms) at this shape */
+    double total_flops = 2.0 * (double)M * (double)N * (double)K;
+    double tput_per_thread_fast = total_flops / t_fast_ms / (double)fast;
+    double tput_per_thread_all  = total_flops / t_all_ms  / (double)all;
+
+    /* crossover: where fast-time == all-time, ignoring overhead which is
+       small (~50us) vs probe times (~1ms+). solve:
+         F / (tput_fast * fast) = F / (tput_all * all)
+       which is degenerate. with a fixed overhead Ω the equation is:
+         F / (tput_fast * fast) + Ω = F / (tput_all * all) + Ω → also degenerate
+       so use the empirical observation: small F prefers fast, large F prefers
+       all. the crossover scales with the throughput difference. set crossover
+       per-fast-thread to total_flops × (t_fast / t_all). when t_fast > t_all
+       (all is faster), crossover shrinks. when t_fast < t_all (fast wins),
+       crossover grows. */
+    double ratio = t_fast_ms / t_all_ms;
+    int64_t new_xover = (int64_t)(total_flops * ratio / (double)fast);
+    if (new_xover < 1000000LL)   new_xover = 1000000LL;
+    if (new_xover > 1000000000LL) new_xover = 1000000000LL;
+    ax_hybrid_crossover_per_fast_thread = new_xover;
+
+#ifndef AX_NO_STDIO
+    fprintf(stderr,
+        "axiom: hybrid xover calibrated: fast=%dthr %.2fms (%.1f gflops/thr) "
+        "all=%dthr %.2fms (%.1f gflops/thr) → crossover %ldM flops/fast-thr\n",
+        fast, t_fast_ms, tput_per_thread_fast / 1e3,
+        all, t_all_ms, tput_per_thread_all / 1e3,
+        (long)(new_xover / 1000000LL));
+#endif
+
+    ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C);
 #endif
 }
 

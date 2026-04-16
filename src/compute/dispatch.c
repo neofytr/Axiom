@@ -157,6 +157,12 @@ ax_status_t ax_compute_init(void) {
        systems where the barrier costs more than the speedup. */
     ax_calibrate_thresholds();
 
+    /* calibrate hybrid CPU fast-vs-all crossover. measures actual GEMM
+       throughput at a representative shape and derives the FLOPs threshold
+       above which all-cores beats fast-only. no-op on non-hybrid CPUs.
+       cheap (~30ms). */
+    ax_calibrate_hybrid_crossover();
+
     /* pre-allocate tls pack buffers on every omp worker. always on —
        moves the lazy-alloc cost out of the first hot gemm call. */
 #ifdef AX_CPU_ISA_DISPATCH
@@ -1075,8 +1081,12 @@ void ax_calibrate_thresholds(void) {
 extern void ax_cpu_opt_calibrate_tiles_avx512(void);
 extern void ax_cpu_opt_calibrate_tiles_avx2(void);
 extern void ax_cpu_opt_calibrate_tiles_scalar(void);
+extern void ax_cpu_opt_calibrate_hybrid_crossover_avx512(void);
+extern void ax_cpu_opt_calibrate_hybrid_crossover_avx2(void);
+extern void ax_cpu_opt_calibrate_hybrid_crossover_scalar(void);
 #else
 extern void ax_cpu_opt_calibrate_tiles(void);
+extern void ax_cpu_opt_calibrate_hybrid_crossover(void);
 #endif
 
 void ax_calibrate_gemm_tiles(void) {
@@ -1089,6 +1099,23 @@ void ax_calibrate_gemm_tiles(void) {
     else ax_cpu_opt_calibrate_tiles_scalar();
 #else
     ax_cpu_opt_calibrate_tiles();
+#endif
+#endif
+}
+
+/* hybrid CPU crossover calibration — measures fast vs all wall-time at a
+   fixed shape and updates the per-fast-thread crossover. fired once per
+   process at init by ax_compute_init when running on a hybrid system. */
+void ax_calibrate_hybrid_crossover(void) {
+#if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
+    return;
+#else
+#ifdef AX_CPU_ISA_DISPATCH
+    if (active_ops == &ax_cpu_opt_ops_avx512) ax_cpu_opt_calibrate_hybrid_crossover_avx512();
+    else if (active_ops == &ax_cpu_opt_ops_avx2) ax_cpu_opt_calibrate_hybrid_crossover_avx2();
+    else ax_cpu_opt_calibrate_hybrid_crossover_scalar();
+#else
+    ax_cpu_opt_calibrate_hybrid_crossover();
 #endif
 #endif
 }
