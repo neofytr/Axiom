@@ -785,6 +785,43 @@ static void test_maxpool2d_nhwc_backward(void)
     ax_layer_destroy(pool);
 }
 
+/* NHWC avgpool correctness: NCHW reference vs NHWC-then-back-to-NCHW. */
+static void test_avgpool2d_nhwc_correctness(void)
+{
+    int N = 2, C = 16, H = 8, W = 8;
+    int k = 2, s = 2, p = 0;
+    int64_t in_sh[] = {N, C, H, W};
+    ax_tensor_t *inp_nchw = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    float *id = (float *)inp_nchw->storage->data;
+    for (int64_t i = 0; i < N * C * H * W; i++)
+        id[i] = (float)((i * 7) % 23 - 11) * 0.1f;
+
+    ax_layer_t *pool = ax_avgpool2d_create(k, s, p);
+    ax_tensor_t *out_nchw = ax_layer_forward(pool, inp_nchw);
+    AX_TEST_ASSERT(out_nchw != NULL, "NCHW avgpool fwd");
+
+    ax_tensor_t *inp_nhwc = ax_tensor_to_nhwc(inp_nchw);
+    ax_tensor_t *out_nhwc = ax_layer_forward(pool, inp_nhwc);
+    AX_TEST_ASSERT(out_nhwc != NULL, "NHWC avgpool fwd");
+    AX_TEST_ASSERT(ax_tensor_get_layout(out_nhwc) == AX_LAYOUT_NHWC, "NHWC out layout");
+
+    ax_tensor_t *out_back = ax_tensor_to_nchw(out_nhwc);
+    int64_t oh = (H + 2*p - k) / s + 1;
+    int64_t ow = (W + 2*p - k) / s + 1;
+    const float *od_n = (const float *)out_nchw->storage->data;
+    const float *od_b = (const float *)out_back->storage->data;
+    int64_t total = N * C * oh * ow;
+    for (int64_t i = 0; i < total; i++)
+        AX_TEST_ASSERT_NEAR(od_n[i], od_b[i], 1e-5f, "NHWC avgpool matches NCHW");
+
+    ax_tensor_destroy(out_back);
+    ax_tensor_destroy(out_nhwc);
+    ax_tensor_destroy(inp_nhwc);
+    ax_tensor_destroy(out_nchw);
+    ax_tensor_destroy(inp_nchw);
+    ax_layer_destroy(pool);
+}
+
 /* NHWC maxpool: forward + backward correctness vs NCHW reference.
    layout transform NCHW → NHWC, run, compare to NCHW result. */
 static void test_maxpool2d_nhwc_correctness(void)
@@ -1018,6 +1055,7 @@ int main(void)
     AX_RUN_TEST(test_maxpool2d_nhwc_backward);
     AX_RUN_TEST(test_conv2d_nhwc_correctness);
     AX_RUN_TEST(test_conv2d_nhwc_backward);
+    AX_RUN_TEST(test_avgpool2d_nhwc_correctness);
     AX_RUN_TEST(test_conv2d_direct_smallcin_vs_gemm);
     AX_RUN_TEST(test_conv2d_smallcin_edges);
     AX_RUN_TEST(test_maxpool2d_simd);

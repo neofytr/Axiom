@@ -3437,6 +3437,139 @@ static void maxpool2d_nhwc_backward(
     }
 }
 
+/* NHWC avgpool forward: input [N, H, W, C] → output [N, OH, OW, C].
+   per (n, oy, ox), accumulate sum across kxk window for SIMD blocks of C
+   then divide by count (handling pad). */
+static void avgpool2d_nhwc_forward(
+    const float *id, float *od,
+    int64_t N, int64_t H, int64_t W, int64_t C,
+    int64_t oh, int64_t ow, int k, int s, int p)
+{
+    int64_t HWC = H * W * C;
+    int64_t OWC = ow * C;
+    int64_t TC = AX_VF32_WIDTH;
+    int64_t cv_end = C - (C % TC);
+
+    int64_t NOH = N * oh;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t noh = 0; noh < NOH; noh++) {
+        int64_t n  = noh / oh;
+        int64_t oy = noh % oh;
+        const float *in_n = id + n * HWC;
+        float *out_n_y = od + (n * oh + oy) * OWC;
+
+        for (int64_t ox = 0; ox < ow; ox++) {
+            float *out_pos = out_n_y + ox * C;
+
+            int count = 0;
+            /* count valid positions in this window (depends on pad/edge). */
+            for (int ky = 0; ky < k; ky++) {
+                int64_t iy = oy * s - p + ky;
+                if (iy < 0 || iy >= H) continue;
+                for (int kx = 0; kx < k; kx++) {
+                    int64_t ix = ox * s - p + kx;
+                    if (ix < 0 || ix >= W) continue;
+                    count++;
+                }
+            }
+            if (count == 0) {
+                memset(out_pos, 0, (size_t)C * sizeof(float));
+                continue;
+            }
+            float inv_count = 1.0f / (float)count;
+            ax_vf32 v_inv = ax_vf32_set1(inv_count);
+
+            int64_t c = 0;
+            for (; c < cv_end; c += TC) {
+                ax_vf32 acc = ax_vf32_zero();
+                for (int ky = 0; ky < k; ky++) {
+                    int64_t iy = oy * s - p + ky;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int kx = 0; kx < k; kx++) {
+                        int64_t ix = ox * s - p + kx;
+                        if (ix < 0 || ix >= W) continue;
+                        acc = ax_vf32_add(acc, ax_vf32_loadu(in_n + (iy * W + ix) * C + c));
+                    }
+                }
+                ax_vf32_storeu(out_pos + c, ax_vf32_mul(acc, v_inv));
+            }
+            for (; c < C; c++) {
+                float sum = 0.0f;
+                for (int ky = 0; ky < k; ky++) {
+                    int64_t iy = oy * s - p + ky;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int kx = 0; kx < k; kx++) {
+                        int64_t ix = ox * s - p + kx;
+                        if (ix < 0 || ix >= W) continue;
+                        sum += in_n[(iy * W + ix) * C + c];
+                    }
+                }
+                out_pos[c] = sum * inv_count;
+            }
+        }
+    }
+}
+
+/* NHWC avgpool backward: each output's grad is uniformly distributed
+   over its kxk valid input positions. SIMD across C per scatter. */
+static void avgpool2d_nhwc_backward(
+    float *ig, const float *go,
+    int64_t N, int64_t H, int64_t W, int64_t C,
+    int64_t oh, int64_t ow, int k, int s, int p)
+{
+    int64_t HWC = H * W * C;
+    int64_t OWC = ow * C;
+    int64_t TC = AX_VF32_WIDTH;
+    int64_t cv_end = C - (C % TC);
+
+    /* per-sample to avoid races between overlapping windows. */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t n = 0; n < N; n++) {
+        const float *go_n = go + n * oh * OWC;
+        float *ig_n = ig + n * HWC;
+        for (int64_t oy = 0; oy < oh; oy++) {
+            for (int64_t ox = 0; ox < ow; ox++) {
+                int count = 0;
+                for (int ky = 0; ky < k; ky++) {
+                    int64_t iy = oy * s - p + ky;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int kx = 0; kx < k; kx++) {
+                        int64_t ix = ox * s - p + kx;
+                        if (ix < 0 || ix >= W) continue;
+                        count++;
+                    }
+                }
+                if (count == 0) continue;
+                float inv_count = 1.0f / (float)count;
+                ax_vf32 v_inv = ax_vf32_set1(inv_count);
+                const float *go_pos = go_n + (oy * ow + ox) * C;
+
+                for (int ky = 0; ky < k; ky++) {
+                    int64_t iy = oy * s - p + ky;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int kx = 0; kx < k; kx++) {
+                        int64_t ix = ox * s - p + kx;
+                        if (ix < 0 || ix >= W) continue;
+                        float *ig_pos = ig_n + (iy * W + ix) * C;
+                        int64_t c = 0;
+                        for (; c < cv_end; c += TC) {
+                            ax_vf32 g = ax_vf32_loadu(go_pos + c);
+                            ax_vf32 v = ax_vf32_mul(g, v_inv);
+                            ax_vf32_storeu(ig_pos + c,
+                                ax_vf32_add(ax_vf32_loadu(ig_pos + c), v));
+                        }
+                        for (; c < C; c++) ig_pos[c] += go_pos[c] * inv_count;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static void maxpool2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
     ax_tensor_t *input = self->inputs[0];
@@ -3774,11 +3907,24 @@ static void avgpool2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     pool_ctx_t *ctx = (pool_ctx_t *)self->ctx;
     int64_t N = ctx->N, C = ctx->C, H = ctx->H, W = ctx->W;
     int k = ctx->k, s = ctx->s, p = ctx->p;
-    int64_t oh = grad_out->shape[2], ow = grad_out->shape[3];
 
-    if (!input->grad)
+    if (!input->grad) {
         input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+        if (input->grad) input->grad->layout = ctx->layout;
+    }
     if (!input->grad) { free(ctx); self->ctx = NULL; return; }
+
+    /* NHWC dispatch */
+    if (ctx->layout == AX_LAYOUT_NHWC) {
+        int64_t oh = grad_out->shape[1], ow = grad_out->shape[2];
+        avgpool2d_nhwc_backward(
+            (float *)input->grad->storage->data,
+            (const float *)grad_out->storage->data,
+            N, H, W, C, oh, ow, k, s, p);
+        free(ctx); self->ctx = NULL;
+        return;
+    }
+    int64_t oh = grad_out->shape[2], ow = grad_out->shape[3];
 
     float *ig = (float *)input->grad->storage->data;
     float *go = (float *)grad_out->storage->data;
@@ -3826,8 +3972,13 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_tensor_t *inp = ax_ensure_contiguous(input);
     if (!inp) return NULL;
 
-    int64_t N = inp->shape[0], C = inp->shape[1];
-    int64_t H = inp->shape[2], W = inp->shape[3];
+    ax_layout_t layout = ax_tensor_get_layout(input);
+    int64_t N, C, H, W;
+    if (layout == AX_LAYOUT_NHWC) {
+        N = inp->shape[0]; H = inp->shape[1]; W = inp->shape[2]; C = inp->shape[3];
+    } else {
+        N = inp->shape[0]; C = inp->shape[1]; H = inp->shape[2]; W = inp->shape[3];
+    }
     int k = pool->kernel_size, s = pool->stride, p = pool->padding;
     int64_t oh = conv_out_dim(H, k, s, p);
     int64_t ow = conv_out_dim(W, k, s, p);
@@ -3838,9 +3989,35 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         return NULL;
     }
 
-    int64_t out_shape[] = {N, C, oh, ow};
+    int64_t out_shape_nchw[] = {N, C, oh, ow};
+    int64_t out_shape_nhwc[] = {N, oh, ow, C};
+    const int64_t *out_shape = (layout == AX_LAYOUT_NHWC) ? out_shape_nhwc : out_shape_nchw;
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
     if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
+    output->layout = layout;
+
+    /* NHWC fast path */
+    if (layout == AX_LAYOUT_NHWC) {
+        avgpool2d_nhwc_forward((const float *)inp->storage->data,
+                                (float *)output->storage->data,
+                                N, H, W, C, oh, ow, k, s, p);
+        if (inp != input) ax_tensor_destroy(inp);
+        if (ax_grad_enabled() && input->requires_grad) {
+            pool_ctx_t *ctx = malloc(sizeof(pool_ctx_t));
+            if (!ctx) return output;
+            ctx->N = N; ctx->C = C; ctx->H = H; ctx->W = W;
+            ctx->k = k; ctx->s = s; ctx->p = p;
+            ctx->layout = AX_LAYOUT_NHWC;
+            ax_grad_fn_t *gf = ax_grad_fn_create(avgpool2d_backward);
+            gf->inputs[0] = input;
+            gf->n_inputs = 1;
+            gf->ctx = ctx;
+            gf->ctx_cleanup = (void(*)(void*))free;
+            output->requires_grad = true;
+            output->grad_fn = gf;
+        }
+        return output;
+    }
 
     float *id = (float *)inp->storage->data;
     float *od = (float *)output->storage->data;
@@ -3946,6 +4123,7 @@ static ax_tensor_t *avgpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         if (ctx) {
             ctx->N = N; ctx->C = C; ctx->H = H; ctx->W = W;
             ctx->k = k; ctx->s = s; ctx->p = p;
+            ctx->layout = AX_LAYOUT_NCHW;
 
             ax_grad_fn_t *gf = ax_grad_fn_create(avgpool2d_backward);
             gf->inputs[0] = input;
