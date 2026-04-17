@@ -578,6 +578,125 @@ static void test_conv2d_1x1_zero_copy_bwd(void)
     ax_layer_destroy(c);
 }
 
+/* NHWC maxpool backward: gradient via finite-difference verification.
+   probe a few input positions, compare analytical dX (from NHWC backward)
+   to numerical dX (loss(x+eps) - loss(x-eps))/(2eps). */
+static void test_maxpool2d_nhwc_backward(void)
+{
+    int N = 2, C = 8, H = 6, W = 6;  /* small enough for FD */
+    int k = 2, s = 2, p = 0;
+    int64_t in_sh[] = {N, C, H, W};
+    ax_tensor_t *inp_nchw = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    float *id = (float *)inp_nchw->storage->data;
+    /* random-ish data; ensure no ties so argmax is well-defined */
+    for (int64_t i = 0; i < N * C * H * W; i++)
+        id[i] = (float)((i * 31) % 97 - 48) * 0.01f;
+
+    ax_tensor_t *inp_nhwc = ax_tensor_to_nhwc(inp_nchw);
+    AX_TEST_ASSERT(inp_nhwc != NULL, "create NHWC input");
+    inp_nhwc->requires_grad = true;
+
+    ax_layer_t *pool = ax_maxpool2d_create(k, s, p);
+
+    ax_enable_grad();
+    ax_tensor_t *out = ax_layer_forward(pool, inp_nhwc);
+    ax_tensor_t *loss = ax_sum(out, -1);
+    ax_backward(loss);
+    ax_no_grad();
+
+    AX_TEST_ASSERT(inp_nhwc->grad != NULL, "input grad allocated");
+    /* dX should be 1.0 at argmax positions, 0 elsewhere (since loss = sum(out)) */
+    float *gd = (float *)inp_nhwc->grad->storage->data;
+
+    /* sanity: total dX should equal number of output positions */
+    int64_t oh = (H + 2*p - k) / s + 1;
+    int64_t ow = (W + 2*p - k) / s + 1;
+    float sum_grad = 0.0f;
+    for (int64_t i = 0; i < N * H * W * C; i++) sum_grad += gd[i];
+    AX_TEST_ASSERT_NEAR(sum_grad, (float)(N * oh * ow * C), 1e-4f,
+                        "sum(dX) = N*OH*OW*C (one per output element)");
+
+    /* numerical FD on a few input positions */
+    float eps = 1e-3f;
+    int probes[] = {0, (N*H*W*C)/4, (N*H*W*C)/2, 3*(N*H*W*C)/4, N*H*W*C - 1};
+    float *id_nhwc = (float *)inp_nhwc->storage->data;
+    for (int p_i = 0; p_i < 5; p_i++) {
+        int64_t i = probes[p_i];
+        float orig = id_nhwc[i];
+        id_nhwc[i] = orig + eps;
+        ax_tensor_t *out_p = ax_layer_forward(pool, inp_nhwc);
+        float lp = 0.0f;
+        const float *od_p = (const float *)out_p->storage->data;
+        for (int64_t j = 0; j < N * oh * ow * C; j++) lp += od_p[j];
+        ax_tensor_destroy(out_p);
+
+        id_nhwc[i] = orig - eps;
+        ax_tensor_t *out_m = ax_layer_forward(pool, inp_nhwc);
+        float lm = 0.0f;
+        const float *od_m = (const float *)out_m->storage->data;
+        for (int64_t j = 0; j < N * oh * ow * C; j++) lm += od_m[j];
+        ax_tensor_destroy(out_m);
+        id_nhwc[i] = orig;
+
+        float fd = (lp - lm) / (2.0f * eps);
+        AX_TEST_ASSERT_NEAR(gd[i], fd, 1e-2f, "dX matches finite difference");
+    }
+
+    ax_tensor_destroy(loss);
+    ax_tensor_destroy(out);
+    ax_tensor_destroy(inp_nhwc);
+    ax_tensor_destroy(inp_nchw);
+    ax_layer_destroy(pool);
+}
+
+/* NHWC maxpool: forward + backward correctness vs NCHW reference.
+   layout transform NCHW → NHWC, run, compare to NCHW result. */
+static void test_maxpool2d_nhwc_correctness(void)
+{
+    int N = 2, C = 16, H = 8, W = 8;
+    int k = 2, s = 2, p = 0;
+    int64_t in_sh[] = {N, C, H, W};
+    ax_tensor_t *inp_nchw = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    AX_TEST_ASSERT(inp_nchw != NULL, "create NCHW input");
+
+    /* deterministic data */
+    float *id = (float *)inp_nchw->storage->data;
+    for (int64_t i = 0; i < N * C * H * W; i++)
+        id[i] = (float)((i * 7) % 23 - 11) * 0.1f;
+
+    /* NCHW reference via existing maxpool */
+    ax_layer_t *pool = ax_maxpool2d_create(k, s, p);
+    ax_tensor_t *out_nchw = ax_layer_forward(pool, inp_nchw);
+    AX_TEST_ASSERT(out_nchw != NULL, "NCHW maxpool fwd");
+    AX_TEST_ASSERT(ax_tensor_get_layout(out_nchw) == AX_LAYOUT_NCHW, "NCHW out has NCHW layout");
+
+    /* NHWC version */
+    ax_tensor_t *inp_nhwc = ax_tensor_to_nhwc(inp_nchw);
+    AX_TEST_ASSERT(inp_nhwc != NULL, "convert input to NHWC");
+    ax_tensor_t *out_nhwc = ax_layer_forward(pool, inp_nhwc);
+    AX_TEST_ASSERT(out_nhwc != NULL, "NHWC maxpool fwd");
+    AX_TEST_ASSERT(ax_tensor_get_layout(out_nhwc) == AX_LAYOUT_NHWC, "NHWC out has NHWC layout");
+
+    /* convert NHWC out back to NCHW for comparison */
+    ax_tensor_t *out_back = ax_tensor_to_nchw(out_nhwc);
+    AX_TEST_ASSERT(out_back != NULL, "convert NHWC out to NCHW");
+
+    int64_t oh = (H + 2*p - k) / s + 1;
+    int64_t ow = (W + 2*p - k) / s + 1;
+    const float *od_n = (const float *)out_nchw->storage->data;
+    const float *od_b = (const float *)out_back->storage->data;
+    int64_t total = N * C * oh * ow;
+    for (int64_t i = 0; i < total; i++)
+        AX_TEST_ASSERT_NEAR(od_n[i], od_b[i], 1e-6f, "NHWC maxpool matches NCHW");
+
+    ax_tensor_destroy(out_back);
+    ax_tensor_destroy(out_nhwc);
+    ax_tensor_destroy(inp_nhwc);
+    ax_tensor_destroy(out_nchw);
+    ax_tensor_destroy(inp_nchw);
+    ax_layer_destroy(pool);
+}
+
 /* validate the direct-smallcin path matches the im2col+gemm reference.
    we can't pick the path explicitly from the public API, so we rely on
    conv2d_forward's internal predicate: C_in ≤ 4 → direct-smallcin.
@@ -759,6 +878,8 @@ int main(void)
     AX_RUN_TEST(test_conv2d_subbatched_fwd_bwd);
     AX_RUN_TEST(test_conv2d_1x1_zero_copy_bwd);
     AX_RUN_TEST(test_conv2d_winograd_f23_correctness);
+    AX_RUN_TEST(test_maxpool2d_nhwc_correctness);
+    AX_RUN_TEST(test_maxpool2d_nhwc_backward);
     AX_RUN_TEST(test_conv2d_direct_smallcin_vs_gemm);
     AX_RUN_TEST(test_conv2d_smallcin_edges);
     AX_RUN_TEST(test_maxpool2d_simd);

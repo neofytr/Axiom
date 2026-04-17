@@ -2887,11 +2887,120 @@ ax_layer_t *ax_sequential_fuse(ax_layer_t *model)
 
 /* maxpool2d */
 
-/* context for maxpool backward: stores input shape and pool params */
+/* context for maxpool backward: stores input shape, pool params, layout. */
 typedef struct {
     int64_t N, C, H, W;
     int k, s, p;
+    ax_layout_t layout;  /* AX_LAYOUT_NCHW or AX_LAYOUT_NHWC */
 } pool_ctx_t;
+
+/* NHWC maxpool forward: input [N, H, W, C] → output [N, OH, OW, C].
+   per (n, oy, ox), process channels in SIMD blocks of AX_VF32_WIDTH; the
+   max is taken across the kxk window via vmax — no horizontal reduction
+   needed (channels are independent). this is fundamentally cheaper per
+   output than the NCHW pmax_pack pattern.
+   indices buffer (when recording) stores the linear input HW index of the
+   argmax per output channel. */
+static void maxpool2d_nhwc_forward(
+    const float *id, float *od, float *idxd,
+    int64_t N, int64_t H, int64_t W, int64_t C,
+    int64_t oh, int64_t ow, int k, int s, int p, bool record)
+{
+    int64_t HWC = H * W * C;
+    int64_t OWC = ow * C;
+    int64_t TC = AX_VF32_WIDTH;
+
+    /* parallelize over n*oy outer dim — each (n, oy) is independent. */
+    int64_t NOH = N * oh;
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t noh = 0; noh < NOH; noh++) {
+        int64_t n  = noh / oh;
+        int64_t oy = noh % oh;
+        const float *in_n = id + n * HWC;
+        float *out_n_y = od + (n * oh + oy) * OWC;
+        float *idx_n_y = record ? idxd + (n * oh + oy) * OWC : NULL;
+
+        for (int64_t ox = 0; ox < ow; ox++) {
+            float *out_pos = out_n_y + ox * C;
+            float *idx_pos = record ? idx_n_y + ox * C : NULL;
+
+            /* SIMD across channels (when not recording argmax) */
+            int64_t c = 0;
+            if (!record) {
+                int64_t cv_end = C - (C % TC);
+                for (; c < cv_end; c += TC) {
+                    ax_vf32 acc = ax_vf32_set1(-INFINITY);
+                    for (int ky = 0; ky < k; ky++) {
+                        int64_t iy = oy * s - p + ky;
+                        if (iy < 0 || iy >= H) continue;
+                        for (int kx = 0; kx < k; kx++) {
+                            int64_t ix = ox * s - p + kx;
+                            if (ix < 0 || ix >= W) continue;
+                            ax_vf32 v = ax_vf32_loadu(in_n + (iy * W + ix) * C + c);
+                            acc = ax_vf32_max(acc, v);
+                        }
+                    }
+                    ax_vf32_storeu(out_pos + c, acc);
+                }
+            }
+            /* scalar path (always for recording, also for tail channels) */
+            for (; c < C; c++) {
+                float mx = -INFINITY;
+                int64_t max_pos = -1;
+                for (int ky = 0; ky < k; ky++) {
+                    int64_t iy = oy * s - p + ky;
+                    if (iy < 0 || iy >= H) continue;
+                    for (int kx = 0; kx < k; kx++) {
+                        int64_t ix = ox * s - p + kx;
+                        if (ix < 0 || ix >= W) continue;
+                        float v = in_n[(iy * W + ix) * C + c];
+                        if (v > mx) { mx = v; max_pos = iy * W + ix; }
+                    }
+                }
+                out_pos[c] = (max_pos >= 0) ? mx : 0.0f;
+                if (record) idx_pos[c] = (float)max_pos;
+            }
+        }
+    }
+}
+
+/* NHWC maxpool backward: scatter grad_out into input_grad at the recorded
+   argmax positions. each (n, oy, ox, c) contributes one scalar add. */
+static void maxpool2d_nhwc_backward(
+    float *ig, const float *go, const float *idx,
+    int64_t N, int64_t H, int64_t W, int64_t C,
+    int64_t oh, int64_t ow)
+{
+    int64_t HWC = H * W * C;
+
+    /* per-(n, oy) writes are within a single sample's input grad slice; rows
+       (oy values) within a sample can have argmax indices that point to the
+       SAME input pixel in adjacent oy outputs (overlapping pool windows). but
+       maxpool with stride==k has disjoint windows; with stride<k there can
+       be collisions. for safety, use per-sample parallelism only. */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t n = 0; n < N; n++) {
+        const float *go_n = go + (n * oh) * (ow * C);
+        const float *idx_n = idx + (n * oh) * (ow * C);
+        float *ig_n = ig + n * HWC;
+        for (int64_t oy = 0; oy < oh; oy++) {
+            for (int64_t ox = 0; ox < ow; ox++) {
+                const float *go_pos = go_n + (oy * ow + ox) * C;
+                const float *idx_pos = idx_n + (oy * ow + ox) * C;
+                for (int64_t c = 0; c < C; c++) {
+                    int64_t pos = (int64_t)idx_pos[c];
+                    if (pos >= 0)
+                        ig_n[pos * C + c] += go_pos[c];
+                }
+            }
+        }
+    }
+}
 
 static void maxpool2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
@@ -2903,9 +3012,23 @@ static void maxpool2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     pool_ctx_t *ctx = (pool_ctx_t *)self->ctx;
     int64_t N = ctx->N, C = ctx->C, H = ctx->H, W = ctx->W;
 
-    if (!input->grad)
+    if (!input->grad) {
         input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+        if (input->grad) input->grad->layout = ctx->layout;  /* match input layout */
+    }
     if (!input->grad) { free(ctx); self->ctx = NULL; return; }
+
+    /* NHWC dispatch: for NHWC, grad_out shape is [N, OH, OW, C], indices same. */
+    if (ctx->layout == AX_LAYOUT_NHWC) {
+        int64_t oh = grad_out->shape[1], ow = grad_out->shape[2];
+        maxpool2d_nhwc_backward(
+            (float *)input->grad->storage->data,
+            (const float *)grad_out->storage->data,
+            (const float *)indices->storage->data,
+            N, H, W, C, oh, ow);
+        free(ctx); self->ctx = NULL;
+        return;
+    }
 
     int64_t oh = grad_out->shape[2], ow = grad_out->shape[3];
     float *ig = (float *)input->grad->storage->data;
@@ -2942,18 +3065,23 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
 
     if (input->ndim != 4)
     {
-        ax_err_set(AX_ERR_SHAPE_MISMATCH, "maxpool2d expects [N, C, H, W]");
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "maxpool2d expects 4D input");
         return NULL;
     }
 
     ax_tensor_t *inp = ax_ensure_contiguous(input);
     if (!inp) return NULL;
 
-    int64_t N = inp->shape[0];
-    int64_t C = inp->shape[1];
-    int64_t H = inp->shape[2];
-    int64_t W = inp->shape[3];
+    ax_layout_t layout = ax_tensor_get_layout(input);
     int k = pool->kernel_size, s = pool->stride, p = pool->padding;
+
+    /* layout-aware shape extraction. */
+    int64_t N, C, H, W;
+    if (layout == AX_LAYOUT_NHWC) {
+        N = inp->shape[0]; H = inp->shape[1]; W = inp->shape[2]; C = inp->shape[3];
+    } else {
+        N = inp->shape[0]; C = inp->shape[1]; H = inp->shape[2]; W = inp->shape[3];
+    }
     int64_t oh = conv_out_dim(H, k, s, p);
     int64_t ow = conv_out_dim(W, k, s, p);
     if (oh <= 0 || ow <= 0)
@@ -2963,8 +3091,51 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         return NULL;
     }
 
-    int64_t out_shape[] = {N, C, oh, ow};
+    /* output shape mirrors input layout. */
+    int64_t out_shape_nchw[] = {N, C, oh, ow};
+    int64_t out_shape_nhwc[] = {N, oh, ow, C};
+    const int64_t *out_shape = (layout == AX_LAYOUT_NHWC) ? out_shape_nhwc : out_shape_nchw;
     ax_tensor_t *output = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
+    if (output) output->layout = layout;
+
+    /* NHWC fast path: SIMD across channels, no horizontal reduction. */
+    if (layout == AX_LAYOUT_NHWC && output) {
+        bool record_nhwc = ax_grad_enabled() && input->requires_grad;
+        ax_tensor_t *indices_nhwc = NULL;
+        if (record_nhwc) {
+            indices_nhwc = ax_tensor_zeros(out_shape, 4, AX_FLOAT32);
+            if (indices_nhwc) indices_nhwc->layout = AX_LAYOUT_NHWC;
+            else record_nhwc = false;
+        }
+        maxpool2d_nhwc_forward(
+            (const float *)inp->storage->data,
+            (float *)output->storage->data,
+            record_nhwc ? (float *)indices_nhwc->storage->data : NULL,
+            N, H, W, C, oh, ow, k, s, p, record_nhwc);
+
+        if (inp != input) ax_tensor_destroy(inp);
+
+        if (record_nhwc) {
+            pool_ctx_t *ctx = malloc(sizeof(pool_ctx_t));
+            if (!ctx) { ax_tensor_destroy(indices_nhwc); return output; }
+            ctx->N = N; ctx->C = C; ctx->H = H; ctx->W = W;
+            ctx->k = k; ctx->s = s; ctx->p = p;
+            ctx->layout = AX_LAYOUT_NHWC;
+            ax_grad_fn_t *gf = ax_grad_fn_create(maxpool2d_backward);
+            gf->inputs[0] = input;
+            gf->n_inputs = 1;
+            gf->saved[0] = indices_nhwc;
+            gf->saved_owned[0] = true;
+            gf->n_saved = 1;
+            gf->ctx = ctx;
+            gf->ctx_cleanup = (void(*)(void*))free;
+            output->requires_grad = true;
+            output->grad_fn = gf;
+        }
+        return output;
+    }
+
+    /* NCHW path (existing): */
     if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
 
     bool record = ax_grad_enabled() && input->requires_grad;
@@ -3124,6 +3295,7 @@ static ax_tensor_t *maxpool2d_forward(ax_layer_t *self, ax_tensor_t *input)
         if (!ctx) { ax_tensor_destroy(indices); return output; }
         ctx->N = N; ctx->C = C; ctx->H = H; ctx->W = W;
         ctx->k = k; ctx->s = s; ctx->p = p;
+        ctx->layout = AX_LAYOUT_NCHW;
 
         ax_grad_fn_t *gf = ax_grad_fn_create(maxpool2d_backward);
         gf->inputs[0] = input;
