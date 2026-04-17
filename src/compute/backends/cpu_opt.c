@@ -1607,15 +1607,31 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
     int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
 
-    bool use_jc_par = (max_threads > 1) && (n_jc_tiles >= 2);
-    bool use_ic_par = !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
+    /* HYBRID JC+IC: triggers only when full-NC gives few jc tiles AND adaptive
+       jc-par's NC shrinkage would hurt pack_a reuse significantly.
+       Threshold: n_jc_full ≤ max_threads/4 — at that point each thread does
+       enough pack_a tiles per jr to amortize the pack_b cost. for larger
+       n_jc_full, adaptive_nc with jc-par fills threads with smaller NC
+       which has its own benefit (smaller pack_b → fits L1/L2 better). */
+    int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
+    int64_t n_jc_full = (n + nc_full - 1) / nc_full;
+    bool use_hybrid = (max_threads > 1)
+                      && (n_jc_full * 4 <= max_threads)
+                      && (n_jc_full * n_ic_tiles >= max_threads);
+
+    bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
+    bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
     /* fine-grained parallel: ~1M FLOPs threshold for fork-join amortization */
-    bool use_fine_par = !use_jc_par && !use_ic_par && (max_threads > 1)
+    bool use_fine_par = !use_hybrid && !use_jc_par && !use_ic_par && (max_threads > 1)
                         && (m <= GEMM_MC) && (fine_units >= 4)
                         && (total_flops_est > 1000000);
 
     int gemm_threads = 1;
-    if (use_jc_par) {
+    if (use_hybrid) {
+        gemm_threads = max_threads;
+        nc_eff = nc_full;
+        n_jc_tiles = n_jc_full;
+    } else if (use_jc_par) {
         gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
     } else if (use_ic_par) {
         gemm_threads = (int)(n_ic_tiles < (int64_t)max_threads ? n_ic_tiles : (int64_t)max_threads);
@@ -1633,7 +1649,57 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     float *od = o_raw;
     if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 
-    if (use_jc_par) {
+    if (use_hybrid) {
+        /* hybrid jc+pc+ic for opt_gemm. structure: collapse(3) over (jct, pct,
+           ict). pc-as-second-outer ensures within a thread's contiguous chunk
+           of work, (jct, pct) stays constant across many ict iterations,
+           making the pack_b cache hit consistently. */
+        int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(gemm_threads)
+        #endif
+        {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            int64_t last_jct = -1;
+            int64_t last_pct = -1;
+
+            #ifdef _OPENMP
+            #pragma omp for collapse(3) schedule(static)
+            #endif
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                        if (!pack_a_buf || !pack_b_buf) continue;
+                        int64_t jc = jct * nc_eff;
+                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                        int64_t pc = pct * kc_max;
+                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                        int64_t ic = ict * GEMM_MC;
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                        if (jct != last_jct || pct != last_pct) {
+                            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
+                            last_jct = jct;
+                            last_pct = pct;
+                        }
+                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_jc_par) {
         /* JC parallel: each thread owns a column strip of C and its own pack buffers.
            Thread-local buffers — lazily allocated once per thread, reused every call.
            Writes to disjoint columns → no synchronization needed. */
@@ -2459,14 +2525,30 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
     int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
 
+    /* HYBRID JC+IC: triggers only when full-NC gives few jc tiles AND adaptive
+       jc-par's NC shrinkage would hurt pack_a reuse significantly.
+       Threshold: n_jc_full ≤ max_threads/4 — at that point each thread does
+       enough pack_a tiles per jr to amortize the pack_b cost. for larger
+       n_jc_full, adaptive_nc with jc-par fills threads with smaller NC
+       which has its own benefit (smaller pack_b → fits L1/L2 better). */
+    int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
+    int64_t n_jc_full = (n + nc_full - 1) / nc_full;
+    bool use_hybrid = (max_threads > 1)
+                      && (n_jc_full * 4 <= max_threads)
+                      && (n_jc_full * n_ic_tiles >= max_threads);
+
     /* same JC/IC/Fine selection as opt_gemm — see opt_gemm_tn for rationale */
-    bool use_jc_par = (max_threads > 1) && (n_jc_tiles >= 2);
-    bool use_ic_par = !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
-    bool use_fine_par = !use_jc_par && !use_ic_par && (max_threads > 1)
+    bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
+    bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
+    bool use_fine_par = !use_hybrid && !use_jc_par && !use_ic_par && (max_threads > 1)
                         && (m <= GEMM_MC) && (fine_units >= 4)
                         && (total_flops_est > 1000000);
     int gemm_threads = 1;
-    if (use_jc_par) {
+    if (use_hybrid) {
+        gemm_threads = max_threads;
+        nc_eff = nc_full;
+        n_jc_tiles = n_jc_full;
+    } else if (use_jc_par) {
         gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
     } else if (use_ic_par) {
         gemm_threads = (int)(n_ic_tiles < (int64_t)max_threads ? n_ic_tiles : (int64_t)max_threads);
@@ -2475,7 +2557,55 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
     (void)gemm_threads;
 
-    if (use_jc_par) {
+    if (use_hybrid) {
+        /* hybrid jc+pc+ic for opt_gemm_nt. collapse(3) over (jct, pct, ict);
+           pack_b_t cached across iterations with same (jct, pct). */
+        int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(gemm_threads)
+        #endif
+        {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            int64_t last_jct = -1;
+            int64_t last_pct = -1;
+
+            #ifdef _OPENMP
+            #pragma omp for collapse(3) schedule(static)
+            #endif
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                        if (!pack_a_buf || !pack_b_buf) continue;
+                        int64_t jc = jct * nc_eff;
+                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                        int64_t pc = pct * kc_max;
+                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                        int64_t ic = ict * GEMM_MC;
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                        if (jct != last_jct || pct != last_pct) {
+                            pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, pack_b_buf);
+                            last_jct = jct;
+                            last_pct = pct;
+                        }
+                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_jc_par) {
         #ifdef _OPENMP
         #pragma omp parallel for num_threads(gemm_threads) schedule(static)
         #endif
@@ -2632,17 +2762,37 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
     int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
 
+    /* HYBRID JC+IC mode: when full-NC gives few jc tiles but plenty of
+       ic tiles, parallelize over (jct, ict) tile pairs. each thread takes
+       one tile pair → uses full NC (32 jr per ic for good pack_a reuse)
+       AND fills all threads. avoids the adaptive_nc shrinking trade-off
+       that loses pack_a reuse for thread parallelism.
+
+       per-thread pack_b is cached across consecutive iterations with the
+       same (jct, pc) — collapse(2) schedule(static) gives contiguous
+       (jct, ict) pairs to each thread, so jct stays constant for a
+       sub-range. pack_b refreshes only at jct transitions. */
+    int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
+    int64_t n_jc_full = (n + nc_full - 1) / nc_full;
+    bool use_hybrid = (max_threads > 1)
+                      && (n_jc_full < max_threads)
+                      && (n_jc_full * n_ic_tiles >= max_threads);
+
     /* mirror opt_gemm strategy: JC parallel when N is wide; IC parallel when
        N is narrow but M is wide; fine (ir, jr) parallel when both are
-       narrow. fixes the prior TN-only-JC choice that left 14/16 cores idle
-       on tn_2048x512x512 (n_jc_tiles = 2). */
-    bool use_jc_par = (max_threads > 1) && (n_jc_tiles >= 2);
-    bool use_ic_par = !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
-    bool use_fine_par = !use_jc_par && !use_ic_par && (max_threads > 1)
+       narrow. */
+    bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
+    bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
+    bool use_fine_par = !use_hybrid && !use_jc_par && !use_ic_par && (max_threads > 1)
                         && (m <= GEMM_MC) && (fine_units >= 4)
                         && (total_flops_est > 1000000);
     int gemm_threads = 1;
-    if (use_jc_par) {
+    if (use_hybrid) {
+        gemm_threads = max_threads;
+        /* override nc_eff to full NC for hybrid mode. */
+        nc_eff = nc_full;
+        n_jc_tiles = n_jc_full;
+    } else if (use_jc_par) {
         gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
     } else if (use_ic_par) {
         gemm_threads = (int)(n_ic_tiles < (int64_t)max_threads ? n_ic_tiles : (int64_t)max_threads);
@@ -2651,7 +2801,55 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
     (void)gemm_threads;
 
-    if (use_jc_par) {
+    if (use_hybrid) {
+        /* hybrid jc+pc+ic for opt_gemm_tn. collapse(3) over (jct, pct, ict);
+           pack_b cached across iterations with same (jct, pct). */
+        int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(gemm_threads)
+        #endif
+        {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            int64_t last_jct = -1;
+            int64_t last_pct = -1;
+
+            #ifdef _OPENMP
+            #pragma omp for collapse(3) schedule(static)
+            #endif
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                        if (!pack_a_buf || !pack_b_buf) continue;
+                        int64_t jc = jct * nc_eff;
+                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                        int64_t pc = pct * kc_max;
+                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                        int64_t ic = ict * GEMM_MC;
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                        if (jct != last_jct || pct != last_pct) {
+                            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
+                            last_jct = jct;
+                            last_pct = pct;
+                        }
+                        pack_a_t(ad + pc * m + ic, m, mc_pack, kc, mc, pack_a_buf);
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_jc_par) {
         #ifdef _OPENMP
         #pragma omp parallel for num_threads(gemm_threads) schedule(static)
         #endif
