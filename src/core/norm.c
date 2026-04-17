@@ -22,7 +22,261 @@ typedef struct {
     ax_tensor_t *x_hat;    /* normalized input [batch, feat] */
     ax_tensor_t *inv_std;  /* 1/sqrt(var+eps) per feature [feat] */
     ax_batchnorm_t *bn;    /* layer pointer for gamma/beta access */
+    ax_layout_t layout;    /* AX_LAYOUT_NCHW or AX_LAYOUT_NHWC */
 } bn_backward_ctx_t;
+
+/* ──────────────────────── NHWC BatchNorm2d kernels ────────────────────────
+   for NHWC, channels are the innermost dim, so:
+   - per-(n, h, w) normalize loop: SIMD across C (vector load+fmadd+store).
+   - per-channel stat reduction: SIMD across C using per-thread accumulators
+     reduced at the end. */
+
+static int bn_nhwc_forward_impl(
+    const float *id, float *od,
+    const float *gd, const float *bd,
+    float *running_mean, float *running_var, float momentum,
+    float *x_hat_save, float *inv_std_save,
+    int64_t N, int64_t H, int64_t W, int64_t C,
+    float eps, bool training)
+{
+    int64_t HW = H * W;
+    int64_t NHW = N * HW;
+    int TC = AX_VF32_WIDTH;
+    int64_t cv_end = C - (C % TC);
+
+    /* per-channel mean & invstd. */
+    float *mean = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
+    float *invstd = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
+    if (!mean || !invstd) { free(mean); free(invstd); return -1; }
+
+    if (training) {
+        /* per-thread reduction buffers. */
+#ifdef _OPENMP
+        int n_threads = omp_get_max_threads();
+#else
+        int n_threads = 1;
+#endif
+        size_t per_t_floats = ((size_t)C + 15) & ~(size_t)15u;
+        float *thr_sum  = (float *)aligned_alloc(64, n_threads * per_t_floats * sizeof(float));
+        float *thr_sum2 = (float *)aligned_alloc(64, n_threads * per_t_floats * sizeof(float));
+        if (!thr_sum || !thr_sum2) {
+            free(mean); free(invstd); free(thr_sum); free(thr_sum2);
+            return -1;
+        }
+        memset(thr_sum,  0, n_threads * per_t_floats * sizeof(float));
+        memset(thr_sum2, 0, n_threads * per_t_floats * sizeof(float));
+
+        /* pass 1+2 fused: per (n, h, w), accumulate sum and sum-of-squares
+           into per-thread channel accumulators using SIMD across C. */
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t i = 0; i < NHW; i++) {
+    #ifdef _OPENMP
+        int tid = omp_get_thread_num();
+#else
+        int tid = 0;
+#endif
+            float *s1 = thr_sum  + tid * per_t_floats;
+            float *s2 = thr_sum2 + tid * per_t_floats;
+            const float *pos = id + i * C;
+            int64_t c = 0;
+            for (; c < cv_end; c += TC) {
+                ax_vf32 v = ax_vf32_loadu(pos + c);
+                ax_vf32 a1 = ax_vf32_loadu(s1 + c);
+                ax_vf32 a2 = ax_vf32_loadu(s2 + c);
+                ax_vf32_storeu(s1 + c, ax_vf32_add(a1, v));
+                ax_vf32_storeu(s2 + c, ax_vf32_fmadd(v, v, a2));
+            }
+            for (; c < C; c++) {
+                float v = pos[c];
+                s1[c] += v;
+                s2[c] += v * v;
+            }
+        }
+
+        /* reduce per-thread → mean, var. */
+        float scale_n = 1.0f / (float)NHW;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t c = 0; c < C; c++) {
+            float s1 = 0, s2 = 0;
+            for (int t = 0; t < n_threads; t++) {
+                s1 += thr_sum [t * per_t_floats + c];
+                s2 += thr_sum2[t * per_t_floats + c];
+            }
+            float m = s1 * scale_n;
+            float var = s2 * scale_n - m * m;
+            mean[c]   = m;
+            invstd[c] = 1.0f / sqrtf(var + eps);
+            running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * m;
+            running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * var;
+        }
+        free(thr_sum); free(thr_sum2);
+    } else {
+        for (int64_t c = 0; c < C; c++) {
+            mean[c]   = running_mean[c];
+            invstd[c] = 1.0f / sqrtf(running_var[c] + eps);
+        }
+    }
+
+    if (inv_std_save) memcpy(inv_std_save, invstd, (size_t)C * sizeof(float));
+
+    /* pre-compute fused (scale, shift) = (gamma*invstd, beta - gamma*invstd*mean).
+       lets the normalize loop be a single FMA per element. */
+    float *scale_eff = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
+    float *shift_eff = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
+    if (!scale_eff || !shift_eff) {
+        free(scale_eff); free(shift_eff); free(mean); free(invstd); return -1;
+    }
+    for (int64_t c = 0; c < C; c++) {
+        scale_eff[c] = gd[c] * invstd[c];
+        shift_eff[c] = bd[c] - scale_eff[c] * mean[c];
+    }
+
+    /* pass 3: normalize. SIMD across C per (n, h, w). */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t i = 0; i < NHW; i++) {
+        const float *in_pos = id + i * C;
+        float *out_pos = od + i * C;
+        float *xh_pos = x_hat_save ? x_hat_save + i * C : NULL;
+        int64_t c = 0;
+        for (; c < cv_end; c += TC) {
+            ax_vf32 vin = ax_vf32_loadu(in_pos + c);
+            ax_vf32 vsc = ax_vf32_loadu(scale_eff + c);
+            ax_vf32 vsh = ax_vf32_loadu(shift_eff + c);
+            ax_vf32_storeu(out_pos + c, ax_vf32_fmadd(vsc, vin, vsh));
+            if (xh_pos) {
+                ax_vf32 vm = ax_vf32_loadu(mean + c);
+                ax_vf32 vi = ax_vf32_loadu(invstd + c);
+                ax_vf32_storeu(xh_pos + c, ax_vf32_mul(ax_vf32_sub(vin, vm), vi));
+            }
+        }
+        for (; c < C; c++) {
+            out_pos[c] = scale_eff[c] * in_pos[c] + shift_eff[c];
+            if (xh_pos) xh_pos[c] = (in_pos[c] - mean[c]) * invstd[c];
+        }
+    }
+
+    free(scale_eff); free(shift_eff); free(mean); free(invstd);
+    return 0;
+}
+
+static void bn_nhwc_backward_impl(
+    const float *go, const float *xh, const float *istd, const float *gd,
+    float *dg, float *db, float *ig,
+    int64_t N, int64_t H, int64_t W, int64_t C)
+{
+    int64_t HW = H * W;
+    int64_t NHW = N * HW;
+    float Nf = (float)NHW;
+    int TC = AX_VF32_WIDTH;
+    int64_t cv_end = C - (C % TC);
+
+    /* per-thread accumulators for sum_go and sum_go_xh per channel. */
+#ifdef _OPENMP
+    int n_threads = omp_get_max_threads();
+#else
+    int n_threads = 1;
+#endif
+    size_t per_t = ((size_t)C + 15) & ~(size_t)15u;
+    float *thr_sgo = (float *)aligned_alloc(64, n_threads * per_t * sizeof(float));
+    float *thr_sgx = (float *)aligned_alloc(64, n_threads * per_t * sizeof(float));
+    if (!thr_sgo || !thr_sgx) { free(thr_sgo); free(thr_sgx); return; }
+    memset(thr_sgo, 0, n_threads * per_t * sizeof(float));
+    memset(thr_sgx, 0, n_threads * per_t * sizeof(float));
+
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t i = 0; i < NHW; i++) {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num();
+#else
+        int tid = 0;
+#endif
+        float *s1 = thr_sgo + tid * per_t;
+        float *s2 = thr_sgx + tid * per_t;
+        const float *gpos = go + i * C;
+        const float *xpos = xh + i * C;
+        int64_t c = 0;
+        for (; c < cv_end; c += TC) {
+            ax_vf32 g = ax_vf32_loadu(gpos + c);
+            ax_vf32 x = ax_vf32_loadu(xpos + c);
+            ax_vf32_storeu(s1 + c, ax_vf32_add(ax_vf32_loadu(s1 + c), g));
+            ax_vf32_storeu(s2 + c, ax_vf32_fmadd(g, x, ax_vf32_loadu(s2 + c)));
+        }
+        for (; c < C; c++) {
+            float g = gpos[c];
+            s1[c] += g;
+            s2[c] += g * xpos[c];
+        }
+    }
+
+    /* sum_go, sum_go_xh per channel; also write d_gamma, d_beta. */
+    float *sum_go    = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
+    float *sum_go_xh = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
+    if (!sum_go || !sum_go_xh) {
+        free(sum_go); free(sum_go_xh); free(thr_sgo); free(thr_sgx); return;
+    }
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t c = 0; c < C; c++) {
+        float s1 = 0, s2 = 0;
+        for (int t = 0; t < n_threads; t++) {
+            s1 += thr_sgo[t * per_t + c];
+            s2 += thr_sgx[t * per_t + c];
+        }
+        sum_go[c]    = s1;
+        sum_go_xh[c] = s2;
+        if (dg) dg[c] += s2;
+        if (db) db[c] += s1;
+    }
+    free(thr_sgo); free(thr_sgx);
+
+    /* d_input. SIMD across C per (n, h, w):
+       dx[i, c] = (gd[c] * istd[c] / N) * (N*go[i,c] - sum_go[c] - xh[i,c]*sum_go_xh[c]) */
+    if (ig) {
+        /* pre-compute coeff[c] = gd[c] * istd[c] / N */
+        float *coeff = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
+        if (!coeff) { free(sum_go); free(sum_go_xh); return; }
+        for (int64_t c = 0; c < C; c++) coeff[c] = gd[c] * istd[c] / Nf;
+
+        ax_vf32 v_N = ax_vf32_set1(Nf);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t i = 0; i < NHW; i++) {
+            const float *gpos = go + i * C;
+            const float *xpos = xh + i * C;
+            float *ipos = ig + i * C;
+            int64_t c = 0;
+            for (; c < cv_end; c += TC) {
+                ax_vf32 g = ax_vf32_loadu(gpos + c);
+                ax_vf32 x = ax_vf32_loadu(xpos + c);
+                ax_vf32 vc = ax_vf32_loadu(coeff + c);
+                ax_vf32 vsg = ax_vf32_loadu(sum_go + c);
+                ax_vf32 vsx = ax_vf32_loadu(sum_go_xh + c);
+                /* dx = vc * (N*g - vsg - x*vsx) */
+                ax_vf32 t1 = ax_vf32_sub(ax_vf32_mul(v_N, g), vsg);
+                ax_vf32 t2 = ax_vf32_sub(t1, ax_vf32_mul(x, vsx));
+                ax_vf32 dx = ax_vf32_mul(vc, t2);
+                ax_vf32_storeu(ipos + c, ax_vf32_add(ax_vf32_loadu(ipos + c), dx));
+            }
+            for (; c < C; c++) {
+                float dx = coeff[c] * (Nf * gpos[c] - sum_go[c] - xpos[c] * sum_go_xh[c]);
+                ipos[c] += dx;
+            }
+        }
+        free(coeff);
+    }
+
+    free(sum_go); free(sum_go_xh);
+}
 
 static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 {
@@ -33,12 +287,56 @@ static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_batchnorm_t *bn = ctx->bn;
 
     int ndim = grad_out->ndim;
-    int64_t batch = grad_out->shape[0];
-    int64_t feat = grad_out->shape[1];
-    int64_t H = (ndim == 4) ? grad_out->shape[2] : 1;
-    int64_t W = (ndim == 4) ? grad_out->shape[3] : 1;
+    int64_t batch, feat, H, W;
+    if (ndim == 4 && ctx->layout == AX_LAYOUT_NHWC) {
+        batch = grad_out->shape[0]; H = grad_out->shape[1]; W = grad_out->shape[2]; feat = grad_out->shape[3];
+    } else {
+        batch = grad_out->shape[0];
+        feat  = grad_out->shape[1];
+        H = (ndim == 4) ? grad_out->shape[2] : 1;
+        W = (ndim == 4) ? grad_out->shape[3] : 1;
+    }
     int64_t spatial = H * W;
     float N = (float)(batch * spatial); /* effective sample count per channel */
+    (void)N; (void)spatial;  /* used only by NCHW path */
+
+    /* NHWC dispatch */
+    if (ndim == 4 && ctx->layout == AX_LAYOUT_NHWC) {
+        if (!input->grad) {
+            input->grad = ax_tensor_zeros(input->shape, input->ndim, input->dtype);
+            if (input->grad) input->grad->layout = AX_LAYOUT_NHWC;
+        }
+        float *dg_ptr = NULL, *db_ptr = NULL, *ig_ptr = NULL;
+        if (bn->gamma->requires_grad) {
+            if (!bn->gamma->grad)
+                bn->gamma->grad = ax_tensor_zeros(bn->gamma->shape, bn->gamma->ndim, bn->gamma->dtype);
+            if (bn->gamma->grad) dg_ptr = (float *)bn->gamma->grad->storage->data;
+        }
+        if (bn->beta->requires_grad) {
+            if (!bn->beta->grad)
+                bn->beta->grad = ax_tensor_zeros(bn->beta->shape, bn->beta->ndim, bn->beta->dtype);
+            if (bn->beta->grad) db_ptr = (float *)bn->beta->grad->storage->data;
+        }
+        if (input->requires_grad && input->grad) ig_ptr = (float *)input->grad->storage->data;
+
+        bn_nhwc_backward_impl(
+            (const float *)grad_out->storage->data,
+            (const float *)x_hat_t->storage->data,
+            (const float *)inv_std_t->storage->data,
+            (const float *)bn->gamma->storage->data,
+            dg_ptr, db_ptr, ig_ptr,
+            batch, H, W, feat);
+
+        if (dg_ptr) ax_storage_touch(bn->gamma->grad->storage);
+        if (db_ptr) ax_storage_touch(bn->beta->grad->storage);
+        if (ig_ptr) ax_storage_touch(input->grad->storage);
+
+        ax_tensor_destroy(ctx->x_hat);
+        ax_tensor_destroy(ctx->inv_std);
+        free(ctx);
+        self->ctx = NULL;
+        return;
+    }
 
     float *go = (float *)grad_out->storage->data;
     float *xh = (float *)x_hat_t->storage->data;
@@ -153,19 +451,25 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_tensor_t *inp = ax_ensure_contiguous(input);
     if (!inp) return NULL;
 
-    int64_t batch = inp->shape[0];
-    int64_t feat = inp->shape[1];
-    int64_t H = (inp->ndim == 4) ? inp->shape[2] : 1;
-    int64_t W = (inp->ndim == 4) ? inp->shape[3] : 1;
+    ax_layout_t layout = ax_tensor_get_layout(input);
+
+    int64_t batch, feat, H, W;
+    if (inp->ndim == 4 && layout == AX_LAYOUT_NHWC) {
+        batch = inp->shape[0]; H = inp->shape[1]; W = inp->shape[2]; feat = inp->shape[3];
+    } else {
+        batch = inp->shape[0];
+        feat  = inp->shape[1];
+        H = (inp->ndim == 4) ? inp->shape[2] : 1;
+        W = (inp->ndim == 4) ? inp->shape[3] : 1;
+    }
     int64_t spatial = H * W;
-    /* float eff_batch removed — unused */
     float *id = (float *)inp->storage->data;
 
     /* uninitialized output — every element is written by the normalize
-       loop below, so the memset in ax_tensor_zeros is wasted bandwidth.
-       BN on a [256, 4096] tensor is 4 MB of pointless zeroing per call. */
+       loop below, so the memset in ax_tensor_zeros is wasted bandwidth. */
     ax_tensor_t *out = ax_tensor_create(inp->shape, inp->ndim, inp->dtype);
     if (!out) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
+    out->layout = layout;
     float *od = (float *)out->storage->data;
     float *gd = (float *)bn->gamma->storage->data;
     float *bd = (float *)bn->beta->storage->data;
@@ -191,6 +495,48 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
             if (inv_std_save) ax_tensor_destroy(inv_std_save);
             record = false;
         }
+    }
+
+    /* NHWC dispatch: 4D NHWC tensors go to the channels-innermost kernel
+       which uses SIMD across C with per-thread reduction accumulators. */
+    if (inp->ndim == 4 && layout == AX_LAYOUT_NHWC) {
+        float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
+        float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
+        int rc = bn_nhwc_forward_impl(
+            id, od, gd, bd, rm, rv, bn->momentum,
+            xh_d, is_d, batch, H, W, feat, bn->eps, self->training);
+        if (rc != 0) {
+            ax_tensor_destroy(out);
+            if (inp != input) ax_tensor_destroy(inp);
+            if (record) {
+                if (x_hat_save) ax_tensor_destroy(x_hat_save);
+                if (inv_std_save) ax_tensor_destroy(inv_std_save);
+            }
+            return NULL;
+        }
+        if (inp != input) ax_tensor_destroy(inp);
+        if (record) {
+            bn_backward_ctx_t *ctx = (bn_backward_ctx_t *)malloc(sizeof(bn_backward_ctx_t));
+            if (!ctx) {
+                ax_tensor_destroy(x_hat_save);
+                ax_tensor_destroy(inv_std_save);
+                return out;
+            }
+            ctx->x_hat = x_hat_save;
+            ctx->inv_std = inv_std_save;
+            ctx->bn = bn;
+            ctx->layout = AX_LAYOUT_NHWC;
+            ax_storage_touch(x_hat_save->storage);
+            ax_storage_touch(inv_std_save->storage);
+            ax_grad_fn_t *gf = ax_grad_fn_create(batchnorm_backward);
+            gf->inputs[0] = input;
+            gf->n_inputs = 1;
+            gf->ctx = ctx;
+            gf->ctx_cleanup = bn_ctx_cleanup;
+            out->requires_grad = true;
+            out->grad_fn = gf;
+        }
+        return out;
     }
 
     if (inp->ndim == 2)
@@ -560,6 +906,7 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         ctx->x_hat = x_hat_save;
         ctx->inv_std = inv_std_save;
         ctx->bn = bn;
+        ctx->layout = AX_LAYOUT_NCHW;  /* legacy 2D + 4D-NCHW path */
 
         ax_grad_fn_t *gf = ax_grad_fn_create(batchnorm_backward);
         gf->inputs[0] = input; /* route grad to original (possibly non-contiguous) input */

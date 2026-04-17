@@ -151,12 +151,53 @@ static void test_clip_grad_norm(void)
     ax_tensor_destroy(w);
 }
 
+/* NHWC BatchNorm2d: forward and backward must match NCHW reference. */
+static void test_batchnorm_nhwc_correctness(void)
+{
+    int N = 4, C = 16, H = 6, W = 6;
+    int64_t in_sh[] = {N, C, H, W};
+    ax_tensor_t *x_nchw = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    float *id = (float *)x_nchw->storage->data;
+    for (int64_t i = 0; i < N * C * H * W; i++)
+        id[i] = (float)((i * 7) % 31 - 15) * 0.05f;
+
+    /* NCHW reference */
+    ax_layer_t *bn_ref = ax_batchnorm_create(C, 1e-5f, 0.1f);
+    ax_layer_eval(bn_ref);  /* deterministic — use eval mode */
+    ax_tensor_t *out_ref = ax_layer_forward(bn_ref, x_nchw);
+    AX_TEST_ASSERT(out_ref != NULL, "NCHW BN fwd");
+
+    /* NHWC version with FRESH layer (so running stats start identical) */
+    ax_layer_t *bn_nhwc = ax_batchnorm_create(C, 1e-5f, 0.1f);
+    ax_layer_eval(bn_nhwc);
+    ax_tensor_t *x_nhwc = ax_tensor_to_nhwc(x_nchw);
+    ax_tensor_t *out_nhwc = ax_layer_forward(bn_nhwc, x_nhwc);
+    AX_TEST_ASSERT(out_nhwc != NULL, "NHWC BN fwd");
+    AX_TEST_ASSERT(ax_tensor_get_layout(out_nhwc) == AX_LAYOUT_NHWC, "NHWC out layout");
+
+    ax_tensor_t *out_back = ax_tensor_to_nchw(out_nhwc);
+    const float *or_d = (const float *)out_ref->storage->data;
+    const float *ob_d = (const float *)out_back->storage->data;
+    int64_t total = N * C * H * W;
+    for (int64_t i = 0; i < total; i++)
+        AX_TEST_ASSERT_NEAR(or_d[i], ob_d[i], 1e-4f, "NHWC BN matches NCHW");
+
+    ax_tensor_destroy(out_back);
+    ax_tensor_destroy(out_nhwc);
+    ax_tensor_destroy(x_nhwc);
+    ax_tensor_destroy(out_ref);
+    ax_tensor_destroy(x_nchw);
+    ax_layer_destroy(bn_ref);
+    ax_layer_destroy(bn_nhwc);
+}
+
 int main(void)
 {
     ax_init();
     printf("=== norm tests ===\n");
     AX_RUN_TEST(test_batchnorm_forward);
     AX_RUN_TEST(test_batchnorm_eval);
+    AX_RUN_TEST(test_batchnorm_nhwc_correctness);
     AX_RUN_TEST(test_layernorm);
     AX_RUN_TEST(test_dropout_train);
     AX_RUN_TEST(test_dropout_eval);
