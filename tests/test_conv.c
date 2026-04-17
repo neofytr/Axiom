@@ -578,6 +578,142 @@ static void test_conv2d_1x1_zero_copy_bwd(void)
     ax_layer_destroy(c);
 }
 
+/* NHWC conv2d: forward correctness vs NCHW reference. */
+static void test_conv2d_nhwc_correctness(void)
+{
+    int N = 2, Cin = 8, H = 7, W = 7, Cout = 4;
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp_nchw = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+
+    /* deterministic data */
+    float *id = (float *)inp_nchw->storage->data;
+    for (int64_t i = 0; i < N * Cin * H * W; i++)
+        id[i] = (float)((i * 7) % 23 - 11) * 0.05f;
+
+    ax_layer_t *conv = ax_conv2d_create(Cin, Cout, 3, 1, 1, false);
+    ax_conv2d_t *cc = (ax_conv2d_t *)conv;
+    int64_t wn = (int64_t)Cout * Cin * 9;
+    float *wd = (float *)cc->weight->storage->data;
+    for (int64_t i = 0; i < wn; i++) wd[i] = (float)((i * 13) % 17 - 8) * 0.05f;
+
+    ax_tensor_t *out_nchw = ax_layer_forward(conv, inp_nchw);
+    AX_TEST_ASSERT(out_nchw != NULL, "NCHW conv fwd");
+
+    /* NHWC version */
+    ax_tensor_t *inp_nhwc = ax_tensor_to_nhwc(inp_nchw);
+    AX_TEST_ASSERT(inp_nhwc != NULL, "convert input to NHWC");
+    ax_tensor_t *out_nhwc = ax_layer_forward(conv, inp_nhwc);
+    AX_TEST_ASSERT(out_nhwc != NULL, "NHWC conv fwd");
+    AX_TEST_ASSERT(ax_tensor_get_layout(out_nhwc) == AX_LAYOUT_NHWC, "NHWC out layout");
+
+    /* convert NHWC out back to NCHW for comparison */
+    ax_tensor_t *out_back = ax_tensor_to_nchw(out_nhwc);
+    AX_TEST_ASSERT(out_back != NULL, "back to NCHW");
+
+    int64_t M = (int64_t)H * W;
+    int64_t total = N * Cout * M;
+    const float *od_n = (const float *)out_nchw->storage->data;
+    const float *od_b = (const float *)out_back->storage->data;
+    for (int64_t i = 0; i < total; i++)
+        AX_TEST_ASSERT_NEAR(od_n[i], od_b[i], 1e-3f, "NHWC conv matches NCHW");
+
+    ax_tensor_destroy(out_back);
+    ax_tensor_destroy(out_nhwc);
+    ax_tensor_destroy(inp_nhwc);
+    ax_tensor_destroy(out_nchw);
+    ax_tensor_destroy(inp_nchw);
+    ax_layer_destroy(conv);
+}
+
+/* NHWC conv2d: backward correctness via FD on a few weights and inputs. */
+static void test_conv2d_nhwc_backward(void)
+{
+    int N = 2, Cin = 4, H = 5, W = 5, Cout = 4;
+    int64_t in_sh[] = {N, Cin, H, W};
+    ax_tensor_t *inp_nchw = ax_tensor_create(in_sh, 4, AX_FLOAT32);
+    float *id = (float *)inp_nchw->storage->data;
+    for (int64_t i = 0; i < N * Cin * H * W; i++)
+        id[i] = (float)((i * 11) % 29 - 14) * 0.02f;
+
+    ax_layer_t *conv = ax_conv2d_create(Cin, Cout, 3, 1, 1, false);
+    ax_conv2d_t *cc = (ax_conv2d_t *)conv;
+    cc->weight->requires_grad = true;
+    int64_t wn = (int64_t)Cout * Cin * 9;
+    float *wd = (float *)cc->weight->storage->data;
+    for (int64_t i = 0; i < wn; i++) wd[i] = (float)((i * 13) % 17 - 8) * 0.02f;
+
+    ax_tensor_t *inp_nhwc = ax_tensor_to_nhwc(inp_nchw);
+    inp_nhwc->requires_grad = true;
+
+    ax_enable_grad();
+    ax_tensor_t *out = ax_layer_forward(conv, inp_nhwc);
+    ax_tensor_t *loss = ax_sum(out, -1);
+    ax_backward(loss);
+    ax_no_grad();
+
+    /* snapshot gradients */
+    float *dW = (float *)malloc((size_t)wn * sizeof(float));
+    memcpy(dW, cc->weight->grad->storage->data, (size_t)wn * sizeof(float));
+
+    int64_t inn = N * Cin * H * W;
+    float *dX = (float *)malloc((size_t)inn * sizeof(float));
+    memcpy(dX, inp_nhwc->grad->storage->data, (size_t)inn * sizeof(float));
+
+    /* FD on weights — bump storage->generation after each in-place mutation
+       so the NHWC weight cache invalidates and re-transposes. */
+    float eps = 1e-3f;
+    int64_t M = (int64_t)H * W;
+    int probes_w[] = {0, (int)wn/2, (int)wn-1};
+    for (int p = 0; p < 3; p++) {
+        int64_t i = probes_w[p];
+        float orig = wd[i];
+        wd[i] = orig + eps;
+        ax_storage_touch(cc->weight->storage);
+        ax_tensor_t *op = ax_layer_forward(conv, inp_nhwc);
+        float lp = 0.0f; const float *od_p = (const float *)op->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lp += od_p[j];
+        ax_tensor_destroy(op);
+        wd[i] = orig - eps;
+        ax_storage_touch(cc->weight->storage);
+        ax_tensor_t *om = ax_layer_forward(conv, inp_nhwc);
+        float lm = 0.0f; const float *od_m = (const float *)om->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lm += od_m[j];
+        ax_tensor_destroy(om);
+        wd[i] = orig;
+        ax_storage_touch(cc->weight->storage);
+        float fd = (lp - lm) / (2.0f * eps);
+        AX_TEST_ASSERT_NEAR(dW[i], fd, 0.05f, "NHWC dW matches FD");
+    }
+
+    /* FD on inputs */
+    float *id_nhwc = (float *)inp_nhwc->storage->data;
+    int probes_x[] = {0, (int)inn/2, (int)inn-1};
+    for (int p = 0; p < 3; p++) {
+        int64_t i = probes_x[p];
+        float orig = id_nhwc[i];
+        id_nhwc[i] = orig + eps;
+        ax_tensor_t *op = ax_layer_forward(conv, inp_nhwc);
+        float lp = 0.0f; const float *od_p = (const float *)op->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lp += od_p[j];
+        ax_tensor_destroy(op);
+        id_nhwc[i] = orig - eps;
+        ax_tensor_t *om = ax_layer_forward(conv, inp_nhwc);
+        float lm = 0.0f; const float *od_m = (const float *)om->storage->data;
+        for (int64_t j = 0; j < N * Cout * M; j++) lm += od_m[j];
+        ax_tensor_destroy(om);
+        id_nhwc[i] = orig;
+        float fd = (lp - lm) / (2.0f * eps);
+        AX_TEST_ASSERT_NEAR(dX[i], fd, 0.05f, "NHWC dX matches FD");
+    }
+
+    free(dW); free(dX);
+    ax_tensor_destroy(loss);
+    ax_tensor_destroy(out);
+    ax_tensor_destroy(inp_nhwc);
+    ax_tensor_destroy(inp_nchw);
+    ax_layer_destroy(conv);
+}
+
 /* NHWC maxpool backward: gradient via finite-difference verification.
    probe a few input positions, compare analytical dX (from NHWC backward)
    to numerical dX (loss(x+eps) - loss(x-eps))/(2eps). */
@@ -880,6 +1016,8 @@ int main(void)
     AX_RUN_TEST(test_conv2d_winograd_f23_correctness);
     AX_RUN_TEST(test_maxpool2d_nhwc_correctness);
     AX_RUN_TEST(test_maxpool2d_nhwc_backward);
+    AX_RUN_TEST(test_conv2d_nhwc_correctness);
+    AX_RUN_TEST(test_conv2d_nhwc_backward);
     AX_RUN_TEST(test_conv2d_direct_smallcin_vs_gemm);
     AX_RUN_TEST(test_conv2d_smallcin_edges);
     AX_RUN_TEST(test_maxpool2d_simd);

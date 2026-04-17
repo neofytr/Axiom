@@ -64,6 +64,25 @@ static inline bool prefer_winograd_f23(int kh, int kw, int sh, int sw, int ph, i
                                         int64_t N, int64_t C_in, int64_t C_out,
                                         int64_t out_h, int64_t out_w);
 
+/* forward declarations for NHWC kernels (defined further down, called by
+   conv2d_backward which appears before them in source order). */
+struct ax_conv_scratch;
+static int  conv2d_nhwc_forward_impl(
+    struct ax_conv_scratch *s,
+    const float *id, const float *wd, const float *bias,
+    float *od, int64_t N, int64_t Cin, int64_t H, int64_t W,
+    int64_t Cout, int64_t out_h, int64_t out_w,
+    int kh, int kw, int sh, int sw, int ph, int pw,
+    uint64_t weight_gen);
+static void conv2d_nhwc_backward_impl(
+    struct ax_conv_scratch *s,
+    const float *id, const float *grd, const float *wd,
+    float *dwd, float *dbd, float *dxd,
+    int64_t N, int64_t Cin, int64_t H, int64_t W,
+    int64_t Cout, int64_t out_h, int64_t out_w,
+    int kh, int kw, int sh, int sw, int ph, int pw,
+    uint64_t weight_gen);
+
 /* 1×1 stride=1 pad=0: im2col is the identity rearrangement.
    the per-sample fast path uses a stack-tensor view to skip the copy
    entirely (zero memcpy). batched path's wider GEMM doesn't help here
@@ -123,6 +142,15 @@ struct ax_conv_scratch {
     ax_tensor_t *wino_V;
     ax_tensor_t *wino_M;
     int64_t wino_num_tiles;     /* N * Ty * Tx; 0 if winograd not allocated */
+
+    /* NHWC path scratch (allocated lazily on first NHWC forward call):
+       wt_nhwc: weight transposed to [K=Cin*kh*kw, Cout] for cache-friendly
+                GEMM with channels-last input (re-filled when weight->generation
+                changes between forward calls — training updates the weight).
+       im2col_nhwc: [N*OH*OW, K] gathered patches from [N, H, W, Cin] input. */
+    ax_tensor_t *wt_nhwc;
+    uint64_t wt_nhwc_gen;
+    ax_tensor_t *im2col_nhwc;
 };
 
 static void scratch_destroy(struct ax_conv_scratch *s)
@@ -150,6 +178,8 @@ static void scratch_destroy(struct ax_conv_scratch *s)
     if (s->wino_U) ax_tensor_destroy(s->wino_U);
     if (s->wino_V) ax_tensor_destroy(s->wino_V);
     if (s->wino_M) ax_tensor_destroy(s->wino_M);
+    if (s->wt_nhwc) ax_tensor_destroy(s->wt_nhwc);
+    if (s->im2col_nhwc) ax_tensor_destroy(s->im2col_nhwc);
     free(s);
 }
 
@@ -684,10 +714,13 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_tensor_t *input_data = self->saved[0];  /* contiguous — for data access */
     ax_tensor_t *weight = conv->weight;
 
-    int64_t N = input_data->shape[0];
-    int64_t C_in = input_data->shape[1];
-    int64_t H = input_data->shape[2];
-    int64_t W = input_data->shape[3];
+    ax_layout_t layout = ax_tensor_get_layout(input_data);
+    int64_t N, C_in, H, W;
+    if (layout == AX_LAYOUT_NHWC) {
+        N = input_data->shape[0]; H = input_data->shape[1]; W = input_data->shape[2]; C_in = input_data->shape[3];
+    } else {
+        N = input_data->shape[0]; C_in = input_data->shape[1]; H = input_data->shape[2]; W = input_data->shape[3];
+    }
     int64_t C_out = weight->shape[0];
     int kh = conv->kernel_h, kw = conv->kernel_w;
     int sh = conv->stride_h, sw = conv->stride_w;
@@ -695,7 +728,7 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t out_h = conv_out_dim(H, kh, sh, ph);
     int64_t out_w = conv_out_dim(W, kw, sw, pw);
 
-    /* grad_out: [N, C_out, out_h, out_w] */
+    /* grad_out matches input layout: NCHW [N,C_out,oh,ow] or NHWC [N,oh,ow,C_out] */
 
     /* weight gradient and input gradient */
     if (weight->requires_grad)
@@ -705,8 +738,42 @@ static void conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
     if (input_orig->requires_grad)
     {
-        if (!input_orig->grad)
+        if (!input_orig->grad) {
             input_orig->grad = ax_tensor_zeros(input_orig->shape, input_orig->ndim, input_orig->dtype);
+            if (input_orig->grad) input_orig->grad->layout = layout;
+        }
+    }
+
+    /* NHWC dispatch: do all three grads (dW, db, dX) in one helper that uses
+       the NHWC im2col + GEMM pipeline. */
+    if (layout == AX_LAYOUT_NHWC) {
+        struct ax_conv_scratch *s = ensure_scratch(conv, N, H, W, true);
+        if (!s) return;
+
+        float *dwd = (weight->requires_grad && weight->grad)
+                     ? (float *)weight->grad->storage->data : NULL;
+        float *dbd = NULL;
+        if (conv->use_bias && conv->bias && conv->bias->requires_grad) {
+            if (!conv->bias->grad)
+                conv->bias->grad = ax_tensor_zeros(conv->bias->shape, conv->bias->ndim, conv->bias->dtype);
+            if (conv->bias->grad) dbd = (float *)conv->bias->grad->storage->data;
+        }
+        float *dxd = (input_orig->requires_grad && input_orig->grad)
+                     ? (float *)input_orig->grad->storage->data : NULL;
+
+        conv2d_nhwc_backward_impl(s,
+            (const float *)input_data->storage->data,
+            (const float *)grad_out->storage->data,
+            (const float *)weight->storage->data,
+            dwd, dbd, dxd,
+            N, C_in, H, W, C_out, out_h, out_w,
+            kh, kw, sh, sw, ph, pw,
+            weight->storage->generation);
+
+        if (dwd) ax_storage_touch(weight->grad->storage);
+        if (dbd) ax_storage_touch(conv->bias->grad->storage);
+        if (dxd) ax_storage_touch(input_orig->grad->storage);
+        return;
     }
 
     /* bias gradient: sum grad_out over N, H, W.
@@ -1719,13 +1786,311 @@ static int conv2d_winograd_f23_forward(
     return 0;
 }
 
+/* ────────────────────── NHWC conv2d kernels ──────────────────────
+   NHWC conv uses the same im2col + GEMM pipeline as NCHW but with two
+   structural advantages:
+   1. im2col_nhwc gathers via plain memcpy (Cin contiguous per patch element),
+      so stride>1 cases are bandwidth-bound rather than going through the
+      NCHW scalar fallback.
+   2. weight is cached in [K=Cin*kh*kw, Cout] layout so the GEMM is just
+      ax_compute_gemm(im2col [M, K], weight [K, Cout], out [M, Cout])
+      where M = N*OH*OW. natural flat-batch GEMM, no per-sample loop.
+   ────────────────────────────────────────────────────────────────── */
+
+/* im2col for NHWC: input [N, H, W, Cin] → cd [N*OH*OW, Cin*kh*kw].
+   per output row, write kh*kw blocks of Cin contiguous floats.
+   memcpy when in-bounds, memset(0) for the pad regions. */
+static void im2col_nhwc(const float *id, int64_t N, int64_t H, int64_t W, int64_t C_in,
+                        int kh, int kw, int sh, int sw, int ph, int pw,
+                        int64_t out_h, int64_t out_w, float *cd)
+{
+    int64_t HWC  = H * W * C_in;
+    int64_t K    = (int64_t)kh * (int64_t)kw * C_in;
+    int64_t OH_OW = out_h * out_w;
+    size_t  Cin_bytes = (size_t)C_in * sizeof(float);
+
+    int64_t total_rows = N * OH_OW;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t row = 0; row < total_rows; row++) {
+        int64_t n  = row / OH_OW;
+        int64_t r  = row - n * OH_OW;
+        int64_t oy = r / out_w;
+        int64_t ox = r - oy * out_w;
+
+        const float *in_n = id + n * HWC;
+        float *cd_row = cd + row * K;
+        int64_t patch_off = 0;
+
+        for (int ky = 0; ky < kh; ky++) {
+            int64_t iy = oy * sh - ph + ky;
+            int iy_valid = (iy >= 0 && iy < H);
+            for (int kx = 0; kx < kw; kx++) {
+                int64_t ix = ox * sw - pw + kx;
+                if (iy_valid && ix >= 0 && ix < W) {
+                    memcpy(cd_row + patch_off,
+                           in_n + (iy * W + ix) * C_in,
+                           Cin_bytes);
+                } else {
+                    memset(cd_row + patch_off, 0, Cin_bytes);
+                }
+                patch_off += C_in;
+            }
+        }
+    }
+}
+
+/* col2im for NHWC: cd [N*OH*OW, Cin*kh*kw] → id [N, H, W, Cin] (accumulating).
+   id MUST be pre-zeroed. each row of cd contains the gradients for the
+   patches that contributed to one output position. */
+static void col2im_nhwc(const float *cd, int64_t N, int64_t H, int64_t W, int64_t C_in,
+                         int kh, int kw, int sh, int sw, int ph, int pw,
+                         int64_t out_h, int64_t out_w, float *id)
+{
+    int64_t HWC = H * W * C_in;
+    int64_t K   = (int64_t)kh * (int64_t)kw * C_in;
+    int64_t OH_OW = out_h * out_w;
+
+    /* per-sample accumulation can race across (oy, ox) for overlapping
+       windows. parallelize over n only (samples are disjoint). */
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t n = 0; n < N; n++) {
+        const float *cd_n = cd + n * OH_OW * K;
+        float *id_n = id + n * HWC;
+        for (int64_t oy = 0; oy < out_h; oy++) {
+            for (int64_t ox = 0; ox < out_w; ox++) {
+                const float *cd_row = cd_n + (oy * out_w + ox) * K;
+                int64_t patch_off = 0;
+                for (int ky = 0; ky < kh; ky++) {
+                    int64_t iy = oy * sh - ph + ky;
+                    int iy_valid = (iy >= 0 && iy < H);
+                    for (int kx = 0; kx < kw; kx++) {
+                        int64_t ix = ox * sw - pw + kx;
+                        if (iy_valid && ix >= 0 && ix < W) {
+                            float *id_pos = id_n + (iy * W + ix) * C_in;
+                            const float *cd_pos = cd_row + patch_off;
+                            int64_t ci = 0;
+                            int64_t ve = C_in - (C_in % AX_VF32_WIDTH);
+                            for (; ci < ve; ci += AX_VF32_WIDTH)
+                                ax_vf32_storeu(id_pos + ci,
+                                               ax_vf32_add(ax_vf32_loadu(id_pos + ci),
+                                                            ax_vf32_loadu(cd_pos + ci)));
+                            for (; ci < C_in; ci++) id_pos[ci] += cd_pos[ci];
+                        }
+                        patch_off += C_in;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* refresh wt_nhwc cache from the source weight (which is [Cout, Cin, kh, kw]).
+   transposed layout [K=Cin*kh*kw, Cout] is what NHWC GEMM expects as B.
+   layout: wt_nhwc[(ky*kw + kx)*Cin + ci, co] = weight[co, ci, ky, kx]. */
+static void refresh_wt_nhwc(struct ax_conv_scratch *s, const float *wd_orig,
+                             int64_t Cout, int64_t Cin, int kh, int kw,
+                             uint64_t src_gen)
+{
+    if (s->wt_nhwc && s->wt_nhwc_gen == src_gen) return;  /* cache hit */
+    int64_t K = (int64_t)Cin * (int64_t)kh * (int64_t)kw;
+    if (!s->wt_nhwc) {
+        int64_t shape[] = {K, Cout};
+        s->wt_nhwc = ax_tensor_create(shape, 2, AX_FLOAT32);
+        if (!s->wt_nhwc) return;
+    }
+    float *dst = (float *)s->wt_nhwc->storage->data;
+    /* dst[(ky*kw + kx)*Cin + ci, co] = wd[co, ci, ky, kx]
+       == wd[(co * Cin + ci) * kh * kw + ky * kw + kx] */
+    int khkw = kh * kw;
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static) collapse(2)
+    #endif
+    for (int kk = 0; kk < khkw; kk++) {
+        for (int64_t ci = 0; ci < Cin; ci++) {
+            for (int64_t co = 0; co < Cout; co++) {
+                int64_t row = kk * Cin + ci;
+                dst[row * Cout + co] = wd_orig[((co * Cin + ci) * khkw) + kk];
+            }
+        }
+    }
+    s->wt_nhwc_gen = src_gen;
+}
+
+/* NHWC conv2d forward: input [N, H, W, Cin], weight [Cout, Cin, kh, kw],
+   output [N, OH, OW, Cout]. fills bias if non-NULL. */
+static int conv2d_nhwc_forward_impl(
+    struct ax_conv_scratch *s,
+    const float *id, const float *wd, const float *bias,
+    float *od, int64_t N, int64_t Cin, int64_t H, int64_t W,
+    int64_t Cout, int64_t out_h, int64_t out_w,
+    int kh, int kw, int sh, int sw, int ph, int pw,
+    uint64_t weight_gen)
+{
+    int64_t K = (int64_t)Cin * (int64_t)kh * (int64_t)kw;
+    int64_t M = N * out_h * out_w;
+
+    /* allocate / reuse im2col buffer of shape [M, K] */
+    bool need_alloc = !s->im2col_nhwc
+        || s->im2col_nhwc->shape[0] != M
+        || s->im2col_nhwc->shape[1] != K;
+    if (need_alloc) {
+        if (s->im2col_nhwc) ax_tensor_destroy(s->im2col_nhwc);
+        int64_t sh2[] = {M, K};
+        s->im2col_nhwc = ax_tensor_create(sh2, 2, AX_FLOAT32);
+        if (!s->im2col_nhwc) return -1;
+    }
+    float *cd = (float *)s->im2col_nhwc->storage->data;
+
+    /* gather */
+    im2col_nhwc(id, N, H, W, Cin, kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
+
+    /* refresh transposed weight cache */
+    refresh_wt_nhwc(s, wd, Cout, Cin, kh, kw, weight_gen);
+    if (!s->wt_nhwc) return -1;
+
+    /* GEMM: out [M, Cout] = im2col [M, K] @ wt_nhwc [K, Cout].
+       use stack tensor views directly so we can call ax_compute_gemm. */
+    ax_storage_t a_st, b_st, c_st;
+    ax_tensor_t  a_tv, b_tv, c_tv;
+    make_stack_view(&a_tv, &a_st, cd,                                                M,    K);
+    make_stack_view(&b_tv, &b_st, (float *)s->wt_nhwc->storage->data,                K,    Cout);
+    make_stack_view(&c_tv, &c_st, od,                                                M,    Cout);
+    if (ax_compute_gemm(&a_tv, &b_tv, &c_tv) != AX_OK) return -1;
+
+    /* bias broadcast: add bias[co] to each row of output. SIMD across cout. */
+    if (bias) {
+        int64_t TC = AX_VF32_WIDTH;
+        int64_t cv_end = Cout - (Cout % TC);
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t r = 0; r < M; r++) {
+            float *row = od + r * Cout;
+            int64_t co = 0;
+            for (; co < cv_end; co += TC) {
+                ax_vf32_storeu(row + co,
+                                ax_vf32_add(ax_vf32_loadu(row + co),
+                                            ax_vf32_loadu(bias + co)));
+            }
+            for (; co < Cout; co++) row[co] += bias[co];
+        }
+    }
+    return 0;
+}
+
+/* NHWC conv2d backward: produces dW, db, dX as needed. signature mirrors the
+   NCHW backward but operates entirely in NHWC. */
+static void conv2d_nhwc_backward_impl(
+    struct ax_conv_scratch *s,
+    const float *id,         /* input data [N, H, W, Cin] */
+    const float *grd,        /* grad_out   [N, OH, OW, Cout] */
+    const float *wd,         /* weight     [Cout, Cin, kh, kw] */
+    float *dwd,              /* weight->grad [Cout, Cin, kh, kw], accumulating */
+    float *dbd,              /* bias->grad   [Cout], accumulating, may be NULL */
+    float *dxd,              /* input->grad [N, H, W, Cin], accumulating, may be NULL */
+    int64_t N, int64_t Cin, int64_t H, int64_t W,
+    int64_t Cout, int64_t out_h, int64_t out_w,
+    int kh, int kw, int sh, int sw, int ph, int pw,
+    uint64_t weight_gen)
+{
+    int64_t K = (int64_t)Cin * (int64_t)kh * (int64_t)kw;
+    int64_t M = N * out_h * out_w;
+
+    /* ensure im2col buf */
+    bool need_alloc = !s->im2col_nhwc
+        || s->im2col_nhwc->shape[0] != M
+        || s->im2col_nhwc->shape[1] != K;
+    if (need_alloc) {
+        if (s->im2col_nhwc) ax_tensor_destroy(s->im2col_nhwc);
+        int64_t sh2[] = {M, K};
+        s->im2col_nhwc = ax_tensor_create(sh2, 2, AX_FLOAT32);
+        if (!s->im2col_nhwc) return;
+    }
+
+    /* dW: [Cout, K] = grd^T [Cout, M] @ col [M, K]
+       i.e. dW[co, k] = sum_m grd[m, co] * col[m, k]
+       this is gemm_tn(grd_view [M, Cout], col_view [M, K], dW_t [Cout, K])
+       wait: gemm_tn(A, B, C) = A^T @ B. so (grd^T) @ col → [Cout, K]. ✓
+       output dW_t shape [Cout, K] which matches our stored weight layout
+       reshape [Cout, Cin*kh*kw]. */
+    if (dwd) {
+        /* rebuild im2col for dW path */
+        float *cd = (float *)s->im2col_nhwc->storage->data;
+        im2col_nhwc(id, N, H, W, Cin, kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
+
+        ax_storage_t a_st, b_st, c_st;
+        ax_tensor_t  a_tv, b_tv, c_tv;
+        make_stack_view(&a_tv, &a_st, (float *)grd, M, Cout);
+        make_stack_view(&b_tv, &b_st, cd,           M, K);
+        /* dW_temp [Cout, K] — reuse wt_nhwc-shaped scratch via heap alloc */
+        size_t dW_bytes = (size_t)Cout * (size_t)K * sizeof(float);
+        float *dW_temp = (float *)malloc(dW_bytes);
+        if (!dW_temp) return;
+        make_stack_view(&c_tv, &c_st, dW_temp, Cout, K);
+        if (ax_compute_gemm_tn(&a_tv, &b_tv, &c_tv) != AX_OK) { free(dW_temp); return; }
+
+        /* accumulate into dwd which is in [Cout, Cin, kh, kw] layout.
+           dW_temp[co, (ky*kw + kx)*Cin + ci] → dwd[((co*Cin + ci)*kh + ky)*kw + kx] */
+        int khkw = kh * kw;
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t co = 0; co < Cout; co++) {
+            for (int64_t ci = 0; ci < Cin; ci++) {
+                for (int kk = 0; kk < khkw; kk++) {
+                    int64_t src = co * K + kk * Cin + ci;
+                    int64_t dst = (co * Cin + ci) * khkw + kk;
+                    dwd[dst] += dW_temp[src];
+                }
+            }
+        }
+        free(dW_temp);
+    }
+
+    /* db: column-sum of grd over rows (axis 0). dbd[co] += sum_m grd[m, co] */
+    if (dbd) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t co = 0; co < Cout; co++) {
+            float sum = 0.0f;
+            for (int64_t m = 0; m < M; m++) sum += grd[m * Cout + co];
+            dbd[co] += sum;
+        }
+    }
+
+    /* dX: input grad. dcol [M, K] = grd [M, Cout] @ wt_nhwc^T [Cout, K]
+       use gemm_nt(grd, wt_nhwc, dcol) — wt_nhwc is [K, Cout] so to take its
+       transpose we want gemm where B is treated as transposed. wt_nhwc as
+       [K, Cout] and we need B^T [Cout, K]. so gemm_nt(grd [M, Cout], wt_nhwc [K, Cout])
+       computes grd @ wt_nhwc^T = [M, K]. ✓ */
+    if (dxd) {
+        refresh_wt_nhwc(s, wd, Cout, Cin, kh, kw, weight_gen);
+        if (!s->wt_nhwc) return;
+        float *cd = (float *)s->im2col_nhwc->storage->data;
+        ax_storage_t a_st, b_st, c_st;
+        ax_tensor_t  a_tv, b_tv, c_tv;
+        make_stack_view(&a_tv, &a_st, (float *)grd, M, Cout);
+        make_stack_view(&b_tv, &b_st, (float *)s->wt_nhwc->storage->data, K, Cout);
+        make_stack_view(&c_tv, &c_st, cd, M, K);
+        if (ax_compute_gemm_nt(&a_tv, &b_tv, &c_tv) != AX_OK) return;
+
+        /* col2im_nhwc accumulates into dxd; dxd is pre-zeroed by caller. */
+        col2im_nhwc(cd, N, H, W, Cin, kh, kw, sh, sw, ph, pw, out_h, out_w, dxd);
+    }
+}
+
 static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
 {
     ax_conv2d_t *conv = (ax_conv2d_t *)self;
 
     if (input->ndim != 4)
     {
-        ax_err_set(AX_ERR_SHAPE_MISMATCH, "conv2d expects [N, C, H, W] input");
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "conv2d expects 4D input");
         return NULL;
     }
 
@@ -1733,10 +2098,13 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_tensor_t *inp = ax_ensure_contiguous(input);
     if (!inp) return NULL;
 
-    int64_t N = inp->shape[0];
-    int64_t C_in = inp->shape[1];
-    int64_t H = inp->shape[2];
-    int64_t W = inp->shape[3];
+    ax_layout_t layout = ax_tensor_get_layout(input);
+    int64_t N, C_in, H, W;
+    if (layout == AX_LAYOUT_NHWC) {
+        N = inp->shape[0]; H = inp->shape[1]; W = inp->shape[2]; C_in = inp->shape[3];
+    } else {
+        N = inp->shape[0]; C_in = inp->shape[1]; H = inp->shape[2]; W = inp->shape[3];
+    }
     int64_t C_out = conv->out_channels;
     int kh = conv->kernel_h, kw = conv->kernel_w;
     int sh = conv->stride_h, sw = conv->stride_w;
@@ -1753,13 +2121,17 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     /* reshape weight to [C_out, C_in*kh*kw] for gemm */
     int64_t K = C_in * kh * kw;
     int64_t M = out_h * out_w;
-    int64_t out_shape[] = {N, C_out, out_h, out_w};
+    /* layout-aware output shape. */
+    int64_t out_shape_nchw[] = {N, C_out, out_h, out_w};
+    int64_t out_shape_nhwc[] = {N, out_h, out_w, C_out};
+    const int64_t *out_shape = (layout == AX_LAYOUT_NHWC) ? out_shape_nhwc : out_shape_nchw;
     /* every conv path below writes the full output (direct/smallcin fold bias
        into init; gemm paths copy res→od overwriting all elements). skip the
        zero pass — saves a full output-buffer write (~410 MB on
        conv_32x3x224x224 → 32x64x224x224). */
     ax_tensor_t *output = ax_tensor_create(out_shape, 4, AX_FLOAT32);
     if (!output) { if (inp != input) ax_tensor_destroy(inp); return NULL; }
+    output->layout = layout;
 
     float *od = (float *)output->storage->data;
     float *wd = (float *)conv->weight->storage->data;
@@ -1768,6 +2140,34 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     bool need_bwd = ax_grad_enabled() && (input->requires_grad || conv->weight->requires_grad);
     struct ax_conv_scratch *s = ensure_scratch(conv, N, H, W, need_bwd);
     if (!s) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
+
+    /* NHWC fast path: dedicated im2col_nhwc + GEMM with cached transposed weight. */
+    if (layout == AX_LAYOUT_NHWC) {
+        uint64_t wgen = conv->weight->storage->generation;
+        int rc = conv2d_nhwc_forward_impl(s,
+            (const float *)inp->storage->data,
+            wd, conv->use_bias && conv->bias ? (const float *)conv->bias->storage->data : NULL,
+            od, N, C_in, H, W, C_out, out_h, out_w,
+            kh, kw, sh, sw, ph, pw, wgen);
+        if (rc != 0) { if (inp != input) ax_tensor_destroy(inp); ax_tensor_destroy(output); return NULL; }
+
+        /* hook up backward if needed */
+        if (ax_grad_enabled() && (input->requires_grad || conv->weight->requires_grad
+                                   || (conv->use_bias && conv->bias && conv->bias->requires_grad))) {
+            output->requires_grad = true;
+            ax_grad_fn_t *gf = ax_grad_fn_create(conv2d_backward);
+            gf->inputs[0] = input;
+            gf->n_inputs = 1;
+            gf->saved[0] = inp;
+            gf->saved_owned[0] = (inp != input);
+            gf->n_saved = 1;
+            gf->ctx = conv;
+            output->grad_fn = gf;
+        } else {
+            if (inp != input) ax_tensor_destroy(inp);
+        }
+        return output;
+    }
 
     /* refresh w2d from current weights (they change every training step) */
     ax_tensor_t *w2d = s->w2d;
