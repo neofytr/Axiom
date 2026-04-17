@@ -45,6 +45,12 @@ typedef struct ax_tensor {
     bool requires_grad;
     struct ax_tensor *grad;
     void *grad_fn;                     /* opaque pointer to grad function */
+
+    /* layout hint for 4D image tensors. defaults to AX_LAYOUT_NCHW (=0) for
+       backward compat — calloc/memset(0) leaves it correct. layers that care
+       about layout (Conv2d, Pool2d, BatchNorm2d) inspect this to dispatch
+       to the right kernel. ignored for ndim != 4. */
+    ax_layout_t layout;
 } ax_tensor_t;
 
 #ifdef __cplusplus
@@ -155,6 +161,32 @@ static inline ax_tensor_t *ax_ensure_contiguous(ax_tensor_t *t) {
     if (ax_tensor_is_contiguous(t) && t->offset == 0) return t;
     return ax_tensor_contiguous(t);
 }
+
+/* layout management (only meaningful for 4D image tensors) */
+
+/* get the layout hint for a 4D image tensor. returns AX_LAYOUT_NCHW for
+   non-4D tensors (default / no meaningful layout). */
+static inline ax_layout_t ax_tensor_get_layout(const ax_tensor_t *t) {
+    return t ? t->layout : AX_LAYOUT_NCHW;
+}
+
+/* tag a tensor with a layout hint. does NOT transpose data — only updates
+   the metadata. caller must ensure the underlying memory order matches the
+   declared layout (i.e. for AX_LAYOUT_NHWC: shape must be [N, H, W, C] with
+   contiguous channels-last memory). use ax_tensor_to_nhwc / to_nchw for
+   the data-moving conversion. */
+static inline void ax_tensor_set_layout(ax_tensor_t *t, ax_layout_t layout) {
+    if (t) t->layout = layout;
+}
+
+/* convert tensor to NHWC layout (transpose if currently NCHW; no-op + retain
+   if already NHWC). returns a NEW tensor; caller frees both. always
+   contiguous in the new layout. ndim must be 4 — returns NULL otherwise. */
+ax_tensor_t *ax_tensor_to_nhwc(ax_tensor_t *t);
+
+/* convert tensor to NCHW layout (transpose if NHWC; no-op + retain if
+   already NCHW). returns a NEW tensor; caller frees both. ndim must be 4. */
+ax_tensor_t *ax_tensor_to_nchw(ax_tensor_t *t);
 
 /* device management */
 

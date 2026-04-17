@@ -250,6 +250,63 @@ static void test_dtype_utils(void) {
     AX_TEST_ASSERT(strcmp(ax_dtype_name(AX_BOOL), "bool") == 0, "bool name");
 }
 
+/* layout: NCHW <-> NHWC round-trip preserves data, default layout is NCHW. */
+static void test_tensor_layout_roundtrip(void) {
+    int64_t sh[] = {2, 4, 3, 5};  /* N=2, C=4, H=3, W=5 */
+    ax_tensor_t *nchw = ax_tensor_create(sh, 4, AX_FLOAT32);
+    AX_TEST_ASSERT(nchw != NULL, "create NCHW tensor");
+    AX_TEST_ASSERT(ax_tensor_get_layout(nchw) == AX_LAYOUT_NCHW, "default layout is NCHW");
+
+    /* fill with i for nchw[n, c, h, w] = encode(n, c, h, w) */
+    float *d = (float *)nchw->storage->data;
+    int64_t N = sh[0], C = sh[1], H = sh[2], W = sh[3];
+    for (int64_t n = 0; n < N; n++)
+        for (int64_t c = 0; c < C; c++)
+            for (int64_t h = 0; h < H; h++)
+                for (int64_t w = 0; w < W; w++)
+                    d[((n * C + c) * H + h) * W + w] = (float)(((n * C + c) * H + h) * W + w);
+
+    /* convert to NHWC */
+    ax_tensor_t *nhwc = ax_tensor_to_nhwc(nchw);
+    AX_TEST_ASSERT(nhwc != NULL, "convert to NHWC");
+    AX_TEST_ASSERT(ax_tensor_get_layout(nhwc) == AX_LAYOUT_NHWC, "layout flag is NHWC");
+    AX_TEST_ASSERT_EQ(nhwc->shape[0], N, "N preserved");
+    AX_TEST_ASSERT_EQ(nhwc->shape[1], H, "H is dim 1 in NHWC");
+    AX_TEST_ASSERT_EQ(nhwc->shape[2], W, "W is dim 2 in NHWC");
+    AX_TEST_ASSERT_EQ(nhwc->shape[3], C, "C is dim 3 in NHWC");
+
+    /* verify data placement: nhwc[n, h, w, c] should equal nchw[n, c, h, w] */
+    float *nd = (float *)nhwc->storage->data;
+    for (int64_t n = 0; n < N; n++)
+        for (int64_t h = 0; h < H; h++)
+            for (int64_t w = 0; w < W; w++)
+                for (int64_t c = 0; c < C; c++) {
+                    float expected = (float)(((n * C + c) * H + h) * W + w);
+                    float actual = nd[((n * H + h) * W + w) * C + c];
+                    AX_TEST_ASSERT_NEAR(actual, expected, 0.0f, "NHWC data matches NCHW source");
+                }
+
+    /* round-trip back */
+    ax_tensor_t *nchw2 = ax_tensor_to_nchw(nhwc);
+    AX_TEST_ASSERT(nchw2 != NULL, "convert back to NCHW");
+    AX_TEST_ASSERT(ax_tensor_get_layout(nchw2) == AX_LAYOUT_NCHW, "layout flag is NCHW");
+    AX_TEST_ASSERT_EQ(nchw2->shape[1], C, "C is dim 1 again");
+
+    float *d2 = (float *)nchw2->storage->data;
+    for (int64_t i = 0; i < N * C * H * W; i++)
+        AX_TEST_ASSERT_NEAR(d2[i], d[i], 0.0f, "round-trip exact");
+
+    /* idempotent: NHWC -> NHWC is no-op */
+    ax_tensor_t *nhwc2 = ax_tensor_to_nhwc(nhwc);
+    AX_TEST_ASSERT(nhwc2 != NULL, "NHWC -> NHWC");
+    AX_TEST_ASSERT(ax_tensor_get_layout(nhwc2) == AX_LAYOUT_NHWC, "layout still NHWC");
+
+    ax_tensor_destroy(nhwc2);
+    ax_tensor_destroy(nchw2);
+    ax_tensor_destroy(nhwc);
+    ax_tensor_destroy(nchw);
+}
+
 int main(void) {
     ax_init();
 
@@ -265,6 +322,7 @@ int main(void) {
     AX_RUN_TEST(test_tensor_transpose);
     AX_RUN_TEST(test_tensor_squeeze_unsqueeze);
     AX_RUN_TEST(test_tensor_contiguous);
+    AX_RUN_TEST(test_tensor_layout_roundtrip);
     AX_RUN_TEST(test_dtype_utils);
 
     ax_shutdown();

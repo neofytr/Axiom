@@ -71,6 +71,25 @@ typedef enum {
     AX_DEVICE_COUNT
 } ax_device_t;
 
+/* memory layout hint for 4D image tensors (N, C, H, W). meaningful only for
+   ndim==4 tensors flowing through conv/pool/bn/etc.; ignored for other ranks.
+   defaults to NCHW for backward compat. NHWC enables better SIMD for
+   pool/bn/elementwise where channels are the innermost dim, and is preferred
+   on cpu for vision workloads with large channel counts (≥32). */
+typedef enum {
+    AX_LAYOUT_NCHW = 0,  /* default; [N, C, H, W] for 4D tensors */
+    AX_LAYOUT_NHWC = 1,  /* [N, H, W, C] — channels innermost */
+    AX_LAYOUT_COUNT
+} ax_layout_t;
+
+static inline const char *ax_layout_name(ax_layout_t l) {
+    static const char *names[] = {
+        [AX_LAYOUT_NCHW] = "NCHW",
+        [AX_LAYOUT_NHWC] = "NHWC",
+    };
+    return (l < AX_LAYOUT_COUNT) ? names[l] : "unknown";
+}
+
 /* returns human-readable name for a status code */
 static inline const char *ax_status_name(ax_status_t s) {
     static const char *names[] = {

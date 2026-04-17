@@ -854,6 +854,112 @@ ax_tensor_t *ax_tensor_contiguous(ax_tensor_t *t) {
    both functions route through the owning backend's vtable. core has no
    idea how the device memory is actually allocated or copied. */
 
+/* generic 2D row-major transpose: in [R, C] → out [C, R].
+   uses 8x8 cache-friendly tiles where possible to minimize TLB / cache thrash;
+   scalar tail handles non-multiple-of-8 dims. caller must ensure out has
+   capacity R*C floats. */
+static void transpose_2d_f32(const float *in, int64_t R, int64_t C, float *out)
+{
+    const int64_t TS = 8;
+    int64_t R_tile = R - (R % TS);
+    int64_t C_tile = C - (C % TS);
+    /* main tile region */
+    for (int64_t r0 = 0; r0 < R_tile; r0 += TS) {
+        for (int64_t c0 = 0; c0 < C_tile; c0 += TS) {
+            for (int64_t i = 0; i < TS; i++)
+                for (int64_t j = 0; j < TS; j++)
+                    out[(c0 + j) * R + (r0 + i)] = in[(r0 + i) * C + (c0 + j)];
+        }
+        /* C tail for this r-tile */
+        for (int64_t c = C_tile; c < C; c++)
+            for (int64_t i = 0; i < TS; i++)
+                out[c * R + (r0 + i)] = in[(r0 + i) * C + c];
+    }
+    /* R tail */
+    for (int64_t r = R_tile; r < R; r++)
+        for (int64_t c = 0; c < C; c++)
+            out[c * R + r] = in[r * C + c];
+}
+
+/* convert NCHW tensor [N, C, H, W] to NHWC [N, H, W, C] via per-sample
+   transpose of the [C, H*W] subblock to [H*W, C]. always returns a NEW
+   contiguous tensor with layout=AX_LAYOUT_NHWC. fast no-op (returns view+
+   layout=NHWC) when input is already NHWC. */
+ax_tensor_t *ax_tensor_to_nhwc(ax_tensor_t *t) {
+    if (!t) return NULL;
+    if (t->ndim != 4) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "ax_tensor_to_nhwc: requires ndim==4");
+        return NULL;
+    }
+    if (t->layout == AX_LAYOUT_NHWC) {
+        ax_tensor_t *v = ax_tensor_view(t);
+        if (v) v->layout = AX_LAYOUT_NHWC;
+        return v;
+    }
+    if (t->dtype != AX_FLOAT32) {
+        ax_err_set(AX_ERR_DTYPE_MISMATCH, "ax_tensor_to_nhwc: float32 only for now");
+        return NULL;
+    }
+
+    int64_t N = t->shape[0], C = t->shape[1], H = t->shape[2], W = t->shape[3];
+    int64_t HW = H * W;
+    int64_t out_shape[] = {N, H, W, C};
+    ax_tensor_t *out = ax_tensor_create(out_shape, 4, AX_FLOAT32);
+    if (!out) return NULL;
+
+    ax_tensor_t *src = ax_ensure_contiguous(t);
+    if (!src) { ax_tensor_destroy(out); return NULL; }
+
+    const float *in = (const float *)src->storage->data + src->offset;
+    float *od = (float *)out->storage->data;
+    /* per-sample [C, HW] → [HW, C] */
+    for (int64_t n = 0; n < N; n++)
+        transpose_2d_f32(in + n * C * HW, C, HW, od + n * HW * C);
+
+    if (src != t) ax_tensor_destroy(src);
+    out->layout = AX_LAYOUT_NHWC;
+    return out;
+}
+
+/* convert NHWC tensor [N, H, W, C] to NCHW [N, C, H, W] via per-sample
+   transpose. inverse of ax_tensor_to_nhwc. */
+ax_tensor_t *ax_tensor_to_nchw(ax_tensor_t *t) {
+    if (!t) return NULL;
+    if (t->ndim != 4) {
+        ax_err_set(AX_ERR_SHAPE_MISMATCH, "ax_tensor_to_nchw: requires ndim==4");
+        return NULL;
+    }
+    if (t->layout == AX_LAYOUT_NCHW) {
+        ax_tensor_t *v = ax_tensor_view(t);
+        if (v) v->layout = AX_LAYOUT_NCHW;
+        return v;
+    }
+    if (t->dtype != AX_FLOAT32) {
+        ax_err_set(AX_ERR_DTYPE_MISMATCH, "ax_tensor_to_nchw: float32 only for now");
+        return NULL;
+    }
+
+    /* NHWC shape is [N, H, W, C] */
+    int64_t N = t->shape[0], H = t->shape[1], W = t->shape[2], C = t->shape[3];
+    int64_t HW = H * W;
+    int64_t out_shape[] = {N, C, H, W};
+    ax_tensor_t *out = ax_tensor_create(out_shape, 4, AX_FLOAT32);
+    if (!out) return NULL;
+
+    ax_tensor_t *src = ax_ensure_contiguous(t);
+    if (!src) { ax_tensor_destroy(out); return NULL; }
+
+    const float *in = (const float *)src->storage->data + src->offset;
+    float *od = (float *)out->storage->data;
+    /* per-sample [HW, C] → [C, HW] */
+    for (int64_t n = 0; n < N; n++)
+        transpose_2d_f32(in + n * HW * C, HW, C, od + n * C * HW);
+
+    if (src != t) ax_tensor_destroy(src);
+    out->layout = AX_LAYOUT_NCHW;
+    return out;
+}
+
 ax_tensor_t *ax_tensor_to_cuda(ax_tensor_t *t) {
     if (!t) return NULL;
     if (t->storage->device == AX_DEVICE_CUDA)
