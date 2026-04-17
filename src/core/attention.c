@@ -174,6 +174,48 @@ static void head_interleave_qkv_split(const float *src,
     }
 }
 
+/* fused split + bias add: same as head_interleave_qkv_split but adds the
+   per-channel bias to each element on-the-fly. eliminates the separate
+   bias-add pass over qkv (save 12 MB of L3↔L1 traffic at B=1 S=512 D=1024).
+   bias layout: [3D] = [bq[D] | bk[D] | bv[D]]. */
+static void head_interleave_qkv_split_bias(const float *src, const float *bias,
+                                            float *dstQ, float *dstK, float *dstV,
+                                            int64_t B, int64_t S, int64_t H, int64_t dk,
+                                            int64_t D)
+{
+    int64_t src_cols = 3 * D;
+    int64_t TC = AX_VF32_WIDTH;
+    int64_t ve = dk - (dk % TC);
+#ifdef _OPENMP
+    #pragma omp parallel for collapse(2) schedule(static)
+#endif
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t h = 0; h < H; h++) {
+            const float *bQ_h = bias + h * dk;             /* bq slice for this head */
+            const float *bK_h = bias + D + h * dk;
+            const float *bV_h = bias + 2 * D + h * dk;
+            for (int64_t s = 0; s < S; s++) {
+                const float *src_row = src + ((b * S) + s) * src_cols + h * dk;
+                int64_t dst_off = (((b * H) + h) * S + s) * dk;
+                float *dQ = dstQ + dst_off;
+                float *dK = dstK + dst_off;
+                float *dV = dstV + dst_off;
+                int64_t i = 0;
+                for (; i < ve; i += TC) {
+                    ax_vf32_storeu(dQ + i, ax_vf32_add(ax_vf32_loadu(src_row +       i), ax_vf32_loadu(bQ_h + i)));
+                    ax_vf32_storeu(dK + i, ax_vf32_add(ax_vf32_loadu(src_row + D   + i), ax_vf32_loadu(bK_h + i)));
+                    ax_vf32_storeu(dV + i, ax_vf32_add(ax_vf32_loadu(src_row + 2*D + i), ax_vf32_loadu(bV_h + i)));
+                }
+                for (; i < dk; i++) {
+                    dQ[i] = src_row[i] + bQ_h[i];
+                    dK[i] = src_row[D + i] + bK_h[i];
+                    dV[i] = src_row[2*D + i] + bV_h[i];
+                }
+            }
+        }
+    }
+}
+
 /* rebuild Wqkv_cache [D, 3D] and bqkv_cache [3D] from Wq/Wk/Wv/bq/bk/bv
    if any of the source generations have changed since last call. */
 static void refresh_fused_qkv(ax_mha_t *m)
@@ -310,29 +352,11 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     ALLOC_SHAPE(qkv, qkv_sh, 2);
     if (!qkv) goto fail;
     if (ax_compute_gemm(x_flat, m->Wqkv_cache, qkv) != AX_OK) goto fail;
-    if (m->use_bias) {
-        float *qd = (float *)qkv->storage->data;
-        const float *bd = (const float *)m->bqkv_cache->storage->data;
-        int64_t cols = 3 * D;
-        int64_t ce = cols - (cols % AX_VF32_WIDTH);
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if (rows * cols >= ax_par_threshold_elems)
-#endif
-        for (int64_t r = 0; r < rows; r++) {
-            float *row = qd + r * cols;
-            int64_t c = 0;
-            for (; c < ce; c += AX_VF32_WIDTH) {
-                ax_vf32 v = ax_vf32_loadu(row + c);
-                ax_vf32 b = ax_vf32_loadu(bd + c);
-                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
-            }
-            for (; c < cols; c++) row[c] += bd[c];
-        }
-    }
 
     /* ---- head-interleave directly from the fused QKV buffer into
-       Qh/Kh/Vh, skipping intermediate [rows, D] copies. one memory pass
-       per tensor (vs previous two). ---- */
+       Qh/Kh/Vh, with optional bias fused in. eliminates the separate
+       bias_add pass over the [rows, 3D] qkv buffer (saves ~12 MB of
+       L3↔L1 traffic at B=1 S=512 D=1024). ---- */
     int64_t head_sh[] = {B * H, S, dk};
     ax_tensor_t *Qh = NULL, *Kh = NULL, *Vh = NULL;
     ALLOC_SHAPE(Qh, head_sh, 3);
@@ -340,11 +364,20 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     ALLOC_SHAPE(Vh, head_sh, 3);
     if (!Qh || !Kh || !Vh) goto fail;
 
-    head_interleave_qkv_split((const float *)qkv->storage->data,
-                               (float *)Qh->storage->data,
-                               (float *)Kh->storage->data,
-                               (float *)Vh->storage->data,
-                               B, S, H, dk, D);
+    if (m->use_bias) {
+        head_interleave_qkv_split_bias((const float *)qkv->storage->data,
+                                        (const float *)m->bqkv_cache->storage->data,
+                                        (float *)Qh->storage->data,
+                                        (float *)Kh->storage->data,
+                                        (float *)Vh->storage->data,
+                                        B, S, H, dk, D);
+    } else {
+        head_interleave_qkv_split((const float *)qkv->storage->data,
+                                   (float *)Qh->storage->data,
+                                   (float *)Kh->storage->data,
+                                   (float *)Vh->storage->data,
+                                   B, S, H, dk, D);
+    }
 
     /* qkv no longer needed (non-recorded path); arena reclaims it otherwise */
     if (!record) ax_tensor_destroy(qkv);
