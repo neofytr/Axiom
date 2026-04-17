@@ -121,7 +121,11 @@ static void bench_mha_train(const shape_t *s, int iters)
     ax_layer_t *mha = ax_mha_create(D, H, true, false);
     int64_t sh[] = {B, S, D};
     ax_tensor_t *x = ax_tensor_rand(sh, 3, -0.1f, 0.1f);
-    x->requires_grad = true;
+    /* match tf_mha.py bench_mha_train: x is a constant (no requires_grad),
+       only weight grads via tape.gradient(loss, mha.trainable_variables).
+       skipping dX makes the comparison apples-to-apples — Axiom's MHA
+       backward already short-circuits dX when input->requires_grad is
+       false (see step 6 in mha_backward in src/core/attention.c). */
 
     /* warm up */
     ax_tensor_t *out = ax_layer_forward(mha, x);
