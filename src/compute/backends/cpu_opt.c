@@ -406,6 +406,14 @@ static ax_status_t opt_mul_scalar(const ax_tensor_t *in, double scalar, ax_tenso
 #define AX_GEMM_DEFAULT_KC 256
 #endif
 
+/* per-call max KC: when k fits, use kc=k (single pc tile) to avoid the
+   pc-loop pack_b redundancy. pack buffers are sized for AX_GEMM_MAX_KC.
+   keep at 2× default so per-thread pack_b stays in L3 budget for hybrid
+   16-thread CPUs (256*512*4 = 512 KB × 16 = 8 MB ≤ 80% × 18 MB L3). */
+#ifndef AX_GEMM_MAX_KC
+#define AX_GEMM_MAX_KC 512
+#endif
+
 static int64_t GEMM_MC = AX_GEMM_DEFAULT_MC;
 static int64_t GEMM_NC = AX_GEMM_DEFAULT_NC;
 static int64_t GEMM_KC = AX_GEMM_DEFAULT_KC;
@@ -873,9 +881,14 @@ static __attribute__((constructor)) void ax_cpu_opt_ctor(void) {
 
 /* lazily allocate this thread's pack_a and pack_b buffers (once per thread) */
 static bool ensure_tl_pack_bufs(void) {
+    /* size buffers for AX_GEMM_MAX_KC so per-call kc_eff can grow up to that
+       limit when k fits in a single pc tile. costs extra memory for shapes
+       that don't use the larger KC (~2× over a strict-fit allocation), but
+       eliminates a heap re-alloc when adaptive KC kicks in. */
+    int64_t kc_alloc = (GEMM_KC > AX_GEMM_MAX_KC) ? GEMM_KC : AX_GEMM_MAX_KC;
     if (!tl_pack_a_buf) {
-        size_t pa = (size_t)GEMM_MC * (size_t)GEMM_KC;
-        if (pa / (size_t)GEMM_MC != (size_t)GEMM_KC) return false; /* overflow */
+        size_t pa = (size_t)GEMM_MC * (size_t)kc_alloc;
+        if (pa / (size_t)GEMM_MC != (size_t)kc_alloc) return false; /* overflow */
         if (pa > SIZE_MAX / sizeof(float)) return false;
         tl_pack_a_buf = (float *)ax_aligned_alloc(pa * sizeof(float), 64);
     }
@@ -885,8 +898,8 @@ static bool ensure_tl_pack_bufs(void) {
            pack_b writes ceil(NC/NR)*NR floats per KC row. without the
            round-up the buffer overflows. */
         size_t nc_rounded = (size_t)((GEMM_NC + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-        size_t pb = nc_rounded * (size_t)GEMM_KC;
-        if (pb / nc_rounded != (size_t)GEMM_KC) return false;
+        size_t pb = nc_rounded * (size_t)kc_alloc;
+        if (pb / nc_rounded != (size_t)kc_alloc) return false;
         if (pb > SIZE_MAX / sizeof(float)) return false;
         tl_pack_b_buf = (float *)ax_aligned_alloc(pb * sizeof(float), 64);
     }
@@ -1570,6 +1583,12 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
 
+    /* adaptive KC: when k fits in AX_GEMM_MAX_KC, use kc_eff=k (single pc tile)
+       to halve pack_b launches on shapes like dense_*_S128 with k=512 or
+       conv 3x3 with K=576-1024. pack buffers are sized for AX_GEMM_MAX_KC so
+       no realloc; if k > AX_GEMM_MAX_KC fall back to the original GEMM_KC. */
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
+
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
     int64_t n_ic_tiles = (m + GEMM_MC - 1) / GEMM_MC;
@@ -1632,8 +1651,8 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 pack_b_cached(bd + pc * n + jc, b->storage->generation, n, kc, nc_pack, nc, jc, pc);
 
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
@@ -1664,8 +1683,8 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 int64_t mc = m;  /* whole m fits since m <= GEMM_MC */
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
@@ -1703,8 +1722,8 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 /* serial/IC path: pack_b target is tl_pack_b_buf of the calling thread. */
                 pack_b_cached(bd + pc * n + jc, b->storage->generation, n, kc, nc_pack, nc, jc, pc);
                 const float *pack_b_buf = main_pack_b;  /* shared read-only in parallel region */
@@ -1927,12 +1946,15 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
     float *pack_a_buf = tl_pack_a_buf;
     float *pack_b_buf = tl_pack_b_buf;
 
+    /* adaptive KC: same logic as opt_gemm — single pc tile when k fits */
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
+
     for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
         int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
         int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
 
-        for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-            int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+        for (int64_t pc = 0; pc < k; pc += kc_max) {
+            int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
 
             /* gather B directly from input image */
             pack_b_im2col(params, kc, nc_pack, nc, jc, pc, pack_b_buf);
@@ -2428,6 +2450,8 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
+    /* adaptive KC: see opt_gemm */
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
     int64_t n_ic_tiles = (m + GEMM_MC - 1) / GEMM_MC;
@@ -2464,8 +2488,8 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
             int64_t jc = jct * nc_eff;
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, pack_b_buf);
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
@@ -2488,8 +2512,8 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
         for (int64_t jc = 0; jc < n; jc += nc_eff) {
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 int64_t mc = m;
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
                 pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, main_pack_b);
@@ -2517,8 +2541,8 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
         for (int64_t jc = 0; jc < n; jc += nc_eff) {
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, main_pack_b);
                 const float *pack_b_buf = main_pack_b;
                 #ifdef _OPENMP
@@ -2599,6 +2623,8 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
+    /* adaptive KC: see opt_gemm */
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
     int64_t n_ic_tiles = (m + GEMM_MC - 1) / GEMM_MC;
@@ -2638,8 +2664,8 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
             int64_t jc = jct * nc_eff;
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
@@ -2663,8 +2689,8 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
         for (int64_t jc = 0; jc < n; jc += nc_eff) {
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 int64_t mc = m;
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
                 pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, main_pack_b);
@@ -2694,8 +2720,8 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
         for (int64_t jc = 0; jc < n; jc += nc_eff) {
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-            for (int64_t pc = 0; pc < k; pc += GEMM_KC) {
-                int64_t kc = (pc + GEMM_KC <= k) ? GEMM_KC : (k - pc);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, main_pack_b);
                 const float *pack_b_buf = main_pack_b;
                 #ifdef _OPENMP
