@@ -452,6 +452,56 @@ static void im2col_into(const float *id, int64_t C, int64_t H, int64_t W,
         return;
     }
 
+    /* stride_w == 2 SIMD fast path: extract every-other input column via
+       shuffle. for each block of 8 outputs, load 16 contiguous input floats
+       and pack the even-indexed ones into one SIMD register. closes the
+       gap on stride-2 conv shapes (e.g. conv_64x112_128_s2) where the
+       scalar fallback was a measured bottleneck. */
+#if defined(AX_SIMD_AVX2) && AX_VF32_WIDTH == 8
+    if (stride_w == 2)
+    {
+        const __m256i extract_evens = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+        for (int64_t c = 0; c < C; c++) {
+            for (int ky = 0; ky < kh; ky++) {
+                for (int kx = 0; kx < kw; kx++) {
+                    const int64_t iw_start = (int64_t)kx - (int64_t)pad_w;
+                    for (int64_t oh = 0; oh < out_h; oh++) {
+                        const int64_t ih = oh * stride_h - pad_h + ky;
+                        float *dst_row = cd + col_idx * M + oh * out_w;
+                        if (ih < 0 || ih >= H) {
+                            memset(dst_row, 0, (size_t)out_w * sizeof(float));
+                            continue;
+                        }
+                        const float *src_row = id + c * H * W + ih * W;
+                        int64_t ow = 0;
+                        for (; ow + 8 <= out_w; ow += 8) {
+                            int64_t iw_first = iw_start + 2 * ow;
+                            if (iw_first >= 0 && iw_first + 16 <= W) {
+                                __m256 a = _mm256_loadu_ps(src_row + iw_first);
+                                __m256 b = _mm256_loadu_ps(src_row + iw_first + 8);
+                                __m256 t = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+                                __m256 r = _mm256_permutevar8x32_ps(t, extract_evens);
+                                _mm256_storeu_ps(dst_row + ow, r);
+                            } else {
+                                for (int64_t b8 = 0; b8 < 8; b8++) {
+                                    int64_t iw = iw_start + 2 * (ow + b8);
+                                    dst_row[ow + b8] = (iw >= 0 && iw < W) ? src_row[iw] : 0.0f;
+                                }
+                            }
+                        }
+                        for (; ow < out_w; ow++) {
+                            int64_t iw = iw_start + 2 * ow;
+                            dst_row[ow] = (iw >= 0 && iw < W) ? src_row[iw] : 0.0f;
+                        }
+                    }
+                    col_idx++;
+                }
+            }
+        }
+        return;
+    }
+#endif
+
     /* fallback: fully general scalar gather for strided width. */
     for (int64_t c = 0; c < C; c++)
     {
