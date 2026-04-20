@@ -152,6 +152,25 @@ set(AXIOM_SOURCES
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
 )
+
+# JIT encoders. x86_64 path emits VEX/EVEX, arm64 path emits A64.
+# the encoders themselves are pure C (no SIMD intrinsics) — they just
+# write machine bytes. ALL encoders compile on every host so byte-level
+# tests can verify encodings even when the bytes won't execute. the
+# kernel-emitter wrappers (jit_gemm_*) compile per host ISA so the
+# (per-thread, pthread_once-protected) cached fn-ptr only points at
+# bytes the host can actually run.
+list(APPEND AXIOM_SOURCES src/compute/backends/jit_arm64.c)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    list(APPEND AXIOM_SOURCES
+        src/compute/backends/jit_x64.c
+        src/compute/backends/jit_gemm_avx2.c
+        src/compute/backends/jit_gemm_avx512.c
+    )
+endif()
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    list(APPEND AXIOM_SOURCES src/compute/backends/jit_gemm_neon.c)
+endif()
 # cpu_opt goes in directly under single-build, or via dual object
 # libraries under AX_CPU_ISA_DISPATCH. see the isa-dispatch block
 # below.
@@ -315,6 +334,18 @@ set(TEST_SOURCES
     tests/test_norm.c
     tests/test_cuda.c
 )
+
+# JIT correctness tests. byte-level tests run on every host (independent
+# of execution); execution tests only on x86_64 since this dev box can run
+# AVX2 emitted code.
+list(APPEND TEST_SOURCES tests/test_jit_arm64_bytes.c)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    list(APPEND TEST_SOURCES
+        tests/test_jit_x64.c
+        tests/test_jit_gemm.c
+        tests/test_jit_avx512_bytes.c
+    )
+endif()
 
 # training-only tests: anything that calls ax_backward, optimizers,
 # losses, model_compile, model_train_step, tensor_save, or model_save.

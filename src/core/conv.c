@@ -1695,9 +1695,16 @@ static inline bool can_direct_smallcin(int kh, int kw, int sh, int sw,
        of inner loop time. */
 static inline bool prefer_implicit_gemm(int64_t K, int64_t M)
 {
+    /* implicit gemm gathers im2col patches on-the-fly inside pack_b,
+       avoiding the large materialized [K, M] column buffer. wins when
+       the buffer would exceed L3 (or a meaningful chunk of it) so the
+       explicit im2col write+read pair doubles bandwidth.
+       per-sample im2col bytes = K*M*4. 6 MB is above L1+L2 on typical
+       desktops, low enough to catch shapes like 576*3136*4 = 7.2 MB
+       (the conv_64x112_128_s2 case). */
     if (K >= 1024 && M >= 256) return true;
     int64_t im2col_bytes = K * M * (int64_t)sizeof(float);
-    return im2col_bytes > (int64_t)(8 * 1024 * 1024) && K >= 512 && M >= 256;
+    return im2col_bytes > (int64_t)(6 * 1024 * 1024) && K >= 256 && M >= 256;
 }
 
 /* winograd F(2,3) forward kernel for the whole batch.

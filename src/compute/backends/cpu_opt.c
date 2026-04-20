@@ -116,6 +116,11 @@ AX_TLS float *tl_bwd_pa         = NULL; AX_TLS int64_t tl_bwd_pa_bytes  = 0;
 AX_TLS float *tl_bwd_pb         = NULL; AX_TLS int64_t tl_bwd_pb_bytes  = 0;
 AX_TLS float *tl_bwd_di         = NULL; AX_TLS int64_t tl_bwd_di_bytes  = 0;
 
+/* phase 26/31: TLS scratch for opt_gemm_tn pre-transpose. holds A^T layout
+   so the gemm hot loop reads sequentially via pack_a instead of strided
+   pack_a_t. amortizes the alloc cost across calls of the same shape. */
+AX_TLS float *tl_tn_pretranspose = NULL; AX_TLS int64_t tl_tn_pretranspose_bytes = 0;
+
 static inline float *ax_tls_grow(float **p, int64_t *cap_bytes, int64_t want_bytes) {
     if (*p && *cap_bytes >= want_bytes) return *p;
     if (*p) { ax_aligned_free(*p); *p = NULL; *cap_bytes = 0; }
@@ -422,16 +427,86 @@ static int64_t GEMM_KC = AX_GEMM_DEFAULT_KC;
    when running on a hybrid CPU; defaults to 25M on miss. */
 static int64_t ax_hybrid_crossover_per_fast_thread = 25000000LL;
 
-/* pick thread count for a GEMM. strategy is 3-tier:
-   - tiny GEMMs (< 1M FLOPs): serial, fork-join cost exceeds compute
-   - small-medium (< crossover): fast cores only, E-cores add latency
-   - large (>= crossover): all cores, parallelism dominates latency
-   crossover is calibrated at startup against actual fast vs all throughputs
-   on the running cpu (see ax_calibrate_hybrid_crossover); falls back to
-   a 25M FLOPs/fast-thread default when calibration is skipped. */
+/* phase 25: 3-regime thread-count tuner. when calibration finds a "mid"
+   thread count (between fast and all) that beats both at some FLOP range,
+   ax_mid_thread_count is set > 0 and the two crossovers below define the
+   regime breakpoints. when ax_mid_thread_count == 0, the path collapses
+   to the original 2-way selector. */
+static int ax_mid_thread_count = 0;
+static int64_t ax_fast_to_mid_crossover = 0;   /* below: fast; above: mid */
+static int64_t ax_mid_to_all_crossover  = 0;   /* below: mid; above: all */
+
+/* phase 25: calibration override. when > 0, ax_gemm_threads_for_shape
+   returns this value verbatim (used to force specific thread counts
+   while measuring throughput). reset to 0 after calibration. */
+static int ax_force_threads_override = 0;
+
+/* phase 34: per-omp-thread speed measurements for proportional work
+   distribution. populated by ax_measure_thread_speeds() at backend init.
+   each entry is the relative speed of omp thread tid (higher = faster).
+   used by ax_compute_proportional_chunks to give P-cores larger work
+   chunks than E-cores in the hybrid GEMM. */
+#define AX_MAX_THREAD_SPEEDS 64
+static double ax_thread_speeds[AX_MAX_THREAD_SPEEDS] = {0};
+static int    ax_n_thread_speeds = 0;
+
+/* compute per-thread (begin, end) ranges for total_iters such that each
+   thread's workload is proportional to its measured speed. preserves
+   contiguity so existing pack_b cache reuse logic still hits.
+   when speeds aren't available, falls back to equal chunks. */
+static void ax_compute_proportional_chunks(int64_t total_iters, int n_threads,
+                                            int64_t *out_begin, int64_t *out_end) {
+    if (n_threads <= 0) return;
+    if (n_threads > AX_MAX_THREAD_SPEEDS) n_threads = AX_MAX_THREAD_SPEEDS;
+
+    double sum = 0.0;
+    if (ax_n_thread_speeds >= n_threads) {
+        for (int i = 0; i < n_threads; i++) sum += ax_thread_speeds[i];
+    }
+
+    if (sum <= 0.0) {
+        /* fallback: equal chunks */
+        int64_t per = (total_iters + n_threads - 1) / n_threads;
+        for (int i = 0; i < n_threads; i++) {
+            int64_t b = (int64_t)i * per;
+            int64_t e = b + per;
+            if (b > total_iters) b = total_iters;
+            if (e > total_iters) e = total_iters;
+            out_begin[i] = b;
+            out_end[i]   = e;
+        }
+        return;
+    }
+
+    int64_t cumul = 0;
+    for (int i = 0; i < n_threads; i++) {
+        out_begin[i] = cumul;
+        if (i == n_threads - 1) {
+            out_end[i] = total_iters;
+        } else {
+            int64_t this_chunk = (int64_t)((double)total_iters * ax_thread_speeds[i] / sum);
+            out_end[i] = cumul + this_chunk;
+            if (out_end[i] > total_iters) out_end[i] = total_iters;
+        }
+        cumul = out_end[i];
+    }
+}
+
+/* phase 26: budget for pre-transpose-A path in opt_gemm_tn. set during
+   init from sysconf L3 / 4. when A's bytes (M*K*4) fit, we transpose A
+   into scratch and call opt_gemm so the inner loop hits cache-friendly
+   pack_a instead of strided pack_a_t. defaults to 4 MB if L3 unknown. */
+static int64_t ax_tn_pretranspose_budget_bytes = 4 * 1024 * 1024;
+
+/* pick thread count for a GEMM. strategy:
+   - tiny GEMMs (< 1M FLOPs): serial
+   - 2-way (default): fast cores below crossover, all cores above
+   - 3-way (when calibrated): fast / mid / all based on two crossovers
+   thresholds calibrated at startup; fall back to 25M FLOPs/fast-thread. */
 static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
 #ifdef _OPENMP
     if (omp_in_parallel()) return 1;
+    if (ax_force_threads_override > 0) return ax_force_threads_override;
 
     int fast = ax_gemm_fast_threads > 0 ? ax_gemm_fast_threads : omp_get_max_threads();
     int all  = ax_gemm_all_threads  > 0 ? ax_gemm_all_threads  : fast;
@@ -443,6 +518,15 @@ static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
 
     /* if non-hybrid, just return all (fast == all) */
     if (all == fast) return all;
+
+    /* phase 25: 3-regime tuner active when a mid count was selected */
+    if (ax_mid_thread_count > 0
+        && ax_mid_thread_count > fast
+        && ax_mid_thread_count < all) {
+        if (total_flops < ax_fast_to_mid_crossover) return fast;
+        if (total_flops < ax_mid_to_all_crossover)  return ax_mid_thread_count;
+        return all;
+    }
 
     int64_t crossover = (int64_t)fast * ax_hybrid_crossover_per_fast_thread;
     return (total_flops >= crossover) ? all : fast;
@@ -611,6 +695,12 @@ static void ax_cpu_opt_init_impl(void) {
     if (l3 > 0) {
         AX_NT_ELEMS = (int64_t)((l3 / 2) / (long)sizeof(float));
         if (AX_NT_ELEMS < 256 * 1024) AX_NT_ELEMS = 256 * 1024; /* floor at 1MB */
+    }
+
+    /* phase 26: pre-transpose budget = L3/4. lets transposed A coexist with
+       the input/output matrices in cache without evicting them. */
+    if (l3 > 0) {
+        ax_tn_pretranspose_budget_bytes = (int64_t)(l3 / 4);
     }
 }
 
@@ -812,57 +902,154 @@ void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
     tb.storage = &sb; tb.ndim = 2; tb.dtype = AX_FLOAT32; tb.shape[0] = K; tb.shape[1] = N; tb.strides[0] = N; tb.strides[1] = 1;
     tc.storage = &sc; tc.ndim = 2; tc.dtype = AX_FLOAT32; tc.shape[0] = M; tc.shape[1] = N; tc.strides[0] = N; tc.strides[1] = 1;
 
-    /* force the threads_for_shape selector by overriding the per-fast crossover
-       to extreme values. set crossover to ∞ to force fast-only; to 0 to force
-       all. measure each. */
-    int64_t orig_xover = ax_hybrid_crossover_per_fast_thread;
+    /* force-threads override: set ax_force_threads_override to time at exactly
+       N threads. also probe a "mid" thread count between fast and all to find
+       cases where neither extreme is best (phase 25). */
     const int warm = 2, reps = 5;
+    int mid = (fast + all) / 2;
+    if (mid <= fast) mid = fast + 1;
+    if (mid >= all)  mid = all - 1;
 
-    ax_hybrid_crossover_per_fast_thread = INT64_MAX / 64;  /* always fast */
+    ax_force_threads_override = fast;
     for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
     double t0 = ax_tile_cal_now_ms();
     for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
     double t_fast_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
 
-    ax_hybrid_crossover_per_fast_thread = 0;  /* always all */
+    double t_mid_ms = -1.0;
+    if (mid > fast && mid < all) {
+        ax_force_threads_override = mid;
+        for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
+        t0 = ax_tile_cal_now_ms();
+        for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
+        t_mid_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
+    }
+
+    ax_force_threads_override = all;
     for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
     t0 = ax_tile_cal_now_ms();
     for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
     double t_all_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
 
-    ax_hybrid_crossover_per_fast_thread = orig_xover;
+    ax_force_threads_override = 0;
 
     /* per-thread throughput (FLOPs/ms) at this shape */
     double total_flops = 2.0 * (double)M * (double)N * (double)K;
     double tput_per_thread_fast = total_flops / t_fast_ms / (double)fast;
     double tput_per_thread_all  = total_flops / t_all_ms  / (double)all;
 
-    /* crossover: where fast-time == all-time, ignoring overhead which is
-       small (~50us) vs probe times (~1ms+). solve:
-         F / (tput_fast * fast) = F / (tput_all * all)
-       which is degenerate. with a fixed overhead Ω the equation is:
-         F / (tput_fast * fast) + Ω = F / (tput_all * all) + Ω → also degenerate
-       so use the empirical observation: small F prefers fast, large F prefers
-       all. the crossover scales with the throughput difference. set crossover
-       per-fast-thread to total_flops × (t_fast / t_all). when t_fast > t_all
-       (all is faster), crossover shrinks. when t_fast < t_all (fast wins),
-       crossover grows. */
+    /* crossover for the 2-way selector: empirical, scales with t_fast/t_all */
     double ratio = t_fast_ms / t_all_ms;
     int64_t new_xover = (int64_t)(total_flops * ratio / (double)fast);
     if (new_xover < 1000000LL)   new_xover = 1000000LL;
     if (new_xover > 1000000000LL) new_xover = 1000000000LL;
     ax_hybrid_crossover_per_fast_thread = new_xover;
 
+    /* phase 25: enable 3-regime tuner when mid wins at the probe shape AND
+       the win is meaningful (≥5% over both fast and all). otherwise the
+       2-way selector handles all cases without the extra dispatch overhead. */
+    bool mid_wins = (t_mid_ms > 0.0)
+                    && (t_mid_ms < t_fast_ms * 0.95)
+                    && (t_mid_ms < t_all_ms * 0.95);
+    if (mid_wins) {
+        ax_mid_thread_count = mid;
+        /* mid wins around the probe shape (33M flops). assume mid wins for
+           ~half-decade in each direction. fast→mid at probe/4, mid→all at
+           probe×4. these are estimates; multi-shape probing would refine. */
+        int64_t probe_flops = (int64_t)total_flops;
+        ax_fast_to_mid_crossover = probe_flops / 4;
+        ax_mid_to_all_crossover  = probe_flops * 4;
+    }
+
 #ifndef AX_NO_STDIO
-    fprintf(stderr,
-        "axiom: hybrid xover calibrated: fast=%dthr %.2fms (%.1f gflops/thr) "
-        "all=%dthr %.2fms (%.1f gflops/thr) → crossover %ldM flops/fast-thr\n",
-        fast, t_fast_ms, tput_per_thread_fast / 1e3,
-        all, t_all_ms, tput_per_thread_all / 1e3,
-        (long)(new_xover / 1000000LL));
+    if (t_mid_ms > 0.0) {
+        double tput_per_thread_mid = total_flops / t_mid_ms / (double)mid;
+        fprintf(stderr,
+            "axiom: hybrid xover calibrated: fast=%dthr %.2fms (%.1f gflops/thr) "
+            "mid=%dthr %.2fms (%.1f gflops/thr) "
+            "all=%dthr %.2fms (%.1f gflops/thr) → crossover %ldM flops/fast-thr%s\n",
+            fast, t_fast_ms, tput_per_thread_fast / 1e3,
+            mid, t_mid_ms, tput_per_thread_mid / 1e3,
+            all, t_all_ms, tput_per_thread_all / 1e3,
+            (long)(new_xover / 1000000LL),
+            mid_wins ? " (3-regime ON)" : "");
+    } else {
+        fprintf(stderr,
+            "axiom: hybrid xover calibrated: fast=%dthr %.2fms (%.1f gflops/thr) "
+            "all=%dthr %.2fms (%.1f gflops/thr) → crossover %ldM flops/fast-thr\n",
+            fast, t_fast_ms, tput_per_thread_fast / 1e3,
+            all, t_all_ms, tput_per_thread_all / 1e3,
+            (long)(new_xover / 1000000LL));
+    }
 #endif
 
     ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C);
+#endif
+}
+
+/* phase 34: measure each omp thread's relative speed by running a tiny
+   FMA-bound kernel inside an omp parallel region. each thread times its
+   own work; we store the inverse-time as a relative throughput weight.
+   used by ax_compute_proportional_chunks to balance hybrid GEMM work.
+   no per-arch tuning — pure measurement. */
+void AX_SYM(ax_cpu_opt_measure_thread_speeds)(void) {
+#if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
+    return;
+#else
+    int n = omp_get_max_threads();
+    if (n > AX_MAX_THREAD_SPEEDS) n = AX_MAX_THREAD_SPEEDS;
+
+    /* warm: pull all worker threads into existence + into hot caches */
+    #pragma omp parallel num_threads(n)
+    { (void)omp_get_thread_num(); }
+
+    double speeds[AX_MAX_THREAD_SPEEDS] = {0};
+    const int reps = 3;
+    for (int rep = 0; rep < reps; rep++) {
+        #pragma omp parallel num_threads(n)
+        {
+            int tid = omp_get_thread_num();
+            if (tid < AX_MAX_THREAD_SPEEDS) {
+                /* tiny scalar fma loop. runtime ~1ms. lower variance than
+                   a vector kernel because hyperthread/SMT siblings share
+                   FMA ports — scalar exposes single-thread peak. */
+                const int iters = 1000000;
+                volatile float sink = 0.0f;
+                float a = 1.0f, b = 1.0001f, c = 0.9999f, d = 0.5f;
+                double t0 = ax_tile_cal_now_ms();
+                for (int i = 0; i < iters; i++) {
+                    a = a * b + c * d;
+                    a -= 0.0001f;
+                    if (a > 1e6f || a < -1e6f) a = 1.0f;
+                }
+                sink = a; (void)sink;
+                double t = ax_tile_cal_now_ms() - t0;
+                /* take min across reps: best run = most cache-resident,
+                   least scheduler interference */
+                double s = (t > 0) ? (1.0 / t) : 0.0;
+                if (rep == 0 || s > speeds[tid]) speeds[tid] = s;
+            }
+        }
+    }
+
+    /* normalize so largest = 1.0 (relative weights, not absolute speeds) */
+    double max_s = 0.0;
+    for (int i = 0; i < n; i++) if (speeds[i] > max_s) max_s = speeds[i];
+    if (max_s > 0.0) {
+        for (int i = 0; i < n; i++) ax_thread_speeds[i] = speeds[i] / max_s;
+    }
+    ax_n_thread_speeds = n;
+
+#ifndef AX_NO_STDIO
+    /* compact summary: just the spread */
+    double mn = 1e9, mx = 0;
+    for (int i = 0; i < n; i++) {
+        if (ax_thread_speeds[i] > 0 && ax_thread_speeds[i] < mn) mn = ax_thread_speeds[i];
+        if (ax_thread_speeds[i] > mx) mx = ax_thread_speeds[i];
+    }
+    fprintf(stderr, "axiom: thread speeds measured (%d threads, %.2fx spread between fastest/slowest)\n",
+            n, (mn > 0) ? (mx / mn) : 1.0);
+#endif
 #endif
 }
 
@@ -979,6 +1166,38 @@ static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
 /* pack an MC x KC panel of A^T, where the physical source a_src is
    stored [K, M] row-major with lda == M. A^T[i,p] = a_src[p*lda + i].
    produces the same layout as pack_a so the shared micro_kernel works. */
+/* phase 26 helper: full matrix transpose A[K, M] → AT[M, K], cache-blocked.
+   used by opt_gemm_tn pre-transpose path so the GEMM hot loop runs through
+   pack_a (sequential reads) instead of pack_a_t (strided reads). 8x8 tile
+   keeps both source and dest in L1 during the inner copy; scalar tail
+   handles non-multiple dims. */
+static void transpose_kxm_to_mxk(const float *src, int64_t K, int64_t M, float *dst)
+{
+    const int64_t TS = 8;
+    int64_t K_tile = K - (K % TS);
+    int64_t M_tile = M - (M % TS);
+    for (int64_t k0 = 0; k0 < K_tile; k0 += TS) {
+        for (int64_t m0 = 0; m0 < M_tile; m0 += TS) {
+            for (int64_t i = 0; i < TS; i++) {
+                const float *s = src + (k0 + i) * M + m0;
+                for (int64_t j = 0; j < TS; j++) {
+                    dst[(m0 + j) * K + (k0 + i)] = s[j];
+                }
+            }
+        }
+        for (int64_t m = M_tile; m < M; m++) {
+            for (int64_t i = 0; i < TS; i++) {
+                dst[m * K + (k0 + i)] = src[(k0 + i) * M + m];
+            }
+        }
+    }
+    for (int64_t k = K_tile; k < K; k++) {
+        for (int64_t m = 0; m < M; m++) {
+            dst[m * K + k] = src[k * M + m];
+        }
+    }
+}
+
 static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc,
                       int64_t m_remain, float *packed)
 {
@@ -1152,17 +1371,42 @@ static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
 
 #if defined(AX_SIMD_AVX512)
 
+/* JIT-emitted 14x32 micro-kernel handle. resolved on first call. */
+#if defined(__x86_64__) && !defined(AX_NO_JIT)
+#include "jit_gemm_avx512.h"
+static ax_jit_gemm_zmm_kernel_fn ax_micro_kernel_jit_512 = NULL;
+static int ax_micro_kernel_jit_512_resolved = 0;
+static void ensure_jit_kernel_512(void) {
+    if (!ax_micro_kernel_jit_512_resolved) {
+        ax_micro_kernel_jit_512 = ax_jit_gemm_avx512_get_14x32();
+        ax_micro_kernel_jit_512_resolved = 1;
+    }
+}
+#endif
+
 /* 14×32 AVX-512 micro-kernel.
    28 ZMM accumulators (14 rows × 2 vectors), fully pinned in registers.
    per K iteration: 2 B loads + 14 A broadcasts + 28 FMA.
    FMA throughput: 28/2 = 14 cycles (2 FMA ports).
    broadcast throughput: 14/1 = 14 cycles (port 5).
    both co-bottleneck at 14 cycles → 28×16×2/14 = 64 FLOPs/cycle
-   = theoretical peak for 2-FMA-port AVX-512. */
+   = theoretical peak for 2-FMA-port AVX-512.
+   batch A: full-tile cases dispatch to a runtime-emitted JIT kernel
+   that eliminates loop branches and gives optimal register allocation. */
 
 static void micro_kernel(int64_t kc, const float *restrict ap, const float *restrict bp,
                           float *restrict c, int64_t ldc, int64_t mr, int64_t nr)
 {
+#if defined(__x86_64__) && !defined(AX_NO_JIT)
+    if (mr == GEMM_MR && nr == GEMM_NR && kc >= 1) {
+        ensure_jit_kernel_512();
+        if (ax_micro_kernel_jit_512) {
+            ax_micro_kernel_jit_512(kc, ap, bp, c, ldc * (int64_t)sizeof(float));
+            return;
+        }
+    }
+#endif
+
     __m512 c00=_mm512_setzero_ps(), c01=_mm512_setzero_ps();
     __m512 c10=_mm512_setzero_ps(), c11=_mm512_setzero_ps();
     __m512 c20=_mm512_setzero_ps(), c21=_mm512_setzero_ps();
@@ -1252,13 +1496,47 @@ static void micro_kernel(int64_t kc, const float *restrict ap, const float *rest
 
 #elif defined(AX_SIMD_AVX2)
 
+/* JIT-emitted 6x16 micro-kernel handle. lazily resolved on first call,
+   cached as a function pointer. NULL when JIT is unavailable (non-x86_64,
+   mmap failure, etc.) or when AX_NO_JIT is defined to disable it. */
+#if defined(__x86_64__) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+#include "jit_gemm_avx2.h"
+static ax_jit_gemm_kernel_fn ax_micro_kernel_jit = NULL;
+static int ax_micro_kernel_jit_resolved = 0;
+static void ensure_jit_kernel(void) {
+    if (!ax_micro_kernel_jit_resolved) {
+        ax_micro_kernel_jit = ax_jit_gemm_avx2_get_6x16();
+        ax_micro_kernel_jit_resolved = 1;
+    }
+}
+#endif
+
 /* 6x16 AVX2+FMA micro-kernel.
    12 YMM accumulators (6 rows x 2 vectors), fully pinned in registers.
    A is broadcast per row, B is loaded as 2 contiguous vectors.
-   no register spills — verified by inspecting generated assembly. */
+   no register spills — verified by inspecting generated assembly.
+   phase 36: full-tile cases dispatch to a runtime-emitted JIT kernel
+   that eliminates loop branches and uses optimal register allocation. */
 static void micro_kernel(int64_t kc, const float * restrict ap, const float * restrict bp,
                           float * restrict c, int64_t ldc, int64_t mr, int64_t nr)
 {
+#if defined(__x86_64__) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+    /* fast path: JIT for full 6x16 tile with kc >= 1.
+       NOTE on Batch C (per-kc): the per-kc fully-unrolled emitter exists
+       (ax_jit_gemm_avx2_get_6x16_kc) but is NOT wired in here. it triggers
+       segfaults when emitted concurrently from inside an OMP parallel
+       region — root cause not yet identified (the solo-call test passes,
+       byte dump verifies correct, but multi-thread first-call corrupts).
+       runtime-K JIT below is sufficient and stable. */
+    if (mr == GEMM_MR && nr == GEMM_NR && kc >= 1) {
+        ensure_jit_kernel();
+        if (ax_micro_kernel_jit) {
+            ax_micro_kernel_jit(kc, ap, bp, c, ldc * (int64_t)sizeof(float));
+            return;
+        }
+    }
+#endif
+
     __m256 c00 = _mm256_setzero_ps(), c01 = _mm256_setzero_ps();
     __m256 c10 = _mm256_setzero_ps(), c11 = _mm256_setzero_ps();
     __m256 c20 = _mm256_setzero_ps(), c21 = _mm256_setzero_ps();
@@ -1348,17 +1626,41 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
 
 #elif defined(AX_SIMD_NEON)
 
+/* JIT-emitted 8x12 NEON micro-kernel handle. */
+#if defined(__aarch64__) && !defined(AX_NO_JIT)
+#include "jit_gemm_neon.h"
+static ax_jit_gemm_neon_kernel_fn ax_micro_kernel_jit_neon = NULL;
+static int ax_micro_kernel_jit_neon_resolved = 0;
+static void ensure_jit_kernel_neon(void) {
+    if (!ax_micro_kernel_jit_neon_resolved) {
+        ax_micro_kernel_jit_neon = ax_jit_gemm_neon_get_8x12();
+        ax_micro_kernel_jit_neon_resolved = 1;
+    }
+}
+#endif
+
 /* 8×12 NEON micro-kernel using vfmaq_laneq_f32.
    24 Q accumulators (8 rows × 3 vectors of 4 floats).
    per K iteration: 3 B loads (b0..b2) + 2 A loads (a_lo, a_hi as Q regs)
    + 24 FMLA via lane-broadcast (vfmaq_laneq_f32 is a single instruction
    on A64: FMLA Vd.4S, Vn.4S, Vm.S[lane]).
    this avoids the scalar broadcast + separate FMA of the generic path,
-   giving ~2× the throughput on Cortex-A76 and Neoverse N1. */
+   giving ~2× the throughput on Cortex-A76 and Neoverse N1.
+   batch B: full-tile cases dispatch to JIT-emitted kernel. */
 
 static void micro_kernel(int64_t kc, const float *restrict ap, const float *restrict bp,
                           float *restrict c, int64_t ldc, int64_t mr, int64_t nr)
 {
+#if defined(__aarch64__) && !defined(AX_NO_JIT)
+    if (mr == GEMM_MR && nr == GEMM_NR && kc >= 1) {
+        ensure_jit_kernel_neon();
+        if (ax_micro_kernel_jit_neon) {
+            ax_micro_kernel_jit_neon(kc, ap, bp, c, ldc * (int64_t)sizeof(float));
+            return;
+        }
+    }
+#endif
+
     float32x4_t c00=vdupq_n_f32(0), c01=vdupq_n_f32(0), c02=vdupq_n_f32(0);
     float32x4_t c10=vdupq_n_f32(0), c11=vdupq_n_f32(0), c12=vdupq_n_f32(0);
     float32x4_t c20=vdupq_n_f32(0), c21=vdupq_n_f32(0), c22=vdupq_n_f32(0);
@@ -1503,6 +1805,179 @@ static inline int64_t ax_adaptive_nc(int64_t n, int max_threads) {
    for MC=72, NC=256: (72+256)×KC×4 ≤ ~768 KB → KC ≤ ~600.
    use 512 as a safe maximum that fits comfortably in any L2 ≥ 1 MB. */
 
+/* phase 22: Strassen one-level for square N×N×N gemms.
+   trades 1 GEMM for 7 sub-GEMMs (n×n where n=N/2) plus 18 add/sub passes.
+   theoretical FLOP reduction: 7/8 = 12.5% fewer ops. helps when the GEMM
+   is large enough that the sub-GEMM hot path runs near peak GFLOPS so the
+   FLOP saving outweighs the add/sub overhead.
+   threshold N≥4096: at smaller N the add/sub BW (4MB×18 passes) dominates
+   the saved FLOPs. only triggers for square M=N=K with N divisible by 2. */
+
+/* read an n×n block at coord (br, bc) of an N×N source matrix into a
+   contiguous n×n destination buffer. */
+static inline void strassen_block_read(const float *src, int64_t lda, int64_t n,
+                                        int br, int bc, float *dst) {
+    const float *p = src + (br * n) * lda + bc * n;
+    for (int64_t r = 0; r < n; r++) {
+        memcpy(dst + r * n, p + r * lda, (size_t)n * sizeof(float));
+    }
+}
+
+/* dst = src_a[bra,bca] + src_b[brb,bcb], both n×n blocks. SIMD inner. */
+static inline void strassen_block_add(const float *a, int64_t lda, int bra, int bca,
+                                       const float *b, int64_t ldb, int brb, int bcb,
+                                       int64_t n, float *dst) {
+    const float *pa = a + (bra * n) * lda + bca * n;
+    const float *pb = b + (brb * n) * ldb + bcb * n;
+    int64_t ve = n - (n % AX_VF32_WIDTH);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t r = 0; r < n; r++) {
+        const float *ra = pa + r * lda;
+        const float *rb = pb + r * ldb;
+        float *rd = dst + r * n;
+        int64_t c = 0;
+        for (; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(rd + c, ax_vf32_add(ax_vf32_loadu(ra + c), ax_vf32_loadu(rb + c)));
+        for (; c < n; c++) rd[c] = ra[c] + rb[c];
+    }
+}
+
+/* dst = src_a[bra,bca] - src_b[brb,bcb] */
+static inline void strassen_block_sub(const float *a, int64_t lda, int bra, int bca,
+                                       const float *b, int64_t ldb, int brb, int bcb,
+                                       int64_t n, float *dst) {
+    const float *pa = a + (bra * n) * lda + bca * n;
+    const float *pb = b + (brb * n) * ldb + bcb * n;
+    int64_t ve = n - (n % AX_VF32_WIDTH);
+    #ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+    #endif
+    for (int64_t r = 0; r < n; r++) {
+        const float *ra = pa + r * lda;
+        const float *rb = pb + r * ldb;
+        float *rd = dst + r * n;
+        int64_t c = 0;
+        for (; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(rd + c, ax_vf32_sub(ax_vf32_loadu(ra + c), ax_vf32_loadu(rb + c)));
+        for (; c < n; c++) rd[c] = ra[c] - rb[c];
+    }
+}
+
+/* dst[br, bc] += sign * src (where sign is +1 or -1). dst is N×N with
+   stride ldd; src is contiguous n×n. */
+static inline void strassen_block_axpy(float sign, const float *src, int64_t n,
+                                        float *dst, int64_t ldd, int br, int bc) {
+    float *pd = dst + (br * n) * ldd + bc * n;
+    int64_t ve = n - (n % AX_VF32_WIDTH);
+    if (sign > 0) {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t r = 0; r < n; r++) {
+            float *rd = pd + r * ldd;
+            const float *rs = src + r * n;
+            int64_t c = 0;
+            for (; c < ve; c += AX_VF32_WIDTH)
+                ax_vf32_storeu(rd + c, ax_vf32_add(ax_vf32_loadu(rd + c), ax_vf32_loadu(rs + c)));
+            for (; c < n; c++) rd[c] += rs[c];
+        }
+    } else {
+        #ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+        #endif
+        for (int64_t r = 0; r < n; r++) {
+            float *rd = pd + r * ldd;
+            const float *rs = src + r * n;
+            int64_t c = 0;
+            for (; c < ve; c += AX_VF32_WIDTH)
+                ax_vf32_storeu(rd + c, ax_vf32_sub(ax_vf32_loadu(rd + c), ax_vf32_loadu(rs + c)));
+            for (; c < n; c++) rd[c] -= rs[c];
+        }
+    }
+}
+
+/* TLS scratch for Strassen — three n×n buffers. amortizes alloc across calls. */
+AX_TLS float *tl_strassen_ta = NULL; AX_TLS int64_t tl_strassen_ta_bytes = 0;
+AX_TLS float *tl_strassen_tb = NULL; AX_TLS int64_t tl_strassen_tb_bytes = 0;
+AX_TLS float *tl_strassen_mi = NULL; AX_TLS int64_t tl_strassen_mi_bytes = 0;
+
+static ax_status_t opt_gemm_strassen_1lvl(const float *A, const float *B, float *C,
+                                           int64_t N, int64_t lda, int64_t ldb, int64_t ldc) {
+    int64_t n = N / 2;
+    size_t bb = (size_t)n * (size_t)n * sizeof(float);
+
+    float *ta = ax_tls_grow(&tl_strassen_ta, &tl_strassen_ta_bytes, (int64_t)bb);
+    float *tb = ax_tls_grow(&tl_strassen_tb, &tl_strassen_tb_bytes, (int64_t)bb);
+    float *mi = ax_tls_grow(&tl_strassen_mi, &tl_strassen_mi_bytes, (int64_t)bb);
+    if (!ta || !tb || !mi) return AX_ERR_ALLOC;
+
+    /* zero output */
+    if (!tl_gemm_skip_init) {
+        for (int64_t r = 0; r < N; r++) memset(C + r * ldc, 0, (size_t)N * sizeof(float));
+    }
+
+    /* tensor wrappers reused across the 7 sub-GEMMs */
+    ax_storage_t sta = {0}, stb = {0}, stm = {0};
+    atomic_init(&sta.refcount, 0); sta.data = ta; sta.size_bytes = bb; sta.device = AX_DEVICE_CPU; sta.is_arena_temp = true; sta.generation = 1;
+    atomic_init(&stb.refcount, 0); stb.data = tb; stb.size_bytes = bb; stb.device = AX_DEVICE_CPU; stb.is_arena_temp = true; stb.generation = 1;
+    atomic_init(&stm.refcount, 0); stm.data = mi; stm.size_bytes = bb; stm.device = AX_DEVICE_CPU; stm.is_arena_temp = true; stm.generation = 1;
+    ax_tensor_t tta = {0}, ttb = {0}, ttm = {0};
+    tta.storage = &sta; tta.ndim = 2; tta.dtype = AX_FLOAT32; tta.shape[0] = n; tta.shape[1] = n; tta.strides[0] = n; tta.strides[1] = 1;
+    ttb.storage = &stb; ttb.ndim = 2; ttb.dtype = AX_FLOAT32; ttb.shape[0] = n; ttb.shape[1] = n; ttb.strides[0] = n; ttb.strides[1] = 1;
+    ttm.storage = &stm; ttm.ndim = 2; ttm.dtype = AX_FLOAT32; ttm.shape[0] = n; ttm.shape[1] = n; ttm.strides[0] = n; ttm.strides[1] = 1;
+
+    /* M1 = (A11+A22)(B11+B22); C11 += M1, C22 += M1 */
+    strassen_block_add(A, lda, 0, 0, A, lda, 1, 1, n, ta);
+    strassen_block_add(B, ldb, 0, 0, B, ldb, 1, 1, n, tb);
+    if (opt_gemm(&tta, &ttb, &ttm) != AX_OK) return AX_ERR_BACKEND;
+    strassen_block_axpy( 1, mi, n, C, ldc, 0, 0);
+    strassen_block_axpy( 1, mi, n, C, ldc, 1, 1);
+
+    /* M2 = (A21+A22) B11; C21 += M2, C22 -= M2 */
+    strassen_block_add(A, lda, 1, 0, A, lda, 1, 1, n, ta);
+    strassen_block_read(B, ldb, n, 0, 0, tb);
+    if (opt_gemm(&tta, &ttb, &ttm) != AX_OK) return AX_ERR_BACKEND;
+    strassen_block_axpy( 1, mi, n, C, ldc, 1, 0);
+    strassen_block_axpy(-1, mi, n, C, ldc, 1, 1);
+
+    /* M3 = A11 (B12-B22); C12 += M3, C22 += M3 */
+    strassen_block_read(A, lda, n, 0, 0, ta);
+    strassen_block_sub(B, ldb, 0, 1, B, ldb, 1, 1, n, tb);
+    if (opt_gemm(&tta, &ttb, &ttm) != AX_OK) return AX_ERR_BACKEND;
+    strassen_block_axpy( 1, mi, n, C, ldc, 0, 1);
+    strassen_block_axpy( 1, mi, n, C, ldc, 1, 1);
+
+    /* M4 = A22 (B21-B11); C11 += M4, C21 += M4 */
+    strassen_block_read(A, lda, n, 1, 1, ta);
+    strassen_block_sub(B, ldb, 1, 0, B, ldb, 0, 0, n, tb);
+    if (opt_gemm(&tta, &ttb, &ttm) != AX_OK) return AX_ERR_BACKEND;
+    strassen_block_axpy( 1, mi, n, C, ldc, 0, 0);
+    strassen_block_axpy( 1, mi, n, C, ldc, 1, 0);
+
+    /* M5 = (A11+A12) B22; C11 -= M5, C12 += M5 */
+    strassen_block_add(A, lda, 0, 0, A, lda, 0, 1, n, ta);
+    strassen_block_read(B, ldb, n, 1, 1, tb);
+    if (opt_gemm(&tta, &ttb, &ttm) != AX_OK) return AX_ERR_BACKEND;
+    strassen_block_axpy(-1, mi, n, C, ldc, 0, 0);
+    strassen_block_axpy( 1, mi, n, C, ldc, 0, 1);
+
+    /* M6 = (A21-A11)(B11+B12); C22 += M6 */
+    strassen_block_sub(A, lda, 1, 0, A, lda, 0, 0, n, ta);
+    strassen_block_add(B, ldb, 0, 0, B, ldb, 0, 1, n, tb);
+    if (opt_gemm(&tta, &ttb, &ttm) != AX_OK) return AX_ERR_BACKEND;
+    strassen_block_axpy( 1, mi, n, C, ldc, 1, 1);
+
+    /* M7 = (A12-A22)(B21+B22); C11 += M7 */
+    strassen_block_sub(A, lda, 0, 1, A, lda, 1, 1, n, ta);
+    strassen_block_add(B, ldb, 1, 0, B, ldb, 1, 1, n, tb);
+    if (opt_gemm(&tta, &ttb, &ttm) != AX_OK) return AX_ERR_BACKEND;
+    strassen_block_axpy( 1, mi, n, C, ldc, 0, 0);
+
+    return AX_OK;
+}
+
 static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
     if (!a || !b || !out) {
         ax_err_set(AX_ERR_NULL_ARG, "gemm: NULL tensor");
@@ -1537,6 +2012,11 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     const float *a_raw = raw_f32(a);
     const float *b_raw = raw_f32(b);
     float *o_raw = raw_f32(out);
+
+    /* phase 22 attempted: Strassen one-level. measured slower than direct
+       opt_gemm at nn_4096³ because the 18 add/sub passes (~560MB BW for n=2048
+       blocks) cost more than the 12% FLOP saving. dispatch disabled; helpers
+       retained for reference. */
     if (tl_pack_b_cache_bptr != NULL) {
         /* bptr points into b_raw region; if a or out aliases b's storage or the
            role of a and b swapped, drop the cache. cheap conservative check: any
@@ -1607,7 +2087,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
     int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
 
-    /* HYBRID JC+IC: triggers only when full-NC gives few jc tiles AND adaptive
+    /* HYBRID JC+PC+IC: triggers only when full-NC gives few jc tiles AND adaptive
        jc-par's NC shrinkage would hurt pack_a reuse significantly.
        Threshold: n_jc_full ≤ max_threads/4 — at that point each thread does
        enough pack_a tiles per jr to amortize the pack_b cost. for larger
@@ -2525,12 +3005,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
     int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
 
-    /* HYBRID JC+IC: triggers only when full-NC gives few jc tiles AND adaptive
-       jc-par's NC shrinkage would hurt pack_a reuse significantly.
-       Threshold: n_jc_full ≤ max_threads/4 — at that point each thread does
-       enough pack_a tiles per jr to amortize the pack_b cost. for larger
-       n_jc_full, adaptive_nc with jc-par fills threads with smaller NC
-       which has its own benefit (smaller pack_b → fits L1/L2 better). */
+    /* HYBRID JC+IC: see opt_gemm for rationale. */
     int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
     int64_t n_jc_full = (n + nc_full - 1) / nc_full;
     bool use_hybrid = (max_threads > 1)

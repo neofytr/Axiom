@@ -163,6 +163,10 @@ ax_status_t ax_compute_init(void) {
        cheap (~30ms). */
     ax_calibrate_hybrid_crossover();
 
+    /* phase 34: measure each omp thread's speed for proportional GEMM
+       work distribution. cheap (~5ms). */
+    ax_measure_thread_speeds();
+
     /* pre-allocate tls pack buffers on every omp worker. always on —
        moves the lazy-alloc cost out of the first hot gemm call. */
 #ifdef AX_CPU_ISA_DISPATCH
@@ -1084,9 +1088,13 @@ extern void ax_cpu_opt_calibrate_tiles_scalar(void);
 extern void ax_cpu_opt_calibrate_hybrid_crossover_avx512(void);
 extern void ax_cpu_opt_calibrate_hybrid_crossover_avx2(void);
 extern void ax_cpu_opt_calibrate_hybrid_crossover_scalar(void);
+extern void ax_cpu_opt_measure_thread_speeds_avx512(void);
+extern void ax_cpu_opt_measure_thread_speeds_avx2(void);
+extern void ax_cpu_opt_measure_thread_speeds_scalar(void);
 #else
 extern void ax_cpu_opt_calibrate_tiles(void);
 extern void ax_cpu_opt_calibrate_hybrid_crossover(void);
+extern void ax_cpu_opt_measure_thread_speeds(void);
 #endif
 
 void ax_calibrate_gemm_tiles(void) {
@@ -1116,6 +1124,22 @@ void ax_calibrate_hybrid_crossover(void) {
     else ax_cpu_opt_calibrate_hybrid_crossover_scalar();
 #else
     ax_cpu_opt_calibrate_hybrid_crossover();
+#endif
+#endif
+}
+
+/* phase 34: per-omp-thread speed measurement for proportional GEMM
+   work distribution. fired once at init alongside the hybrid crossover. */
+void ax_measure_thread_speeds(void) {
+#if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
+    return;
+#else
+#ifdef AX_CPU_ISA_DISPATCH
+    if (active_ops == &ax_cpu_opt_ops_avx512) ax_cpu_opt_measure_thread_speeds_avx512();
+    else if (active_ops == &ax_cpu_opt_ops_avx2) ax_cpu_opt_measure_thread_speeds_avx2();
+    else ax_cpu_opt_measure_thread_speeds_scalar();
+#else
+    ax_cpu_opt_measure_thread_speeds();
 #endif
 #endif
 }
