@@ -149,6 +149,7 @@ set(AXIOM_SOURCES
     src/core/attention.c
     src/core/fused_attention.c
     src/core/rng.c
+    src/core/quantize.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
 )
@@ -231,6 +232,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
         src/core/losses.c
         src/core/norm.c
         src/core/optim.c
+        src/core/quantize.c
         PROPERTIES COMPILE_FLAGS "-mavx2 -mfma")
 endif()
 
@@ -338,7 +340,7 @@ set(TEST_SOURCES
 # JIT correctness tests. byte-level tests run on every host (independent
 # of execution); execution tests only on x86_64 since this dev box can run
 # AVX2 emitted code.
-list(APPEND TEST_SOURCES tests/test_jit_arm64_bytes.c)
+list(APPEND TEST_SOURCES tests/test_jit_arm64_bytes.c tests/test_quantize.c)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
     list(APPEND TEST_SOURCES
         tests/test_jit_x64.c
@@ -446,7 +448,7 @@ if(NOT AX_INFERENCE_ONLY)
     # benchmarks/summarize.py merges RESULT lines from both sides.
     foreach(suite_bench
             bench_gemm_suite bench_ops_suite bench_conv_suite
-            bench_transformer bench_stress bench_parity)
+            bench_transformer bench_stress bench_parity bench_qgemm)
         if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/${suite_bench}.c")
             add_executable(${suite_bench} benchmarks/${suite_bench}.c)
             target_include_directories(${suite_bench} PRIVATE benchmarks)
