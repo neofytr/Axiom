@@ -284,18 +284,37 @@ ax_jit_gemm_kernel_fn ax_jit_gemm_avx2_get_6x16_kc(int64_t kc) {
         return cached;
     }
 
-    /* allocate a dedicated buffer for THIS kc. size budget per kernel:
-       prologue ~80B + per-K-iter ~100B + epilogue ~150B. for kc=256
-       that's ~26 KB → round up to 32 KB. for small kc we use one page. */
-    size_t per_kc_need = (size_t)kc * 100 + 300;
+    /* allocate a dedicated buffer for THIS kc. byte budget:
+         per K iter (worst case, disp32 forms when k*MR*4 or k*NR*4 > 127):
+           - 2 vmovaps load:        2 × 9 = 18  (mod=10, disp32)
+           - 6 vbroadcastss:        6 × 9 = 54
+           - 12 vfmadd231ps:       12 × 5 = 60
+           subtotal:                       132
+           safety pad:                      28
+           ─── total ~160 B/iter, was estimating 100 B/iter (which was the
+           disp8 case only) — that off-by-2x silently truncated kernels
+           for kc≳21 once displacements switched to disp32, causing the
+           kernel to fall off the end of the page → SEGV in the zero pad.
+         prologue (push×4 + 6 mov + 5 add + 12 vxorps): ~120 B
+         writeback (6 rows × 6 ops): ~280 B
+         epilogue (pop×4 + ret): ~10 B
+         total fixed: ~410 B */
+    size_t per_kc_need = (size_t)kc * 160 + 512;
     ax_jit_buf_t *buf = ax_jit_buf_create(per_kc_need);
     if (!buf) {
         pthread_mutex_unlock(&g_jit_kc_mu);
         return NULL;
     }
 
+    size_t before_pos = buf->pos;
     emit_one_kernel_kc(buf, kc);
-    if (buf->pos == 0) {
+    /* defensive overflow check: if our budget was wrong the buffer would
+       silently truncate (ax_jit_emit_u8 no-ops past capacity). detect
+       by requiring the kernel to end with a RET (0xC3). otherwise the
+       final flow would fall through into zero-padded bytes → SEGV. */
+    if (buf->pos == before_pos
+        || buf->base[buf->pos - 1] != 0xC3
+        || buf->pos > buf->capacity) {
         ax_jit_buf_destroy(buf);
         pthread_mutex_unlock(&g_jit_kc_mu);
         return NULL;

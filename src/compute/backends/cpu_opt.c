@@ -1521,14 +1521,17 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
                           float * restrict c, int64_t ldc, int64_t mr, int64_t nr)
 {
 #if defined(__x86_64__) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
-    /* fast path: JIT for full 6x16 tile with kc >= 1.
-       NOTE on Batch C (per-kc): the per-kc fully-unrolled emitter exists
-       (ax_jit_gemm_avx2_get_6x16_kc) but is NOT wired in here. it triggers
-       segfaults when emitted concurrently from inside an OMP parallel
-       region — root cause not yet identified (the solo-call test passes,
-       byte dump verifies correct, but multi-thread first-call corrupts).
-       runtime-K JIT below is sufficient and stable. */
+    /* fast path: JIT for full 6x16 tile.
+       per-kc fully-unrolled when kc fits the per-kc emitter's range
+       (KC_MIN..KC_MAX = 1..256); runtime-K kernel otherwise. */
     if (mr == GEMM_MR && nr == GEMM_NR && kc >= 1) {
+        if (kc <= 256) {
+            ax_jit_gemm_kernel_fn fn_kc = ax_jit_gemm_avx2_get_6x16_kc(kc);
+            if (fn_kc) {
+                fn_kc(kc, ap, bp, c, ldc * (int64_t)sizeof(float));
+                return;
+            }
+        }
         ensure_jit_kernel();
         if (ax_micro_kernel_jit) {
             ax_micro_kernel_jit(kc, ap, bp, c, ldc * (int64_t)sizeof(float));
