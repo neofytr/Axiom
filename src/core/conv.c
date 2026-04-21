@@ -59,6 +59,9 @@ static inline int64_t conv_out_dim(int64_t in_dim, int kernel, int stride, int p
 
 /* forward declarations for predicates used by ensure_scratch */
 static inline bool can_direct_3x3(int kh, int kw, int sh, int sw, int ph, int pw, int64_t C_in);
+static inline bool can_direct_3x3_s2(int kh, int kw, int sh, int sw,
+                                      int ph, int pw, int64_t C_in,
+                                      int64_t H, int64_t W);
 static inline bool prefer_implicit_gemm(int64_t K, int64_t M);
 static inline bool prefer_winograd_f23(int kh, int kw, int sh, int sw, int ph, int pw,
                                         int64_t N, int64_t C_in, int64_t C_out,
@@ -1230,6 +1233,112 @@ static void conv2d_direct_3x3_sample(
     }
 }
 
+/* direct 3x3 stride=2 pad=1 conv for a single sample.
+   skips im2col + gemm entirely. output shape:
+     out_h = (H + 2*1 - 3) / 2 + 1 = (H + 1) / 2  (when H is even)
+     out_w = (W + 1) / 2
+   structure mirrors conv2d_direct_3x3_sample (stride=1 variant) above —
+   write bias to out, then for each (ci, ky, kx) accumulate into out via
+   broadcast-FMA. the only delta is the stride-2 input gather which we
+   handle via the same shuffle+permute trick as im2col_into's stride_w==2
+   fast path: load 16 contiguous floats, _mm256_shuffle_ps(a,b,(2,0,2,0))
+   collects evens within each 128-bit lane, _mm256_permutevar8x32_ps
+   reorders cross-lane → 8 stride-2 floats. */
+static void conv2d_direct_3x3_s2_sample(
+    const float *in_n,
+    const float *wd,
+    const float *bias,
+    float *out_n,
+    int64_t C_in, int64_t C_out,
+    int64_t H, int64_t W,
+    int64_t out_h, int64_t out_w)
+{
+    const int64_t HW = H * W;
+    const int64_t out_HW = out_h * out_w;
+    const int64_t K9 = C_in * 9;
+
+#if defined(AX_SIMD_AVX2) && AX_VF32_WIDTH == 8
+    const __m256i extract_evens = _mm256_setr_epi32(0, 1, 4, 5, 2, 3, 6, 7);
+#endif
+
+    for (int64_t co = 0; co < C_out; co++) {
+        float bias_val = bias ? bias[co] : 0.0f;
+        ax_vf32 vb = ax_vf32_set1(bias_val);
+        const float *wco = wd + co * K9;
+        float *out_co = out_n + co * out_HW;
+
+        /* init output to bias */
+        for (int64_t y = 0; y < out_h; y++) {
+            float *out_row = out_co + y * out_w;
+            int64_t xi = 0, vend = out_w - (out_w % AX_VF32_WIDTH);
+            for (; xi < vend; xi += AX_VF32_WIDTH)
+                ax_vf32_storeu(out_row + xi, vb);
+            for (; xi < out_w; xi++) out_row[xi] = bias_val;
+        }
+
+        /* accumulate Cin × 9 contributions */
+        for (int64_t ci = 0; ci < C_in; ci++) {
+            const float *win = wco + ci * 9;
+            const float *in_ci = in_n + ci * HW;
+
+            for (int ky = 0; ky < 3; ky++) {
+                for (int kx = 0; kx < 3; kx++) {
+                    float wv = win[ky * 3 + kx];
+                    ax_vf32 vw = ax_vf32_set1(wv);
+
+                    for (int64_t oh = 0; oh < out_h; oh++) {
+                        int64_t ih = oh * 2 - 1 + ky;
+                        if (ih < 0 || ih >= H) continue;
+                        const float *in_row = in_ci + ih * W;
+                        float *out_row = out_co + oh * out_w;
+
+                        /* ow bounds for in-image accesses:
+                             iw = ow*2 - 1 + kx must be in [0, W)
+                             → ow_lo = ceil((1 - kx) / 2) when (1-kx) > 0
+                             → ow_hi = floor((W - 1 + 1 - kx) / 2) + 1 */
+                        int64_t ow_lo = (kx == 0) ? 1 : 0;
+                        int64_t ow_hi = out_w;
+                        while (ow_hi > 0 && (ow_hi - 1) * 2 - 1 + kx >= W) ow_hi--;
+
+                        int64_t ow = ow_lo;
+                        int64_t span = ow_hi - ow_lo;
+                        int64_t ow_vec_end = ow_lo + (span - (span % AX_VF32_WIDTH));
+
+#if defined(AX_SIMD_AVX2) && AX_VF32_WIDTH == 8
+                        /* SIMD: 8 outputs per iter; stride-2 gather via shuffle */
+                        for (; ow < ow_vec_end; ow += AX_VF32_WIDTH) {
+                            int64_t iw_first = ow * 2 - 1 + kx;
+                            /* must have iw_first + 16 <= W to load 16 floats */
+                            if (iw_first + 16 > W) break;
+                            __m256 a = _mm256_loadu_ps(in_row + iw_first);
+                            __m256 b = _mm256_loadu_ps(in_row + iw_first + 8);
+                            __m256 t = _mm256_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+                            __m256 vi = _mm256_permutevar8x32_ps(t, extract_evens);
+                            __m256 vo = _mm256_loadu_ps(out_row + ow);
+                            _mm256_storeu_ps(out_row + ow, _mm256_fmadd_ps(vi, vw, vo));
+                        }
+#endif
+                        /* scalar tail / right edge */
+                        for (; ow < ow_hi; ow++) {
+                            int64_t iw = ow * 2 - 1 + kx;
+                            out_row[ow] += in_row[iw] * wv;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static inline bool can_direct_3x3_s2(int kh, int kw, int sh, int sw,
+                                      int ph, int pw, int64_t C_in,
+                                      int64_t H, int64_t W)
+{
+    /* match exactly the strided 3x3-pad1 case the kernel handles */
+    return kh == 3 && kw == 3 && sh == 2 && sw == 2 && ph == 1 && pw == 1
+           && H >= 4 && W >= 16 && C_in >= 1;
+}
+
 /* shape-aware path selection. measurement note: in practice the BLIS-style
    tiled gemm with explicit im2col beats this hand-rolled direct conv on
    typical mnist conv shapes (74s vs 137s at T=1) because the micro-kernel
@@ -2288,12 +2397,20 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     bool use_winograd = prefer_winograd_f23(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)
                         && s->wino_U && s->wino_V && s->wino_M;
     bool use_direct = !use_winograd && can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
-    bool use_smallcin = !use_winograd && !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
-    bool use_implicit = !use_winograd && !use_direct && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
+    /* batch D ATTEMPT (disabled): direct 3x3 stride=2 pad=1 kernel exists
+       below as conv2d_direct_3x3_s2_sample but the (ci, ky, kx) outer loop
+       order touches the full output buffer Cin*9 times, causing cache
+       thrashing on shapes with Cin >= ~32. measured 55 GFLOPS vs 310 for
+       implicit-gemm on conv_64x112_128_s2. needs (oh, ow_blk) outer +
+       register-accumulator rewrite to be competitive — deferred. */
+    bool use_direct_s2 = false;
+    (void)can_direct_3x3_s2;
+    bool use_smallcin = !use_winograd && !use_direct && !use_direct_s2 && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
+    bool use_implicit = !use_winograd && !use_direct && !use_direct_s2 && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
     /* 1×1 stride=1 pad=0 routes to per-sample (zero-copy stack tensor),
        not batched (which pays an im2col-as-transpose cost for no GEMM gain). */
     bool is_1x1_fast = is_1x1_pad0_stride1(kh, kw, sh, sw, ph, pw) && (H == out_h) && (W == out_w);
-    bool use_batched = !use_winograd && !use_direct && !use_smallcin && !use_implicit && !is_1x1_fast
+    bool use_batched = !use_winograd && !use_direct && !use_direct_s2 && !use_smallcin && !use_implicit && !is_1x1_fast
                        && N > 1 && M < AX_CONV_BATCH_M_THRESH
                        && s->batch_col_buf && s->batch_aux_buf;
 
@@ -2376,6 +2493,13 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             conv2d_direct_3x3_sample(
                 ind + n * C_in * H * W, wd, bias_data,
                 od + n * C_out * M, C_in, C_out, H, W);
+            continue;
+        }
+        if (use_direct_s2) {
+            /* batch D: 3x3 stride=2 pad=1 direct kernel — bypasses im2col */
+            conv2d_direct_3x3_s2_sample(
+                ind + n * C_in * H * W, wd, bias_data,
+                od + n * C_out * M, C_in, C_out, H, W, out_h, out_w);
             continue;
         }
         if (use_smallcin) {
