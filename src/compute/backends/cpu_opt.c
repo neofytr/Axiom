@@ -2498,6 +2498,16 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
     /* adaptive KC: same logic as opt_gemm — single pc tile when k fits */
     int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
 
+    /* opt-in profiler: AX_PROFILE_CONV=1 prints per-stage cycle counts.
+       used to bisect where the conv_gemm time goes (pack_b_im2col gather
+       vs pack_a vs micro_kernel). thread-local accumulators flushed
+       at function exit. */
+    static int prof_enabled = -1;
+    if (prof_enabled < 0) prof_enabled = (getenv("AX_PROFILE_CONV") && getenv("AX_PROFILE_CONV")[0] == '1') ? 1 : 0;
+    uint64_t t_packb = 0, t_packa = 0, t_uk = 0;
+    int64_t n_packb = 0, n_packa = 0, n_uk = 0;
+    #define PROF_TICK() __builtin_ia32_rdtsc()
+
     for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
         int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
         int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -2506,24 +2516,44 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
             int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
 
             /* gather B directly from input image */
+            uint64_t t0 = prof_enabled ? PROF_TICK() : 0;
             pack_b_im2col(params, kc, nc_pack, nc, jc, pc, pack_b_buf);
+            if (prof_enabled) { t_packb += PROF_TICK() - t0; n_packb++; }
 
             for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                 int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                uint64_t t1 = prof_enabled ? PROF_TICK() : 0;
                 pack_a(wd + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                if (prof_enabled) { t_packa += PROF_TICK() - t1; n_packa++; }
 
                 for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                     int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                     for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                         int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                        uint64_t t2 = prof_enabled ? PROF_TICK() : 0;
                         micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
                                      od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                        if (prof_enabled) { t_uk += PROF_TICK() - t2; n_uk++; }
                     }
                 }
             }
         }
     }
+
+    if (prof_enabled) {
+        uint64_t total = t_packb + t_packa + t_uk;
+        if (total > 0) {
+            fprintf(stderr,
+                "axiom: conv_gemm M=%ld N=%ld K=%ld  pack_b=%lu cycles (%ld calls, %.1f%%)  "
+                "pack_a=%lu (%ld, %.1f%%)  uk=%lu (%ld, %.1f%%)\n",
+                (long)m, (long)n, (long)k,
+                (unsigned long)t_packb, (long)n_packb, 100.0 * (double)t_packb / (double)total,
+                (unsigned long)t_packa, (long)n_packa, 100.0 * (double)t_packa / (double)total,
+                (unsigned long)t_uk,    (long)n_uk,    100.0 * (double)t_uk    / (double)total);
+        }
+    }
+    #undef PROF_TICK
 
     /* leave pack_b cache invalidated (we clobbered it with custom data). */
     pack_b_cache_invalidate();
