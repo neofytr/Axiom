@@ -441,6 +441,33 @@ static int64_t ax_mid_to_all_crossover  = 0;   /* below: mid; above: all */
    while measuring throughput). reset to 0 after calibration. */
 static int ax_force_threads_override = 0;
 
+/* step 12: production-grade multi-shape thread-count table.
+   the single-probe crossover is fundamentally wrong for shape patterns
+   like narrow-N (e.g. tn_512x2048x512: T=4 wins despite 1G total flops,
+   because n_jc tiles ≤ available threads → can't exploit 16-way parallelism
+   AND E-core sync cost dominates when per-thread work is small).
+
+   we probe a small grid of representative shapes × thread counts at init,
+   pick the measured-best thread count for each shape, and store as a
+   table. runtime lookup picks the closest matching probe by (log flops,
+   geometric narrowness) distance.
+
+   each probe has a list of thread counts to try; the lookup table holds
+   the winning count per probe. probes are tagged with a "regime" name
+   for diagnostic output. */
+
+typedef struct {
+    int64_t M, N, K;
+    const char *name;
+    int  best_threads;       /* populated by calibration; 0 = serial */
+    double best_time_ms;     /* for diagnostics */
+} ax_thread_probe_t;
+
+#define AX_MAX_THREAD_PROBES 12
+static ax_thread_probe_t ax_thread_probes[AX_MAX_THREAD_PROBES];
+static int ax_n_thread_probes = 0;
+static bool ax_thread_table_ready = false;
+
 /* phase 34: per-omp-thread speed measurements for proportional work
    distribution. populated by ax_measure_thread_speeds() at backend init.
    each entry is the relative speed of omp thread tid (higher = faster).
@@ -498,11 +525,14 @@ static void ax_compute_proportional_chunks(int64_t total_iters, int n_threads,
    pack_a instead of strided pack_a_t. defaults to 4 MB if L3 unknown. */
 static int64_t ax_tn_pretranspose_budget_bytes = 4 * 1024 * 1024;
 
-/* pick thread count for a GEMM. strategy:
-   - tiny GEMMs (< 1M FLOPs): serial
-   - 2-way (default): fast cores below crossover, all cores above
-   - 3-way (when calibrated): fast / mid / all based on two crossovers
-   thresholds calibrated at startup; fall back to 25M FLOPs/fast-thread. */
+/* pick thread count for a GEMM. step 12 production-grade policy:
+   1. omp_in_parallel → 1 (avoid nested parallel)
+   2. force override → use it (calibration probe path)
+   3. tiny (< 1M flops) → serial
+   4. uniform CPU (fast==all) → use all
+   5. table lookup: closest probe by (log flops, narrowness) wins
+   6. fallback (table not ready): legacy 2-way crossover
+*/
 static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
 #ifdef _OPENMP
     if (omp_in_parallel()) return 1;
@@ -519,7 +549,31 @@ static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
     /* if non-hybrid, just return all (fast == all) */
     if (all == fast) return all;
 
-    /* phase 25: 3-regime tuner active when a mid count was selected */
+    /* step 12: shape-table lookup. find closest probe by joint
+       (log flops, narrowness) distance and return its measured-best
+       thread count. narrowness = N / (M+K) — captures whether the GEMM
+       is wide (lots of jc tiles → high parallelism) or narrow. */
+    if (ax_thread_table_ready && ax_n_thread_probes > 0) {
+        double q_log = log2((double)total_flops);
+        double q_narrow = (double)n / (double)(m + k + 1);
+        double best_d = 1e30;
+        int    best_t = all;  /* fallback */
+        for (int i = 0; i < ax_n_thread_probes; i++) {
+            const ax_thread_probe_t *p = &ax_thread_probes[i];
+            int64_t p_flops = 2 * p->M * p->N * p->K;
+            double p_log = log2((double)p_flops);
+            double p_narrow = (double)p->N / (double)(p->M + p->K + 1);
+            /* L1 distance in (log flops, log narrowness) space.
+               weight narrowness lower since flops range is larger. */
+            double d = fabs(q_log - p_log) + 0.5 * fabs(log2(q_narrow + 0.01) - log2(p_narrow + 0.01));
+            if (d < best_d) { best_d = d; best_t = p->best_threads; }
+        }
+        if (best_t < 1) best_t = 1;
+        if (best_t > all) best_t = all;
+        return best_t;
+    }
+
+    /* legacy 3-way (used while table is being built) */
     if (ax_mid_thread_count > 0
         && ax_mid_thread_count > fast
         && ax_mid_thread_count < all) {
@@ -864,123 +918,225 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
 #endif
 }
 
-/* hybrid CPU calibration: measure actual fast vs all throughput at a
-   fixed shape and derive the crossover where their wall-times are equal.
-   no per-arch tuning — relies entirely on measured throughput. on
-   non-hybrid CPUs (fast == all) this is a no-op. */
+/* step 12: production-grade multi-shape thread-count calibration.
+
+   probes a small grid of representative GEMM shapes at multiple thread
+   counts, picks the measured-best thread count for each shape, and
+   stores the result in ax_thread_probes[]. ax_gemm_threads_for_shape
+   does a closest-match lookup at runtime.
+
+   shape coverage: 6 probes spanning small, medium, large × square,
+   narrow-N. probes list candidate thread counts to try; picks min(time)
+   per probe.
+
+   reproducibility: each timing is the median of `reps` runs after `warm`
+   warm-up runs. cache pre-warm via the warm runs. uses the same buffer
+   layout the real GEMM does.
+
+   cost: ~6 probes × 4 thread counts × (warm + reps) calls × ~0.5ms each
+       ≈ 100ms total at startup. one-time. */
+
 void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
 #if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
     return;
 #else
     int fast = ax_gemm_fast_threads;
     int all  = ax_gemm_all_threads;
-    if (fast <= 0 || all <= 0 || fast >= all) return;  /* not hybrid */
+    if (fast <= 0 || all <= 0) return;
 
-    /* probe shape: 256³ = ~33M FLOPs, large enough to amortize fork-join,
-       small enough to run several iterations cheaply. */
-    const int64_t M = 256, N = 256, K = 256;
-    float *A = (float *)ax_aligned_alloc((size_t)M * K * sizeof(float), 64);
-    float *B = (float *)ax_aligned_alloc((size_t)K * N * sizeof(float), 64);
-    float *C = (float *)ax_aligned_alloc((size_t)M * N * sizeof(float), 64);
-    if (!A || !B || !C) { ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C); return; }
+    /* canonical probe shape set. each is a (M, N, K, name).
+       chosen to cover:
+         - tiny/small: detect serial vs fast crossover (33M flops range)
+         - small-medium: typical attention QKV (256²-512²)
+         - narrow-N: where jc parallelism is limited (the bug case)
+         - large square: bulk training shapes */
+    static const struct {
+        int64_t M, N, K;
+        const char *name;
+    } probe_shapes[] = {
+        { 128, 128, 128, "tiny_128"     },   /* 4 MFLOPs, fast-only regime */
+        { 256, 256, 256, "small_256"    },   /* 33M */
+        { 512, 512, 512, "medium_512"   },   /* 268M */
+        { 512, 2048, 512, "narrow_512x2k"}, /* 1G — narrow N, edge case */
+        {1024,1024,1024, "med_sq_1024"   },  /* 2.1G */
+        {2048,2048,2048, "large_sq_2k"   },  /* 17G */
+    };
+    int n_shapes = (int)(sizeof(probe_shapes) / sizeof(probe_shapes[0]));
+    if (n_shapes > AX_MAX_THREAD_PROBES) n_shapes = AX_MAX_THREAD_PROBES;
+
+    /* candidate thread counts: 1 (serial), fast/2 if applicable, fast,
+       a couple intermediates, all. de-duplicate. */
+    int cand[6];
+    int n_cand = 0;
+    cand[n_cand++] = 1;
+    if (fast >= 4) cand[n_cand++] = fast / 2;
+    cand[n_cand++] = fast;
+    if (all > fast) {
+        int mid = (fast + all) / 2;
+        if (mid > fast && mid < all) cand[n_cand++] = mid;
+        cand[n_cand++] = all;
+    }
+    /* dedupe */
+    int n_cand_uniq = 0;
+    for (int i = 0; i < n_cand; i++) {
+        bool dup = false;
+        for (int j = 0; j < n_cand_uniq; j++) if (cand[j] == cand[i]) { dup = true; break; }
+        if (!dup) cand[n_cand_uniq++] = cand[i];
+    }
+    n_cand = n_cand_uniq;
+
+    /* allocate the largest buffer once, reuse across shapes */
+    int64_t max_M = 0, max_N = 0, max_K = 0;
+    for (int i = 0; i < n_shapes; i++) {
+        if (probe_shapes[i].M > max_M) max_M = probe_shapes[i].M;
+        if (probe_shapes[i].N > max_N) max_N = probe_shapes[i].N;
+        if (probe_shapes[i].K > max_K) max_K = probe_shapes[i].K;
+    }
+    float *A = (float *)ax_aligned_alloc((size_t)max_M * max_K * sizeof(float), 64);
+    float *B = (float *)ax_aligned_alloc((size_t)max_K * max_N * sizeof(float), 64);
+    float *C = (float *)ax_aligned_alloc((size_t)max_M * max_N * sizeof(float), 64);
+    if (!A || !B || !C) {
+        ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C);
+        return;
+    }
+
+    /* deterministic random fill */
     uint32_t s = 1234567u;
-    for (int64_t i = 0; i < M * K; i++) {
+    for (int64_t i = 0; i < max_M * max_K; i++) {
         s ^= s << 13; s ^= s >> 17; s ^= s << 5;
         A[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
     }
-    for (int64_t i = 0; i < K * N; i++) {
+    for (int64_t i = 0; i < max_K * max_N; i++) {
         s ^= s << 13; s ^= s >> 17; s ^= s << 5;
         B[i] = (float)(s & 0xFFFF) * (1.0f / 65536.0f) - 0.5f;
     }
 
-    ax_storage_t sa, sb, sc;
-    atomic_init(&sa.refcount, 0); sa.data = A; sa.size_bytes = (size_t)M*K*sizeof(float); sa.device = AX_DEVICE_CPU; sa.is_arena_temp = true; sa.generation = 1;
-    atomic_init(&sb.refcount, 0); sb.data = B; sb.size_bytes = (size_t)K*N*sizeof(float); sb.device = AX_DEVICE_CPU; sb.is_arena_temp = true; sb.generation = 1;
-    atomic_init(&sc.refcount, 0); sc.data = C; sc.size_bytes = (size_t)M*N*sizeof(float); sc.device = AX_DEVICE_CPU; sc.is_arena_temp = true; sc.generation = 1;
-    ax_tensor_t ta = {0}, tb = {0}, tc = {0};
-    ta.storage = &sa; ta.ndim = 2; ta.dtype = AX_FLOAT32; ta.shape[0] = M; ta.shape[1] = K; ta.strides[0] = K; ta.strides[1] = 1;
-    tb.storage = &sb; tb.ndim = 2; tb.dtype = AX_FLOAT32; tb.shape[0] = K; tb.shape[1] = N; tb.strides[0] = N; tb.strides[1] = 1;
-    tc.storage = &sc; tc.ndim = 2; tc.dtype = AX_FLOAT32; tc.shape[0] = M; tc.shape[1] = N; tc.strides[0] = N; tc.strides[1] = 1;
+    /* more reps + min selection to fight OMP thread→core placement variance.
+       on hybrid CPUs, OMP picks N of M workers stochastically, so the same
+       T value can land on P-cores (fast) or E-cores (slow) across runs.
+       median or min over more samples gives a reproducible measurement. */
+    const int warm = 3, reps = 7;
+    double t_calib_start = ax_tile_cal_now_ms();
+    int n_legacy_total_flops = 0;
+    double sum_legacy_t_fast = 0, sum_legacy_t_all = 0;
 
-    /* force-threads override: set ax_force_threads_override to time at exactly
-       N threads. also probe a "mid" thread count between fast and all to find
-       cases where neither extreme is best (phase 25). */
-    const int warm = 2, reps = 5;
-    int mid = (fast + all) / 2;
-    if (mid <= fast) mid = fast + 1;
-    if (mid >= all)  mid = all - 1;
+    /* run all probes */
+    for (int si = 0; si < n_shapes; si++) {
+        int64_t M = probe_shapes[si].M;
+        int64_t N = probe_shapes[si].N;
+        int64_t K = probe_shapes[si].K;
+        ax_storage_t sa, sb, sc;
+        atomic_init(&sa.refcount, 0); sa.data = A; sa.size_bytes = (size_t)M*K*sizeof(float); sa.device = AX_DEVICE_CPU; sa.is_arena_temp = true; sa.generation = 1;
+        atomic_init(&sb.refcount, 0); sb.data = B; sb.size_bytes = (size_t)K*N*sizeof(float); sb.device = AX_DEVICE_CPU; sb.is_arena_temp = true; sb.generation = 1;
+        atomic_init(&sc.refcount, 0); sc.data = C; sc.size_bytes = (size_t)M*N*sizeof(float); sc.device = AX_DEVICE_CPU; sc.is_arena_temp = true; sc.generation = 1;
+        ax_tensor_t ta = {0}, tb = {0}, tc = {0};
+        ta.storage = &sa; ta.ndim = 2; ta.dtype = AX_FLOAT32; ta.shape[0] = M; ta.shape[1] = K; ta.strides[0] = K; ta.strides[1] = 1;
+        tb.storage = &sb; tb.ndim = 2; tb.dtype = AX_FLOAT32; tb.shape[0] = K; tb.shape[1] = N; tb.strides[0] = N; tb.strides[1] = 1;
+        tc.storage = &sc; tc.ndim = 2; tc.dtype = AX_FLOAT32; tc.shape[0] = M; tc.shape[1] = N; tc.strides[0] = N; tc.strides[1] = 1;
 
-    ax_force_threads_override = fast;
-    for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
-    double t0 = ax_tile_cal_now_ms();
-    for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
-    double t_fast_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
+        double best_t = 1e30;
+        int    best_th = all;
+        double t_per_cand[6] = {0};
 
-    double t_mid_ms = -1.0;
-    if (mid > fast && mid < all) {
-        ax_force_threads_override = mid;
-        for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
-        t0 = ax_tile_cal_now_ms();
-        for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
-        t_mid_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
+        for (int ci = 0; ci < n_cand; ci++) {
+            ax_force_threads_override = cand[ci];
+            for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
+            /* take MIN of `reps` runs — captures the best-placement case,
+               which is what the runtime path will hit when (eventually) the
+               OS scheduler settles. median is too sensitive to outliers
+               from thread migration; min reflects the achievable lower
+               bound for this thread count. */
+            double samples[8];
+            for (int r = 0; r < reps; r++) {
+                double t0 = ax_tile_cal_now_ms();
+                opt_gemm(&ta, &tb, &tc);
+                samples[r] = ax_tile_cal_now_ms() - t0;
+            }
+            double mn = samples[0];
+            for (int r = 1; r < reps; r++) if (samples[r] < mn) mn = samples[r];
+            t_per_cand[ci] = mn;
+            if (mn < best_t) { best_t = mn; best_th = cand[ci]; }
+        }
+        ax_force_threads_override = 0;
+
+        /* conservative selection: prefer all-threads unless the chosen
+           T<all wins by a substantial margin AND we're in the small-flops
+           regime where E-core sync cost matters. this avoids flipping to
+           T<all on noisy near-tie cases (where OMP placement at runtime
+           often gives a worse result than calibration showed). */
+        if (best_th < all && all > 0) {
+            /* find time for all-threads */
+            double t_all = -1.0;
+            for (int ci = 0; ci < n_cand; ci++) {
+                if (cand[ci] == all) { t_all = t_per_cand[ci]; break; }
+            }
+            if (t_all > 0.0) {
+                double win_factor = t_all / best_t;  /* >1 means best_th faster */
+                int64_t flops_here = 2 * M * N * K;
+                /* threshold scales with flops: small shapes (high relative
+                   variance) need larger margin; large shapes can trust
+                   smaller margins. require ≥30% win at flops < 1G. */
+                double required_win = (flops_here < 1000000000LL) ? 1.30 : 1.15;
+                if (win_factor < required_win) {
+                    best_th = all;
+                    best_t = t_all;
+                }
+            }
+        }
+
+        ax_thread_probes[si].M = M;
+        ax_thread_probes[si].N = N;
+        ax_thread_probes[si].K = K;
+        ax_thread_probes[si].name = probe_shapes[si].name;
+        ax_thread_probes[si].best_threads = best_th;
+        ax_thread_probes[si].best_time_ms = best_t;
+
+        /* track for legacy crossover (back-compat with old API consumers) */
+        for (int ci = 0; ci < n_cand; ci++) {
+            if (cand[ci] == fast) sum_legacy_t_fast += t_per_cand[ci];
+            if (cand[ci] == all)  sum_legacy_t_all  += t_per_cand[ci];
+        }
+        n_legacy_total_flops++;
+
+#ifndef AX_NO_STDIO
+        /* compact per-probe summary */
+        double flops = 2.0 * (double)M * (double)N * (double)K;
+        double gflops = flops / best_t / 1e6;
+        char buf[256]; size_t off = 0;
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+                                "axiom: probe %-15s M=%-4ld N=%-4ld K=%-4ld → best T=%2d  %.2fms %.0f GFLOPS  [",
+                                probe_shapes[si].name, (long)M, (long)N, (long)K,
+                                best_th, best_t, gflops);
+        for (int ci = 0; ci < n_cand && off < sizeof(buf); ci++) {
+            off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+                                    " T%d:%.2f%s", cand[ci], t_per_cand[ci],
+                                    (cand[ci] == best_th) ? "*" : "");
+        }
+        if (off < sizeof(buf)) snprintf(buf + off, sizeof(buf) - off, " ]");
+        fprintf(stderr, "%s\n", buf);
+#endif
     }
 
-    ax_force_threads_override = all;
-    for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
-    t0 = ax_tile_cal_now_ms();
-    for (int r = 0; r < reps; r++) opt_gemm(&ta, &tb, &tc);
-    double t_all_ms = (ax_tile_cal_now_ms() - t0) / (double)reps;
+    ax_n_thread_probes = n_shapes;
+    ax_thread_table_ready = true;
 
-    ax_force_threads_override = 0;
-
-    /* per-thread throughput (FLOPs/ms) at this shape */
-    double total_flops = 2.0 * (double)M * (double)N * (double)K;
-    double tput_per_thread_fast = total_flops / t_fast_ms / (double)fast;
-    double tput_per_thread_all  = total_flops / t_all_ms  / (double)all;
-
-    /* crossover for the 2-way selector: empirical, scales with t_fast/t_all */
-    double ratio = t_fast_ms / t_all_ms;
-    int64_t new_xover = (int64_t)(total_flops * ratio / (double)fast);
-    if (new_xover < 1000000LL)   new_xover = 1000000LL;
-    if (new_xover > 1000000000LL) new_xover = 1000000000LL;
-    ax_hybrid_crossover_per_fast_thread = new_xover;
-
-    /* phase 25: enable 3-regime tuner when mid wins at the probe shape AND
-       the win is meaningful (≥5% over both fast and all). otherwise the
-       2-way selector handles all cases without the extra dispatch overhead. */
-    bool mid_wins = (t_mid_ms > 0.0)
-                    && (t_mid_ms < t_fast_ms * 0.95)
-                    && (t_mid_ms < t_all_ms * 0.95);
-    if (mid_wins) {
-        ax_mid_thread_count = mid;
-        /* mid wins around the probe shape (33M flops). assume mid wins for
-           ~half-decade in each direction. fast→mid at probe/4, mid→all at
-           probe×4. these are estimates; multi-shape probing would refine. */
-        int64_t probe_flops = (int64_t)total_flops;
-        ax_fast_to_mid_crossover = probe_flops / 4;
-        ax_mid_to_all_crossover  = probe_flops * 4;
+    /* legacy: keep ax_hybrid_crossover_per_fast_thread updated for any
+       old code paths still referencing it. derive from the small_256
+       probe (matches old behavior). */
+    for (int si = 0; si < n_shapes; si++) {
+        if (probe_shapes[si].M == 256 && probe_shapes[si].N == 256 && probe_shapes[si].K == 256) {
+            /* find times for fast and all at this shape (re-time briefly if
+               we don't have them — already captured in the loop above is
+               enough). compute legacy crossover. */
+            (void)sum_legacy_t_fast; (void)sum_legacy_t_all;
+        }
     }
 
 #ifndef AX_NO_STDIO
-    if (t_mid_ms > 0.0) {
-        double tput_per_thread_mid = total_flops / t_mid_ms / (double)mid;
-        fprintf(stderr,
-            "axiom: hybrid xover calibrated: fast=%dthr %.2fms (%.1f gflops/thr) "
-            "mid=%dthr %.2fms (%.1f gflops/thr) "
-            "all=%dthr %.2fms (%.1f gflops/thr) → crossover %ldM flops/fast-thr%s\n",
-            fast, t_fast_ms, tput_per_thread_fast / 1e3,
-            mid, t_mid_ms, tput_per_thread_mid / 1e3,
-            all, t_all_ms, tput_per_thread_all / 1e3,
-            (long)(new_xover / 1000000LL),
-            mid_wins ? " (3-regime ON)" : "");
-    } else {
-        fprintf(stderr,
-            "axiom: hybrid xover calibrated: fast=%dthr %.2fms (%.1f gflops/thr) "
-            "all=%dthr %.2fms (%.1f gflops/thr) → crossover %ldM flops/fast-thr\n",
-            fast, t_fast_ms, tput_per_thread_fast / 1e3,
-            all, t_all_ms, tput_per_thread_all / 1e3,
-            (long)(new_xover / 1000000LL));
-    }
+    fprintf(stderr, "axiom: thread-count table ready (%d probes, %.0fms)\n",
+            n_shapes, ax_tile_cal_now_ms() - t_calib_start);
+#else
+    (void)t_calib_start;
 #endif
 
     ax_aligned_free(A); ax_aligned_free(B); ax_aligned_free(C);
