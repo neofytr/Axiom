@@ -20,8 +20,8 @@
 #define AX_VERSION (AX_VERSION_MAJOR * 10000 + AX_VERSION_MINOR * 100 + AX_VERSION_PATCH)
 #define AX_VERSION_STRING "0.10.0"
 
-/* abi stability tag. every public function in axiom/*.h (excluding
-   axiom/internal/) is implicitly tagged AX_ABI_STABLE_SINCE("0.10.0").
+/* abi stability tag. every public function in include/axiom/<name>.h
+   (excluding axiom/internal/) is implicitly tagged AX_ABI_STABLE_SINCE("0.10.0").
    future minor versions may not break or remove a tagged symbol; only
    a major bump (1.0.0 -> 2.0.0) may. removals must go through a
    deprecation cycle:
