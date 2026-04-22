@@ -155,6 +155,19 @@ jobs:
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             ctest -j$(nproc) --output-on-failure --timeout 300
 
+  # portability lint: catch x86-only intrinsics outside __x86_64__ guards
+  # before they reach a cross-arch build. three regressions in a row
+  # (rdtsc in cpu_opt.c::ax_prof_tick, attention.c::PF_TICK, conv_gemm
+  # profile) all had the same shape — x86 intrinsic survived dce because
+  # gating was a runtime flag, then arm64 link failed. this lint blocks
+  # that class at PR time. fast (<1s, pure python regex scan).
+  check-portability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: scan for unguarded x86 intrinsics
+        run: python3 scripts/check_portability.py
+
   # static analysis / lint
   lint:
     runs-on: ubuntu-latest
