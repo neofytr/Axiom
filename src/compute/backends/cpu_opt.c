@@ -2841,7 +2841,22 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
     if (prof_enabled < 0) prof_enabled = (getenv("AX_PROFILE_CONV") && getenv("AX_PROFILE_CONV")[0] == '1') ? 1 : 0;
     uint64_t t_packb = 0, t_packa = 0, t_uk = 0;
     int64_t n_packb = 0, n_packa = 0, n_uk = 0;
+    /* PROF_TICK reads a high-frequency cycle counter. on x86 the rdtsc
+       intrinsic is the cheapest path. on aarch64 the cntvct_el0 system
+       register has similar properties (but a different unit, doesn't
+       matter here since we only use deltas for relative attribution).
+       on anything else fall back to clock_gettime monotonic ns. */
+#if defined(__x86_64__) || defined(_M_X64)
     #define PROF_TICK() __builtin_ia32_rdtsc()
+#elif defined(__aarch64__)
+    static inline uint64_t ax_arm_cntvct(void) {
+        uint64_t v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(v));
+        return v;
+    }
+    #define PROF_TICK() ax_arm_cntvct()
+#else
+    #define PROF_TICK() ((uint64_t)0)  /* prof not supported on this isa */
+#endif
 
     for (int64_t jc = 0; jc < n; jc += GEMM_NC) {
         int64_t nc = (jc + GEMM_NC <= n) ? GEMM_NC : (n - jc);
