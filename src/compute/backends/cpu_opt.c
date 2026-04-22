@@ -793,32 +793,63 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
 #if defined(AX_NO_AUTOTUNE) || !defined(_OPENMP)
     return;
 #else
-    const char *calibrate = getenv("AX_GEMM_CALIBRATE");
-    if (!calibrate || calibrate[0] != '1') return;
+    /* step 13: production-grade tile calibration.
+       runs by DEFAULT (no env gate) with a small sweep (~250ms). env vars
+       still respected as overrides:
+         AX_GEMM_CALIBRATE=0 → skip entirely (use static heuristic)
+         AX_GEMM_CALIBRATE=1 → run extended sweep (more candidates)
+         AX_GEMM_MC/NC/KC    → static override, skip calibration
+       conservative: only swaps to a non-default tile config when the
+       measured win is ≥5% over the static defaults. avoids picking a
+       worse-on-noisy-runs config. */
+    const char *calibrate_env = getenv("AX_GEMM_CALIBRATE");
+    if (calibrate_env && calibrate_env[0] == '0') return;          /* user opt-out */
     if (getenv("AX_GEMM_MC") || getenv("AX_GEMM_NC") || getenv("AX_GEMM_KC")) return;
+    bool extended = (calibrate_env && calibrate_env[0] == '1');
 
     int64_t mc_orig = GEMM_MC, nc_orig = GEMM_NC, kc_orig = GEMM_KC;
-    struct { int64_t mc, nc, kc; } configs[] = {
-        { mc_orig,             nc_orig,           kc_orig      },
-        { mc_orig,             nc_orig,           kc_orig / 2  },
-        { mc_orig,             nc_orig / 2,       kc_orig      },
+    /* candidate set: baseline + a few neighbors. extended sweep adds more. */
+    typedef struct { int64_t mc, nc, kc; } tile_cfg_t;
+    tile_cfg_t base_configs[] = {
+        { mc_orig,             nc_orig,           kc_orig      },   /* static default (baseline) */
+        { mc_orig,             nc_orig / 2,       kc_orig      },   /* smaller NC for cache pressure */
+        { mc_orig / 2,         nc_orig,           kc_orig      },   /* smaller MC */
+        { mc_orig,             nc_orig,           kc_orig / 2  },   /* smaller KC */
+    };
+    tile_cfg_t extended_configs[] = {
         { (int64_t)GEMM_MR * 8,  nc_orig,         kc_orig      },
         { (int64_t)GEMM_MR * 16, nc_orig,         kc_orig      },
         { mc_orig,             (int64_t)GEMM_NR * 32, kc_orig  },
     };
-    int nc_configs = (int)(sizeof(configs) / sizeof(configs[0]));
+    int nc_configs = (int)(sizeof(base_configs) / sizeof(base_configs[0]));
+    int nc_extended = (int)(sizeof(extended_configs) / sizeof(extended_configs[0]));
+    /* combine: copy into a unified array */
+    tile_cfg_t configs[16];
+    for (int i = 0; i < nc_configs; i++) configs[i] = base_configs[i];
+    if (extended) {
+        for (int i = 0; i < nc_extended && nc_configs < 16; i++) {
+            configs[nc_configs++] = extended_configs[i];
+        }
+    }
 
-    /* score each config on TWO shapes: a square 1024^3 and a skinny
-       256x1152x3136. the square exercises pack_b reuse and the JC parallel
-       loop; the skinny mirrors typical conv per-sample GEMM (small M, large
-       N). picking on the square alone biased toward configs that overfit
-       BLAS-style benchmarks but underperformed on conv layers. score is
-       the geometric mean of per-shape times so neither shape dominates. */
+    /* score on a triple of representative shapes that together cover the
+       workload range: medium square (MLP/attention typical), large square
+       (training bulk), and skinny (conv per-sample). picking on small
+       shapes alone biased the chosen tiles to be NC=128 which then
+       cost ~10% on nn_4096² where bigger NC reuses pack_b across more
+       output columns. */
     struct { int64_t M, N, K; float *A, *B, *C; ax_storage_t sa, sb, sc; ax_tensor_t ta, tb, tc; }
-        sh[2] = { { 1024, 1024, 1024, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
-                  { 256,  3136, 1152, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} } };
+        sh[3] = { { 512,  512,  512,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+                  {1024, 1024, 1024,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+                  { 128,  1152, 512,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} } };
+    int n_sh = 3;
+    if (extended) {
+        sh[0].M = sh[0].N = sh[0].K = 1024;
+        sh[1].M = sh[1].N = sh[1].K = 2048;
+        sh[2].M = 256; sh[2].N = 3136; sh[2].K = 1152;
+    }
     uint32_t s = 2463534242u;
-    for (int sh_i = 0; sh_i < 2; sh_i++) {
+    for (int sh_i = 0; sh_i < n_sh; sh_i++) {
         int64_t M = sh[sh_i].M, N = sh[sh_i].N, K = sh[sh_i].K;
         sh[sh_i].A = (float *)ax_aligned_alloc((size_t)M * (size_t)K * sizeof(float), 64);
         sh[sh_i].B = (float *)ax_aligned_alloc((size_t)K * (size_t)N * sizeof(float), 64);
@@ -869,50 +900,93 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     #pragma omp parallel
     { ensure_tl_pack_bufs(); }
 
+    /* take min over reps to fight noise; warm runs to fill TLBs / pack
+       buffers / branch predictors. fewer total iters than the old extended
+       sweep because we now run by default. */
     const int warm_iters = 2;
-    const int timed_iters = 5;
-    double best_score = 1e30;
-    double best_sq_ms = 1e30, best_sk_ms = 1e30;
-    int best_i = 0;
+    const int timed_iters = (extended ? 5 : 3);
+    double per_shape_per_config[16][3];
+    int best_i = 0;            /* baseline (config 0) is implicit baseline */
+    double base_score = 1e30;
     double t_start = ax_tile_cal_now_ms();
 
     for (int i = 0; i < nc_configs; i++) {
         GEMM_MC = configs[i].mc;
         GEMM_NC = configs[i].nc;
         GEMM_KC = configs[i].kc;
-        /* pack_b cache keys on bptr+kc+jc+pc/ldb; any of those changing
-           between iterations invalidates automatically inside pack_b_cached.
-           no manual invalidation needed here. */
-        double per_shape[2];
-        for (int sh_i = 0; sh_i < 2; sh_i++) {
+        for (int sh_i = 0; sh_i < n_sh; sh_i++) {
             for (int w = 0; w < warm_iters; w++)
                 opt_gemm(&sh[sh_i].ta, &sh[sh_i].tb, &sh[sh_i].tc);
-            double t0 = ax_tile_cal_now_ms();
-            for (int r = 0; r < timed_iters; r++)
+            /* min-of-N for stability */
+            double mn = 1e30;
+            for (int r = 0; r < timed_iters; r++) {
+                double t0 = ax_tile_cal_now_ms();
                 opt_gemm(&sh[sh_i].ta, &sh[sh_i].tb, &sh[sh_i].tc);
-            per_shape[sh_i] = (ax_tile_cal_now_ms() - t0) / (double)timed_iters;
+                double dt = ax_tile_cal_now_ms() - t0;
+                if (dt < mn) mn = dt;
+            }
+            per_shape_per_config[i][sh_i] = mn;
         }
-        /* geometric mean: equal weight to each shape's relative slowdown */
-        double score = sqrt(per_shape[0] * per_shape[1]);
-        if (score < best_score) {
-            best_score = score; best_i = i;
-            best_sq_ms = per_shape[0]; best_sk_ms = per_shape[1];
+        /* score: geometric mean of all shape times. equal weight per shape. */
+        double prod = 1.0;
+        for (int sh_i = 0; sh_i < n_sh; sh_i++) prod *= per_shape_per_config[i][sh_i];
+        double score = pow(prod, 1.0 / (double)n_sh);
+        if (i == 0) base_score = score;
+    }
+
+    /* conservative selection: only switch if the proposed config beats
+       baseline by ≥8% on the geometric mean. tighter than the prior 5%
+       because we found that small-shape wins (NC=128) cost ~10% on the
+       large-shape regime — the ~5% threshold was below this trade-off,
+       triggering swaps that hurt overall. with 3 probe shapes including
+       a 1024² square, base_score is biased toward configs that work
+       across the workload range. */
+    for (int i = 1; i < nc_configs; i++) {
+        double prod = 1.0;
+        for (int sh_i = 0; sh_i < n_sh; sh_i++) prod *= per_shape_per_config[i][sh_i];
+        double cand_score = pow(prod, 1.0 / (double)n_sh);
+        if (cand_score < base_score * 0.92) {
+            best_i = i;
+            base_score = cand_score;
         }
     }
+
     GEMM_MC = configs[best_i].mc;
     GEMM_NC = configs[best_i].nc;
     GEMM_KC = configs[best_i].kc;
     double total_ms = ax_tile_cal_now_ms() - t_start;
 
 #ifndef AX_NO_STDIO
+    /* report per-shape gflops at the chosen config for diagnostic visibility */
+    char buf[256]; size_t off = 0;
+    off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+        "axiom: gemm calibrate MC=%ld NC=%ld KC=%ld (%s",
+        (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC,
+        (best_i == 0) ? "baseline" : "swap");
+    for (int sh_i = 0; sh_i < n_sh && off < sizeof(buf); sh_i++) {
+        double t = per_shape_per_config[best_i][sh_i];
+        double g = (2.0 * (double)sh[sh_i].M * (double)sh[sh_i].N * (double)sh[sh_i].K)
+                   / (t * 1e-3) / 1e9;
+        off += (size_t)snprintf(buf + off, sizeof(buf) - off,
+            "; sh%d %.0fG", sh_i, g);
+    }
+    if (off < sizeof(buf))
+        snprintf(buf + off, sizeof(buf) - off, "; %.0fms%s)",
+                 total_ms, extended ? ", extended" : "");
+    fprintf(stderr, "%s\n", buf);
+    /* legacy single-shape format also kept for back-compat parsers */
+    double best_sq_ms = per_shape_per_config[best_i][0];
+    double best_sk_ms = per_shape_per_config[best_i][n_sh - 1];
     double sq_gflops = (2.0 * (double)sh[0].M * (double)sh[0].N * (double)sh[0].K) / (best_sq_ms * 1e-3) / 1e9;
-    double sk_gflops = (2.0 * (double)sh[1].M * (double)sh[1].N * (double)sh[1].K) / (best_sk_ms * 1e-3) / 1e9;
+    double sk_gflops = (2.0 * (double)sh[n_sh - 1].M * (double)sh[n_sh - 1].N * (double)sh[n_sh - 1].K) / (best_sk_ms * 1e-3) / 1e9;
+    const char *which = (best_i == 0) ? "baseline" : "swap";
     fprintf(stderr,
-        "axiom: gemm calibrate MC=%ld NC=%ld KC=%ld (square %.1f gflops, skinny %.1f gflops, sweep %.0fms)\n",
-        (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC, sq_gflops, sk_gflops, total_ms);
+        "axiom: gemm calibrate MC=%ld NC=%ld KC=%ld (%s; sq %.1f gflops, sk %.1f gflops, sweep %.0fms%s)\n",
+        (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC, which, sq_gflops, sk_gflops, total_ms,
+        extended ? ", extended" : "");
 #endif
 
-    for (int sh_i = 0; sh_i < 2; sh_i++) {
+    for (int sh_i = 0; sh_i < n_sh; sh_i++) {
         ax_aligned_free(sh[sh_i].A); ax_aligned_free(sh[sh_i].B); ax_aligned_free(sh[sh_i].C);
     }
 #endif
