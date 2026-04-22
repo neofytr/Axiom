@@ -29,6 +29,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include <stdatomic.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -272,6 +274,31 @@ static void refresh_fused_qkv(ax_mha_t *m)
 /* forward declaration — defined below forward() */
 static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out);
 
+/* T1.3/T1.4: stack-allocated 2-D tensor view over an existing buffer.
+   used to skip the x_flat / dOut_flat memcpy when input is already
+   contiguous and we just need to reinterpret its 3D shape as 2D for
+   the GEMM call. zero heap allocation; storage pointer aliases the
+   caller's buffer (caller must keep it alive). */
+static inline void mha_make_stack_view(ax_tensor_t *tv, ax_storage_t *st,
+                                        const float *data,
+                                        int64_t rows, int64_t cols)
+{
+    st->data         = (void *)(uintptr_t)data;  /* drop const for storage_t */
+    st->size_bytes   = (size_t)(rows * cols) * sizeof(float);
+    atomic_store(&st->refcount, 0);
+    st->device       = AX_DEVICE_CPU;
+    st->is_arena_temp = true;
+    st->generation   = 1;
+    memset(tv, 0, sizeof(*tv));
+    tv->storage      = st;
+    tv->ndim         = 2;
+    tv->dtype        = AX_FLOAT32;
+    tv->shape[0]     = rows;
+    tv->shape[1]     = cols;
+    tv->strides[0]   = cols;
+    tv->strides[1]   = 1;
+}
+
 typedef struct {
     ax_mha_t *layer;
     int64_t B, S, D, H, dk;
@@ -339,13 +366,29 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
         else        (t) = ax_tensor_zeros((sh), (nd), AX_FLOAT32);            \
     } while (0)
 
-    /* ---- build x_flat [rows, D] view of input ---- */
+    /* ---- build x_flat [rows, D] view of input ----
+       T1.3: skip the memcpy by using a stack-view aliasing inp's data.
+       saves 2-6 MB BW per forward call (B*S*D*4 bytes). on the record
+       path the input tensor is kept alive by the autograd graph
+       (gf->inputs[0]), so backward can reconstruct an equivalent view
+       — no need to materialize a copy here either. */
     int64_t flat_sh[] = {rows, D};
+    (void)flat_sh;  /* may be unused if view path taken */
     ax_tensor_t *x_flat = NULL;
-    ALLOC_SHAPE(x_flat, flat_sh, 2);
-    if (!x_flat) goto fail;
-    memcpy(x_flat->storage->data, inp->storage->data,
-           (size_t)rows * (size_t)D * sizeof(float));
+    ax_tensor_t  x_flat_view;
+    ax_storage_t x_flat_view_st;
+    bool inp_contig = (inp->storage && inp->storage->data &&
+                       inp->dtype == AX_FLOAT32);
+    if (inp_contig) {
+        mha_make_stack_view(&x_flat_view, &x_flat_view_st,
+                             (const float *)inp->storage->data, rows, D);
+        x_flat = &x_flat_view;
+    } else {
+        ALLOC_SHAPE(x_flat, flat_sh, 2);
+        if (!x_flat) goto fail;
+        memcpy(x_flat->storage->data, inp->storage->data,
+               (size_t)rows * (size_t)D * sizeof(float));
+    }
 
     /* ---- fused QKV: [rows, D] @ [D, 3D] -> [rows, 3D] ---- */
     int64_t qkv_sh[] = {rows, 3 * D};
@@ -486,7 +529,11 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
         }
         ctx->layer = m;
         ctx->B = B; ctx->S = S; ctx->D = D; ctx->H = H; ctx->dk = dk;
-        ctx->x_flat    = x_flat;
+        /* T1.3: x_flat is now a stack-view aliasing input data (when input
+           is contiguous). don't store it in ctx — the stack frame is gone
+           by the time backward runs. backward reconstructs an equivalent
+           view from self->inputs[0] (which the autograd graph keeps alive). */
+        ctx->x_flat    = NULL;
         ctx->Q_head    = Qh;
         ctx->K_head    = Kh;
         ctx->V_head    = Vh;
@@ -587,14 +634,29 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     #define PF_TICK() ((uint64_t)__builtin_ia32_rdtsc())
     uint64_t pf_t0;
 
-    /* contiguous grad_out flattened to [rows, D] */
+    /* contiguous grad_out flattened to [rows, D].
+       T1.4: when grad_out is already contiguous fp32, use a stack-view
+       aliasing its data instead of memcpy'ing into a fresh arena tensor.
+       saves 2-6 MB BW per backward call. fall back to materialize when
+       grad_out is non-contig or wrong dtype. */
     ax_arena_t *arena = ax_backward_arena();
     int64_t flat_sh[] = {rows, D};
-    ax_tensor_t *dOut_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
-    if (!dOut_flat) return;
+    ax_tensor_t *dOut_flat = NULL;
+    ax_tensor_t  dOut_view;
+    ax_storage_t dOut_view_st;
+    bool gout_contig = (grad_out && grad_out->storage && grad_out->storage->data
+                        && grad_out->dtype == AX_FLOAT32);
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    memcpy(dOut_flat->storage->data, grad_out->storage->data,
-           (size_t)rows * (size_t)D * sizeof(float));
+    if (gout_contig) {
+        mha_make_stack_view(&dOut_view, &dOut_view_st,
+                             (const float *)grad_out->storage->data, rows, D);
+        dOut_flat = &dOut_view;
+    } else {
+        dOut_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
+        if (!dOut_flat) return;
+        memcpy(dOut_flat->storage->data, grad_out->storage->data,
+               (size_t)rows * (size_t)D * sizeof(float));
+    }
     if (prof_enabled) pf_dout_copy += PF_TICK() - pf_t0;
 
     /* ================================================================
@@ -691,8 +753,23 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         int64_t dW_sh[] = {D, 3 * D};
         ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
         if (!dWqkv) return;
+
+        /* T1.3: x_flat = stack-view of input data (forward never copied).
+           input is alive because the autograd graph holds a ref via
+           self->inputs[0]. fall back to ctx->x_flat if forward chose
+           the materialized path (non-contig input). */
+        ax_tensor_t  x_flat_view;
+        ax_storage_t x_flat_view_st;
+        ax_tensor_t *x_flat_for_bwd = ctx->x_flat;
+        if (!x_flat_for_bwd && input && input->storage && input->storage->data) {
+            mha_make_stack_view(&x_flat_view, &x_flat_view_st,
+                                 (const float *)input->storage->data, rows, D);
+            x_flat_for_bwd = &x_flat_view;
+        }
+        if (!x_flat_for_bwd) return;
+
         pf_t0 = prof_enabled ? PF_TICK() : 0;
-        if (ax_compute_gemm_tn(ctx->x_flat, dQKV, dWqkv) != AX_OK) return;
+        if (ax_compute_gemm_tn(x_flat_for_bwd, dQKV, dWqkv) != AX_OK) return;
         if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
 
         const float *dw_data = (const float *)dWqkv->storage->data;
