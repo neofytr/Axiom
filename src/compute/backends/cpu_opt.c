@@ -463,7 +463,7 @@ typedef struct {
     double best_time_ms;     /* for diagnostics */
 } ax_thread_probe_t;
 
-#define AX_MAX_THREAD_PROBES 12
+#define AX_MAX_THREAD_PROBES 16
 static ax_thread_probe_t ax_thread_probes[AX_MAX_THREAD_PROBES];
 static int ax_n_thread_probes = 0;
 static bool ax_thread_table_ready = false;
@@ -935,17 +935,16 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     }
 
     /* conservative selection: only switch if the proposed config beats
-       baseline by ≥8% on the geometric mean. tighter than the prior 5%
-       because we found that small-shape wins (NC=128) cost ~10% on the
-       large-shape regime — the ~5% threshold was below this trade-off,
-       triggering swaps that hurt overall. with 3 probe shapes including
-       a 1024² square, base_score is biased toward configs that work
-       across the workload range. */
+       baseline by ≥6% on the geometric mean across 3 probe shapes
+       (512² + 1024² + skinny). 6% sits between the prior 5% (too loose,
+       triggered NC=128 swap that cost large-shape) and 8% (too tight,
+       missed MC=24 swap that helped narrow-N by 13%). this is empirical
+       — the right value depends on the noise floor of the host. */
     for (int i = 1; i < nc_configs; i++) {
         double prod = 1.0;
         for (int sh_i = 0; sh_i < n_sh; sh_i++) prod *= per_shape_per_config[i][sh_i];
         double cand_score = pow(prod, 1.0 / (double)n_sh);
-        if (cand_score < base_score * 0.92) {
+        if (cand_score < base_score * 0.94) {
             best_i = i;
             base_score = cand_score;
         }
@@ -1034,6 +1033,12 @@ void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
         { 512, 2048, 512, "narrow_512x2k"}, /* 1G — narrow N, edge case */
         {1024,1024,1024, "med_sq_1024"   },  /* 2.1G */
         {2048,2048,2048, "large_sq_2k"   },  /* 17G */
+        /* T1.2: MHA backward dWqkv shapes — tn(D, 3D, B*S). probe shows
+           these dominate mha_train backward time. covers a range of
+           (B*S, D) dimension combos common in transformer training. */
+        { 512, 1536,1024, "mha_dwqkv_small"},  /* B=8 S=128 D=512: tn(512, 1536, 1024) */
+        {1024, 3072, 512, "mha_dwqkv_med"  },  /* B=1 S=512 D=1024: tn(1024, 3072, 512) */
+        { 768, 2304,2048, "mha_dwqkv_long" },  /* B=1 S=2048 D=768: tn(768, 2304, 2048) */
     };
     int n_shapes = (int)(sizeof(probe_shapes) / sizeof(probe_shapes[0]));
     if (n_shapes > AX_MAX_THREAD_PROBES) n_shapes = AX_MAX_THREAD_PROBES;
