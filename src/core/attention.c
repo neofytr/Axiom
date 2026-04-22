@@ -26,6 +26,7 @@
 #include "axiom/error.h"
 #include "../compute/backends/simd_defs.h"
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 
@@ -575,13 +576,26 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t dk = ctx->dk;
     int64_t rows = B * S;
 
+    /* T1.1 profile: per-stage cycle counts gated by AX_PROFILE_MHA=1.
+       summed across many calls to amortize printing cost. */
+    static int prof_enabled = -1;
+    if (prof_enabled < 0) prof_enabled = (getenv("AX_PROFILE_MHA") && getenv("AX_PROFILE_MHA")[0] == '1') ? 1 : 0;
+    static __thread uint64_t pf_dout_copy=0, pf_wo_grad=0, pf_dattn=0,
+                              pf_head_int=0, pf_sdpa_bwd=0, pf_deint=0,
+                              pf_dwqkv=0, pf_dbqkv=0, pf_dx=0;
+    static __thread int pf_calls = 0;
+    #define PF_TICK() ((uint64_t)__builtin_ia32_rdtsc())
+    uint64_t pf_t0;
+
     /* contiguous grad_out flattened to [rows, D] */
     ax_arena_t *arena = ax_backward_arena();
     int64_t flat_sh[] = {rows, D};
     ax_tensor_t *dOut_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
     if (!dOut_flat) return;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     memcpy(dOut_flat->storage->data, grad_out->storage->data,
            (size_t)rows * (size_t)D * sizeof(float));
+    if (prof_enabled) pf_dout_copy += PF_TICK() - pf_t0;
 
     /* ================================================================
        step 1 — output projection backward
@@ -593,7 +607,9 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         if (!scratch) return;
         float *dWo = param_grad_ptr(m->Wo);
         if (dWo) {
+            pf_t0 = prof_enabled ? PF_TICK() : 0;
             ax_compute_gemm_tn(ctx->attn_flat, dOut_flat, scratch);
+            if (prof_enabled) pf_wo_grad += PF_TICK() - pf_t0;
             accumulate_f32((const float *)scratch->storage->data, dWo, D * D);
             ax_storage_touch(m->Wo->grad->storage);
         }
@@ -609,7 +625,9 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     /* d_attn_flat = dOut_flat @ Wo^T */
     ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
     if (!d_attn_flat) return;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     if (ax_compute_gemm_nt(dOut_flat, m->Wo, d_attn_flat) != AX_OK) return;
+    if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
 
     /* ================================================================
        step 2 — re-interleave heads + SDPA backward
@@ -617,8 +635,10 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t head_sh[] = {B * H, S, dk};
     ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!dO_head) return;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     head_interleave((const float *)d_attn_flat->storage->data,
                     (float *)dO_head->storage->data, B, S, H, dk);
+    if (prof_enabled) pf_head_int += PF_TICK() - pf_t0;
 
     ax_tensor_t *dQh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *dKh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
@@ -628,6 +648,7 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     float scale = 1.0f / sqrtf((float)dk);
     const float *P_saved = ctx->P_save_tensor
         ? (const float *)ctx->P_save_tensor->storage->data : NULL;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     ax_fused_attention_bwd_use(
         (const float *)ctx->Q_head->storage->data,
         (const float *)ctx->K_head->storage->data,
@@ -640,6 +661,7 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         (float *)dKh->storage->data,
         (float *)dVh->storage->data,
         B * H, S, dk, scale, m->causal);
+    if (prof_enabled) pf_sdpa_bwd += PF_TICK() - pf_t0;
 
     /* ================================================================
        step 3 — FUSED de-interleave into a single dQKV [rows, 3D] buffer,
@@ -649,11 +671,13 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     int64_t qkv_sh[] = {rows, 3 * D};
     ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
     if (!dQKV) return;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     head_deinterleave_qkv_merge((const float *)dQh->storage->data,
                                  (const float *)dKh->storage->data,
                                  (const float *)dVh->storage->data,
                                  (float *)dQKV->storage->data,
                                  B, S, H, dk, D);
+    if (prof_enabled) pf_deint += PF_TICK() - pf_t0;
 
     /* ================================================================
        step 4 — FUSED weight grad: dWqkv = x_flat^T @ dQKV → [D, 3D].
@@ -667,7 +691,9 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         int64_t dW_sh[] = {D, 3 * D};
         ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
         if (!dWqkv) return;
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
         if (ax_compute_gemm_tn(ctx->x_flat, dQKV, dWqkv) != AX_OK) return;
+        if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
 
         const float *dw_data = (const float *)dWqkv->storage->data;
         /* dWqkv row i: [dWq[i,:] | dWk[i,:] | dWv[i,:]], each D wide.
@@ -734,12 +760,39 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         ax_tensor_t *dX = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
         if (!dX) return;
         /* dQKV is [rows, 3D]; Wqkv_cache is [D, 3D]; dX = dQKV @ Wqkv^T */
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
         if (ax_compute_gemm_nt(dQKV, m->Wqkv_cache, dX) != AX_OK) return;
+        if (prof_enabled) pf_dx += PF_TICK() - pf_t0;
 
         float *gx = (float *)input->grad->storage->data;
         accumulate_f32((const float *)dX->storage->data, gx, rows * D);
         ax_storage_touch(input->grad->storage);
     }
+
+    if (prof_enabled) {
+        pf_calls++;
+        if ((pf_calls % 5) == 0) {
+            uint64_t total = pf_dout_copy + pf_wo_grad + pf_dattn + pf_head_int
+                           + pf_sdpa_bwd + pf_deint + pf_dwqkv + pf_dx;
+            if (total > 0) {
+                fprintf(stderr,
+                    "axiom: mha_backward [B=%ld S=%ld D=%ld H=%ld, %d calls] "
+                    "dout_cp=%.0f%% wo_grad=%.0f%% dattn=%.0f%% "
+                    "head_int=%.0f%% sdpa_bwd=%.0f%% deint=%.0f%% "
+                    "dwqkv=%.0f%% dx=%.0f%%\n",
+                    (long)B, (long)S, (long)D, (long)H, pf_calls,
+                    100.0 * (double)pf_dout_copy / (double)total,
+                    100.0 * (double)pf_wo_grad   / (double)total,
+                    100.0 * (double)pf_dattn     / (double)total,
+                    100.0 * (double)pf_head_int  / (double)total,
+                    100.0 * (double)pf_sdpa_bwd  / (double)total,
+                    100.0 * (double)pf_deint     / (double)total,
+                    100.0 * (double)pf_dwqkv     / (double)total,
+                    100.0 * (double)pf_dx        / (double)total);
+            }
+        }
+    }
+    #undef PF_TICK
 
     /* ctx is freed by ctx_cleanup (free). saved arena tensors are reclaimed
        when the forward arena resets in ax_graph_cleanup. */
