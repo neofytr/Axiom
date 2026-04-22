@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.18)
-project(axiom C)
+# version is the single source of truth for the released build artefacts
+# (cmake project version, axiom.pc, library SOVERSION). it MUST track the
+# AX_VERSION_* constants in include/axiom/types.h.
+project(axiom
+        VERSION 0.10.0
+        DESCRIPTION "axiom — pure C deep learning framework (zero-deps, embedded-ready)"
+        HOMEPAGE_URL "https://github.com/neofytr/neoNN"
+        LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -144,9 +151,18 @@ set(AXIOM_SOURCES
     src/core/layer.c
     src/core/model.c
     src/core/serialize.c
-    src/core/conv.c
+    src/core/conv/pool.c
+    src/core/conv/conv_bn_relu.c
+    src/core/conv/winograd.c
+    src/core/conv/direct.c
+    src/core/conv/im2col.c
+    src/core/conv/path_selection.c
+    src/core/conv/backward.c
+    src/core/conv/forward.c
     src/core/norm.c
     src/core/attention.c
+    src/core/attention/layout.c
+    src/core/attention/cache.c
     src/core/fused_attention.c
     src/core/rng.c
     src/core/quantize.c
@@ -202,6 +218,7 @@ if(AX_CUDA)
         src/compute/backends/cuda/ops_optim.cu
         src/compute/backends/cuda/ops_fused.cu
         src/compute/backends/cuda/ops_activations.cu
+        src/compute/backends/cuda/ops_attention.cu
     )
     list(APPEND AXIOM_SOURCES ${AX_CUDA_SOURCES})
 endif()
@@ -245,7 +262,9 @@ if(AX_CPU_ISA_DISPATCH)
 
     # avx-512 variant — fastest on xeon / ice lake+.
     add_library(axiom_cpu_opt_avx512 OBJECT src/compute/backends/cpu_opt.c)
-    target_include_directories(axiom_cpu_opt_avx512 PUBLIC include
+    target_include_directories(axiom_cpu_opt_avx512 PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE src/compute/backends)
     target_compile_definitions(axiom_cpu_opt_avx512 PRIVATE AX_CPU_OPT_SUFFIX=_avx512)
     target_compile_options(axiom_cpu_opt_avx512 PRIVATE -mavx512f -mavx2 -mfma)
@@ -256,7 +275,9 @@ if(AX_CPU_ISA_DISPATCH)
 
     # avx2+fma variant — fast on most x86_64 since haswell (2013).
     add_library(axiom_cpu_opt_avx2 OBJECT src/compute/backends/cpu_opt.c)
-    target_include_directories(axiom_cpu_opt_avx2 PUBLIC include
+    target_include_directories(axiom_cpu_opt_avx2 PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE src/compute/backends)
     target_compile_definitions(axiom_cpu_opt_avx2 PRIVATE AX_CPU_OPT_SUFFIX=_avx2)
     target_compile_options(axiom_cpu_opt_avx2 PRIVATE -mavx2 -mfma)
@@ -271,7 +292,9 @@ if(AX_CPU_ISA_DISPATCH)
     # runs on any x86_64 cpu including very old ones; simd_defs.h
     # falls through to its scalar branch when __AVX2__ isn't set.
     add_library(axiom_cpu_opt_scalar OBJECT src/compute/backends/cpu_opt.c)
-    target_include_directories(axiom_cpu_opt_scalar PUBLIC include
+    target_include_directories(axiom_cpu_opt_scalar PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE src/compute/backends)
     target_compile_definitions(axiom_cpu_opt_scalar PRIVATE AX_CPU_OPT_SUFFIX=_scalar)
     target_compile_options(axiom_cpu_opt_scalar PRIVATE -mno-avx2 -mno-fma -mno-avx)
@@ -287,7 +310,9 @@ endif()
 
 # static library
 add_library(axiom_static STATIC ${AXIOM_SOURCES})
-target_include_directories(axiom_static PUBLIC include)
+target_include_directories(axiom_static PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(axiom_static PUBLIC m)
 if(AX_OPENMP AND OpenMP_C_FOUND)
     target_link_libraries(axiom_static PUBLIC OpenMP::OpenMP_C)
@@ -306,7 +331,9 @@ set_target_properties(axiom_static PROPERTIES OUTPUT_NAME axiom)
 
 # shared library
 add_library(axiom_shared SHARED ${AXIOM_SOURCES})
-target_include_directories(axiom_shared PUBLIC include)
+target_include_directories(axiom_shared PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(axiom_shared PUBLIC m)
 if(AX_OPENMP AND OpenMP_C_FOUND)
     target_link_libraries(axiom_shared PUBLIC OpenMP::OpenMP_C)
@@ -385,17 +412,24 @@ foreach(test_src ${TEST_SOURCES})
     else()
         add_test(NAME ${test_name} COMMAND ${test_name})
     endif()
+    # baseline test environment:
+    #   AX_NO_AUTOTUNE=1   skip thread-count probe (~150 ms / binary)
+    #   AX_GEMM_CALIBRATE=0 skip gemm tile probe (~500 ms / binary)
+    # tests don't need autotuned thresholds — they need correctness. each
+    # test binary previously paid ~6-8 s of startup; this drops it to ~1 s
+    # so the full ctest suite finishes in under a minute.
+    set(_ax_test_env "AX_NO_AUTOTUNE=1;AX_GEMM_CALIBRATE=0")
     # tests intentionally don't clean up every intermediate tensor in the
     # computation graph (that's the model api's job via ax_graph_cleanup).
     # suppress leak detection for tests so asan only catches real bugs.
     if(AX_SANITIZE)
-        set_tests_properties(${test_name} PROPERTIES
-            ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+        list(APPEND _ax_test_env "ASAN_OPTIONS=detect_leaks=0")
     endif()
     if(AX_TSAN)
-        set_tests_properties(${test_name} PROPERTIES
-            ENVIRONMENT "TSAN_OPTIONS=ignore_noninstrumented_modules=1 suppressions=${CMAKE_SOURCE_DIR}/.tsan_suppressions")
+        list(APPEND _ax_test_env
+             "TSAN_OPTIONS=ignore_noninstrumented_modules=1 suppressions=${CMAKE_SOURCE_DIR}/.tsan_suppressions")
     endif()
+    set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "${_ax_test_env}")
 endforeach()
 
 # examples — training examples are excluded under AX_INFERENCE_ONLY
@@ -463,3 +497,88 @@ add_custom_target(run_tests
     DEPENDS ${TEST_NAMES}
     COMMENT "running all axiom tests"
 )
+
+# ---------------------------------------------------------------------------
+# install rules (Phase L.1)
+#
+# `cmake --install build --prefix /usr/local` lays out:
+#   ${prefix}/lib/libaxiom.{a,so.0.10.0}                    (libraries)
+#   ${prefix}/lib/libaxiom.so -> libaxiom.so.0              (versioned symlinks)
+#   ${prefix}/include/axiom/*.h                             (public headers)
+#   ${prefix}/lib/cmake/axiom/axiomConfig.cmake             (find_package support)
+#   ${prefix}/lib/cmake/axiom/axiomConfigVersion.cmake      (semver match)
+#   ${prefix}/lib/pkgconfig/axiom.pc                        (pkg-config)
+#
+# the internal headers (include/axiom/internal/) are intentionally NOT
+# installed — they are part of the framework's implementation detail and
+# carry no abi promise. user code must include only axiom/<name>.h.
+# ---------------------------------------------------------------------------
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+# library SOVERSION = MAJOR; FULLVERSION embeds MAJOR.MINOR.PATCH so the
+# linker resolves libaxiom.so -> libaxiom.so.0 -> libaxiom.so.0.10.0 the
+# usual way. callers link against the SONAME (libaxiom.so.0) and don't
+# need to be rebuilt for patch / minor updates.
+set_target_properties(axiom_shared PROPERTIES
+    VERSION   ${PROJECT_VERSION}
+    SOVERSION ${PROJECT_VERSION_MAJOR})
+
+# the multi-isa cpu_opt sub-libraries are OBJECT libs linked privately
+# into axiom_static / axiom_shared. they have no separate install artefact
+# but cmake EXPORT requires them in the export set so the linker ordering
+# can be reproduced downstream.
+set(_axiom_export_targets axiom_static axiom_shared)
+if(AX_CPU_ISA_DISPATCH)
+    list(APPEND _axiom_export_targets
+         axiom_cpu_opt_avx2 axiom_cpu_opt_scalar)
+    if(TARGET axiom_cpu_opt_avx512)
+        list(APPEND _axiom_export_targets axiom_cpu_opt_avx512)
+    endif()
+endif()
+
+install(TARGETS ${_axiom_export_targets}
+    EXPORT axiomTargets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# install only the public headers — drop axiom/internal/.
+install(DIRECTORY include/axiom/
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/axiom
+    FILES_MATCHING PATTERN "*.h"
+    PATTERN "internal" EXCLUDE)
+
+# cmake package config — lets downstream `find_package(axiom)` work.
+install(EXPORT axiomTargets
+    FILE axiomTargets.cmake
+    NAMESPACE axiom::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/axiom)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/axiomConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/axiomConfig.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/axiom)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/axiomConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/axiomConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/axiomConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/axiom)
+
+# pkg-config file (Phase L.2). populated from axiom.pc.in via
+# configure_file so the version and prefix track the cmake config.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/axiom.pc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/axiom.pc"
+    @ONLY)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/axiom.pc"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)

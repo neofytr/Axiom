@@ -1,0 +1,32 @@
+@PACKAGE_INIT@
+
+# axiomConfig.cmake — find_package(axiom) entry point.
+#
+# usage in a downstream CMakeLists.txt:
+#   find_package(axiom 0.10 REQUIRED)
+#   target_link_libraries(myapp PRIVATE axiom::axiom)
+#
+# the imported target axiom::axiom links against the static library by
+# default. for the shared library, link axiom::axiom_shared.
+
+include(CMakeFindDependencyMacro)
+
+# axiom can use openmp internally; downstreams need to know if it was
+# built with it so their executables link against the right runtime.
+if(@OpenMP_C_FOUND@)
+    find_dependency(OpenMP COMPONENTS C)
+endif()
+
+if(@AX_CUDA@)
+    find_dependency(CUDAToolkit)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/axiomTargets.cmake")
+
+# convenience alias — axiom::axiom resolves to the static lib (default
+# install target). axiom::axiom_shared is also available.
+if(NOT TARGET axiom::axiom)
+    add_library(axiom::axiom ALIAS axiom::axiom_static)
+endif()
+
+check_required_components(axiom)

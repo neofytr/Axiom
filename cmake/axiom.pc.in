@@ -1,0 +1,16 @@
+# axiom.pc — pkg-config descriptor.
+#
+# uses ${pcfiledir} so the install prefix is computed at consumption time
+# rather than configure time. lets the same artefact be relocated from
+# /tmp/install/... to /usr/local/... or wherever else without rebuilding.
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: axiom
+Description: @PROJECT_DESCRIPTION@
+URL: @PROJECT_HOMEPAGE_URL@
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -laxiom -lm
+Cflags: -I${includedir}
