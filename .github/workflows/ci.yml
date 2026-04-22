@@ -40,9 +40,21 @@ jobs:
       # so failures didn't block merges — defeats the point. keeping a
       # quick smoke build here for local dev signal, gate via test-asan.
 
-  # build + test on ARM64 (NEON)
+  # build + test on ARM64 (NEON). matrix bisects regressions:
+  # `default` exercises the full NEON path including the JIT-emitted
+  # 8x12 micro-kernel; `nojit` disables the JIT and uses pure intrinsic
+  # NEON. when only one variant fails it points the finger at that
+  # code path — saves a cross-compile bisect.
   test-arm64:
     runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - name: default
+            cflags: ""
+          - name: nojit
+            cflags: "-DAX_NO_JIT"
     steps:
       - uses: actions/checkout@v4
 
@@ -54,10 +66,12 @@ jobs:
       - name: install deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential cmake libomp-dev
 
-      - name: build
+      - name: build (${{ matrix.config.name }})
         run: |
           mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release ..
+          cmake -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_FLAGS="${{ matrix.config.cflags }}" \
+                ..
           cmake --build . -j$(nproc)
 
       - name: run test suite

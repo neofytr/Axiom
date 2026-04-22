@@ -658,7 +658,10 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         const float *dw_data = (const float *)dWqkv->storage->data;
         /* dWqkv row i: [dWq[i,:] | dWk[i,:] | dWv[i,:]], each D wide.
            we iterate rows and accumulate the three column slices into
-           the three param-grad tensors. */
+           the three param-grad tensors. (a fused single-pass version
+           that read the [3D] source row once and wrote 3 dests was
+           tried but regressed B8_S128 — each thread's working-set blew
+           past L1 with 3 dests open at once.) */
         #define ACC_PARAM(W, col_off) do {                                     \
             if ((W)->requires_grad) {                                          \
                 float *dp = param_grad_ptr(W);                                 \
