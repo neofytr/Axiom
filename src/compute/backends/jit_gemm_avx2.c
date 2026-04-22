@@ -333,3 +333,164 @@ ax_jit_gemm_kernel_fn ax_jit_gemm_avx2_get_6x16_kc(int64_t kc) {
     pthread_mutex_unlock(&g_jit_kc_mu);
     return g_kernel_kc_fns[kc];
 }
+
+/* ===== Phase I.1.a: strided-A per-kc fully-unrolled kernel =============
+   same shape as the packed kernel above but reads A from row-major
+   memory with runtime row stride `lda_bytes`. used by sdpa_bwd to skip
+   the pack_a_t pre-transpose of P_tile / dS_tile.
+
+   System V x86_64 calling convention:
+     rdi = kc                    (loop count, kept as-is — we unroll)
+     rsi = ap (current A row)    (advances by rdx per K)
+     rdx = lda_bytes             (read each K iter to bump rsi)
+     rcx = bp (current B row)    (advances by NR*4 bytes per K iter)
+     r8  = c base                (row 0 of output tile)
+     r9  = ldc_bytes             (used to derive row pointers r10..r15)
+
+   register layout inside the kernel:
+     ymm0..ymm11 : 12 acc regs (rows 0..5 × hi/lo, same as packed kernel)
+     ymm12       : a broadcast (reused per row)
+     ymm13, ymm14: b0, b1
+     ymm15       : free (used by writeback)
+     r10..r15    : 6 row base pointers (r8 + i*r9 for i in 0..5)
+
+   kc is fully unrolled — the K loop becomes kc copies of the body. each
+   body advances a "current A pointer" register (we use rsi) by rdx and
+   bakes the B offset as an immediate (k*NR*4). gives the same per-kc
+   spec speedup as the packed variant.
+
+   instruction-byte budget per K iter:
+     - 2 vmovaps loads  (b0, b1):           2 × 9 = 18  (disp32 worst)
+     - 6 vbroadcastss   (a from rsi):       6 × 9 = 54  (disp8 — rsi+0..20)
+     - 12 vfmadd231ps:                     12 × 5 = 60
+     - 1 add rsi, rdx (advance A row):              3
+     ────────────────────────────────────────────  ~135 + pad ~25 = 160 B/iter
+   prologue/epilogue/writeback identical to packed kernel (~410 B). */
+
+static ax_jit_gemm_stridedA_kernel_fn
+g_kernel_kc_fns_stridedA[KC_MAX + 1] = {0};
+static ax_jit_buf_t *g_jit_kc_buf_stridedA[KC_MAX + 1] = {0};
+static pthread_mutex_t g_jit_kc_mu_stridedA = PTHREAD_MUTEX_INITIALIZER;
+
+static void emit_one_kernel_stridedA_kc(ax_jit_buf_t *b, int64_t kc) {
+    /* prologue: save callee-saved gprs we'll clobber. r10..r15 are
+       caller-saved on sysv-x86_64 but the existing packed kernel saves
+       r12..r15 because they're callee-saved — match that. */
+    ax_jit_emit_push_r64(b, GPR_R12);
+    ax_jit_emit_push_r64(b, GPR_R13);
+    ax_jit_emit_push_r64(b, GPR_R14);
+    ax_jit_emit_push_r64(b, GPR_R15);
+
+    /* row base pointers r10..r15 = r8 + i*r9.
+       (different from packed kernel which uses r9..r14 because there
+       r9 = ldc_bytes is in r8 and c base is in rcx.) */
+    ax_jit_emit_mov_r64_r64(b, GPR_R10, GPR_R8);
+    ax_jit_emit_mov_r64_r64(b, GPR_R11, GPR_R10); ax_jit_emit_add_r64_r64(b, GPR_R11, GPR_R9);
+    ax_jit_emit_mov_r64_r64(b, GPR_R12, GPR_R11); ax_jit_emit_add_r64_r64(b, GPR_R12, GPR_R9);
+    ax_jit_emit_mov_r64_r64(b, GPR_R13, GPR_R12); ax_jit_emit_add_r64_r64(b, GPR_R13, GPR_R9);
+    ax_jit_emit_mov_r64_r64(b, GPR_R14, GPR_R13); ax_jit_emit_add_r64_r64(b, GPR_R14, GPR_R9);
+    ax_jit_emit_mov_r64_r64(b, GPR_R15, GPR_R14); ax_jit_emit_add_r64_r64(b, GPR_R15, GPR_R9);
+
+    /* zero accumulators ymm0..ymm11 */
+    for (int i = 0; i < 12; i++) ax_jit_emit_vxorps_zero(b, i);
+
+    /* fully unrolled K loop. b offset per K iter is k*NR*4 bytes — baked
+       as an immediate. a is read from rsi which is advanced by rdx per
+       iter. broadcasts use disp8 (+0..+20) so they stay short. */
+    for (int64_t k = 0; k < kc; k++) {
+        int b_off = (int)(k * NR * 4);
+        ax_jit_emit_vmovaps_load(b, /*dst*/13, /*base*/GPR_RCX, b_off);
+        ax_jit_emit_vmovaps_load(b, /*dst*/14, /*base*/GPR_RCX, b_off + 32);
+        ax_jit_emit_vbroadcastss(b, /*dst*/12, /*base*/GPR_RSI, 0);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/0,  /*a=*/12, /*b=*/13);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/1,  /*a=*/12, /*b=*/14);
+        ax_jit_emit_vbroadcastss(b, /*dst*/12, /*base*/GPR_RSI, 4);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/2,  /*a=*/12, /*b=*/13);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/3,  /*a=*/12, /*b=*/14);
+        ax_jit_emit_vbroadcastss(b, /*dst*/12, /*base*/GPR_RSI, 8);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/4,  /*a=*/12, /*b=*/13);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/5,  /*a=*/12, /*b=*/14);
+        ax_jit_emit_vbroadcastss(b, /*dst*/12, /*base*/GPR_RSI, 12);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/6,  /*a=*/12, /*b=*/13);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/7,  /*a=*/12, /*b=*/14);
+        ax_jit_emit_vbroadcastss(b, /*dst*/12, /*base*/GPR_RSI, 16);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/8,  /*a=*/12, /*b=*/13);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/9,  /*a=*/12, /*b=*/14);
+        ax_jit_emit_vbroadcastss(b, /*dst*/12, /*base*/GPR_RSI, 20);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/10, /*a=*/12, /*b=*/13);
+        ax_jit_emit_vfmadd231ps (b, /*dst*/11, /*a=*/12, /*b=*/14);
+        /* advance rsi by lda_bytes (rdx) */
+        ax_jit_emit_add_r64_r64(b, GPR_RSI, GPR_RDX);
+    }
+
+    /* writeback: same pattern as packed kernel but using r10..r15 */
+    #define WB_ROW(rowbase, lo, hi) do {                          \
+        ax_jit_emit_vmovups_load (b, 15, (rowbase),  0);          \
+        ax_jit_emit_vaddps       (b, (lo), (lo), 15);             \
+        ax_jit_emit_vmovups_store(b, (rowbase),  0, (lo));        \
+        ax_jit_emit_vmovups_load (b, 15, (rowbase), 32);          \
+        ax_jit_emit_vaddps       (b, (hi), (hi), 15);             \
+        ax_jit_emit_vmovups_store(b, (rowbase), 32, (hi));        \
+    } while (0)
+    WB_ROW(GPR_R10,  0,  1); WB_ROW(GPR_R11,  2,  3);
+    WB_ROW(GPR_R12,  4,  5); WB_ROW(GPR_R13,  6,  7);
+    WB_ROW(GPR_R14,  8,  9); WB_ROW(GPR_R15, 10, 11);
+    #undef WB_ROW
+
+    /* epilogue */
+    ax_jit_emit_pop_r64(b, GPR_R15);
+    ax_jit_emit_pop_r64(b, GPR_R14);
+    ax_jit_emit_pop_r64(b, GPR_R13);
+    ax_jit_emit_pop_r64(b, GPR_R12);
+    ax_jit_emit_ret(b);
+}
+
+ax_jit_gemm_stridedA_kernel_fn
+ax_jit_gemm_avx2_get_6x16_stridedA_kc(int64_t kc) {
+    if (kc < KC_MIN || kc > KC_MAX) return NULL;
+
+    ax_jit_gemm_stridedA_kernel_fn cached = g_kernel_kc_fns_stridedA[kc];
+    if (cached) return cached;
+
+    pthread_mutex_lock(&g_jit_kc_mu_stridedA);
+    cached = g_kernel_kc_fns_stridedA[kc];
+    if (cached) {
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA);
+        return cached;
+    }
+
+    /* same byte budget as the packed kc kernel — 160 B/iter + 512 B fixed.
+       the strided variant is ~3 bytes larger per iter (one extra add r64,
+       r64 vs no-op in the packed case where the rsi/rdx bumps live
+       outside the unrolled body). well within the safety margin. */
+    size_t per_kc_need = (size_t)kc * 160 + 512;
+    ax_jit_buf_t *buf = ax_jit_buf_create(per_kc_need);
+    if (!buf) {
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA);
+        return NULL;
+    }
+
+    size_t before_pos = buf->pos;
+    emit_one_kernel_stridedA_kc(buf, kc);
+    /* same defensive overflow check as packed: kernel must end with RET
+       (0xC3), otherwise we'd fall through into zero pad → SEGV. */
+    if (buf->pos == before_pos
+        || buf->base[buf->pos - 1] != 0xC3
+        || buf->pos > buf->capacity) {
+        ax_jit_buf_destroy(buf);
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA);
+        return NULL;
+    }
+    if (!ax_jit_buf_make_executable(buf)) {
+        ax_jit_buf_destroy(buf);
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA);
+        return NULL;
+    }
+
+    g_jit_kc_buf_stridedA[kc] = buf;
+    g_kernel_kc_fns_stridedA[kc] =
+        (ax_jit_gemm_stridedA_kernel_fn)ax_jit_buf_entry(buf);
+
+    pthread_mutex_unlock(&g_jit_kc_mu_stridedA);
+    return g_kernel_kc_fns_stridedA[kc];
+}

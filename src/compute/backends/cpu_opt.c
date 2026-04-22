@@ -4812,8 +4812,28 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                 }
             }
 
-            /* dV += P^T @ dO (full tile GEMM) */
-            pack_a_t(P_tile, Bk, Bk_p, Bq, Bk, pa);
+            /* dV += P^T @ dO (full tile GEMM).
+               phase i.1.a: when the JIT strided-A 6x16 kernel is available
+               and (mr, nr) is the full-tile case, dispatch directly to it
+               and skip the pack_a_t pre-transpose of P_tile. P_tile lives
+               in row-major [Bq, Bk] so column ir at row k is at byte
+               offset (k*Bk + ir)*4 from P_tile — that matches the
+               strided-A contract (lda_bytes = Bk*4). saves ~64 KB of
+               write+read traffic per tile per call.
+               edge tiles (mr<MR or nr<NR) keep the pack_a_t + micro_kernel
+               path; the JIT only handles full MR×NR. */
+#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+            ax_jit_gemm_stridedA_kernel_fn fn_stridedA = NULL;
+            if (Bq >= 1 && Bq <= 256) {
+                fn_stridedA = ax_jit_gemm_avx2_get_6x16_stridedA_kc(Bq);
+            }
+#else
+            void *fn_stridedA = NULL;
+#endif
+            bool need_edge_pack = (Bk_p > Bk) || (dk_np > dk) || !fn_stridedA;
+            if (need_edge_pack) {
+                pack_a_t(P_tile, Bk, Bk_p, Bq, Bk, pa);
+            }
             /* Phase A: dO B-operand comes from pre-packed dO_pb when available;
                jr-th strip starts at dO_pb + jr*S, row qi at offset qi*GEMM_NR. */
             if (!use_prepack) {
@@ -4828,6 +4848,17 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                     const float *b_ptr = use_prepack
                         ? (dO_pb + jr * S + qi * GEMM_NR)
                         : (pb + jr * Bq);
+#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+                    if (fn_stridedA && mr == GEMM_MR && nr == GEMM_NR) {
+                        /* P_tile + ir = first column of this MR strip in
+                           row-major; lda = Bk floats = Bk*4 bytes. */
+                        fn_stridedA(Bq,
+                                    P_tile + ir, Bk * (int64_t)sizeof(float),
+                                    b_ptr,
+                                    dV + (kj + ir) * dk + jr, dk * (int64_t)sizeof(float));
+                        continue;
+                    }
+#endif
                     micro_kernel(Bq, pa + ir * Bq, b_ptr,
                                  dV + (kj + ir) * dk + jr, dk, mr, nr);
                 }
@@ -4885,8 +4916,19 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                 }
             }
 
-            /* dK += dS^T @ Q */
-            pack_a_t(dS_tile, Bk, Bk_p, Bq, Bk, pa);
+            /* dK += dS^T @ Q. phase i.1.a: same JIT strided-A trick as dV. */
+#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+            ax_jit_gemm_stridedA_kernel_fn fn_stridedA_dk = NULL;
+            if (Bq >= 1 && Bq <= 256) {
+                fn_stridedA_dk = ax_jit_gemm_avx2_get_6x16_stridedA_kc(Bq);
+            }
+#else
+            void *fn_stridedA_dk = NULL;
+#endif
+            bool need_edge_pack_dk = (Bk_p > Bk) || (dk_np > dk) || !fn_stridedA_dk;
+            if (need_edge_pack_dk) {
+                pack_a_t(dS_tile, Bk, Bk_p, Bq, Bk, pa);
+            }
             /* Phase A: Q B-operand from pre-packed Q_pb when available. */
             if (!use_prepack) {
                 pack_b(Q + qi * dk, dk, Bq, dk_np, dk, pb);
@@ -4900,6 +4942,15 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                     const float *b_ptr = use_prepack
                         ? (Q_pb + jr * S + qi * GEMM_NR)
                         : (pb + jr * Bq);
+#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+                    if (fn_stridedA_dk && mr == GEMM_MR && nr == GEMM_NR) {
+                        fn_stridedA_dk(Bq,
+                                       dS_tile + ir, Bk * (int64_t)sizeof(float),
+                                       b_ptr,
+                                       dK + (kj + ir) * dk + jr, dk * (int64_t)sizeof(float));
+                        continue;
+                    }
+#endif
                     micro_kernel(Bq, pa + ir * Bq, b_ptr,
                                  dK + (kj + ir) * dk + jr, dk, mr, nr);
                 }

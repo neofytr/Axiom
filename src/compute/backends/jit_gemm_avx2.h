@@ -34,6 +34,32 @@ ax_jit_gemm_kernel_fn ax_jit_gemm_avx2_get_6x16(void);
 /* check if JIT is available and the kernel was successfully emitted. */
 bool ax_jit_gemm_avx2_available(void);
 
+/* phase i.1.a — strided-A 6x16 micro-kernel.
+
+   same shape as the packed-A 6x16 kernel above but reads A directly from
+   row-major memory with caller-supplied row stride `lda_bytes`. used by
+   sdpa_bwd to skip the pack_a_t step that would otherwise pre-transpose
+   P_tile / dS_tile into MR-strip-packed form.
+
+   semantics: C += sum_{k=0..kc-1} A[k*lda] * B[k*NR],
+              A[k*lda] is a vector of MR=6 floats at byte offset
+                k*lda_bytes from `ap`.
+              B[k*NR] is the standard NR=16-strip-packed b panel
+                (so b[k*NR] is k*64 bytes from `bp`).
+              C is row-major, leading dim ldc_bytes.
+
+   per-kc fully-unrolled emitter mirrors the packed variant:
+     - kc range 1..256
+     - cached per kc; one mmap'd page per kc emitted on demand
+     - thread-safe (each kc lives in its own page; aligned ptr publish) */
+typedef void (*ax_jit_gemm_stridedA_kernel_fn)(int64_t kc,
+                                                const float *ap, int64_t lda_bytes,
+                                                const float *bp,
+                                                float *c, int64_t ldc_bytes);
+
+ax_jit_gemm_stridedA_kernel_fn
+ax_jit_gemm_avx2_get_6x16_stridedA_kc(int64_t kc);
+
 /* batch C: per-kc fully-unrolled kernel. for small kc, emits a kernel
    with the K-loop fully unrolled — no dec/branch overhead, register-
    allocator can schedule FMAs ideally. results cached by kc.
