@@ -39,11 +39,16 @@ static int test_one(int64_t kc, int64_t ldc) {
     }
     ax_jit_gemm_kernel_fn fn = ax_jit_gemm_avx2_get_6x16();
 
-    /* allocate aligned buffers — pack_a/pack_b are produced 64-byte aligned */
-    float *ap = (float *)aligned_alloc(64, (size_t)kc * MR * sizeof(float));
-    float *bp = (float *)aligned_alloc(64, (size_t)kc * NR * sizeof(float));
-    float *c1 = (float *)aligned_alloc(64, (size_t)MR * (size_t)ldc * sizeof(float));
-    float *c2 = (float *)aligned_alloc(64, (size_t)MR * (size_t)ldc * sizeof(float));
+    /* allocate aligned buffers — pack_a/pack_b are produced 64-byte aligned.
+       posix aligned_alloc requires size to be a multiple of alignment, so
+       round each request up to the next 64-byte boundary. matters for the
+       small-kc cases (kc=1 → 24 bytes for ap, not a 64 multiple). */
+    #define ROUND64(n) (((n) + 63u) & ~(size_t)63u)
+    float *ap = (float *)aligned_alloc(64, ROUND64((size_t)kc * MR * sizeof(float)));
+    float *bp = (float *)aligned_alloc(64, ROUND64((size_t)kc * NR * sizeof(float)));
+    float *c1 = (float *)aligned_alloc(64, ROUND64((size_t)MR * (size_t)ldc * sizeof(float)));
+    float *c2 = (float *)aligned_alloc(64, ROUND64((size_t)MR * (size_t)ldc * sizeof(float)));
+    #undef ROUND64
     if (!ap || !bp || !c1 || !c2) { fprintf(stderr, "alloc failed\n"); return 1; }
 
     /* deterministic random data */

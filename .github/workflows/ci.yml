@@ -35,12 +35,10 @@ jobs:
       - name: run test suite
         run: cd build && ctest -j$(nproc) --output-on-failure
 
-      - name: run sanitizer build (debug + ASan)
-        run: |
-          mkdir build-san && cd build-san
-          cmake -DCMAKE_BUILD_TYPE=Debug -DAX_SANITIZE=ON ..
-          cmake --build . -j$(nproc) 2>&1 | tail -5
-          ctest -j$(nproc) --output-on-failure --timeout 300 || true
+      # asan + ubsan build moved to a dedicated gating job (test-asan).
+      # the previous approach ran sanitizers inside this job with `|| true`
+      # so failures didn't block merges — defeats the point. keeping a
+      # quick smoke build here for local dev signal, gate via test-asan.
 
   # build + test on ARM64 (NEON)
   test-arm64:
@@ -100,31 +98,62 @@ jobs:
           ./bench_gemm_suite 2>&1 | head -40
           ./bench_ops_suite  2>&1 | head -40
 
-  # embedded/baremetal build: AX_SINGLE_THREADED + AX_NO_STDIO — ensures the
-  # library builds cleanly for targets with no OS threads and no stdio.
-  # only compiles; does not run (no execution environment to run on).
+  # embedded/baremetal build: validates the AX_PROFILE=embedded-baremetal
+  # path. that profile turns on AX_OPENMP=OFF + AX_SINGLE_THREADED +
+  # AX_NO_STDIO + AX_NO_AUTOTUNE + AX_INFERENCE_ONLY by default and
+  # picks tiny GEMM tiles (24x32x64) sized for a 64 kB SRAM. compile-only;
+  # there's no execution environment for cortex-m here.
+  #
+  # post-build: scan the static archive for stdio symbol references. when
+  # AX_NO_STDIO is on, no public function should pull in printf / fprintf
+  # / fopen / fwrite — those would force the toolchain to link the
+  # ~20 kB stdio machinery into the final firmware image.
   test-embedded:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: build embedded profile (single-threaded, no stdio)
+      - name: build embedded-baremetal profile
         run: |
           mkdir build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release \
-                -DAX_OPENMP=OFF \
-                -DAX_SINGLE_THREADED=ON \
-                -DAX_NO_STDIO=ON \
-                -DAX_NO_AUTOTUNE=ON \
+                -DAX_PROFILE=embedded-baremetal \
                 ..
-          cmake --build . -j$(nproc) --target axiom
+          cmake --build . -j$(nproc) --target axiom_static
 
       - name: check for stdio leaks in library object
         run: |
-          # verify no printf/fprintf/fopen symbol references snuck into the lib
           nm build/libaxiom.a 2>/dev/null | grep -E ' U (printf|fprintf|fopen|fwrite)' \
             && echo "FAIL: stdio symbols found" && exit 1 \
             || echo "ok: no stdio symbols in embedded build"
+
+  # address-sanitizer + undefined-behavior-sanitizer build. catches the
+  # bug classes static analysis misses (use-after-free, heap-buffer-
+  # overflow, signed-overflow, mis-aligned aligned_alloc requests, etc.).
+  # gates merges — failures block the PR. previous version of this job
+  # ran inside test-x86 with `|| true` so failures were ignored;
+  # promoting to its own job + dropping the `|| true` makes asan
+  # findings actionable.
+  test-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build with asan + ubsan
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Debug -DAX_SANITIZE=ON ..
+          cmake --build . -j$(nproc)
+      - name: run test suite under sanitizers
+        run: |
+          cd build
+          # detect_leaks=0: tests intentionally don't free every intermediate
+          # tensor in the autograd graph (that's the model api's job via
+          # ax_graph_cleanup). asan still catches use-after-free / overflow.
+          # halt_on_error=1: any sanitizer report aborts the test, ctest
+          # records it as failure rather than continuing past corruption.
+          ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
+          UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ctest -j$(nproc) --output-on-failure --timeout 300
 
   # static analysis / lint
   lint:

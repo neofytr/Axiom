@@ -346,9 +346,9 @@ static void test_backend_selection(void) {
     AX_TEST_ASSERT_EQ(ax_compute_get_backend(), AX_BACKEND_CPU_SIMD,
                        "default backend should be cpu_opt");
 
-    const ax_backend_ops_t *ops = ax_compute_get_ops();
-    AX_TEST_ASSERT(ops != NULL, "ops should not be null");
-    AX_TEST_ASSERT(strcmp(ops->name, "cpu_opt") == 0, "backend name should be cpu_opt");
+    const char *bname = ax_compute_backend_name();
+    AX_TEST_ASSERT(bname != NULL, "backend name should not be null");
+    AX_TEST_ASSERT(strcmp(bname, "cpu_opt") == 0, "backend name should be cpu_opt");
 
     /* can switch to naive */
     ax_status_t s1 = ax_compute_set_backend(AX_BACKEND_CPU_NAIVE);

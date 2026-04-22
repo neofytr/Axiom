@@ -153,7 +153,7 @@ int main(void)
     ax_rng_seed(42);
 
     printf("mnist_cnn: convolutional network on full MNIST\n");
-    printf("backend: %s\n\n", ax_compute_get_ops()->name);
+    printf("backend: %s\n\n", ax_compute_backend_name());
 
     /* load data */
     printf("loading data...\n"); fflush(stdout);

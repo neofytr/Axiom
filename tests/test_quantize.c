@@ -28,14 +28,20 @@ static void fill_rand(float *buf, int64_t n, uint32_t seed) {
     }
 }
 
+/* posix aligned_alloc requires size to be a multiple of alignment. round up
+   to the next 64-byte boundary to keep small N*K cases (e.g. 4*4 = 64 ok,
+   but 1*8 = 32 would fail) safe. caller-side rounding keeps the alloc
+   within the same heap chunk; the over-allocation is at most 60 bytes. */
+#define ROUND64(n) (((n) + 63u) & ~(size_t)63u)
+
 static void test_quantize_dequantize(int64_t N, int64_t K) {
-    float *fp32 = aligned_alloc(64, (size_t)N * K * sizeof(float));
+    float *fp32 = aligned_alloc(64, ROUND64((size_t)N * K * sizeof(float)));
     fill_rand(fp32, N * K, 42);
 
     ax_qweight_t *qw = ax_qweight_create_from_fp32(fp32, N, K);
     if (!qw) { fprintf(stderr, "FAIL quantize alloc N=%ld K=%ld\n", (long)N, (long)K); rc = 1; free(fp32); return; }
 
-    float *deq = aligned_alloc(64, (size_t)N * K * sizeof(float));
+    float *deq = aligned_alloc(64, ROUND64((size_t)N * K * sizeof(float)));
     ax_qweight_dequantize(qw, deq);
 
     /* check that dequantized values are within scale/127 of the originals
@@ -64,8 +70,8 @@ static void test_quantize_dequantize(int64_t N, int64_t K) {
 
 static void test_qgemm_w8a32(int64_t M, int64_t N, int64_t K) {
     /* compare W8A32 GEMM against (a @ dequant(qw)^T) using the regular fp32 GEMM */
-    float *a    = aligned_alloc(64, (size_t)M * K * sizeof(float));
-    float *fp32 = aligned_alloc(64, (size_t)N * K * sizeof(float));
+    float *a    = aligned_alloc(64, ROUND64((size_t)M * K * sizeof(float)));
+    float *fp32 = aligned_alloc(64, ROUND64((size_t)N * K * sizeof(float)));
     fill_rand(a,    M * K, 7);
     fill_rand(fp32, N * K, 13);
 
@@ -73,18 +79,18 @@ static void test_qgemm_w8a32(int64_t M, int64_t N, int64_t K) {
     if (!qw) { fprintf(stderr, "FAIL alloc\n"); rc = 1; free(a); free(fp32); return; }
 
     /* dequantize for ground truth */
-    float *deq = aligned_alloc(64, (size_t)N * K * sizeof(float));
+    float *deq = aligned_alloc(64, ROUND64((size_t)N * K * sizeof(float)));
     ax_qweight_dequantize(qw, deq);
 
     /* compute qgemm result */
-    float *out_q = aligned_alloc(64, (size_t)M * N * sizeof(float));
+    float *out_q = aligned_alloc(64, ROUND64((size_t)M * N * sizeof(float)));
     memset(out_q, 0, (size_t)M * N * sizeof(float));
     if (ax_qgemm_w8a32(a, qw, out_q, M) != AX_OK) {
         fprintf(stderr, "FAIL qgemm call\n"); rc = 1;
     }
 
     /* reference: out_ref[m, n] = sum_k a[m, k] * deq[n, k] */
-    float *out_ref = aligned_alloc(64, (size_t)M * N * sizeof(float));
+    float *out_ref = aligned_alloc(64, ROUND64((size_t)M * N * sizeof(float)));
     for (int64_t m = 0; m < M; m++) {
         for (int64_t n = 0; n < N; n++) {
             float s = 0;

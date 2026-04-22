@@ -588,7 +588,7 @@ int main(void) {
     ax_init();
 
     printf("=======================================================\n");
-    printf(" axiom optimization bench — backend: %s\n", ax_compute_get_ops()->name);
+    printf(" axiom optimization bench — backend: %s\n", ax_compute_backend_name());
     printf(" openmp threads: %d\n", ax_get_num_threads());
     printf("=======================================================\n");
 
