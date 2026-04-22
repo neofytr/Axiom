@@ -1,8 +1,20 @@
-/* attention.c — multi-head attention layer.
+/* attention.c — multi-head attention layer (mha forward + backward +
+   layer constructor / destructor).
+
+   k.3 split: this file used to contain the layout helpers (head
+   interleave / deinterleave / qkv split-merge variants) and the
+   Wqkv/bqkv cache-rebuild routine inline. those are now in two
+   sibling tu's:
+     attention/layout.c  — pure-data-shuffling helpers (no compute).
+     attention/cache.c   — fused weight + bias panel cache management.
+   their declarations live in src/core/attention/internal.h. this file
+   keeps the layer-level orchestration (forward / backward grad_fn /
+   create / destroy) and ties the pieces together.
 
    fused QKV projection: one [B*S, D] @ [D, 3D] GEMM rebuilds Q, K, V
    together. the [D, 3D] panel is cached between calls and rebuilt only
-   when one of Wq/Wk/Wv mutates (checked via storage generation counter).
+   when one of Wq/Wk/Wv mutates (checked via storage generation counter
+   in cache.c).
 
    forward flow:
      x:[B,S,D]
@@ -22,8 +34,11 @@
 #include "axiom/ops.h"
 #include "axiom/autograd.h"
 #include "axiom/compute.h"
+#include "axiom/internal/compute_internal.h"
+#include "axiom/internal/cuda_extension.h"
 #include "axiom/init.h"
 #include "axiom/error.h"
+#include "attention/internal.h"
 #include "../compute/backends/simd_defs.h"
 #include <stdlib.h>
 #include <stdio.h>
@@ -36,236 +51,9 @@
 #include <omp.h>
 #endif
 
-/* ================================================================
-   helpers
-   ================================================================ */
-
-/* transpose a [B, S, H, dk] row-major buffer into [B, H, S, dk] (= [BH,S,dk]).
-   both buffers must be distinct. */
-static void head_interleave(const float *src, float *dst,
-                            int64_t B, int64_t S, int64_t H, int64_t dk)
-{
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int64_t b = 0; b < B; b++) {
-        for (int64_t h = 0; h < H; h++) {
-            for (int64_t s = 0; s < S; s++) {
-                const float *src_row = src + (((b * S) + s) * H + h) * dk;
-                float *dst_row       = dst + (((b * H) + h) * S + s) * dk;
-                memcpy(dst_row, src_row, (size_t)dk * sizeof(float));
-            }
-        }
-    }
-}
-
-/* inverse of head_interleave: [B, H, S, dk] -> [B, S, H, dk] (= [B*S, D]). */
-static void head_deinterleave(const float *src, float *dst,
-                              int64_t B, int64_t S, int64_t H, int64_t dk)
-{
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int64_t b = 0; b < B; b++) {
-        for (int64_t s = 0; s < S; s++) {
-            for (int64_t h = 0; h < H; h++) {
-                const float *src_row = src + (((b * H) + h) * S + s) * dk;
-                float *dst_row       = dst + (((b * S) + s) * H + h) * dk;
-                memcpy(dst_row, src_row, (size_t)dk * sizeof(float));
-            }
-        }
-    }
-}
-
-/* head-deinterleave into a specific column offset of a wider [rows, dst_cols]
-   buffer. used to pack dQh, dKh, dVh into one [rows, 3D] dQKV tensor so the
-   weight- and input-gradient GEMMs can be fused into single large calls. */
-static void head_deinterleave_slot(const float *src, float *dst,
-                                   int64_t B, int64_t S, int64_t H, int64_t dk,
-                                   int64_t dst_cols, int64_t col_off)
-{
-    int64_t D = H * dk;
-    (void)D;
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int64_t b = 0; b < B; b++) {
-        for (int64_t s = 0; s < S; s++) {
-            for (int64_t h = 0; h < H; h++) {
-                const float *src_row = src + (((b * H) + h) * S + s) * dk;
-                float *dst_row       = dst + ((b * S) + s) * dst_cols + col_off + h * dk;
-                memcpy(dst_row, src_row, (size_t)dk * sizeof(float));
-            }
-        }
-    }
-}
-
-/* fused variant: merge dQh/dKh/dVh into one [rows, 3D] buffer in a
-   single parallel pass. replaces three back-to-back head_deinterleave_slot
-   calls, cutting fork/join overhead to 1/3 and giving each thread
-   sequential writes into the destination row (better store coalescing). */
-static void head_deinterleave_qkv_merge(const float *srcQ, const float *srcK, const float *srcV,
-                                          float *dst,
-                                          int64_t B, int64_t S, int64_t H, int64_t dk,
-                                          int64_t D)
-{
-    int64_t dst_cols = 3 * D;
-    size_t dk_bytes = (size_t)dk * sizeof(float);
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int64_t b = 0; b < B; b++) {
-        for (int64_t s = 0; s < S; s++) {
-            for (int64_t h = 0; h < H; h++) {
-                int64_t src_off = (((b * H) + h) * S + s) * dk;
-                int64_t dst_base = ((b * S) + s) * dst_cols + h * dk;
-                memcpy(dst + dst_base,         srcQ + src_off, dk_bytes);
-                memcpy(dst + dst_base + D,     srcK + src_off, dk_bytes);
-                memcpy(dst + dst_base + 2*D,   srcV + src_off, dk_bytes);
-            }
-        }
-    }
-}
-
-/* head-interleave FROM a specific column slot of a wider [rows, src_cols]
-   buffer. fuses the extract+interleave steps so the QKV fused-projection
-   output can feed SDPA in a single pass instead of going through the
-   intermediate Qf/Kf/Vf [rows, D] buffers. */
-static void head_interleave_from_slot(const float *src, float *dst,
-                                      int64_t B, int64_t S, int64_t H, int64_t dk,
-                                      int64_t src_cols, int64_t col_off)
-{
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int64_t b = 0; b < B; b++) {
-        for (int64_t h = 0; h < H; h++) {
-            for (int64_t s = 0; s < S; s++) {
-                const float *src_row = src + ((b * S) + s) * src_cols + col_off + h * dk;
-                float *dst_row       = dst + (((b * H) + h) * S + s) * dk;
-                memcpy(dst_row, src_row, (size_t)dk * sizeof(float));
-            }
-        }
-    }
-}
-
-/* fused variant: read one [rows, 3D] qkv buffer, split into three
-   [BH, S, dk] tensors in one parallel pass. replaces three back-to-back
-   head_interleave_from_slot calls, saving 2 omp fork/join barriers and
-   giving each thread better cache reuse since the same src row is read
-   for Qh, Kh, and Vh. */
-static void head_interleave_qkv_split(const float *src,
-                                       float *dstQ, float *dstK, float *dstV,
-                                       int64_t B, int64_t S, int64_t H, int64_t dk,
-                                       int64_t D)
-{
-    int64_t src_cols = 3 * D;
-    size_t dk_bytes = (size_t)dk * sizeof(float);
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int64_t b = 0; b < B; b++) {
-        for (int64_t h = 0; h < H; h++) {
-            for (int64_t s = 0; s < S; s++) {
-                const float *src_row = src + ((b * S) + s) * src_cols + h * dk;
-                int64_t dst_off = (((b * H) + h) * S + s) * dk;
-                memcpy(dstQ + dst_off, src_row,           dk_bytes);
-                memcpy(dstK + dst_off, src_row + D,       dk_bytes);
-                memcpy(dstV + dst_off, src_row + 2 * D,   dk_bytes);
-            }
-        }
-    }
-}
-
-/* fused split + bias add: same as head_interleave_qkv_split but adds the
-   per-channel bias to each element on-the-fly. eliminates the separate
-   bias-add pass over qkv (save 12 MB of L3↔L1 traffic at B=1 S=512 D=1024).
-   bias layout: [3D] = [bq[D] | bk[D] | bv[D]]. */
-static void head_interleave_qkv_split_bias(const float *src, const float *bias,
-                                            float *dstQ, float *dstK, float *dstV,
-                                            int64_t B, int64_t S, int64_t H, int64_t dk,
-                                            int64_t D)
-{
-    int64_t src_cols = 3 * D;
-    int64_t TC = AX_VF32_WIDTH;
-    int64_t ve = dk - (dk % TC);
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int64_t b = 0; b < B; b++) {
-        for (int64_t h = 0; h < H; h++) {
-            const float *bQ_h = bias + h * dk;             /* bq slice for this head */
-            const float *bK_h = bias + D + h * dk;
-            const float *bV_h = bias + 2 * D + h * dk;
-            for (int64_t s = 0; s < S; s++) {
-                const float *src_row = src + ((b * S) + s) * src_cols + h * dk;
-                int64_t dst_off = (((b * H) + h) * S + s) * dk;
-                float *dQ = dstQ + dst_off;
-                float *dK = dstK + dst_off;
-                float *dV = dstV + dst_off;
-                int64_t i = 0;
-                for (; i < ve; i += TC) {
-                    ax_vf32_storeu(dQ + i, ax_vf32_add(ax_vf32_loadu(src_row +       i), ax_vf32_loadu(bQ_h + i)));
-                    ax_vf32_storeu(dK + i, ax_vf32_add(ax_vf32_loadu(src_row + D   + i), ax_vf32_loadu(bK_h + i)));
-                    ax_vf32_storeu(dV + i, ax_vf32_add(ax_vf32_loadu(src_row + 2*D + i), ax_vf32_loadu(bV_h + i)));
-                }
-                for (; i < dk; i++) {
-                    dQ[i] = src_row[i] + bQ_h[i];
-                    dK[i] = src_row[D + i] + bK_h[i];
-                    dV[i] = src_row[2*D + i] + bV_h[i];
-                }
-            }
-        }
-    }
-}
-
-/* rebuild Wqkv_cache [D, 3D] and bqkv_cache [3D] from Wq/Wk/Wv/bq/bk/bv
-   if any of the source generations have changed since last call. */
-static void refresh_fused_qkv(ax_mha_t *m)
-{
-    uint64_t gq = m->Wq->storage->generation;
-    uint64_t gk = m->Wk->storage->generation;
-    uint64_t gv = m->Wv->storage->generation;
-
-    int64_t D = m->d_model;
-
-    /* bump weight panel if anything changed OR cache doesn't exist */
-    bool w_stale = !m->Wqkv_cache || gq != m->Wq_gen || gk != m->Wk_gen || gv != m->Wv_gen;
-    if (w_stale) {
-        if (!m->Wqkv_cache) {
-            int64_t sh[] = {D, 3 * D};
-            m->Wqkv_cache = ax_tensor_create(sh, 2, AX_FLOAT32);
-        }
-        float *dst = (float *)m->Wqkv_cache->storage->data;
-        const float *wq = (const float *)m->Wq->storage->data;
-        const float *wk = (const float *)m->Wk->storage->data;
-        const float *wv = (const float *)m->Wv->storage->data;
-        /* [D, 3D] row-major: row i -> [wq[i,:] | wk[i,:] | wv[i,:]] */
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-#endif
-        for (int64_t i = 0; i < D; i++) {
-            memcpy(dst + i * 3 * D,            wq + i * D, (size_t)D * sizeof(float));
-            memcpy(dst + i * 3 * D + D,        wk + i * D, (size_t)D * sizeof(float));
-            memcpy(dst + i * 3 * D + 2 * D,    wv + i * D, (size_t)D * sizeof(float));
-        }
-        ax_storage_touch(m->Wqkv_cache->storage);
-        m->Wq_gen = gq; m->Wk_gen = gk; m->Wv_gen = gv;
-    }
-
-    /* biases: rebuild unconditionally when used — cheap (3D floats) */
-    if (m->use_bias) {
-        if (!m->bqkv_cache) {
-            int64_t sh[] = {3 * D};
-            m->bqkv_cache = ax_tensor_create(sh, 1, AX_FLOAT32);
-        }
-        float *dst = (float *)m->bqkv_cache->storage->data;
-        memcpy(dst,         m->bq->storage->data, (size_t)D * sizeof(float));
-        memcpy(dst + D,     m->bk->storage->data, (size_t)D * sizeof(float));
-        memcpy(dst + 2 * D, m->bv->storage->data, (size_t)D * sizeof(float));
-        ax_storage_touch(m->bqkv_cache->storage);
-    }
-}
+/* helpers used here are now in attention/layout.c (head_*) and
+   attention/cache.c (refresh_fused_qkv). their declarations come in
+   via attention/internal.h above. call sites use the ax_attn_* names. */
 
 /* ================================================================
    backward context
@@ -343,7 +131,7 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     if (!inp) return NULL;
 
     /* ensure fused weight+bias panels are up to date */
-    refresh_fused_qkv(m);
+    ax_attn_refresh_fused_qkv(m);
 
     bool record = ax_grad_enabled() && self->training && input->requires_grad;
     /* always record if any of our params require grad too */
@@ -408,19 +196,44 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     ALLOC_SHAPE(Vh, head_sh, 3);
     if (!Qh || !Kh || !Vh) goto fail;
 
+    /* Phase B: dispatch on device. CPU keeps the existing OMP-parallel
+       memcpy helpers; CUDA uses the coalesced kernels in
+       src/compute/backends/cuda/ops_attention.cu, registered via the
+       cuda extension table (k.4). */
+    const ax_cuda_extension_t *cu = ax_compute_get_cuda_extension();
+    bool on_cuda = (qkv->storage->device != AX_DEVICE_CPU);
     if (m->use_bias) {
-        head_interleave_qkv_split_bias((const float *)qkv->storage->data,
-                                        (const float *)m->bqkv_cache->storage->data,
-                                        (float *)Qh->storage->data,
-                                        (float *)Kh->storage->data,
-                                        (float *)Vh->storage->data,
-                                        B, S, H, dk, D);
+        if (on_cuda && cu && cu->head_interleave_qkv_split_bias) {
+            cu->head_interleave_qkv_split_bias(
+                (const float *)qkv->storage->data,
+                (const float *)m->bqkv_cache->storage->data,
+                (float *)Qh->storage->data,
+                (float *)Kh->storage->data,
+                (float *)Vh->storage->data,
+                B, S, H, dk, D);
+        } else {
+            ax_attn_head_interleave_qkv_split_bias((const float *)qkv->storage->data,
+                                            (const float *)m->bqkv_cache->storage->data,
+                                            (float *)Qh->storage->data,
+                                            (float *)Kh->storage->data,
+                                            (float *)Vh->storage->data,
+                                            B, S, H, dk, D);
+        }
     } else {
-        head_interleave_qkv_split((const float *)qkv->storage->data,
-                                   (float *)Qh->storage->data,
-                                   (float *)Kh->storage->data,
-                                   (float *)Vh->storage->data,
-                                   B, S, H, dk, D);
+        if (on_cuda && cu && cu->head_interleave_qkv_split) {
+            cu->head_interleave_qkv_split(
+                (const float *)qkv->storage->data,
+                (float *)Qh->storage->data,
+                (float *)Kh->storage->data,
+                (float *)Vh->storage->data,
+                B, S, H, dk, D);
+        } else {
+            ax_attn_head_interleave_qkv_split((const float *)qkv->storage->data,
+                                       (float *)Qh->storage->data,
+                                       (float *)Kh->storage->data,
+                                       (float *)Vh->storage->data,
+                                       B, S, H, dk, D);
+        }
     }
 
     /* qkv no longer needed (non-recorded path); arena reclaims it otherwise */
@@ -466,22 +279,42 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
 
     float scale = 1.0f / sqrtf((float)dk);
     float *P_save_ptr = P_save_t ? (float *)P_save_t->storage->data : NULL;
-    ax_fused_attention_fwd_save(
-        (const float *)Qh->storage->data,
-        (const float *)Kh->storage->data,
-        (const float *)Vh->storage->data,
-        (float *)Oh->storage->data,
-        L_t ? (float *)L_t->storage->data : NULL,
-        P_save_ptr,
-        bh, S, dk, scale, m->causal);
+    /* Phase C: dispatch SDPA forward on device. CPU path uses the existing
+       CPU FA-style kernel; CUDA path uses cuBLAS stridedBatched + custom
+       softmax+L kernel. Phase D will add backward. */
+    if (on_cuda && cu && cu->sdpa_fwd) {
+        cu->sdpa_fwd(
+            (const float *)Qh->storage->data,
+            (const float *)Kh->storage->data,
+            (const float *)Vh->storage->data,
+            (float *)Oh->storage->data,
+            L_t ? (float *)L_t->storage->data : NULL,
+            bh, S, dk, scale, m->causal, P_save_ptr);
+    } else {
+        ax_fused_attention_fwd_save(
+            (const float *)Qh->storage->data,
+            (const float *)Kh->storage->data,
+            (const float *)Vh->storage->data,
+            (float *)Oh->storage->data,
+            L_t ? (float *)L_t->storage->data : NULL,
+            P_save_ptr,
+            bh, S, dk, scale, m->causal);
+    }
 
     /* ---- merge heads back to [rows, D] ---- */
     int64_t attn_sh[] = {rows, D};
     ax_tensor_t *attn_flat = NULL;
     ALLOC_SHAPE(attn_flat, attn_sh, 2);
     if (!attn_flat) goto fail;
-    head_deinterleave((const float *)Oh->storage->data,
-                      (float *)attn_flat->storage->data, B, S, H, dk);
+    /* k.4: dispatch on device through the cuda extension registry. */
+    if (on_cuda && cu && cu->head_deinterleave) {
+        cu->head_deinterleave((const float *)Oh->storage->data,
+                              (float *)attn_flat->storage->data,
+                              B, S, H, dk);
+    } else {
+        ax_attn_head_deinterleave((const float *)Oh->storage->data,
+                                   (float *)attn_flat->storage->data, B, S, H, dk);
+    }
 
     /* ---- output projection: attn_flat @ Wo + bo ---- */
     int64_t out_sh[] = {B, S, D};
@@ -499,21 +332,26 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
         goto fail;
     }
     if (m->use_bias) {
-        float *od = (float *)out_flat_view->storage->data;
-        const float *bd = (const float *)m->bo->storage->data;
-        int64_t de = D - (D % AX_VF32_WIDTH);
+        if (on_cuda) {
+            /* dispatched bias_add (CUDA-aware) */
+            ax_compute_bias_add(out_flat_view, m->bo, 1, out_flat_view);
+        } else {
+            float *od = (float *)out_flat_view->storage->data;
+            const float *bd = (const float *)m->bo->storage->data;
+            int64_t de = D - (D % AX_VF32_WIDTH);
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static) if (rows * D >= ax_par_threshold_elems)
+            #pragma omp parallel for schedule(static) if (rows * D >= ax_par_threshold_elems)
 #endif
-        for (int64_t r = 0; r < rows; r++) {
-            float *row = od + r * D;
-            int64_t c = 0;
-            for (; c < de; c += AX_VF32_WIDTH) {
-                ax_vf32 v = ax_vf32_loadu(row + c);
-                ax_vf32 b = ax_vf32_loadu(bd + c);
-                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
+            for (int64_t r = 0; r < rows; r++) {
+                float *row = od + r * D;
+                int64_t c = 0;
+                for (; c < de; c += AX_VF32_WIDTH) {
+                    ax_vf32 v = ax_vf32_loadu(row + c);
+                    ax_vf32 b = ax_vf32_loadu(bd + c);
+                    ax_vf32_storeu(row + c, ax_vf32_add(v, b));
+                }
+                for (; c < D; c++) row[c] += bd[c];
             }
-            for (; c < D; c++) row[c] += bd[c];
         }
     }
     ax_storage_touch(out->storage);
@@ -698,8 +536,17 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!dO_head) return;
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    head_interleave((const float *)d_attn_flat->storage->data,
-                    (float *)dO_head->storage->data, B, S, H, dk);
+    /* k.4: dispatch on device through the cuda extension registry. */
+    const ax_cuda_extension_t *cu = ax_compute_get_cuda_extension();
+    bool bwd_on_cuda = (d_attn_flat->storage->device != AX_DEVICE_CPU);
+    if (bwd_on_cuda && cu && cu->head_interleave) {
+        cu->head_interleave((const float *)d_attn_flat->storage->data,
+                            (float *)dO_head->storage->data,
+                            B, S, H, dk);
+    } else {
+        ax_attn_head_interleave((const float *)d_attn_flat->storage->data,
+                                 (float *)dO_head->storage->data, B, S, H, dk);
+    }
     if (prof_enabled) pf_head_int += PF_TICK() - pf_t0;
 
     ax_tensor_t *dQh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
@@ -711,18 +558,33 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     const float *P_saved = ctx->P_save_tensor
         ? (const float *)ctx->P_save_tensor->storage->data : NULL;
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    ax_fused_attention_bwd_use(
-        (const float *)ctx->Q_head->storage->data,
-        (const float *)ctx->K_head->storage->data,
-        (const float *)ctx->V_head->storage->data,
-        (const float *)ctx->O_head->storage->data,
-        (const float *)dO_head->storage->data,
-        (const float *)ctx->L_tensor->storage->data,
-        P_saved,
-        (float *)dQh->storage->data,
-        (float *)dKh->storage->data,
-        (float *)dVh->storage->data,
-        B * H, S, dk, scale, m->causal);
+    /* k.4: dispatch sdpa backward on device through the cuda registry. */
+    if (bwd_on_cuda && cu && cu->sdpa_bwd) {
+        cu->sdpa_bwd(
+            (const float *)ctx->Q_head->storage->data,
+            (const float *)ctx->K_head->storage->data,
+            (const float *)ctx->V_head->storage->data,
+            (const float *)ctx->O_head->storage->data,
+            (const float *)dO_head->storage->data,
+            (const float *)ctx->L_tensor->storage->data,
+            (float *)dQh->storage->data,
+            (float *)dKh->storage->data,
+            (float *)dVh->storage->data,
+            B * H, S, dk, scale, m->causal, P_saved);
+    } else {
+        ax_fused_attention_bwd_use(
+            (const float *)ctx->Q_head->storage->data,
+            (const float *)ctx->K_head->storage->data,
+            (const float *)ctx->V_head->storage->data,
+            (const float *)ctx->O_head->storage->data,
+            (const float *)dO_head->storage->data,
+            (const float *)ctx->L_tensor->storage->data,
+            P_saved,
+            (float *)dQh->storage->data,
+            (float *)dKh->storage->data,
+            (float *)dVh->storage->data,
+            B * H, S, dk, scale, m->causal);
+    }
     if (prof_enabled) pf_sdpa_bwd += PF_TICK() - pf_t0;
 
     /* ================================================================
@@ -734,11 +596,21 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
     if (!dQKV) return;
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    head_deinterleave_qkv_merge((const float *)dQh->storage->data,
-                                 (const float *)dKh->storage->data,
-                                 (const float *)dVh->storage->data,
-                                 (float *)dQKV->storage->data,
-                                 B, S, H, dk, D);
+    /* k.4: dispatch on device through the cuda extension registry. */
+    if (bwd_on_cuda && cu && cu->head_deinterleave_qkv_merge) {
+        cu->head_deinterleave_qkv_merge(
+            (const float *)dQh->storage->data,
+            (const float *)dKh->storage->data,
+            (const float *)dVh->storage->data,
+            (float *)dQKV->storage->data,
+            B, S, H, dk, D);
+    } else {
+        ax_attn_head_deinterleave_qkv_merge((const float *)dQh->storage->data,
+                                     (const float *)dKh->storage->data,
+                                     (const float *)dVh->storage->data,
+                                     (float *)dQKV->storage->data,
+                                     B, S, H, dk, D);
+    }
     if (prof_enabled) pf_deint += PF_TICK() - pf_t0;
 
     /* ================================================================
@@ -899,10 +771,15 @@ ax_layer_t *ax_mha_create(int64_t d_model, int n_heads,
                            bool use_bias, bool causal)
 {
     if (d_model <= 0 || n_heads <= 0) return NULL;
-    if (d_model % n_heads != 0) return NULL;
+    if (d_model % n_heads != 0) {
+        ax_err_set(AX_ERR_INVALID_SHAPE,
+                   "ax_mha_create: d_model=%lld must be divisible by n_heads=%d",
+                   (long long)d_model, n_heads);
+        return NULL;
+    }
 
     ax_mha_t *m = (ax_mha_t *)calloc(1, sizeof(ax_mha_t));
-    if (!m) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(m, "ax_mha_create");
 
     m->base.ops.forward = mha_forward;
     m->base.ops.destroy = mha_destroy;

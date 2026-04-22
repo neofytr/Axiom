@@ -1,4 +1,7 @@
-/* axiom/broadcast.h — shape broadcasting logic (numpy-style rules) */
+/* axiom/broadcast.h — shape broadcasting logic (numpy-style rules).
+
+   pure functions, no allocation, no error state mutation.
+   thread-safety: fully concurrent-safe. */
 
 #ifndef AX_BROADCAST_H
 #define AX_BROADCAST_H

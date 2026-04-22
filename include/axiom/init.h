@@ -1,6 +1,19 @@
 /* axiom/init.h — weight initialization schemes.
-   proper initialization is surprisingly important.
-   bad init can make deep networks untrainable. */
+
+   proper initialization is surprisingly important. bad init can make
+   deep networks untrainable.
+
+   ownership: each init function fills the supplied tensor in-place. no
+   allocation. NULL t is a safe no-op.
+
+   error handling: return type is void; on dtype/dim errors the function
+   logs via ax_err_set and leaves the tensor partially or fully written.
+   inspect ax_err_last_status() to detect.
+
+   thread-safety: writes to the supplied tensor — single-thread per
+   tensor. the underlying RNG is process-global; concurrent init calls
+   to disjoint tensors race on the rng state. seed before init for a
+   deterministic sequence (single-threaded). */
 
 #ifndef AX_INIT_H
 #define AX_INIT_H

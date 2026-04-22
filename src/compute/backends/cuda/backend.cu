@@ -77,10 +77,17 @@ static ax_status_t cuda_init_hook(void) {
         }
         g_cuda_scratch_used = 0;
     }
+    /* k.4: register the cuda extension table so cpu paths can dispatch
+       cuda-only ops (sdpa, layout transforms, batched conv gemm)
+       through ax_compute_get_cuda_extension() instead of weak symbols. */
+    ax_compute_register_cuda_extension(&ax_cuda_ext_table);
     return AX_OK;
 }
 
 static void cuda_shutdown_hook(void) {
+    /* clear the extension registration first so any in-flight cpu code
+       falls back to its non-cuda path on the way out. */
+    ax_compute_register_cuda_extension(NULL);
     if (g_cuda_scratch) {
         cudaFree(g_cuda_scratch);
         g_cuda_scratch = NULL;
@@ -176,4 +183,63 @@ extern const ax_backend_ops_t ax_cuda_ops = {
     .memcpy_h2d    = cuda_memcpy_h2d_hook,
     .memcpy_d2h    = cuda_memcpy_d2h_hook,
     .memcpy_d2d    = cuda_memcpy_d2d_hook,
+};
+
+/* ── cuda extension registry (k.4) ──
+   ops_attention.cu and ops_conv.cu provide cuda implementations of
+   layout transforms, sdpa, weight/bias cache builds, and batched conv
+   gemm. previously cpu code reached them via __attribute__((weak))
+   externs and a force-link table here kept the .o files in the static
+   archive. that approach scattered the contract across many call sites.
+
+   k.4 collapses the contract into one ax_cuda_extension_t struct
+   defined in axiom/internal/cuda_extension.h. cuda_init_hook below
+   constructs the table and registers it via
+   ax_compute_register_cuda_extension(). cpu code calls
+   ax_compute_get_cuda_extension() and dispatches through the struct
+   instead of through weak symbols. removes 10 weak externs, the
+   force-link table, and the implicit symbol-keep-alive contract. */
+#include "axiom/internal/cuda_extension.h"
+
+extern "C" {
+extern void ax_cuda_head_interleave(const float *, float *,
+    int64_t, int64_t, int64_t, int64_t);
+extern void ax_cuda_head_deinterleave(const float *, float *,
+    int64_t, int64_t, int64_t, int64_t);
+extern void ax_cuda_head_interleave_qkv_split(const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, int64_t, int64_t);
+extern void ax_cuda_head_interleave_qkv_split_bias(const float *, const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, int64_t, int64_t);
+extern void ax_cuda_head_deinterleave_qkv_merge(const float *, const float *, const float *,
+    float *, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern ax_status_t ax_cuda_qkv_cache_build(float *,
+    const float *, const float *, const float *, int64_t);
+extern ax_status_t ax_cuda_bias_cache_build(float *,
+    const float *, const float *, const float *, int64_t);
+extern ax_status_t ax_cuda_sdpa_fwd(const float *, const float *, const float *,
+    float *, float *, int64_t, int64_t, int64_t, float, bool, float *);
+extern ax_status_t ax_cuda_sdpa_bwd(const float *, const float *, const float *,
+    const float *, const float *, const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, float, bool, const float *);
+extern ax_status_t cuda_conv_gemm_batched(const ax_tensor_t *,
+    const float *, int64_t, const ax_conv_params_t *, ax_tensor_t *);
+}
+
+/* the extension table — populated at module load. shared across all
+   threads (read-only after init); registered with the dispatch
+   subsystem during cuda_init_hook. */
+static const ax_cuda_extension_t ax_cuda_ext_table = {
+    .head_interleave_qkv_split        = ax_cuda_head_interleave_qkv_split,
+    .head_interleave_qkv_split_bias   = ax_cuda_head_interleave_qkv_split_bias,
+    .head_interleave                  = ax_cuda_head_interleave,
+    .head_deinterleave                = ax_cuda_head_deinterleave,
+    .head_deinterleave_qkv_merge      = ax_cuda_head_deinterleave_qkv_merge,
+    .qkv_cache_build                  = ax_cuda_qkv_cache_build,
+    .bias_cache_build                 = ax_cuda_bias_cache_build,
+    .sdpa_fwd                         = ax_cuda_sdpa_fwd,
+    .sdpa_bwd                         = ax_cuda_sdpa_bwd,
+    .conv_gemm_batched                = cuda_conv_gemm_batched,
 };

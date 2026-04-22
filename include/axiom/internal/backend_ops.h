@@ -1,30 +1,33 @@
-/* axiom/backend_ops.h — vtable interface that every compute backend must implement */
+/* axiom/internal/backend_ops.h — backend vtable, internal contract.
 
-#ifndef AX_BACKEND_OPS_H
-#define AX_BACKEND_OPS_H
+   defines the full ax_backend_ops_t struct that every compute backend
+   fills in. NOT part of the public abi — library users must not include
+   this. the public compute.h forward-declares the type as opaque. backend
+   authors writing new modules in src/compute/backends/ include this to
+   construct their vtable instance. */
 
-#include "types.h"
+#ifndef AX_INTERNAL_BACKEND_OPS_H
+#define AX_INTERNAL_BACKEND_OPS_H
 
-/* forward declaration — tensor is defined in tensor.h */
-typedef struct ax_tensor ax_tensor_t;
+#include "axiom/types.h"
+#include "axiom/device.h"
+#include "axiom/compute.h"  /* for ax_conv_params_t and forward decls */
 
-/* per-sample conv parameters for implicit im2col gemm.
-   describes a single [C_in, H, W] input sample (pointer into the batched
-   input buffer) plus kernel/stride/pad dimensions. the input pointer lives
-   in its caller's storage — no ownership transfer. */
-typedef struct {
-    const float *input;  /* [C_in, H, W] contiguous, row-major */
-    int64_t C_in, H, W;
-    int kh, kw;
-    int sh, sw;
-    int ph, pw;
-    int64_t out_h, out_w;
-} ax_conv_params_t;
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ax_tensor_t and ax_conv_params_t already forward-declared by compute.h
+   above. ax_backend_ops_t the typedef name comes from compute.h too;
+   the struct body here completes the type. */
 
 /* backend operation vtable.
    each backend (cpu naive, cpu simd, cuda, etc.) provides one of these
-   with function pointers filled in for every supported operation. */
-typedef struct {
+   with function pointers filled in for every supported operation.
+   the public compute.h forward-declares this struct as opaque
+   (typedef struct ax_backend_ops ax_backend_ops_t;) so library users
+   never see the layout. */
+struct ax_backend_ops {
     const char *name;   /* human-readable backend name, e.g. "cpu_naive" */
 
     /* element-wise binary ops */
@@ -199,6 +202,11 @@ typedef struct {
     ax_status_t (*memcpy_d2h)(void *dst, const void *src, size_t bytes);
     ax_status_t (*memcpy_d2d)(void *dst, const void *src, size_t bytes);
 
-} ax_backend_ops_t;
+};
+/* the typedef itself is declared opaquely in compute.h (public). */
 
-#endif /* AX_BACKEND_OPS_H */
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* AX_INTERNAL_BACKEND_OPS_H */

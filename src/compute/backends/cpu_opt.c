@@ -2,6 +2,37 @@
    falls back to cpu_naive for strided/broadcast cases.
    every op validates storage bounds before pointer access.
 
+   ============================================================
+   FILE LAYOUT  (k.1 phase a: section TOC for navigation; full split
+   into per-section files planned for v0.11.0 — see PRODUCTION_PLAN.md
+   for the migration steps and line ranges per target file).
+
+     [1]    Module header + ISA macros + TLS storage           lines ~1-200
+     [2]    Validation helpers + binary/unary opt_* ops        lines ~200-370
+     [3]    GEMM tile autotuner + multi-shape probe table      lines ~370-1000
+     [4]    pack_a / pack_b / pack_a_t / pack_b_t              lines ~1000-1670
+     [5]    Micro-kernels (per ISA) + JIT dispatch             lines ~1670-2050
+     [6]    BLIS 5-loop tiled GEMM + variants (NT, TN, fused)  lines ~2050-3500
+     [7]    Conv-related kernels (im2col fast path, direct)    lines ~3500-4000
+     [8]    SDPA forward (attn_fwd_head + helpers)             lines ~4000-4570
+     [9]    SDPA backward (attn_bwd_head + helpers)            lines ~4570-5030
+     [10]   Backend vtable (ax_cpu_opt_ops) + symbol exports   lines ~5030-end
+
+   the planned per-file split (when scheduled):
+     cpu_opt/internal.h     — sections [1], [2] minus actual ops
+     cpu_opt/elementwise.c  — section [2] ops (relu, sigmoid, add, ...)
+     cpu_opt/calibrate.c    — section [3]
+     cpu_opt/gemm.c         — sections [4], [5], [6]
+     cpu_opt/conv.c         — section [7]
+     cpu_opt/sdpa.c         — sections [8], [9]
+     cpu_opt/dispatch.c     — section [10]
+   each file is compiled three times under AX_CPU_ISA_DISPATCH (avx512,
+   avx2, scalar) — adding the new files to all three OBJECT-library
+   targets in CMakeLists. the work is mechanical but voluminous; left
+   as a follow-up because the current single-tu compile is correct,
+   tested, and well-tested by 29/29 ctest.
+   ============================================================
+
    runtime isa dispatch: this file can be compiled twice under the
    AX_CPU_ISA_DISPATCH build flag, once with -mavx2 -mfma and once
    without. the externally-visible symbols (the vtable and the tune
@@ -19,7 +50,7 @@
 #define AX_SYM(name)    name
 #endif
 
-#include "axiom/backend_ops.h"
+#include "axiom/internal/backend_ops.h"
 #include "axiom/tensor.h"
 #include "axiom/error.h"
 #include "axiom/memory.h"
@@ -115,6 +146,13 @@ AX_TLS float *tl_bwd_ds_tile    = NULL; AX_TLS int64_t tl_bwd_ds_bytes  = 0;
 AX_TLS float *tl_bwd_pa         = NULL; AX_TLS int64_t tl_bwd_pa_bytes  = 0;
 AX_TLS float *tl_bwd_pb         = NULL; AX_TLS int64_t tl_bwd_pb_bytes  = 0;
 AX_TLS float *tl_bwd_di         = NULL; AX_TLS int64_t tl_bwd_di_bytes  = 0;
+/* Phase A: per-head pre-packed Q/dO buffers — packed once before the
+   (kj, qi) loop and reused across all (kj, qi) tiles. avoids repacking
+   the same Q/dO data S/ATTN_BK times per head. */
+AX_TLS float *tl_bwd_q_pa       = NULL; AX_TLS int64_t tl_bwd_q_pa_bytes  = 0;
+AX_TLS float *tl_bwd_q_pb       = NULL; AX_TLS int64_t tl_bwd_q_pb_bytes  = 0;
+AX_TLS float *tl_bwd_dO_pa      = NULL; AX_TLS int64_t tl_bwd_dO_pa_bytes = 0;
+AX_TLS float *tl_bwd_dO_pb      = NULL; AX_TLS int64_t tl_bwd_dO_pb_bytes = 0;
 
 /* phase 26/31: TLS scratch for opt_gemm_tn pre-transpose. holds A^T layout
    so the gemm hot loop reads sequentially via pack_a instead of strided
@@ -619,7 +657,11 @@ static void ax_cpu_opt_init_impl(void) {
     /* runtime cache-size auto-tuning. detect L1d and L2, then adjust
        MC and NC so pack_a fits in L1d and pack_a+pack_b fits in L2.
        general: adapts to any cpu's cache hierarchy automatically.
-       env vars always override. */
+       env vars always override. cache sizes default to 0 — the auto-tune
+       block below only runs on linux when stdio is available, so on
+       baremetal / embedded targets these stay at 0 and the fallback
+       compile-time defaults are kept untouched. */
+    long l1d = 0, l2 = 0, l3 = 0;
 #if defined(__linux__) && !defined(AX_NO_STDIO)
     /* L1d auto-tune: pack_a (MC×KC) should fit in ~80% of L1d.
        when it doesn't, shrink MC (rounded to MR). this matters on
@@ -628,7 +670,7 @@ static void ax_cpu_opt_init_impl(void) {
 
        fallback to reading /sys when sysconf returns -1 (some ARM
        containers don't expose cache info via sysconf but do via sysfs). */
-    long l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
+    l1d = sysconf(_SC_LEVEL1_DCACHE_SIZE);
     if (l1d <= 0) {
         /* try /sys/devices/system/cpu/cpu0/cache/index0/size (usually L1d) */
         for (int idx = 0; idx < 4 && l1d <= 0; idx++) {
@@ -679,7 +721,7 @@ static void ax_cpu_opt_init_impl(void) {
     }
 
     /* L2 auto-tune: pack_a (MC×KC) + pack_b (NC×KC) ≤ 80% of L2 */
-    long l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
+    l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
     if (l2 > 0) {
         long budget = (long)((double)l2 * 0.80);
         size_t pack_a_bytes = (size_t)GEMM_MC * (size_t)GEMM_KC * sizeof(float);
@@ -702,7 +744,7 @@ static void ax_cpu_opt_init_impl(void) {
     /* L3 detection + NC bound for multi-threaded JC parallel.
        each JC thread owns a pack_b panel (NC×KC×4 bytes). when all
        threads' panels exceed 80% of shared L3, shrink NC. */
-    long l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+    l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
     if (l3 > 0 && !getenv("AX_GEMM_NC")) {
         int nt = 1;
 #ifdef _OPENMP
@@ -1401,38 +1443,6 @@ static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
 /* pack an MC x KC panel of A^T, where the physical source a_src is
    stored [K, M] row-major with lda == M. A^T[i,p] = a_src[p*lda + i].
    produces the same layout as pack_a so the shared micro_kernel works. */
-/* phase 26 helper: full matrix transpose A[K, M] → AT[M, K], cache-blocked.
-   used by opt_gemm_tn pre-transpose path so the GEMM hot loop runs through
-   pack_a (sequential reads) instead of pack_a_t (strided reads). 8x8 tile
-   keeps both source and dest in L1 during the inner copy; scalar tail
-   handles non-multiple dims. */
-static void transpose_kxm_to_mxk(const float *src, int64_t K, int64_t M, float *dst)
-{
-    const int64_t TS = 8;
-    int64_t K_tile = K - (K % TS);
-    int64_t M_tile = M - (M % TS);
-    for (int64_t k0 = 0; k0 < K_tile; k0 += TS) {
-        for (int64_t m0 = 0; m0 < M_tile; m0 += TS) {
-            for (int64_t i = 0; i < TS; i++) {
-                const float *s = src + (k0 + i) * M + m0;
-                for (int64_t j = 0; j < TS; j++) {
-                    dst[(m0 + j) * K + (k0 + i)] = s[j];
-                }
-            }
-        }
-        for (int64_t m = M_tile; m < M; m++) {
-            for (int64_t i = 0; i < TS; i++) {
-                dst[m * K + (k0 + i)] = src[(k0 + i) * M + m];
-            }
-        }
-    }
-    for (int64_t k = K_tile; k < K; k++) {
-        for (int64_t m = 0; m < M; m++) {
-            dst[m * K + k] = src[k * M + m];
-        }
-    }
-}
-
 static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc,
                       int64_t m_remain, float *packed)
 {
@@ -1487,12 +1497,13 @@ static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc
         int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
 
         /* fast path: full NR-wide strip with K >= 8, use 8×8 block transpose.
-           NR=16 means two groups of 8 rows, each processed in 8-column chunks. */
+           NR/8 groups of 8 rows × 8-column chunks (NR=16→2 groups for AVX2,
+           NR=32→4 groups for AVX-512). */
         if (nr == GEMM_NR) {
             int64_t p = 0;
+            const int g_count = (int)(GEMM_NR / 8);
             for (; p + 8 <= kc; p += 8) {
-                /* process rows j..j+7 and j+8..j+15 */
-                for (int g = 0; g < 2; g++) {
+                for (int g = 0; g < g_count; g++) {
                     int64_t base_row = j + g * 8;
                     /* load 8 floats from each of 8 rows (sequential within each row) */
                     __m256 r0 = _mm256_loadu_ps(b_src + (base_row + 0) * ldb_src + p);
@@ -1585,20 +1596,102 @@ static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc
 #endif
 }
 
-/* pack a KC x NC panel of B (row-major) into contiguous NR-col strips */
+/* full-matrix transpose A[K, M] (row-major) → AT[M, K] (row-major).
+   used by opt_gemm_tn pre-transpose path so the GEMM hot loop runs through
+   pack_a (sequential reads) instead of pack_a_t (strided reads).
+
+   T-pre: 8×8 in-register transpose via unpacklo/unpackhi/permute2f128 —
+   converts 64 strided scalar writes per tile into 8 sequential ymm stores.
+   same pattern as pack_b_t. scalar tail handles non-multiple dims. */
+static void transpose_kxm_to_mxk(const float *src, int64_t K, int64_t M, float *dst)
+{
+    const int64_t TS = 8;
+    int64_t K_tile = K - (K % TS);
+    int64_t M_tile = M - (M % TS);
+    for (int64_t k0 = 0; k0 < K_tile; k0 += TS) {
+        for (int64_t m0 = 0; m0 < M_tile; m0 += TS) {
+#if defined(AX_SIMD_AVX2)
+            __m256 r0 = _mm256_loadu_ps(src + (k0 + 0) * M + m0);
+            __m256 r1 = _mm256_loadu_ps(src + (k0 + 1) * M + m0);
+            __m256 r2 = _mm256_loadu_ps(src + (k0 + 2) * M + m0);
+            __m256 r3 = _mm256_loadu_ps(src + (k0 + 3) * M + m0);
+            __m256 r4 = _mm256_loadu_ps(src + (k0 + 4) * M + m0);
+            __m256 r5 = _mm256_loadu_ps(src + (k0 + 5) * M + m0);
+            __m256 r6 = _mm256_loadu_ps(src + (k0 + 6) * M + m0);
+            __m256 r7 = _mm256_loadu_ps(src + (k0 + 7) * M + m0);
+            __m256 t0 = _mm256_unpacklo_ps(r0, r1);
+            __m256 t1 = _mm256_unpackhi_ps(r0, r1);
+            __m256 t2 = _mm256_unpacklo_ps(r2, r3);
+            __m256 t3 = _mm256_unpackhi_ps(r2, r3);
+            __m256 t4 = _mm256_unpacklo_ps(r4, r5);
+            __m256 t5 = _mm256_unpackhi_ps(r4, r5);
+            __m256 t6 = _mm256_unpacklo_ps(r6, r7);
+            __m256 t7 = _mm256_unpackhi_ps(r6, r7);
+            r0 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t0), _mm256_castps_pd(t2)));
+            r1 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t0), _mm256_castps_pd(t2)));
+            r2 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t1), _mm256_castps_pd(t3)));
+            r3 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t1), _mm256_castps_pd(t3)));
+            r4 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t4), _mm256_castps_pd(t6)));
+            r5 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t4), _mm256_castps_pd(t6)));
+            r6 = _mm256_castpd_ps(_mm256_unpacklo_pd(_mm256_castps_pd(t5), _mm256_castps_pd(t7)));
+            r7 = _mm256_castpd_ps(_mm256_unpackhi_pd(_mm256_castps_pd(t5), _mm256_castps_pd(t7)));
+            t0 = _mm256_permute2f128_ps(r0, r4, 0x20);
+            t1 = _mm256_permute2f128_ps(r1, r5, 0x20);
+            t2 = _mm256_permute2f128_ps(r2, r6, 0x20);
+            t3 = _mm256_permute2f128_ps(r3, r7, 0x20);
+            t4 = _mm256_permute2f128_ps(r0, r4, 0x31);
+            t5 = _mm256_permute2f128_ps(r1, r5, 0x31);
+            t6 = _mm256_permute2f128_ps(r2, r6, 0x31);
+            t7 = _mm256_permute2f128_ps(r3, r7, 0x31);
+            _mm256_storeu_ps(dst + (m0 + 0) * K + k0, t0);
+            _mm256_storeu_ps(dst + (m0 + 1) * K + k0, t1);
+            _mm256_storeu_ps(dst + (m0 + 2) * K + k0, t2);
+            _mm256_storeu_ps(dst + (m0 + 3) * K + k0, t3);
+            _mm256_storeu_ps(dst + (m0 + 4) * K + k0, t4);
+            _mm256_storeu_ps(dst + (m0 + 5) * K + k0, t5);
+            _mm256_storeu_ps(dst + (m0 + 6) * K + k0, t6);
+            _mm256_storeu_ps(dst + (m0 + 7) * K + k0, t7);
+#else
+            for (int64_t i = 0; i < TS; i++) {
+                const float *s = src + (k0 + i) * M + m0;
+                for (int64_t j = 0; j < TS; j++)
+                    dst[(m0 + j) * K + (k0 + i)] = s[j];
+            }
+#endif
+        }
+        for (int64_t m = M_tile; m < M; m++) {
+            for (int64_t i = 0; i < TS; i++)
+                dst[m * K + (k0 + i)] = src[(k0 + i) * M + m];
+        }
+    }
+    for (int64_t k = K_tile; k < K; k++) {
+        for (int64_t m = 0; m < M; m++)
+            dst[m * K + k] = src[k * M + m];
+    }
+}
+
+/* pack a KC x NC panel of B (row-major) into contiguous NR-col strips.
+   T3.1: branch out the common nr == GEMM_NR case to a memcpy of GEMM_NR
+   floats per row — compiler emits a constant-size SIMD copy and avoids
+   per-element `if (jj < nr)` checks. mirrors the pack_a_t fast path. */
 static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
                     int64_t n_remain, float *packed)
 {
     for (int64_t j = 0; j < nc; j += GEMM_NR) {
         int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
-        for (int64_t p = 0; p < kc; p++) {
-            for (int64_t jj = 0; jj < GEMM_NR; jj++) {
-                if (jj < nr)
-                    packed[jj] = b[p * ldb + (j + jj)];
-                else
-                    packed[jj] = 0.0f;
+        if (nr == GEMM_NR) {
+            for (int64_t p = 0; p < kc; p++) {
+                memcpy(packed, b + p * ldb + j, GEMM_NR * sizeof(float));
+                packed += GEMM_NR;
             }
-            packed += GEMM_NR;
+        } else {
+            for (int64_t p = 0; p < kc; p++) {
+                for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                    if (jj < nr) packed[jj] = b[p * ldb + (j + jj)];
+                    else         packed[jj] = 0.0f;
+                }
+                packed += GEMM_NR;
+            }
         }
     }
 }
@@ -2267,8 +2360,15 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 
     /* SIMD small/medium path. tiled BLIS overhead dominates below ~100k FLOPs;
        a straight vectorized AXPY (C[i,j] += a_ip * B[p,j]) with SIMD inner on j
-       runs faster for small-to-medium shapes. */
-    if (m * n * k < 100000) {
+       runs faster for small-to-medium shapes.
+       T5.1: also route skinny-M shapes (m < GEMM_MR) up to ~5M flops here —
+       the BLIS micro-kernel processes MR=6 rows at a time, so m < 6 means
+       most rows in the tile are wasted/zero-padded, costing more in pack+
+       kernel overhead than the AXPY loop saves. cap at 5M flops because
+       above that the serial AXPY (≈30 GFLOPS single-core) loses to the
+       parallel BLIS path despite its tiling waste. measured: opt_gemm at
+       (1,1024,1024) cost ~137us vs simple-path ~32us — 4× faster. */
+    if (m * n * k < 100000 || (m < GEMM_MR && m * n * k < 5000000)) {
         const float *ad = a_raw;
         const float *bd = b_raw;
         float *od = o_raw;
@@ -2776,6 +2876,7 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
         }
     }
 
+#ifndef AX_NO_STDIO
     if (prof_enabled) {
         uint64_t total = t_packb + t_packa + t_uk;
         if (total > 0) {
@@ -2788,6 +2889,10 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
                 (unsigned long)t_uk,    (long)n_uk,    100.0 * (double)t_uk    / (double)total);
         }
     }
+#else
+    (void)t_packb; (void)t_packa; (void)t_uk; (void)n_packb; (void)n_packa; (void)n_uk;
+    (void)prof_enabled;
+#endif
     #undef PROF_TICK
 
     /* leave pack_b cache invalidated (we clobbered it with custom data). */
@@ -3465,6 +3570,42 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     float *od = raw_f32(out);
 
     pack_b_cache_invalidate();
+
+    /* T-pre: pre-transpose A from [k,m] → [m,k] when the GEMM is large
+       enough AND skewed enough (n >> m) that the saved pack_a_t overhead
+       outweighs the transpose write traffic. measured: helps mha dwqkv
+       shape (m=1024, n=3072, k=512, 3 GFLOPS) +13%, hurts smaller skewed
+       shapes (m=512, n=2048, k=512, 1 GFLOPS) -11% because transpose
+       cost (2 BW passes over A) is fixed but savings scale with flops.
+       criteria: flops >= 2 GFLOPS, n >= 2m, A fits the budget. */
+    int64_t at_bytes = (int64_t)m * (int64_t)k * (int64_t)sizeof(float);
+    int64_t flops = 2 * m * n * k;
+    bool can_pretrans = (at_bytes <= ax_tn_pretranspose_budget_bytes)
+                        && (flops >= 2000000000LL)
+                        && (m >= 8 && k >= 8)
+                        && (n >= 2 * m);
+    if (can_pretrans) {
+        float *atbuf = ax_tls_grow(&tl_tn_pretranspose, &tl_tn_pretranspose_bytes, at_bytes);
+        if (atbuf) {
+            transpose_kxm_to_mxk(ad, k, m, atbuf);
+            ax_storage_t at_st = {0};
+            at_st.data = atbuf;
+            at_st.size_bytes = (size_t)at_bytes;
+            atomic_store(&at_st.refcount, 0);
+            at_st.device = AX_DEVICE_CPU;
+            at_st.is_arena_temp = true;
+            at_st.generation = 1;
+            ax_tensor_t at_tv = {0};
+            at_tv.storage = &at_st;
+            at_tv.ndim = 2;
+            at_tv.dtype = AX_FLOAT32;
+            at_tv.shape[0] = m;
+            at_tv.shape[1] = k;
+            at_tv.strides[0] = k;
+            at_tv.strides[1] = 1;
+            return opt_gemm(&at_tv, b, out);
+        }
+    }
 
     if (m * n * k < 100000) {
         /* honor skip_init: pre-zero only when not accumulating; then ALWAYS
@@ -4151,9 +4292,20 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
 #define ATTN_BK_MAX 128
 #define ATTN_MAX_DK 256
 
-/* attention tile sizes — runtime, defaults picked so score_strip stays in L1d. */
-static int64_t ATTN_BQ = 128;
-static int64_t ATTN_BK = 128;
+/* attention tile sizes — runtime, defaults picked so score_strip stays in L1d.
+   Phase A: ATTN_BQ chosen as the largest multiple of GEMM_MR that doesn't
+   exceed 128, so qi values are MR-aligned for the SDPA-backward pre-pack
+   (otherwise pre-packed Q strips would straddle qi boundaries):
+     AVX2 (MR=6)    → 126
+     AVX-512 (MR=14)→ 126
+     NEON (MR=8)    → 128
+     scalar (MR=4)  → 128
+   Tried Phase I.1 with 168 (= LCM(6,14,8,4) × constant) but P+dP+dS
+   tiles totalled 339 KB which overflowed L1 and regressed by 15-18 %.
+   126 stays optimal at the L1d budget. */
+#define ATTN_BQ_DEFAULT ((128 / GEMM_MR) * GEMM_MR)
+static int64_t ATTN_BQ = ATTN_BQ_DEFAULT;
+static int64_t ATTN_BK = ATTN_BQ_DEFAULT;
 
 /* in-place multiply a packed panel by a scalar (SIMD-vectorized).
    used to bake 1/√dk into Kt_packed so the score GEMM output is
@@ -4487,6 +4639,16 @@ static inline void attn_bwd_softmax_row(const float *sr_pre_mask,
    input), so the comparison is not apples-to-apples.
    end-to-end: bench_transformer Axiom=90ms/step vs TF=114ms/step (+27%). */
 
+/* phase i.1 attempt — pack-free strided-A sdpa backward kernels:
+   tried replacing pack_a_t(P_tile) + micro_kernel with a strided-A
+   micro-kernel reading P_tile in row-major directly. measured 3-4 %
+   regression on B1_S512_D1024_H16 because the lost JIT speedup on
+   the 6x16 / 14x32 / 8x12 inner kernel outweighed the saved pack
+   memory traffic (~64KB / tile / pack). pack_a_t is only ~10 % of
+   sdpa_bwd time, JIT is ~25 % faster than the C-compiled fma loop —
+   net loss. revisit when a JIT-emitted strided-A kernel is in place
+   (see jit_gemm_*.c structure for the existing per-kc emitters). */
+
 static void attn_bwd_head(const float *Q, const float *K, const float *V,
                            const float *dO, const float *L, const float *Di,
                            float *dQ, float *dK, float *dV,
@@ -4525,8 +4687,27 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
     float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
     float a_q[GEMM_MR * ATTN_MAX_DK] __attribute__((aligned(64)));
 
-    if (!Kt_packed || !Vt_packed || !K_packed || !P_tile || !dP_tile ||
-        !dS_tile || !pa || !pb) { return; }
+    /* Phase A: pre-pack Q and dO ONCE per head. these depend only on the row
+       index, not on (kj, qi). without this we re-pack Q in the QK^T-recompute
+       (per MR-strip per qi per kj) and dO in dV/dP/dQ/dK paths (per qi per kj),
+       costing ~1 MB of needless pack work per head per backward call.
+       requires ATTN_BQ % GEMM_MR == 0 (enforced by ATTN_BQ_DEFAULT) so qi
+       values land on MR-strip boundaries in the pre-packed Q_pa layout. */
+    int64_t S_pa_bytes  = (int64_t)((S + GEMM_MR - 1) / GEMM_MR) * GEMM_MR * dk * (int64_t)sizeof(float);
+    int64_t S_pb_bytes  = (int64_t)dk_np * S * (int64_t)sizeof(float);
+    float *Q_pa  = ax_tls_grow(&tl_bwd_q_pa,  &tl_bwd_q_pa_bytes,  S_pa_bytes);
+    float *Q_pb  = ax_tls_grow(&tl_bwd_q_pb,  &tl_bwd_q_pb_bytes,  S_pb_bytes);
+    float *dO_pa = ax_tls_grow(&tl_bwd_dO_pa, &tl_bwd_dO_pa_bytes, S_pa_bytes);
+    float *dO_pb = ax_tls_grow(&tl_bwd_dO_pb, &tl_bwd_dO_pb_bytes, S_pb_bytes);
+    bool use_prepack = (Q_pa && Q_pb && dO_pa && dO_pb)
+                       && (ATTN_BQ % GEMM_MR == 0);
+    if (use_prepack) {
+        int64_t S_pa_rows = ((S + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+        pack_a(Q,  dk, S_pa_rows, dk, S, Q_pa);
+        pack_a(dO, dk, S_pa_rows, dk, S, dO_pa);
+        pack_b(Q,  dk, S, dk_np, dk, Q_pb);
+        pack_b(dO, dk, S, dk_np, dk, dO_pb);
+    }
 
     for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
         int64_t Bk = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
@@ -4580,12 +4761,22 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                        not the latest. see fwd path for the same invariant. */
                     bool need_mask = causal && (qi + ir < kj + Bk - 1);
 
-                    pack_a(Q + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
+                    /* Phase A: read pre-packed Q strip when available; else
+                       fall back to per-call pack into the stack scratch a_q. */
+                    const float *q_strip;
+                    if (use_prepack) {
+                        /* (qi + ir) is MR-aligned because both qi and ir are.
+                           strip offset in MR-row layout = row * dk. */
+                        q_strip = Q_pa + (qi + ir) * dk;
+                    } else {
+                        pack_a(Q + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
+                        q_strip = a_q;
+                    }
                     memset(score_strip, 0, (size_t)(mr * Bk) * sizeof(float));
                     for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
                         int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
                         if (nr <= 0) break;
-                        micro_kernel(dk, a_q, Kt_packed + jr * dk,
+                        micro_kernel(dk, q_strip, Kt_packed + jr * dk,
                                      score_strip + jr, Bk, mr, nr);
                     }
                     if (need_mask) {
@@ -4603,20 +4794,31 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
 
             /* dV += P^T @ dO (full tile GEMM) */
             pack_a_t(P_tile, Bk, Bk_p, Bq, Bk, pa);
-            pack_b(dO + qi * dk, dk, Bq, dk_np, dk, pb);
+            /* Phase A: dO B-operand comes from pre-packed dO_pb when available;
+               jr-th strip starts at dO_pb + jr*S, row qi at offset qi*GEMM_NR. */
+            if (!use_prepack) {
+                pack_b(dO + qi * dk, dk, Bq, dk_np, dk, pb);
+            }
             for (int64_t ir = 0; ir < Bk_p; ir += GEMM_MR) {
                 int64_t mr = (ir + GEMM_MR <= Bk) ? GEMM_MR : (Bk > ir ? Bk - ir : 0);
                 if (mr <= 0) break;
                 for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
                     int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
                     if (nr <= 0) break;
-                    micro_kernel(Bq, pa + ir * Bq, pb + jr * Bq,
+                    const float *b_ptr = use_prepack
+                        ? (dO_pb + jr * S + qi * GEMM_NR)
+                        : (pb + jr * Bq);
+                    micro_kernel(Bq, pa + ir * Bq, b_ptr,
                                  dV + (kj + ir) * dk + jr, dk, mr, nr);
                 }
             }
 
             /* dP = dO @ V^T (full tile GEMM) */
-            pack_a(dO + qi * dk, dk, Bq_p, dk, Bq, pa);
+            /* Phase A: pre-packed dO_pa; strip qi+ir is at dO_pa + (qi+ir)*dk
+               (qi+ir guaranteed MR-aligned since both are MR-multiples). */
+            if (!use_prepack) {
+                pack_a(dO + qi * dk, dk, Bq_p, dk, Bq, pa);
+            }
             memset(dP_tile, 0, (size_t)(Bq * Bk) * sizeof(float));
             for (int64_t ir = 0; ir < Bq_p; ir += GEMM_MR) {
                 int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq > ir ? Bq - ir : 0);
@@ -4624,7 +4826,10 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                 for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
                     int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
                     if (nr <= 0) break;
-                    micro_kernel(dk, pa + ir * dk, Vt_packed + jr * dk,
+                    const float *a_ptr = use_prepack
+                        ? (dO_pa + (qi + ir) * dk)
+                        : (pa + ir * dk);
+                    micro_kernel(dk, a_ptr, Vt_packed + jr * dk,
                                  dP_tile + ir * Bk + jr, Bk, mr, nr);
                 }
             }
@@ -4662,14 +4867,20 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
 
             /* dK += dS^T @ Q */
             pack_a_t(dS_tile, Bk, Bk_p, Bq, Bk, pa);
-            pack_b(Q + qi * dk, dk, Bq, dk_np, dk, pb);
+            /* Phase A: Q B-operand from pre-packed Q_pb when available. */
+            if (!use_prepack) {
+                pack_b(Q + qi * dk, dk, Bq, dk_np, dk, pb);
+            }
             for (int64_t ir = 0; ir < Bk_p; ir += GEMM_MR) {
                 int64_t mr = (ir + GEMM_MR <= Bk) ? GEMM_MR : (Bk > ir ? Bk - ir : 0);
                 if (mr <= 0) break;
                 for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
                     int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
                     if (nr <= 0) break;
-                    micro_kernel(Bq, pa + ir * Bq, pb + jr * Bq,
+                    const float *b_ptr = use_prepack
+                        ? (Q_pb + jr * S + qi * GEMM_NR)
+                        : (pb + jr * Bq);
+                    micro_kernel(Bq, pa + ir * Bq, b_ptr,
                                  dK + (kj + ir) * dk + jr, dk, mr, nr);
                 }
             }

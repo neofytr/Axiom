@@ -1,6 +1,22 @@
 /* axiom/ops.h — high-level tensor operations.
-   these handle output allocation, broadcasting, and (later) autograd recording.
-   this is what user code should call, not the compute layer directly. */
+
+   these handle output allocation, broadcasting, and autograd graph
+   recording. this is the layer user code should call — the lower-level
+   compute api is for backend authors and tensor.c internals.
+
+   ownership: every op returns a NEW heap tensor owned by the caller.
+   release with ax_tensor_destroy(). when autograd is recording (see
+   ax_enable_grad / ax_disable_grad in autograd.h), the returned tensor
+   participates in the graph and ax_graph_cleanup releases its arena
+   allocations on demand.
+
+   error handling: returns NULL on failure (allocation or shape mismatch);
+   ax_err_last_message() describes the cause. failure modes include
+   incompatible broadcast shapes, dtype mismatch, or out-of-memory.
+
+   thread-safety: each op is single-threaded with internal openmp
+   parallelism. independent ops on disjoint tensors may run concurrently;
+   do NOT call ops on the same tensor from multiple threads. */
 
 #ifndef AX_OPS_H
 #define AX_OPS_H

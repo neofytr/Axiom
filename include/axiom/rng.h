@@ -1,6 +1,18 @@
 /* axiom/rng.h — high-quality pseudorandom number generator.
-   xoshiro256** with per-thread state. replaces rand()/srand()
-   which has poor quality and is not thread-safe. */
+
+   xoshiro256** with per-thread state. replaces rand()/srand() which
+   has poor quality and is not thread-safe.
+
+   thread-safety: every thread keeps its own xoshiro256** state
+   initialised by mixing the global seed with the thread id. each
+   ax_rng_* call is concurrent-safe across threads but sequential within
+   one thread.
+
+   ownership: no allocations. all functions return values by value.
+
+   error handling: no failure modes. ax_rng_seed mutates the per-thread
+   seed source; subsequent rng_* calls produce a deterministic sequence
+   per thread. */
 
 #ifndef AX_RNG_H
 #define AX_RNG_H

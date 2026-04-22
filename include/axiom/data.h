@@ -5,7 +5,21 @@
    - tensor dataset (wraps existing tensors)
    - csv loader (parses csv files into tensors)
    - dataloader (batching, shuffling, iteration)
-   - basic transforms (normalize, one-hot encode) */
+   - basic transforms (normalize, one-hot encode)
+
+   ownership: ax_*_create returns a heap dataset/dataloader; release
+   with ax_dataset_destroy / ax_dataloader_destroy. tensor dataset
+   wrappers borrow the underlying tensor (caller keeps ownership);
+   csv loader allocates its own tensor that the dataset owns.
+   batches returned by the dataloader are owned by the loader and
+   recycled per iteration — copy them out if you need to keep them.
+
+   error handling: ax_*_create returns NULL on alloc failure or invalid
+   shapes. csv loader returns NULL on file-open / parse error;
+   ax_err_last_message describes the cause.
+
+   thread-safety: dataloader iteration is not concurrent-safe. for
+   parallel loaders, instantiate one dataloader per thread. */
 
 #ifndef AX_DATA_H
 #define AX_DATA_H

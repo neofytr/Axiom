@@ -22,7 +22,7 @@
 static ax_optimizer_t *optim_alloc(ax_optim_type_t type, ax_tensor_t **params, int n)
 {
     ax_optimizer_t *opt = calloc(1, sizeof(ax_optimizer_t));
-    if (!opt) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(opt, "ax_*_optimizer_create");
 
     opt->type = type;
     opt->params = params;
@@ -31,6 +31,7 @@ static ax_optimizer_t *optim_alloc(ax_optim_type_t type, ax_tensor_t **params, i
     if (!opt->state)
     {
         free(opt);
+        ax_err_set(AX_ERR_ALLOC, "ax_*_optimizer_create: state array alloc failed");
         return NULL;
     }
     return opt;

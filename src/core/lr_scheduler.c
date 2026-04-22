@@ -1,6 +1,7 @@
 /* lr_scheduler.c — learning rate scheduling implementations. */
 
 #include "axiom/lr_scheduler.h"
+#include "axiom/error.h"
 #include <stdlib.h>
 #include <math.h>
 
@@ -10,9 +11,12 @@
 
 static ax_lr_scheduler_t *sched_alloc(ax_sched_type_t type, ax_optimizer_t *opt)
 {
-    if (!opt) return NULL;
+    if (!opt) {
+        ax_err_set(AX_ERR_NULL_ARG, "ax_sched_*: optimizer is NULL");
+        return NULL;
+    }
     ax_lr_scheduler_t *s = calloc(1, sizeof(ax_lr_scheduler_t));
-    if (!s) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(s, "ax_sched_*");
     s->type = type;
     s->opt = opt;
     s->initial_lr = opt->lr;

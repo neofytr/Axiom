@@ -33,7 +33,7 @@ static inline int atomic_fetch_sub(atomic_int *obj, int val) {
 #define _STDATOMIC_H
 
 /* ---- 2. axiom headers ---- */
-#include "axiom/backend_ops.h"
+#include "axiom/internal/backend_ops.h"
 #include "axiom/tensor.h"
 #include "axiom/error.h"
 

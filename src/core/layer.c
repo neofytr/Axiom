@@ -7,6 +7,7 @@
 #include "axiom/init.h"
 #include "axiom/compute.h"
 #include "axiom/autograd.h"
+#include "axiom/error.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -65,7 +66,7 @@ static void dense_destroy(ax_layer_t *self)
 ax_layer_t *ax_dense_create(int64_t in_features, int64_t out_features, bool use_bias)
 {
     ax_dense_t *d = calloc(1, sizeof(ax_dense_t));
-    if (!d) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(d, "ax_dense_create");
 
     d->base.ops.forward = dense_forward;
     d->base.ops.destroy = dense_destroy;
@@ -137,7 +138,7 @@ static ax_layer_t *make_activation(ax_layer_type_t type,
                                     ax_tensor_t *(*fwd)(ax_layer_t *, ax_tensor_t *))
 {
     ax_activation_layer_t *a = calloc(1, sizeof(ax_activation_layer_t));
-    if (!a) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(a, "ax_*_layer_create");
     a->base.ops.forward = fwd;
     a->base.ops.destroy = activation_destroy;
     a->base.type = type;
@@ -241,7 +242,7 @@ static void sequential_destroy(ax_layer_t *self)
 ax_layer_t *ax_sequential_create(void)
 {
     ax_sequential_t *seq = calloc(1, sizeof(ax_sequential_t));
-    if (!seq) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(seq, "ax_sequential_create");
 
     seq->base.ops.forward = sequential_forward;
     seq->base.ops.destroy = sequential_destroy;

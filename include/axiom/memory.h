@@ -31,28 +31,49 @@ typedef struct ax_arena {
     size_t total_allocated;       /* total bytes allocated across all blocks */
 } ax_arena_t;
 
-/* create a new arena with the given default block size (0 = use default) */
+/* create a new arena with the given default block size (0 = use default).
+   ownership: caller owns the returned arena and must release it via
+   ax_arena_destroy.
+   returns NULL on allocation failure (ax_err_last_message describes why).
+   thread-safety: not concurrent-safe — one thread per arena. */
 ax_arena_t *ax_arena_create(size_t block_size);
 
-/* allocate n bytes from the arena, aligned to the given alignment */
+/* allocate `size` bytes from the arena, aligned to `alignment` (must be
+   a power of two). returns NULL if a fresh block cannot be allocated.
+   ownership: pointer is owned by the arena; freed by ax_arena_reset or
+   ax_arena_destroy. do not free individually.
+   thread-safety: not concurrent-safe on the same arena. */
 void *ax_arena_alloc(ax_arena_t *arena, size_t size, size_t alignment);
 
-/* convenience: allocate with default alignment */
+/* convenience: allocate `size` bytes aligned to AX_DEFAULT_ALIGNMENT (64).
+   same ownership and thread-safety contract as ax_arena_alloc. */
 static inline void *ax_arena_alloc_default(ax_arena_t *arena, size_t size) {
     return ax_arena_alloc(arena, size, AX_DEFAULT_ALIGNMENT);
 }
 
-/* reset the arena — marks all memory as free without releasing it.
-   subsequent allocations reuse existing blocks. */
+/* reset the arena — invalidates all prior allocations but retains the
+   underlying blocks for reuse. subsequent ax_arena_alloc calls bump
+   from the start of the existing chain.
+   thread-safety: not concurrent-safe on the same arena. */
 void ax_arena_reset(ax_arena_t *arena);
 
-/* destroy the arena — frees all blocks */
+/* destroy the arena — frees every block. arena pointer must not be
+   dereferenced after this call.
+   thread-safety: not concurrent-safe on the same arena. */
 void ax_arena_destroy(ax_arena_t *arena);
 
-/* aligned malloc/free wrappers */
-/* general-purpose aligned allocation for persistent data */
+/* aligned malloc/free wrappers for persistent data (tensor storage,
+   long-lived buffers). general-purpose, paired calls. */
 
+/* allocate `size` bytes aligned to `alignment` (power-of-two).
+   ownership: caller owns the returned pointer and must release it via
+   ax_aligned_free.
+   returns NULL on allocation failure.
+   thread-safety: process-wide allocator; concurrent-safe. */
 void *ax_aligned_alloc(size_t size, size_t alignment);
+
+/* free a pointer previously returned by ax_aligned_alloc. NULL is a no-op.
+   thread-safety: concurrent-safe (each pointer freed by one thread). */
 void ax_aligned_free(void *ptr);
 
 /* allocation counting (compile with -DAX_COUNT_ALLOCS to enable) */

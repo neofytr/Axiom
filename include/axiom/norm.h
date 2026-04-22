@@ -1,4 +1,9 @@
-/* axiom/norm.h — normalization, dropout, and gradient clipping. */
+/* axiom/norm.h — normalization, dropout, and gradient clipping.
+
+   ownership/error-handling/thread-safety follow the conventions in
+   axiom/axiom.h. all ax_*_create functions return a heap layer (NULL
+   on alloc failure); release with ax_layer_destroy. layers own their
+   parameter tensors (gamma, beta) and running buffers. */
 
 #ifndef AX_NORM_H
 #define AX_NORM_H

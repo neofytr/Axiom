@@ -20,7 +20,7 @@
 #include "axiom/tensor.h"
 #include "axiom/compute.h"
 #include "axiom/device.h"
-#include "axiom/backend_ops.h"
+#include "axiom/internal/backend_ops.h"
 #include "axiom/rng.h"
 #include "axiom/error.h"
 #include <stdlib.h>

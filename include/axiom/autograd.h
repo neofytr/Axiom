@@ -1,6 +1,26 @@
 /* axiom/autograd.h — reverse-mode automatic differentiation engine.
-   records operations as they happen, then walks backwards
-   through the computation graph to accumulate gradients. */
+
+   records operations as they happen, then walks backwards through the
+   computation graph to accumulate gradients.
+
+   ownership: the autograd graph borrows pointers to user tensors (leaves)
+   and owns intermediate (non-leaf) tensors created via ops. ax_graph_cleanup
+   releases the intermediates and detaches the leaf chain.
+
+   thread-safety: each thread has its own grad enabled flag, forward
+   arena, backward arena, and grad_fn slab. autograd state is per-thread
+   — concurrent training across threads is safe AS LONG AS each thread
+   touches only tensors it created. shared parameters between threads
+   (e.g. data-parallel training) require explicit gradient reduction
+   that axiom does not provide; do that work in user code.
+
+   error handling: ax_backward returns ax_status_t. construction helpers
+   (ax_grad_fn_create, ax_*_arena) return NULL on allocation failure.
+
+   inference-only build: when compiled with -DAX_INFERENCE_ONLY all the
+   training entry points become NULL stubs / link errors. ax_grad_enabled()
+   constant-folds to false so forward kernels skip the recording branch
+   entirely. */
 
 #ifndef AX_AUTOGRAD_H
 #define AX_AUTOGRAD_H

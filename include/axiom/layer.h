@@ -5,7 +5,22 @@
 
    the design is intentionally minimal for embedded targets:
    no heap-allocated strings, no dynamic arrays where avoidable,
-   just function pointers and flat structs. */
+   just function pointers and flat structs.
+
+   ownership: ax_*_create returns a heap layer; release with
+   ax_layer_destroy. layers own their parameter and buffer tensors and
+   destroy them in their vtable destroy hook. layers added to a
+   sequential container transfer ownership to the container.
+   ax_layer_forward returns a NEW heap tensor owned by the caller (or
+   by the autograd graph if grad is enabled).
+
+   error handling: ax_*_create returns NULL on allocation failure;
+   ax_layer_forward returns NULL on shape mismatch or runtime error.
+   inspect ax_err_last_message() in either case.
+
+   thread-safety: layer objects are not concurrent-safe. forward calls
+   on a single layer instance must be serialised (the layer mutates its
+   internal autograd state per call). */
 
 #ifndef AX_LAYER_H
 #define AX_LAYER_H

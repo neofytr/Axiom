@@ -1,4 +1,4 @@
-/* axiom/types.h — fundamental type definitions for the axiom framework */
+/* axiom/types.h — fundamental type definitions for the axiom framework. */
 
 #ifndef AX_TYPES_H
 #define AX_TYPES_H
@@ -6,6 +6,44 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+
+/* version number — bumped per the SemVer rules:
+     MAJOR  — incompatible api change (re-tag all functions abi-stable
+              again at the next major).
+     MINOR  — new functionality added in a backward-compatible manner.
+     PATCH  — backward-compatible bug fixes.
+   the integer constant AX_VERSION packs MM*10000 + mm*100 + pp so
+   compile-time `#if AX_VERSION >= 1000` checks work. */
+#define AX_VERSION_MAJOR  0
+#define AX_VERSION_MINOR  10
+#define AX_VERSION_PATCH  0
+#define AX_VERSION (AX_VERSION_MAJOR * 10000 + AX_VERSION_MINOR * 100 + AX_VERSION_PATCH)
+#define AX_VERSION_STRING "0.10.0"
+
+/* abi stability tag. every public function in axiom/*.h (excluding
+   axiom/internal/) is implicitly tagged AX_ABI_STABLE_SINCE("0.10.0").
+   future minor versions may not break or remove a tagged symbol; only
+   a major bump (1.0.0 -> 2.0.0) may. removals must go through a
+   deprecation cycle:
+       1) tag the symbol AX_DEPRECATED with a hint to its replacement;
+       2) keep both names available for at least one minor release;
+       3) remove the old name only at the next major bump.
+   the AX_DEPRECATED macro emits a compiler warning at every call site
+   so users can migrate at their own pace. */
+#if defined(__GNUC__) || defined(__clang__)
+  #define AX_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#elif defined(_MSC_VER)
+  #define AX_DEPRECATED(msg) __declspec(deprecated(msg))
+#else
+  #define AX_DEPRECATED(msg)
+#endif
+
+/* purely documentary — does not affect codegen. usage:
+       AX_ABI_STABLE_SINCE("0.10.0") ax_status_t ax_compute_init(void);
+   most public functions inherit the implicit baseline (0.10.0) above
+   and don't need this tag explicitly; mark only when the symbol's
+   guarantee differs from the baseline (e.g. "stable since 0.11.0"). */
+#define AX_ABI_STABLE_SINCE(version)
 
 /* max tensor dimensions — covers all practical cases */
 #define AX_MAX_DIMS 8

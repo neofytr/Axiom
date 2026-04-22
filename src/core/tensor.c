@@ -4,6 +4,7 @@
 #include "axiom/autograd.h"
 #include "axiom/memory.h"
 #include "axiom/compute.h"
+#include "axiom/internal/compute_internal.h"
 #include "axiom/device.h"
 #include "axiom/rng.h"
 #include <stdalign.h>

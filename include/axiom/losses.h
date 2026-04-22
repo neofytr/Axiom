@@ -1,5 +1,16 @@
 /* axiom/losses.h — loss functions for training.
-   each returns a scalar tensor (1 element) suitable for ax_backward(). */
+
+   each returns a scalar tensor (1 element) suitable for ax_backward().
+   ownership: caller; release with ax_tensor_destroy after the backward
+   pass and ax_graph_cleanup. when autograd is enabled, the loss tensor
+   carries a grad_fn that backpropagates through the loss formula and
+   reduces correctly across the batch dimension.
+
+   error handling: returns NULL on shape mismatch, dtype mismatch, or
+   allocation failure. ax_err_last_message() describes the cause.
+
+   thread-safety: per-thread autograd state — safe to compute losses in
+   parallel as long as each thread uses its own tensors. */
 
 #ifndef AX_LOSSES_H
 #define AX_LOSSES_H

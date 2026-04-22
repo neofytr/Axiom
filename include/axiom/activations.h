@@ -1,5 +1,10 @@
 /* axiom/activations.h — activation functions with autograd support.
-   relu and sigmoid already live in ops.h; these are the rest. */
+   relu and sigmoid already live in ops.h; these are the rest.
+
+   ownership / error handling / thread-safety: same contract as ops.h
+   — every function returns a NEW heap tensor owned by the caller; NULL
+   on alloc/shape failure (ax_err_last_message describes); single-thread
+   per tensor with internal openmp parallelism. */
 
 #ifndef AX_ACTIVATIONS_H
 #define AX_ACTIVATIONS_H

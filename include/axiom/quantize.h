@@ -17,8 +17,21 @@
    (no BW win, but uses the JIT'd kernel). path (a) is what we ship
    for the inference fast path. */
 
-#ifndef AXIOM_QUANTIZE_H
-#define AXIOM_QUANTIZE_H
+#ifndef AX_QUANTIZE_H
+#define AX_QUANTIZE_H
+
+/* ownership: ax_qweight_create_from_fp32 returns a heap qweight owned
+   by the caller; release with ax_qweight_destroy. ax_qweight_dequantize
+   writes into a caller-supplied fp32 buffer; no allocation.
+
+   error handling: ax_qweight_create_from_fp32 returns NULL on alloc
+   failure. ax_qgemm_w8a32 returns AX_ERR_INVALID for shape mismatch,
+   AX_ERR_NULL_ARG for null inputs, AX_OK on success.
+
+   thread-safety: qweight contents are immutable post-construction —
+   ax_qgemm_w8a32 is concurrent-safe across distinct (a, out) buffers
+   on the same qweight. ax_qweight_dequantize is read-only on the
+   qweight and writes a unique buffer per call. */
 
 #include "types.h"
 #include "tensor.h"
@@ -69,4 +82,4 @@ ax_status_t ax_qgemm_w8a32(
 }
 #endif
 
-#endif
+#endif /* AX_QUANTIZE_H */

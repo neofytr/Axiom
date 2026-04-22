@@ -5,6 +5,7 @@
 #include "axiom/activations.h"
 #include "axiom/autograd.h"
 #include "axiom/compute.h"
+#include "axiom/internal/compute_internal.h"
 #include "axiom/error.h"
 #include "../compute/backends/simd_defs.h"
 #include <math.h>

@@ -2,8 +2,18 @@
 
    learning rate is the most important hyperparameter. starting high
    and decaying it during training is almost always better than
-   a constant lr. these schedulers modify the optimizer's lr
-   based on the current epoch/step. */
+   a constant lr. these schedulers modify the optimizer's lr based on
+   the current epoch/step.
+
+   ownership: scheduler borrows the optimizer (does NOT own it).
+   ax_sched_destroy frees only the scheduler. release the optimizer
+   separately with ax_optimizer_destroy.
+
+   error handling: ax_sched_*_create returns NULL on alloc failure.
+   ax_sched_step / ax_sched_get_lr are tolerant of NULL (no-op /
+   return 0) but will warn via ax_err_set in debug builds.
+
+   thread-safety: not concurrent-safe on the same scheduler. */
 
 #ifndef AX_LR_SCHEDULER_H
 #define AX_LR_SCHEDULER_H

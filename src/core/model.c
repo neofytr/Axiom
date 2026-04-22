@@ -3,15 +3,19 @@
 #include "axiom/model.h"
 #include "axiom/autograd.h"
 #include "axiom/compute.h"
+#include "axiom/error.h"
 #include <stdlib.h>
 #include <stdio.h>
 
 ax_model_t *ax_model_create(ax_layer_t *net)
 {
-    if (!net) return NULL;
+    if (!net) {
+        ax_err_set(AX_ERR_NULL_ARG, "ax_model_create: net is NULL");
+        return NULL;
+    }
 
     ax_model_t *m = calloc(1, sizeof(ax_model_t));
-    if (!m) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(m, "ax_model_create");
 
     m->net = net;
     m->n_params = ax_layer_get_params(net, m->params, AX_MODEL_MAX_PARAMS);

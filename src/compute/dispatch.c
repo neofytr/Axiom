@@ -7,6 +7,7 @@
 #endif
 
 #include "axiom/compute.h"
+#include "axiom/internal/compute_internal.h"
 #include "axiom/device.h"
 #include "axiom/error.h"
 #include <stddef.h>
@@ -68,6 +69,12 @@ static int device_backend_inited[AX_DEVICE_COUNT] = { 0 };
 static ax_backend_id_t active_id = AX_BACKEND_CPU_NAIVE;
 static const ax_backend_ops_t *active_ops = NULL;
 static int compute_initialized = 0;
+
+/* k.4 cuda extension registry. populated by the cuda backend at init
+   via ax_compute_register_cuda_extension. NULL when no cuda backend is
+   loaded — cpu paths must check before dispatching. */
+#include "axiom/internal/cuda_extension.h"
+static const ax_cuda_extension_t *cuda_extension = NULL;
 
 /* claim ownership of ops->device in the device table and fire ops->init
    exactly once per process. safe to call with NULL or with a backend
@@ -223,6 +230,25 @@ ax_backend_id_t ax_compute_get_backend(void) {
 
 const ax_backend_ops_t *ax_compute_get_ops(void) {
     return active_ops;
+}
+
+const char *ax_compute_backend_name(void) {
+    return active_ops ? active_ops->name : NULL;
+}
+
+/* k.4: cuda extension registry. the cuda backend's init hook calls
+   register_cuda_extension(&its_static_table). cpu paths call
+   get_cuda_extension() and dispatch through the returned struct. */
+ax_status_t ax_compute_register_cuda_extension(const ax_cuda_extension_t *ext) {
+    /* NULL clears the registration (used by ax_compute_shutdown). a
+       second non-NULL call would replace the prior registration; we
+       allow that for plugin reload scenarios but tag it with no error. */
+    cuda_extension = ext;
+    return AX_OK;
+}
+
+const ax_cuda_extension_t *ax_compute_get_cuda_extension(void) {
+    return cuda_extension;
 }
 
 ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops_t *ops) {

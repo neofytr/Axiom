@@ -1,6 +1,23 @@
 /* axiom/optim.h — optimizers for updating model parameters.
-   each optimizer holds per-parameter state (momentum, adam moments, etc.)
-   and implements the step() function to update weights using gradients. */
+
+   each optimizer holds per-parameter state (momentum, adam moments,
+   etc.) and implements the step() function to update weights using
+   gradients.
+
+   ownership: optimizer borrows the parameter array (does NOT own the
+   tensors). caller keeps the tensor lifetime separate (typically tied
+   to a model). ax_*_create returns a heap optimizer; release with
+   ax_optimizer_destroy. ax_optimizer_destroy frees per-parameter state
+   buffers but never the parameters themselves.
+
+   error handling: ax_*_create returns NULL on allocation failure;
+   ax_err_last_message() describes the cause. ax_optimizer_step has
+   void return — failures are signalled via ax_err_last_status() but
+   are rare (usually only on out-of-memory).
+
+   thread-safety: optimizer state is not concurrent-safe. one thread per
+   optimizer instance; use one optimizer per replica in data-parallel
+   training. */
 
 #ifndef AX_OPTIM_H
 #define AX_OPTIM_H

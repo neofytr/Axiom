@@ -1,9 +1,26 @@
 /* axiom/model.h — high-level model container.
-   wraps a layer (usually sequential) with an optimizer and loss function
-   to provide a simple train/predict interface.
 
-   designed to be usable on embedded: no heap-allocated arrays for params,
-   uses a fixed-size buffer. bump AX_MODEL_MAX_PARAMS if you need more. */
+   wraps a layer (usually sequential) with an optimizer and loss
+   function to provide a simple train/predict interface.
+
+   designed to be usable on embedded: no heap-allocated arrays for
+   params, uses a fixed-size buffer. bump AX_MODEL_MAX_PARAMS if you
+   need more.
+
+   ownership: ax_model_create takes ownership of the supplied network
+   layer (do not destroy it separately). ax_model_compile takes
+   ownership of the optimizer. ax_model_destroy releases the network,
+   the optimizer, and any state it allocated.
+
+   error handling: ax_model_create returns NULL on alloc failure or
+   parameter overflow (more than AX_MODEL_MAX_PARAMS).
+   ax_model_train_step returns NaN on backward / forward failure
+   (ax_err_last_message describes); successful steps return the loss
+   value as a float.
+
+   thread-safety: not concurrent-safe on a single model. one thread per
+   model instance for training; predict is also single-threaded but
+   independent models may be evaluated in parallel. */
 
 #ifndef AX_MODEL_H
 #define AX_MODEL_H

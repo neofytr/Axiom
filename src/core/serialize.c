@@ -35,6 +35,16 @@
 #include "axiom/conv.h"
 #include "axiom/norm.h"
 #include "axiom/attention.h"
+
+/* under AX_NO_STDIO the entire save/load path compiles out — these
+   functions need fopen/fread/fwrite which would force the toolchain
+   to link the stdio runtime (~20 kB on flash). embedded targets that
+   want to ship a pre-trained model should bake the weights in via
+   --section data injection or a generated blob included as a header.
+   the public api in axiom/serialize.h still resolves at link time
+   but now returns AX_ERR_NOT_IMPLEMENTED / NULL with a clear msg. */
+#ifndef AX_NO_STDIO
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -736,3 +746,41 @@ ax_model_t *ax_model_load(const char *path)
     ax_model_t *model = ax_model_create(seq);
     return model;
 }
+
+#else /* AX_NO_STDIO */
+
+/* embedded stubs: file-based save/load aren't viable without stdio.
+   keep the symbols resolvable so user code that conditionally uses
+   them links cleanly; report the failure via the standard error api. */
+
+#include "axiom/error.h"
+
+ax_status_t ax_tensor_save(ax_tensor_t *t, const char *path) {
+    (void)t; (void)path;
+    ax_err_set(AX_ERR_NOT_IMPLEMENTED,
+               "ax_tensor_save: AX_NO_STDIO build — bake weights at compile time");
+    return AX_ERR_NOT_IMPLEMENTED;
+}
+
+ax_tensor_t *ax_tensor_load(const char *path) {
+    (void)path;
+    ax_err_set(AX_ERR_NOT_IMPLEMENTED,
+               "ax_tensor_load: AX_NO_STDIO build");
+    return NULL;
+}
+
+ax_status_t ax_model_save(ax_model_t *model, const char *path) {
+    (void)model; (void)path;
+    ax_err_set(AX_ERR_NOT_IMPLEMENTED,
+               "ax_model_save: AX_NO_STDIO build");
+    return AX_ERR_NOT_IMPLEMENTED;
+}
+
+ax_model_t *ax_model_load(const char *path) {
+    (void)path;
+    ax_err_set(AX_ERR_NOT_IMPLEMENTED,
+               "ax_model_load: AX_NO_STDIO build");
+    return NULL;
+}
+
+#endif /* AX_NO_STDIO */

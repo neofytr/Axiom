@@ -25,7 +25,27 @@
      three x @ [D, D]. saves 2/3 of the weight-matrix traffic.
    - backward uses recompute (not materialized P) — on cache-limited
      cpus, materializing per-head S*S scores thrashes L3. recompute
-     is cheaper when the score matrix exceeds ~half of L3. */
+     is cheaper when the score matrix exceeds ~half of L3.
+
+   ownership: ax_mha_create returns a heap layer; release with
+   ax_layer_destroy. ax_kv_cache_create returns a heap cache; release
+   with ax_kv_cache_destroy. the SDPA primitive functions
+   (ax_fused_attention_*) take all buffers as caller-owned pointers —
+   no allocation, no destroy.
+
+   error handling: ax_mha_create / ax_kv_cache_create return NULL on
+   alloc failure or invalid args. ax_kv_cache_append returns false when
+   the cache is full. SDPA primitives are void: any internal failure is
+   logged via ax_err_set; callers should check ax_err_last_status only
+   if they suspect a problem.
+
+   thread-safety: per layer.h contract for ax_mha_t (single-thread per
+   layer instance). SDPA primitives are reentrant and use openmp
+   internally — DO NOT call them from inside another openmp parallel
+   region (omp will not nest by default). ax_kv_cache_t mutators
+   (append, reset) are not concurrent-safe; ax_kv_cache_attend is
+   read-only and safe to call concurrently with disjoint Q_new buffers
+   on the same cache. */
 
 #ifndef AX_ATTENTION_H
 #define AX_ATTENTION_H

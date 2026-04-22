@@ -4,6 +4,7 @@
 #include "axiom/ops.h"
 #include "axiom/autograd.h"
 #include "axiom/compute.h"
+#include "axiom/internal/compute_internal.h"
 #include "axiom/init.h"
 #include "axiom/error.h"
 #include "axiom/rng.h"
@@ -934,7 +935,7 @@ static void batchnorm_destroy(ax_layer_t *self)
 ax_layer_t *ax_batchnorm_create(int64_t num_features, float eps, float momentum)
 {
     ax_batchnorm_t *bn = calloc(1, sizeof(ax_batchnorm_t));
-    if (!bn) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(bn, "ax_batchnorm_create");
 
     bn->base.ops.forward = batchnorm_forward;
     bn->base.ops.destroy = batchnorm_destroy;
@@ -1337,7 +1338,7 @@ static void layernorm_destroy(ax_layer_t *self)
 ax_layer_t *ax_layernorm_create(int64_t num_features, float eps)
 {
     ax_layernorm_t *ln = calloc(1, sizeof(ax_layernorm_t));
-    if (!ln) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(ln, "ax_layernorm_create");
 
     ln->base.ops.forward = layernorm_forward;
     ln->base.ops.destroy = layernorm_destroy;
@@ -1526,7 +1527,7 @@ static void dropout_destroy(ax_layer_t *self) { free(self); }
 ax_layer_t *ax_dropout_create(float p)
 {
     ax_dropout_t *dp = calloc(1, sizeof(ax_dropout_t));
-    if (!dp) return NULL;
+    AX_RETURN_NULL_IF_ALLOC_FAIL(dp, "ax_dropout_create");
     dp->base.ops.forward = dropout_forward;
     dp->base.ops.destroy = dropout_destroy;
     dp->base.type = AX_LAYER_DROPOUT;

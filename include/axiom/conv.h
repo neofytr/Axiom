@@ -5,15 +5,20 @@
    locality: nearby pixels are related, so a small local detector
    is more efficient than a full dense connection.
 
-   data layout is NCHW throughout:
-     N = batch size
-     C = channels (e.g. 3 for rgb)
-     H = height
-     W = width
+   data layout is NCHW by default (N=batch, C=channels, H=height,
+   W=width). NHWC is also supported via ax_tensor_set_layout() —
+   layers dispatch to the right kernel based on the input tag.
 
-   NCHW is standard for most frameworks and more cache-friendly
-   for convolution. on embedded you'd typically have a single
-   image (N=1) so the batch overhead is negligible. */
+   ownership: ax_*_create returns a heap layer; release with
+   ax_layer_destroy. layers own their parameter tensors. ax_im2col /
+   ax_col2im return NEW heap tensors owned by the caller.
+
+   error handling: ax_*_create returns NULL on alloc failure or
+   geometrically invalid (e.g. kernel > input + 2*pad) configs.
+   ax_im2col / ax_col2im return NULL on shape mismatch.
+
+   thread-safety: layer instances are not concurrent-safe (per layer.h
+   contract). conv kernels parallelise internally with openmp. */
 
 #ifndef AX_CONV_H
 #define AX_CONV_H

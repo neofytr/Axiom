@@ -1,7 +1,7 @@
 /* cpu_naive.c — pure c fallback backend, no simd, no external deps.
    correctness over performance — this is the reference implementation. */
 
-#include "axiom/backend_ops.h"
+#include "axiom/internal/backend_ops.h"
 #include "axiom/tensor.h"
 #include "axiom/error.h"
 #include <math.h>

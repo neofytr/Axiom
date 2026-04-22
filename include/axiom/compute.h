@@ -1,18 +1,53 @@
-/* axiom/compute.h — compute dispatch api.
-   all math goes through these functions; they route to the active backend. */
+/* axiom/compute.h — public compute dispatch api.
+
+   high-level compute primitives that route to the active backend. all
+   tensor-level math goes through here. user code rarely calls these
+   directly — the tensor and ops apis (axiom/ops.h, axiom/tensor.h) are
+   the recommended entry points.
+
+   internal-only declarations (vtable struct, register hook, parallelism
+   thresholds, calibration entry points) live in
+   `axiom/internal/compute_internal.h` and are not part of the abi. */
 
 #ifndef AX_COMPUTE_H
 #define AX_COMPUTE_H
 
 #include "types.h"
-#include "backend_ops.h"
+#include "device.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* opaque forward declaration. the full struct definition lives in the
+   internal header `axiom/internal/backend_ops.h` so that user code can
+   pass and store pointers without depending on the layout. */
+typedef struct ax_backend_ops ax_backend_ops_t;
+
+/* tensor forward declaration — the canonical definition lives in
+   axiom/tensor.h. forward-declared here so this header doesn't need to
+   pull tensor.h in just to name the type. */
+typedef struct ax_tensor ax_tensor_t;
+
+/* per-sample conv parameters for the implicit-im2col gemm. describes
+   one [C_in, H, W] sample (pointer into the batched input buffer) plus
+   the kernel/stride/pad geometry. the input pointer is borrowed — no
+   ownership transfer. used by ax_compute_conv_gemm() and the conv layer. */
+typedef struct {
+    const float *input;  /* [C_in, H, W] contiguous, row-major */
+    int64_t C_in, H, W;
+    int kh, kw;
+    int sh, sw;
+    int ph, pw;
+    int64_t out_h, out_w;
+} ax_conv_params_t;
 
 /* backend identifiers */
 typedef enum {
     AX_BACKEND_CPU_NAIVE = 0,  /* pure c fallback — always available */
-    AX_BACKEND_CPU_SIMD,       /* avx2/neon optimized — future */
+    AX_BACKEND_CPU_SIMD,       /* avx2/neon optimized */
     AX_BACKEND_CPU_BLAS,       /* openblas/mkl — future */
-    AX_BACKEND_CUDA,           /* gpu via cuda — future */
+    AX_BACKEND_CUDA,           /* gpu via cuda */
     AX_BACKEND_COUNT
 } ax_backend_id_t;
 
@@ -29,17 +64,10 @@ ax_status_t ax_compute_set_backend(ax_backend_id_t id);
 /* get the currently active backend id */
 ax_backend_id_t ax_compute_get_backend(void);
 
-/* get the ops vtable for the active backend (used internally by tensor ops) */
-const ax_backend_ops_t *ax_compute_get_ops(void);
-
-/* register a custom backend at runtime (for plugins/extensions) */
-ax_status_t ax_compute_register_backend(ax_backend_id_t id, const ax_backend_ops_t *ops);
-
-/* look up the backend that owns memory/lifecycle for a given device.
-   returns NULL for AX_DEVICE_CPU or for devices whose backend module is
-   not compiled in. core uses this to route storage allocation and
-   host<->device transfers without knowing specific device types. */
-const ax_backend_ops_t *ax_backend_for_device(ax_device_t device);
+/* return the human-readable name of the active backend (e.g. "cpu_opt",
+   "cpu_naive", "cuda"). pointer is owned by the framework and lives
+   until ax_compute_shutdown(). NULL if no backend is active. */
+const char *ax_compute_backend_name(void);
 
 /* set the maximum number of threads used by parallel ops.
    wraps omp_set_num_threads() when openmp is enabled.
@@ -62,27 +90,6 @@ int ax_get_num_threads(void);
    total calibration time is bounded under 200ms.
    returns the chosen thread count. */
 int ax_autotune_threads(void);
-
-/* calibrated parallelism thresholds. set by ax_calibrate_thresholds()
-   based on measured omp fork/join overhead at init time. kernels with
-   per-iteration work below the threshold skip omp and run serial
-   (fork-join barrier would dominate). */
-extern int64_t ax_par_threshold_elems;   /* reduction / elementwise */
-extern int64_t ax_par_threshold_batch;   /* per-sample loops (norm, loss) */
-extern int64_t ax_par_threshold_flops;   /* generic flop-count threshold */
-extern double  ax_omp_overhead_ms;       /* measured fork/join cost */
-
-/* measure omp fork/join overhead and derive the thresholds above.
-   cheap (<50ms). called lazily from ax_compute_init(). safe to call
-   multiple times (idempotent). no-op under AX_NO_AUTOTUNE=1 or
-   when compiled without openmp. */
-void ax_calibrate_thresholds(void);
-
-/* measure gemm tile (mc/nc/kc) performance across a small grid of
-   candidate configurations and pick the best. sweeps ~5 configs on a
-   representative shape; budget ~500ms. opt-in via AX_GEMM_CALIBRATE=1
-   env var because it adds startup cost. */
-void ax_calibrate_gemm_tiles(void);
 
 /* dispatch functions */
 /* these call through to the active backend's function pointers.
@@ -194,5 +201,9 @@ ax_status_t ax_compute_sgd_update(ax_tensor_t *weight, ax_tensor_t *grad,
                                     bool nesterov);
 int ax_compute_has_adam_update(void);
 int ax_compute_has_sgd_update(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* AX_COMPUTE_H */

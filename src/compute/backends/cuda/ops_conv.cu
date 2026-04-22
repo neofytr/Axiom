@@ -206,4 +206,87 @@ ax_status_t cuda_conv_gemm(const ax_tensor_t *weight,
     return AX_OK;
 }
 
+/* batched conv_gemm: same op as cuda_conv_gemm, but launches im2col for
+   N samples in one go and uses cublasSgemmStridedBatched for the matmul.
+   reduces per-sample kernel-launch overhead and lets cuBLAS pick a
+   batched-friendly kernel for small per-sample shapes. */
+ax_status_t cuda_conv_gemm_batched(const ax_tensor_t *weight,
+                                    const float *input_batched, int64_t N,
+                                    const ax_conv_params_t *single,
+                                    ax_tensor_t *out_batched)
+{
+    if (weight->dtype != AX_FLOAT32 || out_batched->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (weight->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    int64_t C_out = weight->shape[0];
+    int64_t K     = weight->shape[1];
+    int64_t M     = single->out_h * single->out_w;
+    int64_t expect_K = single->C_in * single->kh * single->kw;
+    if (K != expect_K) return AX_ERR_SHAPE_MISMATCH;
+    /* output expected: [N, C_out, M] flattened, contiguous. */
+    if (out_batched->ndim != 3 ||
+        out_batched->shape[0] != N || out_batched->shape[1] != C_out ||
+        out_batched->shape[2] != M)
+        return AX_ERR_SHAPE_MISMATCH;
+
+    static float *s_col_buf = NULL;
+    static size_t s_col_cap = 0;
+    size_t want = (size_t)N * (size_t)K * (size_t)M * sizeof(float);
+    if (want > s_col_cap) {
+        if (s_col_buf) cudaFree(s_col_buf);
+        s_col_buf = NULL;
+        s_col_cap = 0;
+        if (cudaMalloc(&s_col_buf, want) != cudaSuccess) {
+            ax_err_set(AX_ERR_ALLOC, "cuda conv_gemm_batched: cudaMalloc col failed");
+            return AX_ERR_ALLOC;
+        }
+        s_col_cap = want;
+    }
+    float *d_col = s_col_buf;
+
+    int64_t in_stride = single->C_in * single->H * single->W;
+    int64_t col_stride = K * M;
+    dim3 block(16, 16);
+    dim3 grid((unsigned)((M + block.x - 1) / block.x),
+              (unsigned)((K + block.y - 1) / block.y));
+    for (int64_t n = 0; n < N; n++) {
+        k_im2col_sample<<<grid, block>>>(
+            input_batched + n * in_stride,
+            single->C_in, single->H, single->W,
+            single->kh, single->kw,
+            single->sh, single->sw,
+            single->ph, single->pw,
+            single->out_h, single->out_w,
+            d_col + n * col_stride);
+    }
+    cudaError_t cerr = cudaGetLastError();
+    if (cerr != cudaSuccess) {
+        ax_err_set(AX_ERR_BACKEND, "cuda conv_gemm_batched im2col launch failed: %s",
+                   cudaGetErrorString(cerr));
+        return AX_ERR_BACKEND;
+    }
+
+    /* batched GEMM: per-batch C^T = B^T @ A^T (row-major trick).
+       A = weight (broadcast, strideA=0)
+       B = col[n] (strideB = col_stride)
+       C = out[n] (strideC = C_out*M) */
+    const float *wd = (const float *)weight->storage->data + weight->offset;
+    float       *od = (float *)      out_batched->storage->data + out_batched->offset;
+    float alpha = 1.0f, beta = 0.0f;
+    cublasStatus_t st = cublasSgemmStridedBatched(
+        ax_cuda_cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+        (int)M, (int)C_out, (int)K,
+        &alpha,
+        d_col, (int)M, col_stride,
+        wd,    (int)K, 0,
+        &beta,
+        od,    (int)M, (long long)(C_out * M),
+        (int)N);
+    if (st != CUBLAS_STATUS_SUCCESS) {
+        ax_err_set(AX_ERR_BACKEND, "cuda conv_gemm_batched cublasSgemmStridedBatched failed (%d)", (int)st);
+        return AX_ERR_BACKEND;
+    }
+    return AX_OK;
+}
+
 } /* extern "C" */

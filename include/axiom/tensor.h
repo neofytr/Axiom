@@ -1,4 +1,20 @@
-/* axiom/tensor.h — n-dimensional tensor with refcounted storage */
+/* axiom/tensor.h — n-dimensional tensor with refcounted storage.
+
+   ownership pattern: every ax_tensor_* function that returns ax_tensor_t*
+   produces a heap tensor owned by the caller; release with
+   ax_tensor_destroy(). zero-copy view constructors (reshape/transpose/
+   squeeze/unsqueeze/view) return a NEW heap tensor that shares storage
+   with the parent — destroying the view does not free the underlying
+   buffer (ref-counted via ax_storage_t).
+
+   thread safety: ax_storage_t refcount is atomic; ax_storage_retain/release
+   are concurrent-safe. all other tensor mutations (set, reshape, etc.) on
+   the SAME tensor object are not concurrent-safe. independent tensors
+   may be operated on concurrently as long as they share no storage.
+
+   failure mode: constructors return NULL on allocation failure;
+   ax_err_last_message() describes the cause. */
+
 
 #ifndef AX_TENSOR_H
 #define AX_TENSOR_H
@@ -57,23 +73,31 @@ typedef struct ax_tensor {
 extern "C" {
 #endif
 
-/* storage management */
+/* storage management. storage is ref-counted with atomic operations and
+   shared between views. callers usually let the tensor lifecycle drive
+   storage release; direct retain/release is only needed for advanced
+   ownership patterns (e.g. handing storage to a non-axiom subsystem). */
 
-/* create a new storage with the given byte count */
+/* allocate a fresh storage of `size_bytes` bytes on `device`. refcount = 1.
+   ownership: caller; release with ax_storage_release.
+   returns NULL on allocation failure or unknown device. */
 ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device);
 
-/* increment reference count */
+/* atomically increment refcount. NULL is a safe no-op. */
 void ax_storage_retain(ax_storage_t *s);
 
-/* decrement reference count; frees if it hits 0 */
+/* atomically decrement refcount; frees the buffer when it reaches zero.
+   NULL is a safe no-op. */
 void ax_storage_release(ax_storage_t *s);
 
-/* tensor creation */
+/* tensor creation. all constructors below allocate a heap tensor owned
+   by the caller; release with ax_tensor_destroy. they return NULL on
+   allocation failure with ax_err_last_message() set. */
 
-/* create a tensor with the given shape and dtype; memory is uninitialized */
+/* create with given shape and dtype; storage is uninitialised. */
 ax_tensor_t *ax_tensor_create(const int64_t *shape, int ndim, ax_dtype_t dtype);
 
-/* create and fill with zeros */
+/* create and fill with zeros. */
 ax_tensor_t *ax_tensor_zeros(const int64_t *shape, int ndim, ax_dtype_t dtype);
 
 /* arena-allocated zero tensor: metadata, storage struct, AND data buffer all bumped
@@ -115,15 +139,19 @@ ax_tensor_t *ax_tensor_scalar(float value);
 
 /* tensor destruction */
 
-/* release the tensor and its storage (if refcount drops to 0) */
+/* release the tensor metadata; storage is released too if its refcount
+   hits zero (otherwise other views keep it alive). NULL is a safe no-op.
+   thread-safety: concurrent-safe across distinct tensor pointers; one
+   caller per tensor. */
 void ax_tensor_destroy(ax_tensor_t *t);
 
-/* shape queries */
+/* shape queries — read-only and concurrent-safe on the same tensor. */
 
-/* total number of elements */
+/* total number of elements (product of shape). returns 0 for NULL t. */
 int64_t ax_tensor_numel(const ax_tensor_t *t);
 
-/* check if tensor data is contiguous in memory */
+/* true if the data is contiguous in memory (row-major, no holes).
+   false for NULL t or non-contiguous strides. */
 bool ax_tensor_is_contiguous(const ax_tensor_t *t);
 
 /* shape manipulation (zero-copy where possible) */
@@ -140,10 +168,19 @@ ax_tensor_t *ax_tensor_squeeze(ax_tensor_t *t, int dim);
 /* insert a dimension of size 1 at the given position */
 ax_tensor_t *ax_tensor_unsqueeze(ax_tensor_t *t, int dim);
 
-/* element access */
+/* element access. slow path — favour vectorised compute ops in tight loops.
+   bounds checking is debug-only (NDEBUG removes it). */
 
-/* get/set a single f32 element using ndim indices */
+/* read a single f32 element. returns 0.0f for NULL t or out-of-bounds
+   indices in debug builds (debug build aborts via AX_BOUNDS_CHECK).
+   thread-safety: concurrent-safe on the same tensor as long as no
+   writer is active. */
 float ax_tensor_get_f32(const ax_tensor_t *t, const int64_t *indices);
+
+/* write a single f32 element. NULL t is a no-op. mutates storage in
+   place; bumps storage->generation for cache invalidation.
+   thread-safety: not concurrent-safe with other writers or readers
+   on the same tensor. */
 void ax_tensor_set_f32(ax_tensor_t *t, const int64_t *indices, float value);
 
 /* view creation */
@@ -188,13 +225,17 @@ ax_tensor_t *ax_tensor_to_nhwc(ax_tensor_t *t);
    already NCHW). returns a NEW tensor; caller frees both. ndim must be 4. */
 ax_tensor_t *ax_tensor_to_nchw(ax_tensor_t *t);
 
-/* device management */
+/* device management. process-wide setting; takes effect for any tensor
+   constructor called after the change.
+   thread-safety: not concurrent-safe with parallel tensor construction;
+   set during single-threaded initialisation, then leave alone. */
 
-/* set/get the default device for all new tensor allocations.
-   ax_set_default_device(AX_DEVICE_CUDA) combined with
-   ax_compute_set_backend(AX_BACKEND_CUDA) routes all tensor creation
-   and compute to the GPU with no changes to training code. */
+/* set the default device used by every subsequent tensor constructor.
+   pair with ax_compute_set_backend() to route both allocation and
+   compute to the same device. */
 void ax_set_default_device(ax_device_t dev);
+
+/* return the currently selected default device. */
 ax_device_t ax_get_default_device(void);
 
 /* move a tensor to the cuda device (nop + retain if already on gpu).
