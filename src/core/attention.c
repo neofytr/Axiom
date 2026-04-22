@@ -469,7 +469,18 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                               pf_head_int=0, pf_sdpa_bwd=0, pf_deint=0,
                               pf_dwqkv=0, pf_dbqkv=0, pf_dx=0;
     static __thread int pf_calls = 0;
+    /* high-frequency cycle counter for profile attribution (gated by
+       AX_PROFILE_MHA=1). x86 reads rdtsc, aarch64 reads cntvct_el0;
+       anything else returns 0 (profile unsupported on that arch). only
+       deltas matter so the unit difference between rdtsc cycles and
+       cntvct ticks doesn't affect attribution. */
+#if defined(__x86_64__) || defined(_M_X64)
     #define PF_TICK() ((uint64_t)__builtin_ia32_rdtsc())
+#elif defined(__aarch64__)
+    #define PF_TICK() ({ uint64_t _v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(_v)); _v; })
+#else
+    #define PF_TICK() ((uint64_t)0)
+#endif
     uint64_t pf_t0;
 
     /* contiguous grad_out flattened to [rows, D].
