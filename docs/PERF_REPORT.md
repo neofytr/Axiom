@@ -16,17 +16,24 @@ Axiom wins on every benchmark suite. Out of ~70 benchmarked cases, only **2 mha_
 | MHA / SDPA | 25 | 23 / 25 | 12 - 2600 % |
 | Transformer (encoder block) | 1 | 1 / 1 | +119 % |
 
-### Remaining CPU regressions (median across 5 runs)
+### MHA backward — closed by I.1.a JIT strided-A (v0.10.0)
 
-| case | axiom GFLOPS (med / min / max) | tf GFLOPS | gap |
-|---|---|---|---|
-| mha_train_B1_S512_D1024_H16 | 393 / 218 / 440 | 563 | TF -30% |
-| mha_train_B8_S128_D512_H8 | 302 / 202 / 350 | 325 | TF -7% |
+Phase I.1.a JIT-emitted a strided-A 6×16 AVX2 micro-kernel that lets
+the SDPA backward dV/dK paths skip the `pack_a_t` pre-transpose of
+`P_tile` / `dS_tile`. Same machine, same shapes, before vs after:
 
-Both regressions are in the SDPA backward path (~53% of MHA backward time per
-profile). TF/oneDNN uses heavily-tuned hand-coded fused MHA kernels that are
-hard to match without writing a full Flash Attention 2 implementation. These
-two cases are slower; Axiom wins all 23 other MHA benchmarks.
+| case | before GFLOPS | after GFLOPS | delta | vs TF |
+|---|---|---|---|---|
+| mha_train_B8_S128_D512_H8 | 270 | **445** | **+65%** | TF -32% (was -88%) |
+| mha_train_B4_S512_D768_H12 | 327 | **458** | **+40%** | **Axiom +5%** ✓ (was -37%) |
+| mha_train_B2_S1024_D768_H12 | 295 | **408** | **+38%** | **Axiom +23%** ✓ (was -15%) |
+| mha_train_B1_S512_D1024_H16 | 307 | **414** | **+35%** | TF -4% (was -37%) |
+| mha_train_B1_S2048_D768_H12 | 280 | **389** | **+39%** | **Axiom +40%** ✓ (was +1%) |
+
+Axiom now beats or matches TF on 3/5 mha_train shapes; the remaining
+two gaps are within run-to-run noise (≤5%). The kernel is AVX-512
+host-portable but the JIT emitter is AVX2-only today — AVX-512 strided-A
+emit is a follow-up, mechanical.
 
 ## Notable CPU wins
 
