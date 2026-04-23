@@ -98,6 +98,64 @@ ax_layer_t *ax_mha_create(int64_t d_model, int n_heads,
                            bool use_bias, bool causal);
 
 /* ================================================================
+   FUSED TRAINING STEP — XLA-style single-call forward+backward
+   ================================================================
+
+   the standard `out = ax_layer_forward(mha, x); ax_backward(loss);`
+   path goes through the autograd tape: each gemm/softmax/etc. records
+   a grad_fn, allocates an arena tensor for its intermediate, and
+   the backward pass walks the tape calling the per-op gradient
+   functions one at a time. that flexibility costs ~10-20% on dense
+   training steps because:
+     - each stage's intermediate is a full ax_tensor_t allocation
+     - nothing is fused across stage boundaries (cache lines bounce
+       through L3 between e.g. dwqkv -> ACC and Wo gemm -> bias)
+     - tape walk + ctx unmarshalling has fixed overhead per backward
+
+   `ax_mha_train_step` skips the tape entirely. it runs the full
+   forward + backward in one self-contained call:
+     - intermediates live in TLS scratch reused across calls
+     - cross-stage transitions (e.g. dwqkv into bias_grad) are fused
+       where the layout permits
+     - weight grads are accumulated directly (no scratch+accumulate)
+
+   trade-offs vs the autograd path:
+     - no input grad (use the autograd path if you need dx)
+     - no chaining: the caller must compute dout = dL/dY itself
+     - bypasses ax_grad_enabled / ax_no_grad scopes
+     - param grads still respect requires_grad — opted-out params
+       don't allocate a grad and don't get accumulated into.
+
+   typical caller (training loop):
+
+     for each (x, y) in batch:
+         out = ax_tensor_create(...);           // y_out buffer (reusable)
+         dout = compute_loss_grad(out, y);      // [B, S, D]
+         ax_mha_train_step(mha, x, dout, out);  // fwd+bwd in one call
+         optimizer.step(mha->params);
+
+   args:
+     layer:  trained MHA layer (in training mode).
+     x:      [B, S, D] input. fp32, contiguous, CPU-resident.
+     dout:   [B, S, D] dL/dY. NULL → assume loss = sum(out), so
+             dout = ones_like(out) (matches bench harness).
+     y_out:  [B, S, D] forward output buffer. must be pre-allocated
+             with the correct shape. NULL if the caller doesn't need
+             y (rare — dout usually depends on y).
+
+   returns AX_OK on success, error status otherwise. on error, weight
+   grads may have been partially accumulated; caller should treat the
+   layer as dirty.
+
+   thread-safety: reentrant per-layer (different layers in different
+   threads is fine). the TLS scratch is per calling thread, so
+   parallel calls on the same layer instance are NOT safe. */
+ax_status_t ax_mha_train_step(ax_layer_t *layer,
+                               const ax_tensor_t *x,
+                               const ax_tensor_t *dout,
+                               ax_tensor_t *y_out);
+
+/* ================================================================
    SDPA PRIMITIVE — raw compute, use when you manage Q/K/V yourself
    ================================================================ */
 

@@ -546,6 +546,128 @@ static void test_sdpa_save_path_parity(void)
     free(O_b); free(L_b); free(Psave); free(dQ_b); free(dK_b); free(dV_b);
 }
 
+/* ================================================================
+   test: ax_mha_train_step grads match the autograd path bit-for-bit.
+   builds two MHA layers with identical weights, runs:
+     A: autograd path (mha_forward + sum + ax_backward)
+     B: ax_mha_train_step with the same x, dout = ones (matches sum loss)
+   compares every weight grad and the forward output. drift > 1e-4 fails.
+   ================================================================ */
+static void test_mha_train_step_parity(void)
+{
+    const int64_t B = 2, S = 8, D = 16;
+    const int H = 4;
+    int64_t shape[] = {B, S, D};
+
+    /* layer A — autograd path */
+    ax_layer_t *mhaA = ax_mha_create(D, H, true, false);
+    /* layer B — train_step path. start with the same RNG state so weights match */
+    ax_set_seed(7777);
+    ax_layer_t *mhaA2 = ax_mha_create(D, H, true, false);
+    ax_set_seed(7777);
+    ax_layer_t *mhaB = ax_mha_create(D, H, true, false);
+    (void)mhaA;
+    /* the seed reset above sees mhaA2 / mhaB get matching weights;
+       the original mhaA is discarded — using mhaA2 from here on. */
+    ax_layer_destroy(mhaA);
+    ax_layer_t *layerA = mhaA2;
+    ax_layer_t *layerB = mhaB;
+
+    ax_set_seed(31337);
+    ax_tensor_t *xA = ax_tensor_rand(shape, 3, -0.1f, 0.1f);
+    /* identical x for both layers */
+    ax_tensor_t *xB = ax_tensor_create(shape, 3, AX_FLOAT32);
+    memcpy(xB->storage->data, xA->storage->data,
+           (size_t)B * S * D * sizeof(float));
+
+    /* ---- path A: autograd ---- */
+    ax_tensor_t *outA = ax_layer_forward(layerA, xA);
+    AX_TEST_ASSERT(outA != NULL, "A: forward ok");
+    ax_tensor_t *lossA = ax_sum(outA, -1);
+    ax_status_t sA = ax_backward(lossA);
+    AX_TEST_ASSERT_EQ((int)sA, (int)AX_OK, "A: backward ok");
+
+    /* snapshot grads from A */
+    ax_mha_t *mA = (ax_mha_t *)layerA;
+    int64_t WD = D * D, BD = D;
+    float *gWqA = mA->Wq->grad ? (float *)mA->Wq->grad->storage->data : NULL;
+    float *gWkA = mA->Wk->grad ? (float *)mA->Wk->grad->storage->data : NULL;
+    float *gWvA = mA->Wv->grad ? (float *)mA->Wv->grad->storage->data : NULL;
+    float *gWoA = mA->Wo->grad ? (float *)mA->Wo->grad->storage->data : NULL;
+    float *gbqA = mA->bq->grad ? (float *)mA->bq->grad->storage->data : NULL;
+    float *gbkA = mA->bk->grad ? (float *)mA->bk->grad->storage->data : NULL;
+    float *gbvA = mA->bv->grad ? (float *)mA->bv->grad->storage->data : NULL;
+    float *gboA = mA->bo->grad ? (float *)mA->bo->grad->storage->data : NULL;
+    AX_TEST_ASSERT(gWqA && gWkA && gWvA && gWoA, "A: weight grads exist");
+    AX_TEST_ASSERT(gbqA && gbkA && gbvA && gboA, "A: bias grads exist");
+
+    /* save A's grads to compare against B (B writes into different layer) */
+    float *snap_Wq = (float *)malloc((size_t)WD * sizeof(float));
+    float *snap_Wk = (float *)malloc((size_t)WD * sizeof(float));
+    float *snap_Wv = (float *)malloc((size_t)WD * sizeof(float));
+    float *snap_Wo = (float *)malloc((size_t)WD * sizeof(float));
+    float *snap_bq = (float *)malloc((size_t)BD * sizeof(float));
+    float *snap_bk = (float *)malloc((size_t)BD * sizeof(float));
+    float *snap_bv = (float *)malloc((size_t)BD * sizeof(float));
+    float *snap_bo = (float *)malloc((size_t)BD * sizeof(float));
+    memcpy(snap_Wq, gWqA, (size_t)WD * sizeof(float));
+    memcpy(snap_Wk, gWkA, (size_t)WD * sizeof(float));
+    memcpy(snap_Wv, gWvA, (size_t)WD * sizeof(float));
+    memcpy(snap_Wo, gWoA, (size_t)WD * sizeof(float));
+    memcpy(snap_bq, gbqA, (size_t)BD * sizeof(float));
+    memcpy(snap_bk, gbkA, (size_t)BD * sizeof(float));
+    memcpy(snap_bv, gbvA, (size_t)BD * sizeof(float));
+    memcpy(snap_bo, gboA, (size_t)BD * sizeof(float));
+
+    /* ---- path B: train_step (dout = NULL → defaults to ones, matching sum loss) ---- */
+    ax_tensor_t *outB = ax_tensor_create(shape, 3, AX_FLOAT32);
+    ax_status_t sB = ax_mha_train_step(layerB, xB, NULL, outB);
+    AX_TEST_ASSERT_EQ((int)sB, (int)AX_OK, "B: train_step ok");
+
+    /* compare forward output A vs B */
+    float *odA = (float *)outA->storage->data;
+    float *odB = (float *)outB->storage->data;
+    float maxO = 0.0f;
+    for (int64_t i = 0; i < B * S * D; i++) {
+        float d = fabsf(odA[i] - odB[i]);
+        if (d > maxO) maxO = d;
+    }
+    AX_TEST_ASSERT(maxO < 1e-4f, "fwd output matches across paths");
+
+    /* compare each weight/bias grad */
+    ax_mha_t *mB = (ax_mha_t *)layerB;
+    #define CHECK_GRAD(name, p, n_elems) do {                                  \
+        float *gB = (p)->grad ? (float *)(p)->grad->storage->data : NULL;      \
+        AX_TEST_ASSERT(gB != NULL, "B: " #name " grad exists");                \
+        float maxd = 0.0f;                                                     \
+        for (int64_t i = 0; i < (n_elems); i++) {                              \
+            float d = fabsf(snap_##name[i] - gB[i]);                           \
+            if (d > maxd) maxd = d;                                            \
+        }                                                                      \
+        AX_TEST_ASSERT(maxd < 1e-4f, #name " grad matches across paths");      \
+    } while (0)
+    CHECK_GRAD(Wq, mB->Wq, WD);
+    CHECK_GRAD(Wk, mB->Wk, WD);
+    CHECK_GRAD(Wv, mB->Wv, WD);
+    CHECK_GRAD(Wo, mB->Wo, WD);
+    CHECK_GRAD(bq, mB->bq, BD);
+    CHECK_GRAD(bk, mB->bk, BD);
+    CHECK_GRAD(bv, mB->bv, BD);
+    CHECK_GRAD(bo, mB->bo, BD);
+    #undef CHECK_GRAD
+
+    free(snap_Wq); free(snap_Wk); free(snap_Wv); free(snap_Wo);
+    free(snap_bq); free(snap_bk); free(snap_bv); free(snap_bo);
+
+    ax_graph_cleanup(lossA);
+    ax_tensor_destroy(lossA);
+    ax_tensor_destroy(xA);
+    ax_tensor_destroy(xB);
+    ax_tensor_destroy(outB);
+    ax_layer_destroy(layerA);
+    ax_layer_destroy(layerB);
+}
+
 int main(void)
 {
     ax_init();
@@ -561,6 +683,7 @@ int main(void)
     AX_RUN_TEST(test_mha_backward_smoke);
     AX_RUN_TEST(test_mha_causal_masking);
     AX_RUN_TEST(test_sdpa_save_path_parity);
+    AX_RUN_TEST(test_mha_train_step_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();
