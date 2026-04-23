@@ -3446,8 +3446,11 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     (void)gemm_threads;
 
     if (use_hybrid) {
-        /* hybrid jc+pc+ic for opt_gemm_nt. collapse(3) over (jct, pct, ict);
-           pack_b_t cached across iterations with same (jct, pct). */
+        /* hybrid jc+pc+ic for opt_gemm_nt. collapse(3) over (jct, pct, ict).
+           dynamic schedule with chunk = n_ic_tiles preserves pack_b_t cache
+           reuse within a chunk while distributing chunks dynamically across
+           threads (P-cores grab more). same pattern as opt_gemm + opt_gemm_tn_raw
+           use_hybrid (commits bc12ad5 + this iteration). */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
         #ifdef _OPENMP
         #pragma omp parallel num_threads(gemm_threads)
@@ -3460,7 +3463,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(static)
+            #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
