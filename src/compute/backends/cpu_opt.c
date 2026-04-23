@@ -4928,32 +4928,37 @@ static inline void attn_bwd_kj_block(
 
 /* I.1.c: Flash-Attention-2 style fused backward.
 
-   the materialized variant (attn_bwd_kj_block above) computes the full
-   P/dP/dS tiles into TLS scratch (~64 KB each = 192 KB total). on hosts
-   where L1d is smaller than the working set (Alder Lake L1d = 48 KB,
-   most x86 L1d ≤ 64 KB) the tiles spill to L2 between stages, so each
-   "read P_tile for dV" / "compute dS reads P_tile + dP_tile" / "pack
-   dS_tile for dQ / strided dK" pays L2 latency.
+   the materialized variant (attn_bwd_kj_block above) writes the full
+   P/dP/dS tiles to TLS scratch (~3 × Bq×Bk floats; ~190 KB at Bq=Bk=126).
+   on hosts where the working set spills out of L1d (32-48 KB on most
+   x86), each subsequent stage that re-reads those tiles pays L2 latency.
+   on hosts with very small L2 the cost compounds.
 
-   FA-2 fusion: do everything per MR-row strip (P_strip, dP_strip,
-   dS_strip ≈ MR * Bk floats each, fits L1 even at Bk=128). per strip,
-   one pass through: P → contribute to dV → dP → dS → dQ row → contribute
-   to dK. P/dP/dS never written to TLS scratch — they live in stack
-   arrays that stay hot in L1.
+   FA-2 fusion: per MR-row strip of qi, perform every dependent stage
+   in one pass (P → dV partial += P^T@dO → dP = dO@V^T → dS = P*(dP-Di)
+   *scale → dQ row += dS@K → dK partial += dS^T@Q). P / dP / dS live in
+   stack arrays of size MR×Bk (≤ 1.7 KB each on AVX-512, well under L1).
+   the per-strip output contributions to dV/dK accumulate into the
+   global tensors via the same strided-A JIT used in the materialized
+   path, just with kc=MR instead of kc=Bq.
 
-   floating-point work is identical to the materialized variant. the
-   savings come from (a) removing 3 × Bq×Bk write+read traffic to L2
-   and (b) keeping the strips' scratch in L1 across the 5 inner GEMMs
-   per strip. plan estimate: 20-30% on bwd time when sdpa_bwd dominates.
+   constraints to enable this path:
+     - use_prepack must be true (Q_pa/Q_pb/dO_pa/dO_pb pre-packed at the
+       attn_bwd_head prologue). without it the per-strip B-operand
+       reconstruction is messy enough to negate any cache win.
+     - mr == GEMM_MR (full strip). edge strips (mr < MR) fall through
+       to the materialized path locally so the partial-strip fallback
+       stays small and well-tested.
 
-   gated behind AX_SDPA_FUSED env var initially for A/B testing; once
-   bench data confirms the win on a representative host this becomes
-   the default and the materialized variant becomes the fallback for
-   tiny shapes where strip-overhead exceeds the cache win.
+   bench on i5-12500H (Alder Lake, L1d=48 KB, L2=1280 KB): ~neutral on
+   long-seq shapes, ~7% win on B8_S128. the L2 size on this host
+   absorbs the materialized tiles cheaply, so the fusion saves only
+   the L1-vs-L2 latency delta. on hosts with smaller L2 (mobile /
+   embedded class) the win should be larger. opt-in via AX_SDPA_FUSED=1.
 
-   for the partial-strip case (mr < GEMM_MR, edge of Bq), the strided-A
-   JIT kernel is unavailable (it only emits full MR×NR tiles); we fall
-   back to pack_a_t + micro_kernel as the materialized variant does. */
+   the dispatcher in attn_bwd_head falls back to the materialized
+   variant when use_prepack is false, so this function can assume
+   prepack is available and skip the fallback paths. */
 static inline void attn_bwd_kj_block_fused(
     int64_t kj, int64_t S, int64_t dk, int64_t dk_np, float scale,
     bool causal, const float *L, const float *Di,
@@ -4998,7 +5003,8 @@ static inline void attn_bwd_kj_block_fused(
         ax_jit_gemm_stridedA_kernel_fn fn_strip = NULL;
         fn_strip = ax_jit_gemm_avx2_get_6x16_stridedA_kc(GEMM_MR);
 #else
-        void *fn_strip = NULL;
+        /* no JIT path — declared but never read; suppress warning */
+        void *fn_strip __attribute__((unused)) = NULL;
 #endif
 
         for (int64_t ir = 0; ir < Bq; ir += GEMM_MR) {
@@ -5011,7 +5017,6 @@ static inline void attn_bwd_kj_block_fused(
             float dP_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
             float dS_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
             float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
-            float a_q[GEMM_MR * ATTN_MAX_DK] __attribute__((aligned(64)));
 
             /* === STEP 1: compute P_strip [mr, Bk] =================== */
             if (causal && qi + ir + mr - 1 < kj) {
@@ -5034,13 +5039,8 @@ static inline void attn_bwd_kj_block_fused(
                 /* recompute path: score = Q_strip @ Kt; mask if causal;
                    P_strip = exp(score - L). */
                 bool need_mask = causal && (qi + ir < kj + Bk - 1);
-                const float *q_strip;
-                if (use_prepack) {
-                    q_strip = Q_pa + (qi + ir) * dk;
-                } else {
-                    pack_a(Q + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
-                    q_strip = a_q;
-                }
+                /* dispatcher guarantees use_prepack=true for fused path */
+                const float *q_strip = Q_pa + (qi + ir) * dk;
                 memset(score_strip, 0, (size_t)(mr * Bk) * sizeof(float));
                 for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
                     int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
@@ -5071,12 +5071,10 @@ static inline void attn_bwd_kj_block_fused(
                 for (int64_t djr = 0; djr < dk_np; djr += GEMM_NR) {
                     int64_t dnr = (djr + GEMM_NR <= dk) ? GEMM_NR : (dk > djr ? dk - djr : 0);
                     if (dnr <= 0) break;
-                    const float *b_ptr = use_prepack
-                        ? (dO_pb + djr * S + (qi + ir) * GEMM_NR)
-                        : NULL;  /* non-prepack handled by pack-fallback */
+                    /* dispatcher guarantees use_prepack=true for fused path */
+                    const float *b_ptr = dO_pb + djr * S + (qi + ir) * GEMM_NR;
 #if (defined(AX_SIMD_AVX512) || (defined(AX_SIMD_AVX2) && !defined(AX_CPU_OPT_SUFFIX_avx512))) && !defined(AX_NO_JIT)
-                    if (fn_strip && mr == GEMM_MR && dmr == GEMM_MR && dnr == GEMM_NR
-                        && use_prepack) {
+                    if (fn_strip && mr == GEMM_MR && dmr == GEMM_MR && dnr == GEMM_NR) {
                         fn_strip(mr,
                                  P_strip + dir, Bk * (int64_t)sizeof(float),
                                  b_ptr,
@@ -5085,11 +5083,12 @@ static inline void attn_bwd_kj_block_fused(
                         continue;
                     }
 #endif
-                    /* fallback: pack the [dmr, mr] slice of P_strip^T
-                       (= P_strip's columns dir..dir+dmr stacked as MR
-                       rows, kc=mr). then micro_kernel + dO from pb. */
+                    /* edge-tile fallback: pack the [dmr, mr] slice of
+                       P_strip^T into a tiny stack panel, then micro_kernel.
+                       pack: pa_local[k * MR + i] = P_strip[k, dir+i] for
+                       i ∈ [0, dmr); zero-pad i ≥ dmr so micro_kernel can
+                       safely run a full GEMM_MR × GEMM_NR tile. */
                     float pa_local[GEMM_MR * GEMM_MR] __attribute__((aligned(64)));
-                    /* pack: pa_local[k * GEMM_MR + i] = P_strip[k, dir+i] for k in 0..mr, i in 0..dmr (zero-pad i>=dmr) */
                     for (int64_t k = 0; k < mr; k++) {
                         int64_t i = 0;
                         for (; i < dmr; i++) {
@@ -5099,38 +5098,16 @@ static inline void attn_bwd_kj_block_fused(
                             pa_local[k * GEMM_MR + i] = 0.0f;
                         }
                     }
-                    /* dO B-operand: prepack uses dO_pb at stride S floats per col
-                       block; non-prepack would need a per-strip pack into pb here. */
-                    if (use_prepack) {
-                        micro_kernel(mr, pa_local, b_ptr,
-                                     dV + (kj + dir) * dk + djr, dk, dmr, dnr);
-                    } else {
-                        /* one-shot per-strip pack of dO into stack scratch */
-                        float pb_local[ATTN_MAX_DK * GEMM_NR] __attribute__((aligned(64)));
-                        pack_b(dO + (qi + ir) * dk, dk, mr, GEMM_NR, dnr,
-                               pb_local + djr * mr);
-                        /* note: pb_local lays out one column block at a time;
-                           offset for column block djr is djr*mr in pb_local but
-                           that's wrong — pack_b expects a pre-sized buffer for the
-                           whole nc range. simpler: pack_b for just this (djr) col
-                           block into a fresh scratch. */
-                        micro_kernel(mr, pa_local,
-                                     pb_local /* col block at offset 0 */,
-                                     dV + (kj + dir) * dk + djr, dk, dmr, dnr);
-                    }
+                    micro_kernel(mr, pa_local, b_ptr,
+                                 dV + (kj + dir) * dk + djr, dk, dmr, dnr);
                 }
             }
 
             /* === STEP 3: dP_strip = dO_strip @ V^T ==================
                dO_strip: [mr, dk], Vt_packed: B-operand [dk, Bk_np] packed.
                output: dP_strip [mr, Bk] (stack). */
-            const float *do_strip;
-            if (use_prepack) {
-                do_strip = dO_pa + (qi + ir) * dk;
-            } else {
-                pack_a(dO + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
-                do_strip = a_q;
-            }
+            /* dispatcher guarantees use_prepack=true for fused path */
+            const float *do_strip = dO_pa + (qi + ir) * dk;
             memset(dP_strip, 0, (size_t)(mr * Bk) * sizeof(float));
             for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
                 int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
@@ -5182,9 +5159,9 @@ static inline void attn_bwd_kj_block_fused(
                     const float *b_ptr = use_prepack
                         ? (Q_pb + djr * S + (qi + ir) * GEMM_NR)
                         : NULL;
+                    /* dispatcher guarantees use_prepack=true for fused path */
 #if (defined(AX_SIMD_AVX512) || (defined(AX_SIMD_AVX2) && !defined(AX_CPU_OPT_SUFFIX_avx512))) && !defined(AX_NO_JIT)
-                    if (fn_strip && mr == GEMM_MR && dmr == GEMM_MR && dnr == GEMM_NR
-                        && use_prepack) {
+                    if (fn_strip && mr == GEMM_MR && dmr == GEMM_MR && dnr == GEMM_NR) {
                         fn_strip(mr,
                                  dS_strip + dir, Bk * (int64_t)sizeof(float),
                                  b_ptr,
@@ -5193,7 +5170,7 @@ static inline void attn_bwd_kj_block_fused(
                         continue;
                     }
 #endif
-                    /* fallback (mirror of STEP 2 fallback) */
+                    /* edge-tile fallback (mirror of STEP 2) */
                     float pa_local[GEMM_MR * GEMM_MR] __attribute__((aligned(64)));
                     for (int64_t k = 0; k < mr; k++) {
                         int64_t i = 0;
@@ -5204,22 +5181,14 @@ static inline void attn_bwd_kj_block_fused(
                             pa_local[k * GEMM_MR + i] = 0.0f;
                         }
                     }
-                    if (use_prepack) {
-                        micro_kernel(mr, pa_local, b_ptr,
-                                     dK + (kj + dir) * dk + djr, dk, dmr, dnr);
-                    } else {
-                        float pb_local[ATTN_MAX_DK * GEMM_NR] __attribute__((aligned(64)));
-                        pack_b(Q + (qi + ir) * dk, dk, mr, GEMM_NR, dnr, pb_local);
-                        micro_kernel(mr, pa_local, pb_local,
-                                     dK + (kj + dir) * dk + djr, dk, dmr, dnr);
-                    }
+                    micro_kernel(mr, pa_local, b_ptr,
+                                 dK + (kj + dir) * dk + djr, dk, dmr, dnr);
                 }
             }
         }
     }
-
-    /* unused params silenced for the !AX_HAS_SIMD configurations */
-    (void)pa; (void)pb;
+    /* unused param sink */
+    (void)pb;
 }
 
 /* I.1.c dispatch: function-pointer indirection between the materialized
@@ -5240,17 +5209,21 @@ typedef void (*ax_attn_bwd_kj_fn_t)(
     float *pa, float *pb,
     float *dQ_dest, float *dK, float *dV);
 
-static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(void) {
-    static int initialized = 0;
-    static ax_attn_bwd_kj_fn_t impl = NULL;
-    if (!initialized) {
+static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack) {
+    static int env_resolved = 0;
+    static int env_fused = 0;
+    if (!env_resolved) {
         const char *env = getenv("AX_SDPA_FUSED");
-        impl = (env && env[0] == '1')
-            ? (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block_fused
-            : (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block;
-        initialized = 1;
+        env_fused = (env && env[0] == '1') ? 1 : 0;
+        env_resolved = 1;
     }
-    return impl;
+    /* fused path requires use_prepack=true (drops messy non-prepack
+       fallback code that had layout bugs). dispatcher transparently
+       falls back to materialized when prepack is unavailable. */
+    if (env_fused && use_prepack) {
+        return (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block_fused;
+    }
+    return (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block;
 }
 
 /* I.1.b: number of inner threads to allocate per attn_bwd_head call.
@@ -5276,9 +5249,6 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                            int64_t S, int64_t dk, float scale, bool causal,
                            const float *P_saved_head, int n_inner)
 {
-    /* I.1.c: pick the kj-block implementation once per call. */
-    ax_attn_bwd_kj_fn_t kj_impl = ax_attn_bwd_get_impl();
-
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bq_p_max = ((ATTN_BQ + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
@@ -5307,9 +5277,10 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
     float *pa        = ax_tls_grow(&tl_bwd_pa,        &tl_bwd_pa_bytes, pa_want);
     float *pb        = ax_tls_grow(&tl_bwd_pb,        &tl_bwd_pb_bytes, pb_want);
 
-    /* MR-strip score scratch for the forward-recompute pass */
-    float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
-    float a_q[GEMM_MR * ATTN_MAX_DK] __attribute__((aligned(64)));
+    /* score_strip / a_q used to be declared here when the kj-block body
+       was inline; both helpers (attn_bwd_kj_block, attn_bwd_kj_block_fused)
+       declare their own stack arrays now, so this scope no longer needs
+       them. */
 
     /* Phase A: pre-pack Q and dO ONCE per head. these depend only on the row
        index, not on (kj, qi). without this we re-pack Q in the QK^T-recompute
@@ -5332,6 +5303,12 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
         pack_b(Q,  dk, S, dk_np, dk, Q_pb);
         pack_b(dO, dk, S, dk_np, dk, dO_pb);
     }
+
+    /* I.1.c: pick the kj-block implementation. fused path requires
+       use_prepack=true (otherwise non-prepack fallback paths in the
+       fused function would need to exist; we drop them and route to
+       the materialized variant when prepack is unavailable). */
+    ax_attn_bwd_kj_fn_t kj_impl = ax_attn_bwd_get_impl(use_prepack);
 
     /* I.1.b: per-(head, kj) parallel path. when n_inner > 1 we
        have spare threads after the outer per-head omp_for; spawn
