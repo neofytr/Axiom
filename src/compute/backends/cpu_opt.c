@@ -4702,7 +4702,11 @@ void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
         if (!row_max || !row_sum) goto done;
 
 #ifdef _OPENMP
-        #pragma omp for schedule(static)
+        /* dynamic schedule: faster threads (P-cores) grab additional heads
+           when slower threads (E-cores) are still working on theirs.
+           same rationale as opt_sdpa_bwd's outer loop — see commit
+           8b36775 for measurement detail. */
+        #pragma omp for schedule(dynamic, 1)
 #endif
         for (int64_t h = 0; h < BH; h++) {
             attn_fwd_head(Q + h * head_sz, K + h * head_sz, V + h * head_sz,
