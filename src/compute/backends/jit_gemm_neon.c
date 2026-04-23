@@ -30,7 +30,26 @@ static ax_jit_arm64_buf_t          *g_jit_buf_neon = NULL;
 static ax_jit_gemm_neon_kernel_fn   g_kernel_neon  = NULL;
 static pthread_once_t               g_jit_once_neon = PTHREAD_ONCE_INIT;
 
+/* AAPCS64 register-31 alias used as base for SP-relative loads/stores.
+   the ld/str/sub/add immediate encodings interpret Rn=31 as SP (rather
+   than XZR like the data-processing forms). */
+#define X31_SP 31
+
 static void emit_8x12_kernel(ax_jit_arm64_buf_t *b) {
+    /* prologue: callee-save NEON regs v8..v15. AAPCS64 says the lower
+       64 bits of these must be preserved across calls. our accumulators
+       v0..v23 include v8..v15 — without this prologue the kernel
+       silently corrupts caller state, which manifested as test_sdpa_causal
+       and test_large_mlp_trains failing on arm64 (CI run 24803112568)
+       while non-causal SDPA + scalar tests passed.
+       we save the full 128 bits via STR Q for code simplicity (slightly
+       more stack than strictly required). 128 bytes keeps SP 16-aligned. */
+    ax_jit_arm64_emit_sub_imm(b, X31_SP, X31_SP, 128);
+    for (int i = 0; i < 8; i++) {
+        /* str q(8+i), [sp, #i*16] — imm12 field is scaled by 16, so pass i */
+        ax_jit_arm64_emit_str_q_imm(b, 8 + i, X31_SP, i);
+    }
+
     /* zero v0..v23 (24 accumulators) */
     for (int i = 0; i < 24; i++) ax_jit_arm64_emit_movi_zero(b, i);
 
@@ -97,7 +116,11 @@ static void emit_8x12_kernel(ax_jit_arm64_buf_t *b) {
         }
     }
 
-    /* RET */
+    /* epilogue: restore v8..v15, deallocate stack, RET */
+    for (int i = 0; i < 8; i++) {
+        ax_jit_arm64_emit_ldr_q_imm(b, 8 + i, X31_SP, i);
+    }
+    ax_jit_arm64_emit_add_imm(b, X31_SP, X31_SP, 128);
     ax_jit_arm64_emit_ret(b);
 }
 
