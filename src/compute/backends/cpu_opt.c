@@ -4858,7 +4858,16 @@ static inline void attn_bwd_kj_block(
 
         /* dQ_dest += dS @ K — writes to per-thread accumulator in
            parallel path, global dQ in serial. dQ_dest is indexed by
-           the SAME (qi+ir)*dk+jr layout in both modes. */
+           the SAME (qi+ir)*dk+jr layout in both modes.
+           note: this path looks like a candidate for the same JIT
+           strided-A trick as dV/dK, but it isn't. dV/dK use the kernel
+           via A=P (or A=dS_tile), where the MR strip's row index maps
+           to dS_tile's COLUMN dim — that's stride 1 in row-major
+           memory and matches the kernel's "MR consecutive floats per
+           K iter" ABI. dQ wants A=dS with the MR strip's row index
+           mapping to dS_tile's ROW dim (stride Bk apart in memory),
+           which doesn't match. either pre-transpose dS (= pack_a, no
+           win) or design a different kernel ABI. left as a follow-up. */
         pack_a(dS_tile, Bk, Bq_p, Bk, Bq, pa);
         for (int64_t ir = 0; ir < Bq_p; ir += GEMM_MR) {
             int64_t mr = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq > ir ? Bq - ir : 0);
