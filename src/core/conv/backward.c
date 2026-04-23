@@ -94,7 +94,7 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         float *dxd = (input_orig->requires_grad && input_orig->grad)
                      ? (float *)input_orig->grad->storage->data : NULL;
 
-        conv2d_nhwc_backward_impl(s,
+        ax_conv_nhwc_backward_impl(s,
             (const float *)input_data->storage->data,
             (const float *)grad_out->storage->data,
             (const float *)weight->storage->data,
@@ -453,7 +453,7 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 }
 /* NHWC conv2d backward: produces dW, db, dX as needed. chunked per-sample
    to keep im2col_nhwc in L3 (matches forward's chunk strategy). */
-void conv2d_nhwc_backward_impl(
+void ax_conv_nhwc_backward_impl(
     struct ax_conv_scratch *s,
     const float *id,         /* input data [N, H, W, Cin] */
     const float *grd,        /* grad_out   [N, OH, OW, Cout] */

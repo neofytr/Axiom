@@ -62,7 +62,8 @@ static void bench_conv_bn_relu(int N, int C_in, int H, int W, int C_out, int K, 
     ax_tensor_destroy(probe);
 
     int iters = (int)(2e10 / conv_flops(N, C_in, C_out, H_out, W_out, K));
-    if (iters < 2) iters = 2; if (iters > 50) iters = 50;
+    if (iters < 2) iters = 2;
+    if (iters > 50) iters = 50;
 
     double t0 = bench_now_ms();
     for (int i = 0; i < iters; i++) {
@@ -86,7 +87,8 @@ static void bench_maxpool(int N, int C, int H, int W, int K, int stride) {
     ax_no_grad();
     for (int w = 0; w < 3; w++) { ax_tensor_t *y = ax_layer_forward(p, x); ax_tensor_destroy(y); }
     int iters = (int)(1e9 / (N * C * H * W));
-    if (iters < 5) iters = 5; if (iters > 500) iters = 500;
+    if (iters < 5) iters = 5;
+    if (iters > 500) iters = 500;
     double t0 = bench_now_ms();
     for (int i = 0; i < iters; i++) { ax_tensor_t *y = ax_layer_forward(p, x); ax_tensor_destroy(y); }
     double lat = (bench_now_ms() - t0) / iters;
@@ -105,7 +107,8 @@ static void bench_maxpool_nhwc(int N, int C, int H, int W, int K, int stride) {
     ax_no_grad();
     for (int w = 0; w < 3; w++) { ax_tensor_t *y = ax_layer_forward(p, x); ax_tensor_destroy(y); }
     int iters = (int)(1e9 / (N * C * H * W));
-    if (iters < 5) iters = 5; if (iters > 500) iters = 500;
+    if (iters < 5) iters = 5;
+    if (iters > 500) iters = 500;
     double t0 = bench_now_ms();
     for (int i = 0; i < iters; i++) { ax_tensor_t *y = ax_layer_forward(p, x); ax_tensor_destroy(y); }
     double lat = (bench_now_ms() - t0) / iters;
@@ -129,7 +132,8 @@ static void bench_conv_nhwc(int N, int C_in, int H, int W, int C_out, int K, int
     int W_out = (int)probe->shape[2];
     ax_tensor_destroy(probe);
     int iters = (int)(2e10 / conv_flops(N, C_in, C_out, H_out, W_out, K));
-    if (iters < 2) iters = 2; if (iters > 50) iters = 50;
+    if (iters < 2) iters = 2;
+    if (iters > 50) iters = 50;
     double t0 = bench_now_ms();
     for (int i = 0; i < iters; i++) { ax_tensor_t *y = ax_layer_forward(conv, x); ax_tensor_destroy(y); }
     double lat = (bench_now_ms() - t0) / iters;

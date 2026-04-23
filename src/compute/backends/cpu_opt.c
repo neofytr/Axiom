@@ -543,7 +543,11 @@ static int    ax_n_thread_speeds = 0;
 /* compute per-thread (begin, end) ranges for total_iters such that each
    thread's workload is proportional to its measured speed. preserves
    contiguity so existing pack_b cache reuse logic still hits.
-   when speeds aren't available, falls back to equal chunks. */
+   when speeds aren't available, falls back to equal chunks.
+   currently un-dispatched — wired in as part of phase 34 once the gemm
+   driver opts into the per-thread weighted partition. retained so the
+   measurement (ax_thread_speeds) is consumable when dispatch flips on. */
+__attribute__((unused))
 static void ax_compute_proportional_chunks(int64_t total_iters, int n_threads,
                                             int64_t *out_begin, int64_t *out_end) {
     if (n_threads <= 0) return;
@@ -704,14 +708,18 @@ static void ax_cpu_opt_init_impl(void) {
                      "/sys/devices/system/cpu/cpu0/cache/index%d/level", idx);
             FILE *fl = fopen(path, "r");
             if (!fl) continue;
-            int lvl = 0; fscanf(fl, "%d", &lvl); fclose(fl);
-            if (lvl != 1) continue;
+            int lvl = 0;
+            int lvl_ok = fscanf(fl, "%d", &lvl);
+            fclose(fl);
+            if (lvl_ok != 1 || lvl != 1) continue;
             snprintf(path, sizeof(path),
                      "/sys/devices/system/cpu/cpu0/cache/index%d/type", idx);
             FILE *ft = fopen(path, "r");
             if (!ft) continue;
             char type[32] = {0};
-            fscanf(ft, "%31s", type); fclose(ft);
+            int type_ok = fscanf(ft, "%31s", type);
+            fclose(ft);
+            if (type_ok != 1) continue;
             if (strcmp(type, "Data") != 0 && strcmp(type, "Unified") != 0) continue;
             snprintf(path, sizeof(path),
                      "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
@@ -2259,6 +2267,11 @@ AX_TLS float *tl_strassen_ta = NULL; AX_TLS int64_t tl_strassen_ta_bytes = 0;
 AX_TLS float *tl_strassen_tb = NULL; AX_TLS int64_t tl_strassen_tb_bytes = 0;
 AX_TLS float *tl_strassen_mi = NULL; AX_TLS int64_t tl_strassen_mi_bytes = 0;
 
+/* dispatch is currently disabled (see "Strassen 1-level helpers retained but
+   dispatch disabled" in commit 03ac6d4). kept here as scaffolding for the
+   eventual phase-25 reactivation; mark unused so -Wunused-function stays
+   silent until the dispatch site is added back. */
+__attribute__((unused))
 static ax_status_t opt_gemm_strassen_1lvl(const float *A, const float *B, float *C,
                                            int64_t N, int64_t lda, int64_t ldb, int64_t ldc) {
     int64_t n = N / 2;

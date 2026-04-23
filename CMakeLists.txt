@@ -246,7 +246,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
         src/core/activations.c
         src/core/attention.c
         src/core/autograd_ops.c
-        src/core/conv.c
+        src/core/conv/backward.c
+        src/core/conv/conv_bn_relu.c
+        src/core/conv/direct.c
+        src/core/conv/forward.c
+        src/core/conv/im2col.c
+        src/core/conv/pool.c
+        src/core/conv/winograd.c
         src/core/losses.c
         src/core/norm.c
         src/core/optim.c

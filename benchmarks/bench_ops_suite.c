@@ -81,7 +81,8 @@ static void bench_softmax(int64_t rows, int64_t cols) {
     int64_t sh[] = {rows, cols};
     ax_tensor_t *x = ax_tensor_rand(sh, 2, -1.0f, 1.0f);
     int iters = (int)(5e8 / (rows * cols));
-    if (iters < 10) iters = 10; if (iters > 2000) iters = 2000;
+    if (iters < 10) iters = 10;
+    if (iters > 2000) iters = 2000;
     for (int w = 0; w < 3; w++) { ax_tensor_t *y = ax_softmax(x, 1); ax_tensor_destroy(y); }
     double t0 = bench_now_ms();
     for (int i = 0; i < iters; i++) {

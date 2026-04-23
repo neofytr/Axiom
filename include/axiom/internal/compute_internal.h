@@ -56,6 +56,17 @@ void ax_calibrate_thresholds(void);
    pick the best. opt-in via AX_GEMM_CALIBRATE=1 (adds ~500 ms startup). */
 void ax_calibrate_gemm_tiles(void);
 
+/* hybrid CPU fast-vs-all crossover calibration. measures gemm throughput
+   on a representative shape and derives the FLOPs threshold above which
+   spreading work to all cores beats fast-only. cheap (~30ms). no-op on
+   non-hybrid CPUs and under AX_NO_AUTOTUNE=1. */
+void ax_calibrate_hybrid_crossover(void);
+
+/* phase 34: measure each omp thread's relative throughput so gemm work
+   distribution can be weighted proportionally. cheap (~5ms). no-op under
+   AX_NO_AUTOTUNE=1 or without openmp. */
+void ax_measure_thread_speeds(void);
+
 #ifdef __cplusplus
 }
 #endif

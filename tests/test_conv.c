@@ -388,7 +388,8 @@ static void test_conv2d_subbatched_fwd_bwd(void)
        n_batch = 8MB/(K*M*4) = 4 → 2 chunks of 4 samples each. */
     int N = 8, Cin = 256, H = 14, W = 14, Cout = 32;
     int64_t M = (int64_t)H * W;
-    int64_t K = (int64_t)Cin * 9;
+    /* K = Cin * 9 = 2304 (documented in the header comment above for the
+       batch-split sizing — not needed at runtime here). */
 
     ax_layer_t *c = ax_conv2d_create(Cin, Cout, 3, 1, 1, false);
     ax_conv2d_t *cc = (ax_conv2d_t *)c;

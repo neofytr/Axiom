@@ -467,7 +467,7 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     if (prof_enabled < 0) prof_enabled = (getenv("AX_PROFILE_MHA") && getenv("AX_PROFILE_MHA")[0] == '1') ? 1 : 0;
     static __thread uint64_t pf_dout_copy=0, pf_wo_grad=0, pf_dattn=0,
                               pf_head_int=0, pf_sdpa_bwd=0, pf_deint=0,
-                              pf_dwqkv=0, pf_dbqkv=0, pf_dx=0;
+                              pf_dwqkv=0, pf_dx=0;
     static __thread int pf_calls = 0;
     /* high-frequency cycle counter for profile attribution (gated by
        AX_PROFILE_MHA=1). x86 reads rdtsc, aarch64 reads cntvct_el0;

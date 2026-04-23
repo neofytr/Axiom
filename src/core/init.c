@@ -21,6 +21,7 @@
 #include "axiom/compute.h"
 #include "axiom/device.h"
 #include "axiom/internal/backend_ops.h"
+#include "axiom/internal/compute_internal.h"
 #include "axiom/rng.h"
 #include "axiom/error.h"
 #include <stdlib.h>
