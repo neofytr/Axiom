@@ -215,6 +215,7 @@ if(AX_CUDA)
         src/compute/backends/cuda/ops_reduce.cu
         src/compute/backends/cuda/ops_gemm.cu
         src/compute/backends/cuda/ops_conv.cu
+        src/compute/backends/cuda/ops_winograd.cu
         src/compute/backends/cuda/ops_optim.cu
         src/compute/backends/cuda/ops_fused.cu
         src/compute/backends/cuda/ops_activations.cu

@@ -512,7 +512,28 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             out_b.shape[0] = N; out_b.shape[1] = C_out; out_b.shape[2] = M;
             out_b.strides[0] = C_out * M; out_b.strides[1] = M; out_b.strides[2] = 1;
             out_b.offset = output->offset;
-            if (cu->conv_gemm_batched(w2d, ind_dev, N, &single, &out_b) == AX_OK) {
+            /* I.2: opt-in Winograd F(2,3) for 3x3 stride-1 convs. gated
+               on AX_CUDA_WINOGRAD=1 to avoid regressing on GPUs where
+               my unfused implementation is bandwidth-bound (RTX 3050
+               class — neutral to slightly negative on most shapes,
+               positive only on a few large ones). datacenter GPUs with
+               higher compute/BW ratio likely win more. */
+            ax_status_t (*conv_fn)(const ax_tensor_t *, const float *,
+                                   int64_t, const ax_conv_params_t *,
+                                   ax_tensor_t *) = cu->conv_gemm_batched;
+            if (kh == 3 && kw == 3 && sh == 1 && sw == 1
+                && cu->conv_winograd_f23 && cu->winograd_f23_prefer
+                && cu->winograd_f23_prefer(C_in, C_out, H, W)) {
+                static int wg_env_resolved = 0;
+                static int wg_enabled = 0;
+                if (!wg_env_resolved) {
+                    const char *e = getenv("AX_CUDA_WINOGRAD");
+                    wg_enabled = (e && e[0] == '1') ? 1 : 0;
+                    wg_env_resolved = 1;
+                }
+                if (wg_enabled) conv_fn = cu->conv_winograd_f23;
+            }
+            if (conv_fn(w2d, ind_dev, N, &single, &out_b) == AX_OK) {
                 used_batched = true;
                 if (conv->use_bias && conv->bias) {
                     ax_compute_bias_add(&out_b, conv->bias, 1, &out_b);

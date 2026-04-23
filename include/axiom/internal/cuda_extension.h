@@ -106,6 +106,27 @@ typedef struct {
                                       const float *in_dev, int64_t N,
                                       const ax_conv_params_t *single,
                                       ax_tensor_t *out);
+
+    /* I.2: Winograd F(2,3) conv forward — same signature as
+       conv_gemm_batched. only valid when params->kh=kw=3, sh=sw=1.
+       trades the 9 muls of dense 3x3 conv for 4 muls + transforms per
+       2x2 output tile. on memory-bound GPUs (RTX 3050-class) the
+       transforms add traffic that cancels much of the FLOP win — opt-in
+       via the dispatch heuristic in conv.c, currently default-off. NULL
+       when the cuda backend was built without winograd support. */
+    ax_status_t (*conv_winograd_f23)(const ax_tensor_t *weight,
+                                      const float *in_dev, int64_t N,
+                                      const ax_conv_params_t *single,
+                                      ax_tensor_t *out);
+
+    /* heuristic: should the dispatcher use Winograd F(2,3) for this
+       shape? called only after the shape constraints (kh=kw=3, sh=sw=1)
+       are satisfied. NULL → never use winograd.
+       (renamed away from `prefer_winograd_f23` to avoid macro collision
+       with the cpu-side ax_conv_prefer_winograd_f23 alias defined in
+       core/conv/forward.c.) */
+    bool (*winograd_f23_prefer)(int64_t C_in, int64_t C_out,
+                                 int64_t H, int64_t W);
 } ax_cuda_extension_t;
 
 /* register the cuda backend's extension table. called once from the

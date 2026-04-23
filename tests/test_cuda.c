@@ -328,6 +328,100 @@ static void test_gpu_conv_gemm(void) {
     ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
 }
 
+/* I.2: Winograd F(2,3) parity vs the existing im2col + cuBLAS path.
+   builds N=2 samples, C_in=C_out=32, 8x8 input, 3x3 kernel pad=1
+   (a Winograd-friendly shape: even dims, C ≥ heuristic threshold).
+   exercises:
+     1. weight transform U = G * w * G^T
+     2. input transform V = B^T * d * B over multiple tiles + samples
+     3. cuBLAS batched gemm
+     4. output transform Y = A^T * M * A back to NCHW
+   compares against cuda_conv_gemm_batched element-wise; mismatches
+   indicate either a Winograd-matrix bug or an indexing bug. */
+extern ax_status_t cuda_conv_gemm_batched(const ax_tensor_t *,
+                                            const float *, int64_t,
+                                            const ax_conv_params_t *,
+                                            ax_tensor_t *);
+extern ax_status_t cuda_conv_winograd_f23(const ax_tensor_t *,
+                                            const float *, int64_t,
+                                            const ax_conv_params_t *,
+                                            ax_tensor_t *);
+static void test_gpu_winograd_f23_parity(void) {
+    const int N = 2, C_in = 32, C_out = 32, H = 8, W = 8;
+    const int kh = 3, kw = 3, sh = 1, sw = 1, ph = 1, pw = 1;
+    const int out_h = (H + 2*ph - kh) / sh + 1;
+    const int out_w = (W + 2*pw - kw) / sw + 1;
+    const int M = out_h * out_w;
+    const int K = C_in * kh * kw;
+
+    int64_t in_shape[]  = {N, C_in, H, W};
+    int64_t w_shape[]   = {C_out, K};
+    int64_t out_shape[] = {N, C_out, M};
+
+    /* deterministic init */
+    int64_t in_n  = (int64_t)N * C_in * H * W;
+    int64_t w_n   = (int64_t)C_out * K;
+    float *h_in  = (float *)malloc((size_t)in_n * sizeof(float));
+    float *h_w   = (float *)malloc((size_t)w_n  * sizeof(float));
+    for (int64_t i = 0; i < in_n; i++) h_in[i] = 0.005f * (float)((i * 7 + 3) % 199 - 99);
+    for (int64_t i = 0; i < w_n;  i++) h_w[i]  = 0.01f  * (float)((i * 5 + 1) % 79  - 39);
+
+    /* push to gpu */
+    ax_compute_set_backend(AX_BACKEND_CUDA);
+    ax_set_default_device(AX_DEVICE_CUDA);
+    ax_tensor_t *cpu_in  = ax_tensor_from_array(h_in, in_shape, 4, AX_FLOAT32);
+    ax_tensor_t *cpu_w   = ax_tensor_from_array(h_w,  w_shape,  2, AX_FLOAT32);
+    ax_tensor_t *gpu_in  = ax_tensor_to_cuda(cpu_in);
+    ax_tensor_t *gpu_w   = ax_tensor_to_cuda(cpu_w);
+    ax_tensor_t *out_ref = ax_tensor_zeros(out_shape, 3, AX_FLOAT32);
+    ax_tensor_t *out_wno = ax_tensor_zeros(out_shape, 3, AX_FLOAT32);
+
+    ax_conv_params_t cp = {
+        .input = NULL,  /* unused — input passed separately via input_batched */
+        .C_in = C_in, .H = H, .W = W,
+        .kh = kh, .kw = kw,
+        .sh = sh, .sw = sw,
+        .ph = ph, .pw = pw,
+        .out_h = out_h, .out_w = out_w,
+    };
+    const float *in_dev = (const float *)gpu_in->storage->data;
+
+    /* reference path */
+    AX_TEST_ASSERT(cuda_conv_gemm_batched(gpu_w, in_dev, N, &cp, out_ref) == AX_OK,
+                   "im2col reference conv should succeed");
+    /* winograd path */
+    AX_TEST_ASSERT(cuda_conv_winograd_f23(gpu_w, in_dev, N, &cp, out_wno) == AX_OK,
+                   "winograd_f23 conv should succeed");
+    ax_cuda_synchronize();
+
+    ax_tensor_t *check_ref = ax_tensor_to_cpu(out_ref);
+    ax_tensor_t *check_wno = ax_tensor_to_cpu(out_wno);
+    int mismatches = 0;
+    float max_err = 0.0f;
+    int64_t total = (int64_t)N * C_out * M;
+    for (int64_t i = 0; i < total; i++) {
+        float a = cpu_f32(check_ref, i);
+        float b = cpu_f32(check_wno, i);
+        float e = fabsf(a - b);
+        if (e > max_err) max_err = e;
+        /* Winograd has slightly worse fp32 numerical conditioning than
+           direct due to the larger sum of products in the transforms;
+           tol of 5e-3 is comfortable for this shape. */
+        if (e > 5e-3f) mismatches++;
+    }
+    AX_TEST_ASSERT(mismatches == 0, "winograd_f23 vs im2col mismatch");
+    printf("  (N=%d C=%d %dx%d: %d mismatches, max_err=%g)\n",
+           N, C_in, H, W, mismatches, max_err);
+
+    ax_tensor_destroy(cpu_in); ax_tensor_destroy(cpu_w);
+    ax_tensor_destroy(gpu_in); ax_tensor_destroy(gpu_w);
+    ax_tensor_destroy(out_ref); ax_tensor_destroy(out_wno);
+    ax_tensor_destroy(check_ref); ax_tensor_destroy(check_wno);
+    free(h_in); free(h_w);
+    ax_set_default_device(AX_DEVICE_CPU);
+    ax_compute_set_backend(AX_BACKEND_CPU_SIMD);
+}
+
 /* fused-op parity: add_relu, axpy, softmax_rowwise vs cpu reference. */
 static void test_gpu_fused_ops(void) {
     /* add_relu */
@@ -440,6 +534,7 @@ int main(void) {
         AX_RUN_TEST(test_gpu_sum_reduction);
         AX_RUN_TEST(test_gpu_larger_gemm);
         AX_RUN_TEST(test_gpu_conv_gemm);
+        AX_RUN_TEST(test_gpu_winograd_f23_parity);
         AX_RUN_TEST(test_gpu_fused_ops);
     } else {
         printf("--- no GPU found, skipping GPU tests ---\n");

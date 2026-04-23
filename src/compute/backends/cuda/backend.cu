@@ -232,6 +232,9 @@ extern ax_status_t ax_cuda_sdpa_bwd(const float *, const float *, const float *,
     int64_t, int64_t, int64_t, float, bool, const float *);
 extern ax_status_t cuda_conv_gemm_batched(const ax_tensor_t *,
     const float *, int64_t, const ax_conv_params_t *, ax_tensor_t *);
+extern ax_status_t cuda_conv_winograd_f23(const ax_tensor_t *,
+    const float *, int64_t, const ax_conv_params_t *, ax_tensor_t *);
+extern bool ax_cuda_prefer_winograd_f23(int64_t, int64_t, int64_t, int64_t);
 }
 
 /* the extension table — populated at module load. shared across all
@@ -250,4 +253,6 @@ const ax_cuda_extension_t ax_cuda_ext_table = {
     .sdpa_fwd                         = ax_cuda_sdpa_fwd,
     .sdpa_bwd                         = ax_cuda_sdpa_bwd,
     .conv_gemm_batched                = cuda_conv_gemm_batched,
+    .conv_winograd_f23                = cuda_conv_winograd_f23,
+    .winograd_f23_prefer              = ax_cuda_prefer_winograd_f23,
 };
