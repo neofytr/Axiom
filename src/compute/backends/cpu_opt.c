@@ -3741,6 +3741,14 @@ static ax_status_t opt_gemm_tn_raw(
         }
     } else if (use_jc_par) {
         #ifdef _OPENMP
+        /* tried schedule(dynamic, 1) here for hybrid CPU implicit
+           weighting — won 5-7 % on mha_train_B2_S1024 / B1_S512 but
+           regressed bench_gemm_suite at medium shapes (nn_512x512:
+           -11 %, nn_2048x2048: -5 %) because pack_b is per-thread but
+           dynamic distribution forces re-packs across the n_jc_tiles
+           range. static keeps each thread on a fixed jct and reuses
+           pack_b across pc iterations. revisit when a per-shape jct
+           threshold can detect the n_jc_tiles >> n_threads case. */
         #pragma omp parallel for num_threads(gemm_threads) schedule(static)
         #endif
         for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
