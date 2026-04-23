@@ -594,3 +594,87 @@ match to XLA's generated code. ~1500-2000 LOC of careful work. Not
 landed this session — prioritised the many low-risk wins above, which
 together may close 1/2 to 2/3 of the TF gap on the most-lagging shape
 (B8_S128, TF -32 % pre-session).
+
+## F.4 session (2026-04-24 overnight) — FINAL RESULTS
+
+Updates to the earlier "commits landed, bench pending" section: bench
+ran at ~2 AM with load fluctuating 0.7-8 (still not fully quiet — user
+bg work extended). 5-run interleaved A/B medians, 7 pairs per test.
+
+### Measured impact
+
+**mha_train (all shapes, 5-run interleaved medians, baseline b5005f7 vs HEAD)**:
+
+| shape | baseline | HEAD | delta |
+|---|---|---|---|
+| mha_train_B8_S128_D512_H8   | 19.26 | 20.05 | +4% (noise-scale) |
+| mha_train_B4_S512_D768_H12  | 82.17 | 81.18 | -1% |
+| mha_train_B2_S1024_D768_H12 | 111.00 | 109.42 | -1% |
+| mha_train_B1_S512_D1024_H16 | 47.48 | 48.59 | +2% (noise) |
+| mha_train_B1_S2048_D768_H12 | 172.97 | 173.16 | 0% |
+
+Net: session impact is **flat-to-slightly-positive**. Most shapes within
+noise floor of ~2% given the high bg load during measurement.
+
+### What reverted
+
+Three of my planned perf commits were measured as regressions and reverted:
+
+1. **opt_gemm use_hybrid schedule(dynamic, n_ic_tiles)** (3fdf52a, reverted):
+   matched the bc12ad5 / e80703b pattern, but regressed B8_S128 by ~17%.
+   root cause: for forward y gemm at [1024, 512, 512], nc_eff=256 gives
+   n_jc_full=2 and n_pc_tiles=2 — only 4 collapse(3) chunks for 16 threads.
+   dynamic chunk=n_ic_tiles stranded 12 threads idle. static schedule
+   spreads all 60 iterations uniformly. a work-count-adaptive chunk
+   formula (e.g., `max(1, total_chunks / NT)`) would fix this but needs
+   its own commit with bench validation on all shapes.
+
+2. **dwqkv_split_acc use_hybrid schedule(dynamic, n_ic_tiles)** (4642674, reverted):
+   same pattern, reverted for consistency. only triggered on D>=1024
+   (B1_S512 only), so impact was limited but the chunk formula issue
+   is the same structurally.
+
+3. **layout.c head_interleave variants schedule(dynamic, 1)** (e540489, reverted):
+   plan.md flagged as "wasn't tried yet" — measurement confirmed it
+   doesn't help. for B8_S128 (BH=64), 4 iters/thread with static is
+   already well-balanced; dynamic chunk=1 adds dispatcher overhead per
+   iteration for no load-balance win.
+
+### What stayed
+
+- **F.4.2 output-projection reorder** (5122194): train_step_fused.c only.
+  Parity test now full grad-equality bit-check, not just OK.
+- **F.4.3 defer** (0cd5557): docs only, rationale recorded.
+- **ACC_PARAM omp merge** (4104945): train_step_fused.c only; 3 regions → 1.
+- **AX_SDPA_FUSED=auto opt-in** (a2891a3 + ebc162b revert-default):
+  default is materialized (same as session-start). users can opt into
+  shape-dispatch via `AX_SDPA_FUSED=auto`, or force fused with =1 /
+  materialized with =0. the shape-dispatch code path is preserved for
+  future measurement on a less-noisy host.
+- **debug trace** (86c7e8d): AX_SDPA_DISPATCH_LOG=1 shows sdpa_bwd impl
+  choice per call.
+
+### Lessons
+
+- plan.md's pre-session bench numbers (measured at unknown load) did not
+  reproduce on 2026-04-24's 2 AM window. fused SDPA_bwd was ~flat vs
+  materialized on B8_S128 here, not the -10% plan.md recorded.
+  likely explanation: recent commits (286654e single-pass dwqkv,
+  408600e F.3.c, others) shifted the cache-pressure profile and the
+  fused variant's relative win.
+- dynamic-chunk scheduling on gemm tile loops works when the chunk count
+  comfortably exceeds thread count. for low-iter-count tile loops
+  (4 chunks / 16 threads on forward y), static is better. a correct
+  dynamic formula would be chunk = max(1, total_chunks / (NT * k))
+  for some small k; left as follow-up.
+- interleaved A/B is more reliable than separate-run A/B, but neither
+  beats a genuinely idle machine. bench on a dedicated runner if
+  performance decisions are load-bearing.
+
+### F.4.4 status
+
+F.4.4 (monolithic per-tile fwd+bwd fused train kernel) remains unwritten.
+~1500-2000 LOC of careful work to match XLA's generated code structurally.
+tackled this session's many small-and-reversible experiments first to
+narrow the remaining TF-gap without committing to a multi-week kernel;
+the remaining gap is structural and still needs F.4.4 to close.
