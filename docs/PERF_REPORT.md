@@ -395,6 +395,30 @@ The win this phase **does** unlock is structural:
   fusion lands as an incremental commit on top of `ax_mha_train_step`
   without disturbing the autograd path.
 
+### G.0: OMP_PROC_BIND=spread default (commit e111821)
+
+Quick experimental finding: setting `OMP_PROC_BIND=spread` as a default
+(via `setenv` in `ax_compute_init` with overwrite=0) gives a **5-10 %
+mha_train win on most shapes**, completely free.
+
+5-run medians on i5-12500H AVX2 (4 P + 8 E hybrid):
+
+| shape                       | before | after | delta |
+|-----------------------------|--------|-------|-------|
+| mha_train_B8_S128_D512_H8   | 19.6   | 17.7  | -10%  |
+| mha_train_B4_S512_D768_H12  | 91.8   | 84.8  | -8%   |
+| mha_train_B2_S1024_D768_H12 | 122.4  | 119.3 | -3%   |
+| mha_train_B1_S512_D1024_H16 | 40.1   | 37.8  | -6%   |
+| mha_train_B1_S2048_D768_H12 | 185.5  | 176.2 | -5%   |
+
+mechanism: without proc_bind, the OS migrates threads off the cores
+libgomp picked, so each thread's L1/L2 goes cold across iterations of
+the gemm tile loops. spread pins each thread to its initial core.
+
+**Closed gap to TF (B8_S128)**: was -32 %, now -27 %. Compounded with
+remaining structural fusion work (F.3, F.4) the path to parity is
+visible.
+
 ### F.3: cross-stage tile fusion (next)
 
 Fusion candidates with estimated BW savings on B8_S128 (12 MB qkv,
