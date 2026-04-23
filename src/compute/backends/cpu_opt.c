@@ -5729,6 +5729,16 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                 int tid = omp_get_thread_num();
                 float *my_dQ = dQ_pool + (int64_t)tid * S * dk;
                 if (Kt_p_x && Vt_p_x && K_p_x && P_x && dP_x && dS_x && pa_x && pb_x) {
+                    /* tried schedule(dynamic, 1) here for hybrid CPU implicit
+                       weighting on the n_inner-thread inner team — regressed
+                       4/5 mha_train shapes (B4 +11%, B2 +7%, others +1-2%);
+                       only B8_S128 won marginally, and that shape doesn't
+                       even take this branch (n_inner=1 → serial loop).
+                       reverted. probable cause: with n_inner=2 (the only
+                       shape that takes this branch), there's only 17 kj
+                       iters split across 2 threads — dynamic dispatcher
+                       overhead per chunk-of-1 outweighs the load-balance
+                       win at this granularity. */
                     #pragma omp for schedule(static)
                     for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
                         kj_impl(kj, S, dk, dk_np, scale, causal,
