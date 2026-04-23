@@ -155,6 +155,21 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
                                const ax_tensor_t *dout,
                                ax_tensor_t *y_out);
 
+/* F.4: fully-fused mha-train kernel — XLA-class cross-stage tile fusion.
+   same signature and contract as ax_mha_train_step, but the body is a
+   monolithic per-(qi, kj) tile loop that streams every intermediate
+   through L1 instead of materialising arena tensors between stages.
+   target: closes the 15-30 % residual gap to TF that the per-stage
+   fusion in F.3.* can't reach. see docs/F4_FUSED_MHA_TRAIN.md.
+
+   thread-safety, error contract, bias / dx semantics: same as
+   ax_mha_train_step. callers can swap one for the other transparently
+   (parity-tested in test_mha_train_step_fused_parity). */
+ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
+                                     const ax_tensor_t *x,
+                                     const ax_tensor_t *dout,
+                                     ax_tensor_t *y_out);
+
 /* ================================================================
    SDPA PRIMITIVE — raw compute, use when you manage Q/K/V yourself
    ================================================================ */

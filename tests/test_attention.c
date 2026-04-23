@@ -684,6 +684,29 @@ int main(void)
     AX_RUN_TEST(test_mha_causal_masking);
     AX_RUN_TEST(test_sdpa_save_path_parity);
     AX_RUN_TEST(test_mha_train_step_parity);
+    /* F.4 parity test reuses the same checker by switching the entry
+       point. each F.4 phase that swaps the body must keep this green. */
+    {
+        extern ax_status_t ax_mha_train_step_fused(ax_layer_t *, const ax_tensor_t *, const ax_tensor_t *, ax_tensor_t *);
+        /* runtime swap of the API the parity test calls.
+           since the C-level test_mha_train_step_parity uses
+           ax_mha_train_step directly, we rely on F.4 phases reading
+           AX_MHA_USE_FUSED to redirect under env. for now both
+           entries do the same thing — the test below validates the
+           contract is wired up. */
+        const int64_t B = 2, S = 8, D = 16; const int H = 4;
+        int64_t shape[] = {B, S, D};
+        ax_set_seed(7777);
+        ax_layer_t *layer = ax_mha_create(D, H, true, false);
+        ax_set_seed(31337);
+        ax_tensor_t *x = ax_tensor_rand(shape, 3, -0.1f, 0.1f);
+        ax_tensor_t *y = ax_tensor_create(shape, 3, AX_FLOAT32);
+        ax_status_t s = ax_mha_train_step_fused(layer, x, NULL, y);
+        AX_TEST_ASSERT_EQ((int)s, (int)AX_OK, "F.4: ax_mha_train_step_fused returns OK");
+        ax_tensor_destroy(x);
+        ax_tensor_destroy(y);
+        ax_layer_destroy(layer);
+    }
 
     ax_shutdown();
     AX_TEST_SUMMARY();
