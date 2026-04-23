@@ -5635,6 +5635,24 @@ static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
 #endif
     }
 
+    /* debug trace: AX_SDPA_DISPATCH_LOG=1 prints the dispatch decision */
+    static int dbg_resolved = 0;
+    static int dbg_on = 0;
+    if (!dbg_resolved) {
+        const char *dbg = getenv("AX_SDPA_DISPATCH_LOG");
+        dbg_on = (dbg && dbg[0] == '1') ? 1 : 0;
+        dbg_resolved = 1;
+    }
+    if (dbg_on) {
+#ifdef _OPENMP
+        fprintf(stderr, "axiom: sdpa_bwd dispatch BH=%ld NT=%d env_mode=%d use_fused=%d use_prepack=%d\n",
+                (long)BH, omp_get_max_threads(), env_mode, use_fused, use_prepack);
+#else
+        fprintf(stderr, "axiom: sdpa_bwd dispatch BH=%ld env_mode=%d use_fused=%d use_prepack=%d\n",
+                (long)BH, env_mode, use_fused, use_prepack);
+#endif
+    }
+
     if (use_fused && use_prepack) {
         return (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block_fused;
     }
