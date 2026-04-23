@@ -365,6 +365,7 @@ set(TEST_SOURCES
     tests/test_memory.c
     tests/test_tensor.c
     tests/test_compute.c
+    tests/test_property.c
     tests/test_ops.c
     tests/test_conv.c
     tests/test_norm.c
