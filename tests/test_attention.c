@@ -547,13 +547,17 @@ static void test_sdpa_save_path_parity(void)
 }
 
 /* ================================================================
-   test: ax_mha_train_step grads match the autograd path bit-for-bit.
-   builds two MHA layers with identical weights, runs:
-     A: autograd path (mha_forward + sum + ax_backward)
-     B: ax_mha_train_step with the same x, dout = ones (matches sum loss)
-   compares every weight grad and the forward output. drift > 1e-4 fails.
+   test: train_step entry points grads match the autograd path bit-for-bit.
+   parameterised on entry_fn so each F.4 phase runs the same parity
+   check against the same autograd reference. a static wrapper
+   test_mha_train_step_parity runs entry_fn = ax_mha_train_step;
+   test_mha_train_step_fused_parity runs entry_fn = ax_mha_train_step_fused.
+   every F.4 phase that swaps the fused body must keep both green.
    ================================================================ */
-static void test_mha_train_step_parity(void)
+typedef ax_status_t (*train_step_fn_t)(ax_layer_t *, const ax_tensor_t *,
+                                        const ax_tensor_t *, ax_tensor_t *);
+
+static void run_train_step_parity(train_step_fn_t entry_fn, const char *tag)
 {
     const int64_t B = 2, S = 8, D = 16;
     const int H = 4;
@@ -619,10 +623,11 @@ static void test_mha_train_step_parity(void)
     memcpy(snap_bv, gbvA, (size_t)BD * sizeof(float));
     memcpy(snap_bo, gboA, (size_t)BD * sizeof(float));
 
-    /* ---- path B: train_step (dout = NULL → defaults to ones, matching sum loss) ---- */
+    /* ---- path B: entry_fn (dout = NULL → defaults to ones, matching sum loss) ---- */
     ax_tensor_t *outB = ax_tensor_create(shape, 3, AX_FLOAT32);
-    ax_status_t sB = ax_mha_train_step(layerB, xB, NULL, outB);
+    ax_status_t sB = entry_fn(layerB, xB, NULL, outB);
     AX_TEST_ASSERT_EQ((int)sB, (int)AX_OK, "B: train_step ok");
+    (void)tag;
 
     /* compare forward output A vs B */
     float *odA = (float *)outA->storage->data;
@@ -668,6 +673,16 @@ static void test_mha_train_step_parity(void)
     ax_layer_destroy(layerB);
 }
 
+static void test_mha_train_step_parity(void)
+{
+    run_train_step_parity(ax_mha_train_step, "train_step");
+}
+
+static void test_mha_train_step_fused_parity(void)
+{
+    run_train_step_parity(ax_mha_train_step_fused, "train_step_fused");
+}
+
 int main(void)
 {
     ax_init();
@@ -684,29 +699,7 @@ int main(void)
     AX_RUN_TEST(test_mha_causal_masking);
     AX_RUN_TEST(test_sdpa_save_path_parity);
     AX_RUN_TEST(test_mha_train_step_parity);
-    /* F.4 parity test reuses the same checker by switching the entry
-       point. each F.4 phase that swaps the body must keep this green. */
-    {
-        extern ax_status_t ax_mha_train_step_fused(ax_layer_t *, const ax_tensor_t *, const ax_tensor_t *, ax_tensor_t *);
-        /* runtime swap of the API the parity test calls.
-           since the C-level test_mha_train_step_parity uses
-           ax_mha_train_step directly, we rely on F.4 phases reading
-           AX_MHA_USE_FUSED to redirect under env. for now both
-           entries do the same thing — the test below validates the
-           contract is wired up. */
-        const int64_t B = 2, S = 8, D = 16; const int H = 4;
-        int64_t shape[] = {B, S, D};
-        ax_set_seed(7777);
-        ax_layer_t *layer = ax_mha_create(D, H, true, false);
-        ax_set_seed(31337);
-        ax_tensor_t *x = ax_tensor_rand(shape, 3, -0.1f, 0.1f);
-        ax_tensor_t *y = ax_tensor_create(shape, 3, AX_FLOAT32);
-        ax_status_t s = ax_mha_train_step_fused(layer, x, NULL, y);
-        AX_TEST_ASSERT_EQ((int)s, (int)AX_OK, "F.4: ax_mha_train_step_fused returns OK");
-        ax_tensor_destroy(x);
-        ax_tensor_destroy(y);
-        ax_layer_destroy(layer);
-    }
+    AX_RUN_TEST(test_mha_train_step_fused_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();
