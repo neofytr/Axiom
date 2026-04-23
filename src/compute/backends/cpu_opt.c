@@ -3692,8 +3692,14 @@ static ax_status_t opt_gemm_tn_raw(
     (void)gemm_threads;
 
     if (use_hybrid) {
-        /* hybrid jc+pc+ic for opt_gemm_tn. collapse(3) over (jct, pct, ict);
-           pack_b cached across iterations with same (jct, pct). */
+        /* hybrid jc+pc+ic for opt_gemm_tn. collapse(3) over (jct, pct, ict).
+           dynamic schedule with chunk = n_ic_tiles: each thread grabs one
+           (jct, pct) "row" of n_ic_tiles iterations. preserves pack_b
+           cache reuse within the chunk (cache keyed on jct, pct — within
+           chunk these are constant). between chunks, fast threads grab
+           additional (jct, pct) pairs from the dynamic queue, giving
+           implicit weighted distribution on hybrid CPUs (P-cores process
+           more chunks than E-cores). */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
         #ifdef _OPENMP
         #pragma omp parallel num_threads(gemm_threads)
@@ -3706,7 +3712,7 @@ static ax_status_t opt_gemm_tn_raw(
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(static)
+            #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
