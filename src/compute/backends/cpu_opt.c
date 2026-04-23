@@ -5583,36 +5583,36 @@ typedef void (*ax_attn_bwd_kj_fn_t)(
     float *dQ_dest, float *dK, float *dV);
 
 /* pick the kj-block impl. dispatch:
-     AX_SDPA_FUSED=1  → force fused
-     AX_SDPA_FUSED=0  → force materialized
-     unset            → shape-dispatched: fused when BH != NT, materialized
-                        when BH == NT (the sole regression case per plan.md,
-                        where each thread owns exactly one head with no inner
-                        parallelism so the fused kernel's 190 KB stack
-                        pressure isn't amortized across calls).
+     AX_SDPA_FUSED=1     → force fused
+     AX_SDPA_FUSED=0     → force materialized
+     AX_SDPA_FUSED=auto  → shape-dispatched: fused when BH != NT, materialized
+                           when BH == NT (the known regression case per
+                           plan.md where each thread owns exactly one head)
+     unset               → materialized (same as =0; conservative default)
 
-   fused bench deltas measured post-OMP_PROC_BIND wins (see plan.md / F4 doc):
-     B8_S128  (BH=64, NT=16): -10% (win)
-     B4_S512  (BH=48, NT=16): -2%  (win)
-     B2_S1024 (BH=24, NT=16): -1%  (win)
-     B1_S512  (BH=16, NT=16): +12% (LOSS → dispatch to materialized)
-     B1_S2048 (BH=12, NT=16): -1%  (win — inner parallelism amortizes stack)
+   the default was briefly flipped to shape-auto in a2891a3 based on
+   plan.md's bench table that showed fused -10% on B8_S128. subsequent
+   bench on 2026-04-24 at ~2 AM local, with lower bg load, measured
+   fused ~flat or marginally slower than materialized on B8_S128 at
+   the current post-F.3.c code state — plan.md's numbers appear to
+   have drifted relative to the current kernel. reverted to
+   materialized default; users can opt into shape-dispatch with
+   AX_SDPA_FUSED=auto or force-enable with AX_SDPA_FUSED=1 after
+   measuring locally.
 
-   on AVX-512 hosts (not available locally) the fused 14x32 kernel may have
-   a different stack pressure profile; revisit the BH == NT dispatch rule
-   when bench data from an AVX-512 runner is available. */
+   BH=16=NT regression case still handled by =auto dispatch. */
 static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
-    /* cache env parse once. -2 = uninitialised, -1 = auto,
-       0 = force off, 1 = force on. */
+    /* cache env parse once. -2 = uninitialised, 0 = force off (default),
+       1 = force on, 2 = shape-dispatched auto. */
     static int env_mode = -2;
     if (env_mode == -2) {
         const char *env = getenv("AX_SDPA_FUSED");
         if (env) {
             if (env[0] == '1') env_mode = 1;
-            else if (env[0] == '0') env_mode = 0;
-            else env_mode = -1;
+            else if (env[0] == 'a' || env[0] == 'A') env_mode = 2;
+            else env_mode = 0;
         } else {
-            env_mode = -1;
+            env_mode = 0;
         }
     }
 
