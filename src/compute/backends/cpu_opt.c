@@ -4926,6 +4926,333 @@ static inline void attn_bwd_kj_block(
     }
 }
 
+/* I.1.c: Flash-Attention-2 style fused backward.
+
+   the materialized variant (attn_bwd_kj_block above) computes the full
+   P/dP/dS tiles into TLS scratch (~64 KB each = 192 KB total). on hosts
+   where L1d is smaller than the working set (Alder Lake L1d = 48 KB,
+   most x86 L1d ≤ 64 KB) the tiles spill to L2 between stages, so each
+   "read P_tile for dV" / "compute dS reads P_tile + dP_tile" / "pack
+   dS_tile for dQ / strided dK" pays L2 latency.
+
+   FA-2 fusion: do everything per MR-row strip (P_strip, dP_strip,
+   dS_strip ≈ MR * Bk floats each, fits L1 even at Bk=128). per strip,
+   one pass through: P → contribute to dV → dP → dS → dQ row → contribute
+   to dK. P/dP/dS never written to TLS scratch — they live in stack
+   arrays that stay hot in L1.
+
+   floating-point work is identical to the materialized variant. the
+   savings come from (a) removing 3 × Bq×Bk write+read traffic to L2
+   and (b) keeping the strips' scratch in L1 across the 5 inner GEMMs
+   per strip. plan estimate: 20-30% on bwd time when sdpa_bwd dominates.
+
+   gated behind AX_SDPA_FUSED env var initially for A/B testing; once
+   bench data confirms the win on a representative host this becomes
+   the default and the materialized variant becomes the fallback for
+   tiny shapes where strip-overhead exceeds the cache win.
+
+   for the partial-strip case (mr < GEMM_MR, edge of Bq), the strided-A
+   JIT kernel is unavailable (it only emits full MR×NR tiles); we fall
+   back to pack_a_t + micro_kernel as the materialized variant does. */
+static inline void attn_bwd_kj_block_fused(
+    int64_t kj, int64_t S, int64_t dk, int64_t dk_np, float scale,
+    bool causal, const float *L, const float *Di,
+    const float *Q, const float *K, const float *V, const float *dO,
+    const float *P_saved_head,
+    bool use_prepack,
+    const float *Q_pa, const float *Q_pb,
+    const float *dO_pa, const float *dO_pb,
+    float *Kt_packed, float *Vt_packed, float *K_packed,
+    float *P_tile, float *dP_tile, float *dS_tile,
+    float *pa, float *pb,
+    float *dQ_dest, float *dK, float *dV)
+{
+    int64_t Bk    = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
+    int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+    int64_t Bk_p  = ((Bk + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+    /* unused in this variant — accepted only for ABI parity with
+       attn_bwd_kj_block so the dispatch site doesn't fork its
+       parameter pack. */
+    (void)P_tile; (void)dP_tile; (void)dS_tile;
+
+    /* per-kj-block packing — same as materialized variant. */
+    if (!P_saved_head) {
+        pack_b_t(K + kj * dk, dk, dk, Bk_np, Bk, Kt_packed);
+        attn_scale_packed(Kt_packed, dk * Bk_np, scale);
+    }
+    pack_b_t(V + kj * dk, dk, dk, Bk_np, Bk, Vt_packed);
+    pack_b(K + kj * dk, dk, Bk, dk_np, dk, K_packed);
+
+    for (int64_t qi = 0; qi < S; qi += ATTN_BQ) {
+        int64_t Bq   = (qi + ATTN_BQ <= S) ? ATTN_BQ : (S - qi);
+        if (causal && qi + Bq - 1 < kj) continue;
+
+        /* per-strip GEMM kernel for dV / dK — kc=GEMM_MR full tile.
+           the kernel emits per-kc unrolled bodies; with kc=MR fixed
+           we hit the same JIT cache slot every strip. */
+#if defined(AX_SIMD_AVX512) && !defined(AX_NO_JIT)
+        ax_jit_gemm_zmm_stridedA_kernel_fn fn_strip = NULL;
+        fn_strip = ax_jit_gemm_avx512_get_14x32_stridedA_kc(GEMM_MR);
+#elif defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+        ax_jit_gemm_stridedA_kernel_fn fn_strip = NULL;
+        fn_strip = ax_jit_gemm_avx2_get_6x16_stridedA_kc(GEMM_MR);
+#else
+        void *fn_strip = NULL;
+#endif
+
+        for (int64_t ir = 0; ir < Bq; ir += GEMM_MR) {
+            int64_t mr   = (ir + GEMM_MR <= Bq) ? GEMM_MR : (Bq - ir);
+            int64_t mr_p = ((mr + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+            /* stack-resident strip scratch — total ~3 * MR * BK_MAX ≤ 18 KB on
+               AVX-512, fits L1d on every host we target. */
+            float P_strip[GEMM_MR * ATTN_BK_MAX]  __attribute__((aligned(64)));
+            float dP_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
+            float dS_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
+            float score_strip[GEMM_MR * ATTN_BK_MAX] __attribute__((aligned(64)));
+            float a_q[GEMM_MR * ATTN_MAX_DK] __attribute__((aligned(64)));
+
+            /* === STEP 1: compute P_strip [mr, Bk] =================== */
+            if (causal && qi + ir + mr - 1 < kj) {
+                /* whole strip in future — zero P so it contributes
+                   nothing to dV / dK / dQ updates below. */
+                memset(P_strip, 0, (size_t)(mr * Bk) * sizeof(float));
+            } else if (P_saved_head) {
+                /* fast path: read post-mask pre-softmax scores from the
+                   forward-saved buffer; just exp-normalize per row. */
+                for (int64_t r = 0; r < mr; r++) {
+                    if (causal && qi + ir + r < kj) {
+                        memset(P_strip + r * Bk, 0, (size_t)Bk * sizeof(float));
+                        continue;
+                    }
+                    attn_bwd_softmax_row(P_saved_head + (qi + ir + r) * S + kj,
+                                         L[qi + ir + r],
+                                         P_strip + r * Bk, Bk);
+                }
+            } else {
+                /* recompute path: score = Q_strip @ Kt; mask if causal;
+                   P_strip = exp(score - L). */
+                bool need_mask = causal && (qi + ir < kj + Bk - 1);
+                const float *q_strip;
+                if (use_prepack) {
+                    q_strip = Q_pa + (qi + ir) * dk;
+                } else {
+                    pack_a(Q + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
+                    q_strip = a_q;
+                }
+                memset(score_strip, 0, (size_t)(mr * Bk) * sizeof(float));
+                for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
+                    int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
+                    if (nr <= 0) break;
+                    micro_kernel(dk, q_strip, Kt_packed + jr * dk,
+                                 score_strip + jr, Bk, mr, nr);
+                }
+                if (need_mask) {
+                    for (int64_t r = 0; r < mr; r++)
+                        attn_apply_causal_mask(score_strip + r * Bk,
+                                                qi + ir + r, kj, Bk);
+                }
+                for (int64_t r = 0; r < mr; r++) {
+                    attn_bwd_softmax_row(score_strip + r * Bk, L[qi + ir + r],
+                                          P_strip + r * Bk, Bk);
+                }
+            }
+
+            /* === STEP 2: dV[kj_block, :] += P_strip^T @ dO_strip =====
+               kc = mr (this strip's row count). output tile is the FULL
+               dV[kj : kj+Bk, :] slice, written incrementally over all
+               strips (each strip contributes mr K-iters). per-strip JIT
+               call when full-tile, pack_a_t + micro_kernel fallback for
+               edge tiles. */
+            for (int64_t dir = 0; dir < Bk_p; dir += GEMM_MR) {
+                int64_t dmr = (dir + GEMM_MR <= Bk) ? GEMM_MR : (Bk > dir ? Bk - dir : 0);
+                if (dmr <= 0) break;
+                for (int64_t djr = 0; djr < dk_np; djr += GEMM_NR) {
+                    int64_t dnr = (djr + GEMM_NR <= dk) ? GEMM_NR : (dk > djr ? dk - djr : 0);
+                    if (dnr <= 0) break;
+                    const float *b_ptr = use_prepack
+                        ? (dO_pb + djr * S + (qi + ir) * GEMM_NR)
+                        : NULL;  /* non-prepack handled by pack-fallback */
+#if (defined(AX_SIMD_AVX512) || (defined(AX_SIMD_AVX2) && !defined(AX_CPU_OPT_SUFFIX_avx512))) && !defined(AX_NO_JIT)
+                    if (fn_strip && mr == GEMM_MR && dmr == GEMM_MR && dnr == GEMM_NR
+                        && use_prepack) {
+                        fn_strip(mr,
+                                 P_strip + dir, Bk * (int64_t)sizeof(float),
+                                 b_ptr,
+                                 dV + (kj + dir) * dk + djr,
+                                 dk * (int64_t)sizeof(float));
+                        continue;
+                    }
+#endif
+                    /* fallback: pack the [dmr, mr] slice of P_strip^T
+                       (= P_strip's columns dir..dir+dmr stacked as MR
+                       rows, kc=mr). then micro_kernel + dO from pb. */
+                    float pa_local[GEMM_MR * GEMM_MR] __attribute__((aligned(64)));
+                    /* pack: pa_local[k * GEMM_MR + i] = P_strip[k, dir+i] for k in 0..mr, i in 0..dmr (zero-pad i>=dmr) */
+                    for (int64_t k = 0; k < mr; k++) {
+                        int64_t i = 0;
+                        for (; i < dmr; i++) {
+                            pa_local[k * GEMM_MR + i] = P_strip[k * Bk + dir + i];
+                        }
+                        for (; i < GEMM_MR; i++) {
+                            pa_local[k * GEMM_MR + i] = 0.0f;
+                        }
+                    }
+                    /* dO B-operand: prepack uses dO_pb at stride S floats per col
+                       block; non-prepack would need a per-strip pack into pb here. */
+                    if (use_prepack) {
+                        micro_kernel(mr, pa_local, b_ptr,
+                                     dV + (kj + dir) * dk + djr, dk, dmr, dnr);
+                    } else {
+                        /* one-shot per-strip pack of dO into stack scratch */
+                        float pb_local[ATTN_MAX_DK * GEMM_NR] __attribute__((aligned(64)));
+                        pack_b(dO + (qi + ir) * dk, dk, mr, GEMM_NR, dnr,
+                               pb_local + djr * mr);
+                        /* note: pb_local lays out one column block at a time;
+                           offset for column block djr is djr*mr in pb_local but
+                           that's wrong — pack_b expects a pre-sized buffer for the
+                           whole nc range. simpler: pack_b for just this (djr) col
+                           block into a fresh scratch. */
+                        micro_kernel(mr, pa_local,
+                                     pb_local /* col block at offset 0 */,
+                                     dV + (kj + dir) * dk + djr, dk, dmr, dnr);
+                    }
+                }
+            }
+
+            /* === STEP 3: dP_strip = dO_strip @ V^T ==================
+               dO_strip: [mr, dk], Vt_packed: B-operand [dk, Bk_np] packed.
+               output: dP_strip [mr, Bk] (stack). */
+            const float *do_strip;
+            if (use_prepack) {
+                do_strip = dO_pa + (qi + ir) * dk;
+            } else {
+                pack_a(dO + (qi + ir) * dk, dk, mr_p, dk, mr, a_q);
+                do_strip = a_q;
+            }
+            memset(dP_strip, 0, (size_t)(mr * Bk) * sizeof(float));
+            for (int64_t jr = 0; jr < Bk_np; jr += GEMM_NR) {
+                int64_t nr = (jr + GEMM_NR <= Bk) ? GEMM_NR : (Bk > jr ? Bk - jr : 0);
+                if (nr <= 0) break;
+                micro_kernel(dk, do_strip, Vt_packed + jr * dk,
+                             dP_strip + jr, Bk, mr, nr);
+            }
+
+            /* === STEP 4: dS_strip = P_strip * (dP_strip - Di) * scale === */
+            for (int64_t r = 0; r < mr; r++) {
+                float di = Di[qi + ir + r];
+                float *pr  = P_strip  + r * Bk;
+                float *dpr = dP_strip + r * Bk;
+                float *dsr = dS_strip + r * Bk;
+                int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+                ax_vf32 vdi = ax_vf32_set1(di), vsc = ax_vf32_set1(scale);
+                int64_t bve = Bk - (Bk % AX_VF32_WIDTH);
+                for (; j < bve; j += AX_VF32_WIDTH) {
+                    ax_vf32 p  = ax_vf32_loadu(pr + j);
+                    ax_vf32 dp = ax_vf32_loadu(dpr + j);
+                    ax_vf32_storeu(dsr + j, ax_vf32_mul(ax_vf32_mul(p, ax_vf32_sub(dp, vdi)), vsc));
+                }
+#endif
+                for (; j < Bk; j++) dsr[j] = pr[j] * (dpr[j] - di) * scale;
+            }
+
+            /* === STEP 5: dQ_dest[qi+ir : qi+ir+mr, :] += dS_strip @ K ===
+               dS_strip is [mr, Bk] row-major. pack into pa scratch (TLS,
+               mr_p * Bk floats, well under pa_want), then micro_kernel
+               with K_packed for each NR column block of dk. */
+            pack_a(dS_strip, Bk, mr_p, Bk, mr, pa);
+            for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
+                int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
+                if (nr <= 0) break;
+                micro_kernel(Bk, pa, K_packed + jr * Bk,
+                             dQ_dest + (qi + ir) * dk + jr, dk, mr, nr);
+            }
+
+            /* === STEP 6: dK[kj_block, :] += dS_strip^T @ Q_strip =====
+               same shape / dispatch as STEP 2 but with dS_strip as A and
+               Q (via Q_pb prepack or per-strip pack) as B. */
+            for (int64_t dir = 0; dir < Bk_p; dir += GEMM_MR) {
+                int64_t dmr = (dir + GEMM_MR <= Bk) ? GEMM_MR : (Bk > dir ? Bk - dir : 0);
+                if (dmr <= 0) break;
+                for (int64_t djr = 0; djr < dk_np; djr += GEMM_NR) {
+                    int64_t dnr = (djr + GEMM_NR <= dk) ? GEMM_NR : (dk > djr ? dk - djr : 0);
+                    if (dnr <= 0) break;
+                    const float *b_ptr = use_prepack
+                        ? (Q_pb + djr * S + (qi + ir) * GEMM_NR)
+                        : NULL;
+#if (defined(AX_SIMD_AVX512) || (defined(AX_SIMD_AVX2) && !defined(AX_CPU_OPT_SUFFIX_avx512))) && !defined(AX_NO_JIT)
+                    if (fn_strip && mr == GEMM_MR && dmr == GEMM_MR && dnr == GEMM_NR
+                        && use_prepack) {
+                        fn_strip(mr,
+                                 dS_strip + dir, Bk * (int64_t)sizeof(float),
+                                 b_ptr,
+                                 dK + (kj + dir) * dk + djr,
+                                 dk * (int64_t)sizeof(float));
+                        continue;
+                    }
+#endif
+                    /* fallback (mirror of STEP 2 fallback) */
+                    float pa_local[GEMM_MR * GEMM_MR] __attribute__((aligned(64)));
+                    for (int64_t k = 0; k < mr; k++) {
+                        int64_t i = 0;
+                        for (; i < dmr; i++) {
+                            pa_local[k * GEMM_MR + i] = dS_strip[k * Bk + dir + i];
+                        }
+                        for (; i < GEMM_MR; i++) {
+                            pa_local[k * GEMM_MR + i] = 0.0f;
+                        }
+                    }
+                    if (use_prepack) {
+                        micro_kernel(mr, pa_local, b_ptr,
+                                     dK + (kj + dir) * dk + djr, dk, dmr, dnr);
+                    } else {
+                        float pb_local[ATTN_MAX_DK * GEMM_NR] __attribute__((aligned(64)));
+                        pack_b(Q + (qi + ir) * dk, dk, mr, GEMM_NR, dnr, pb_local);
+                        micro_kernel(mr, pa_local, pb_local,
+                                     dK + (kj + dir) * dk + djr, dk, dmr, dnr);
+                    }
+                }
+            }
+        }
+    }
+
+    /* unused params silenced for the !AX_HAS_SIMD configurations */
+    (void)pa; (void)pb;
+}
+
+/* I.1.c dispatch: function-pointer indirection between the materialized
+   variant and the FA-2 fused variant. selected once per process at
+   first call, gated by AX_SDPA_FUSED env var. once bench data on a
+   representative host confirms the win this becomes the default and
+   the env var becomes the opt-out. */
+typedef void (*ax_attn_bwd_kj_fn_t)(
+    int64_t kj, int64_t S, int64_t dk, int64_t dk_np, float scale,
+    bool causal, const float *L, const float *Di,
+    const float *Q, const float *K, const float *V, const float *dO,
+    const float *P_saved_head,
+    bool use_prepack,
+    const float *Q_pa, const float *Q_pb,
+    const float *dO_pa, const float *dO_pb,
+    float *Kt_packed, float *Vt_packed, float *K_packed,
+    float *P_tile, float *dP_tile, float *dS_tile,
+    float *pa, float *pb,
+    float *dQ_dest, float *dK, float *dV);
+
+static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(void) {
+    static int initialized = 0;
+    static ax_attn_bwd_kj_fn_t impl = NULL;
+    if (!initialized) {
+        const char *env = getenv("AX_SDPA_FUSED");
+        impl = (env && env[0] == '1')
+            ? (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block_fused
+            : (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block;
+        initialized = 1;
+    }
+    return impl;
+}
+
 /* I.1.b: number of inner threads to allocate per attn_bwd_head call.
    when BH < NT we have spare threads (NT/BH each); use them to
    parallelize the kj loop with a per-thread dQ accumulator + final
@@ -4949,6 +5276,9 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                            int64_t S, int64_t dk, float scale, bool causal,
                            const float *P_saved_head, int n_inner)
 {
+    /* I.1.c: pick the kj-block implementation once per call. */
+    ax_attn_bwd_kj_fn_t kj_impl = ax_attn_bwd_get_impl();
+
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bq_p_max = ((ATTN_BQ + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
@@ -5013,7 +5343,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
        branch and is byte-identical to the pre-I.1.b code path. */
     if (n_inner <= 1) {
         for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
-            attn_bwd_kj_block(kj, S, dk, dk_np, scale, causal,
+            kj_impl(kj, S, dk, dk_np, scale, causal,
                               L, Di, Q, K, V, dO, P_saved_head,
                               use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                               Kt_packed, Vt_packed, K_packed,
@@ -5027,7 +5357,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
         if (!dQ_pool) {
             /* alloc failed — fall back to serial. */
             for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
-                attn_bwd_kj_block(kj, S, dk, dk_np, scale, causal,
+                kj_impl(kj, S, dk, dk_np, scale, causal,
                                   L, Di, Q, K, V, dO, P_saved_head,
                                   use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                                   Kt_packed, Vt_packed, K_packed,
@@ -5053,7 +5383,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                 if (Kt_p_x && Vt_p_x && K_p_x && P_x && dP_x && dS_x && pa_x && pb_x) {
                     #pragma omp for schedule(static)
                     for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
-                        attn_bwd_kj_block(kj, S, dk, dk_np, scale, causal,
+                        kj_impl(kj, S, dk, dk_np, scale, causal,
                                           L, Di, Q, K, V, dO, P_saved_head,
                                           use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                                           Kt_p_x, Vt_p_x, K_p_x,
@@ -5082,7 +5412,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
 #else
         /* no openmp — fall through to serial. */
         for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
-            attn_bwd_kj_block(kj, S, dk, dk_np, scale, causal,
+            kj_impl(kj, S, dk, dk_np, scale, causal,
                               L, Di, Q, K, V, dO, P_saved_head,
                               use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                               Kt_packed, Vt_packed, K_packed,
