@@ -4822,7 +4822,14 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                write+read traffic per tile per call.
                edge tiles (mr<MR or nr<NR) keep the pack_a_t + micro_kernel
                path; the JIT only handles full MR×NR. */
-#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+#if defined(AX_SIMD_AVX512) && !defined(AX_NO_JIT)
+            /* AVX-512 build (single or ISA-suffix avx512) — 14x32 strided */
+            ax_jit_gemm_zmm_stridedA_kernel_fn fn_stridedA = NULL;
+            if (Bq >= 1 && Bq <= 256) {
+                fn_stridedA = ax_jit_gemm_avx512_get_14x32_stridedA_kc(Bq);
+            }
+#elif defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+            /* AVX2 build (single or ISA-suffix avx2) — 6x16 strided */
             ax_jit_gemm_stridedA_kernel_fn fn_stridedA = NULL;
             if (Bq >= 1 && Bq <= 256) {
                 fn_stridedA = ax_jit_gemm_avx2_get_6x16_stridedA_kc(Bq);
@@ -4848,7 +4855,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                     const float *b_ptr = use_prepack
                         ? (dO_pb + jr * S + qi * GEMM_NR)
                         : (pb + jr * Bq);
-#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+#if (defined(AX_SIMD_AVX512) || (defined(AX_SIMD_AVX2) && !defined(AX_CPU_OPT_SUFFIX_avx512))) && !defined(AX_NO_JIT)
                     if (fn_stridedA && mr == GEMM_MR && nr == GEMM_NR) {
                         /* P_tile + ir = first column of this MR strip in
                            row-major; lda = Bk floats = Bk*4 bytes. */
@@ -4917,7 +4924,12 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
             }
 
             /* dK += dS^T @ Q. phase i.1.a: same JIT strided-A trick as dV. */
-#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+#if defined(AX_SIMD_AVX512) && !defined(AX_NO_JIT)
+            ax_jit_gemm_zmm_stridedA_kernel_fn fn_stridedA_dk = NULL;
+            if (Bq >= 1 && Bq <= 256) {
+                fn_stridedA_dk = ax_jit_gemm_avx512_get_14x32_stridedA_kc(Bq);
+            }
+#elif defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
             ax_jit_gemm_stridedA_kernel_fn fn_stridedA_dk = NULL;
             if (Bq >= 1 && Bq <= 256) {
                 fn_stridedA_dk = ax_jit_gemm_avx2_get_6x16_stridedA_kc(Bq);
@@ -4942,7 +4954,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                     const float *b_ptr = use_prepack
                         ? (Q_pb + jr * S + qi * GEMM_NR)
                         : (pb + jr * Bq);
-#if defined(AX_SIMD_AVX2) && !defined(AX_NO_JIT) && !defined(AX_CPU_OPT_SUFFIX_avx512)
+#if (defined(AX_SIMD_AVX512) || (defined(AX_SIMD_AVX2) && !defined(AX_CPU_OPT_SUFFIX_avx512))) && !defined(AX_NO_JIT)
                     if (fn_stridedA_dk && mr == GEMM_MR && nr == GEMM_NR) {
                         fn_stridedA_dk(Bq,
                                        dS_tile + ir, Bk * (int64_t)sizeof(float),

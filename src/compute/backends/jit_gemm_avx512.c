@@ -102,3 +102,128 @@ ax_jit_gemm_zmm_kernel_fn ax_jit_gemm_avx512_get_14x32(void) {
 bool ax_jit_gemm_avx512_available(void) {
     return ax_jit_gemm_avx512_get_14x32() != NULL;
 }
+
+/* ====================================================================
+   strided-A 14x32 variant — see header. per-kc unrolled, lazy-init,
+   cached. abi:
+     rdi = kc       (unrolled, consumed at emit time — runtime arg ignored)
+     rsi = ap       (advances by lda_bytes per K iter)
+     rdx = lda_bytes (runtime — used to bump rsi between K iters)
+     rcx = bp       (B base; per-K-iter offsets baked as immediates)
+     r8  = c base
+     r9  = ldc_bytes
+   register layout matches the packed kernel (zmm0..zmm27 = 28 acc,
+   zmm28 = a bcast, zmm29/30 = b loads, zmm31 = wb scratch).
+   no callee-saved gprs touched — rax used as roving writeback ptr.
+   ==================================================================== */
+
+#define KC_MIN 1
+#define KC_MAX 256
+
+static ax_jit_gemm_zmm_stridedA_kernel_fn
+g_kernel_kc_fns_stridedA_512[KC_MAX + 1] = {0};
+static ax_jit_buf_t *g_jit_kc_buf_stridedA_512[KC_MAX + 1] = {0};
+static pthread_mutex_t g_jit_kc_mu_stridedA_512 = PTHREAD_MUTEX_INITIALIZER;
+
+static void emit_one_kernel_14x32_stridedA_kc(ax_jit_buf_t *b, int64_t kc) {
+    /* zero accumulators zmm0..zmm27 */
+    for (int i = 0; i < 28; i++) ax_jit_emit_vxorps_zero_zmm(b, i);
+
+    /* fully unrolled K loop. b offset per K iter is k*NR*4 bytes (baked
+       as an immediate disp32). a is read from rsi which gets bumped by
+       rdx (lda_bytes) at the end of each iter. broadcasts use disp8
+       (+0..+52) so they stay short. */
+    for (int64_t k = 0; k < kc; k++) {
+        int b_off = (int)(k * NR * 4);
+        ax_jit_emit_vmovaps_load_zmm(b, /*dst*/29, /*base*/GPR_RCX, b_off);
+        ax_jit_emit_vmovaps_load_zmm(b, /*dst*/30, /*base*/GPR_RCX, b_off + 64);
+        for (int r = 0; r < MR; r++) {
+            ax_jit_emit_vbroadcastss_zmm(b, /*dst*/28, /*base*/GPR_RSI, r * 4);
+            ax_jit_emit_vfmadd231ps_zmm (b, /*dst*/2*r,     /*a=*/28, /*b=*/29);
+            ax_jit_emit_vfmadd231ps_zmm (b, /*dst*/2*r + 1, /*a=*/28, /*b=*/30);
+        }
+        /* advance rsi by lda_bytes (rdx) to point at next A row */
+        ax_jit_emit_add_r64_r64(b, GPR_RSI, GPR_RDX);
+    }
+
+    /* writeback: rax = c base, then for each row accumulate [rax]+[rax+64]
+       with the two accumulator vectors and bump rax by ldc_bytes (r9). */
+    ax_jit_emit_mov_r64_r64(b, GPR_RAX, GPR_R8);
+
+    for (int r = 0; r < MR; r++) {
+        ax_jit_emit_vmovups_load_zmm (b, /*dst*/31, /*base*/GPR_RAX,  0);
+        ax_jit_emit_vaddps_zmm       (b, /*dst*/2*r,   /*a=*/2*r,   /*b=*/31);
+        ax_jit_emit_vmovups_store_zmm(b, /*base*/GPR_RAX,  0, /*src*/2*r);
+        ax_jit_emit_vmovups_load_zmm (b, /*dst*/31, /*base*/GPR_RAX, 64);
+        ax_jit_emit_vaddps_zmm       (b, /*dst*/2*r+1, /*a=*/2*r+1, /*b=*/31);
+        ax_jit_emit_vmovups_store_zmm(b, /*base*/GPR_RAX, 64, /*src*/2*r+1);
+        if (r < MR - 1) {
+            ax_jit_emit_add_r64_r64(b, GPR_RAX, GPR_R9);
+        }
+    }
+
+    ax_jit_emit_ret(b);
+}
+
+ax_jit_gemm_zmm_stridedA_kernel_fn
+ax_jit_gemm_avx512_get_14x32_stridedA_kc(int64_t kc) {
+    if (kc < KC_MIN || kc > KC_MAX) return NULL;
+
+    /* lock-free hot path: aligned pointer load is atomic on x86. mutex
+       on slow path provides the release fence. */
+    ax_jit_gemm_zmm_stridedA_kernel_fn cached =
+        g_kernel_kc_fns_stridedA_512[kc];
+    if (cached) return cached;
+
+    pthread_mutex_lock(&g_jit_kc_mu_stridedA_512);
+    cached = g_kernel_kc_fns_stridedA_512[kc];
+    if (cached) {
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA_512);
+        return cached;
+    }
+
+    /* byte budget per K iter (worst case, b offsets in disp32 range):
+         2 vmovaps load_zmm:   2 × 10 = 20
+         14 vbroadcastss_zmm:  14 × 9 = 126
+         28 vfmadd231ps_zmm:   28 × 7 = 196
+         1 add r64,r64:                  3
+         subtotal:                     345
+         safety pad:                    35
+         ─── ~380 B/iter
+       fixed cost (zero 28 acc + writeback ~14 rows × 4 ops + ret):
+         28 vxorps_zero:        ~120 B
+         14 wb rows × ~32 B:    ~450 B
+         + mov rax,r8 + ret:     ~10 B
+         total fixed:           ~600 B
+       safety pad:               412 B */
+    size_t per_kc_need = (size_t)kc * 380 + 1024;
+    ax_jit_buf_t *buf = ax_jit_buf_create(per_kc_need);
+    if (!buf) {
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA_512);
+        return NULL;
+    }
+
+    size_t before_pos = buf->pos;
+    emit_one_kernel_14x32_stridedA_kc(buf, kc);
+    /* defensive: kernel must end with RET (0xC3); zero-pad fall-through
+       would SEGV. */
+    if (buf->pos == before_pos
+        || buf->base[buf->pos - 1] != 0xC3
+        || buf->pos > buf->capacity) {
+        ax_jit_buf_destroy(buf);
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA_512);
+        return NULL;
+    }
+    if (!ax_jit_buf_make_executable(buf)) {
+        ax_jit_buf_destroy(buf);
+        pthread_mutex_unlock(&g_jit_kc_mu_stridedA_512);
+        return NULL;
+    }
+
+    g_jit_kc_buf_stridedA_512[kc]  = buf;
+    cached = (ax_jit_gemm_zmm_stridedA_kernel_fn)ax_jit_buf_entry(buf);
+    /* publish — release fence via the mutex unlock below */
+    g_kernel_kc_fns_stridedA_512[kc] = cached;
+    pthread_mutex_unlock(&g_jit_kc_mu_stridedA_512);
+    return cached;
+}
