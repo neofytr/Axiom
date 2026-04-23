@@ -5331,15 +5331,25 @@ static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack) {
 }
 
 /* I.1.b: number of inner threads to allocate per attn_bwd_head call.
-   when BH < NT we have spare threads (NT/BH each); use them to
-   parallelize the kj loop with a per-thread dQ accumulator + final
-   reduction. when BH >= NT (the common case — B8_S128 BH=64 etc.)
-   returns 1 and the existing serial loop runs unchanged. */
+   when BH < NT we have spare threads; use them to parallelize the
+   kj loop with a per-thread dQ accumulator + final reduction. when
+   BH >= NT (the common case — B8_S128 BH=64 etc.) returns 1 and the
+   existing serial loop runs unchanged.
+
+   ceiling semantics: when BH doesn't divide NT evenly (e.g. NT=16,
+   BH=12), floor=1 leaves 4 spare threads idle. ceil=2 oversubscribes
+   the kj-parallel inner team (12 heads * 2 inner threads = 24
+   thread-tasks for 16 cores) but the OMP dispatcher absorbs the
+   excess via round-robin scheduling onto cores that finished their
+   outer-loop tasks. measured -3% on mha_train_B1_S2048_D768_H12
+   (BH=12) on i5-12500H AVX2, no impact on the other bench shapes
+   where BH is either an exact multiple or ≥ NT. */
 static inline int ax_attn_bwd_inner_threads(int64_t BH) {
 #ifdef _OPENMP
     int max_t = omp_get_max_threads();
     if (max_t < 2 || BH < 1) return 1;
-    int n_inner = (int)(max_t / BH);
+    /* ceil(max_t / BH) — captures the spare threads when BH < NT */
+    int n_inner = (int)((max_t + BH - 1) / BH);
     return n_inner < 1 ? 1 : n_inner;
 #else
     (void)BH;
