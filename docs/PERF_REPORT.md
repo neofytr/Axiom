@@ -329,3 +329,46 @@ failing since April 17. Pre-dates this work; tracked as Phase G.
 | C4 | Wire `cublasSgemmStridedBatched` for batched conv (fold N into the batch dim) | conv throughput at large batch |
 | C5 | Multi-stream pipeline (overlap H2D, compute, D2H) for inference loops | 10-15 % throughput gain on inference |
 | C6 | Optional: cuDNN convolution backend if license-compatible | fastest conv path |
+
+## A (deferred): dwqkv fused kernel — analysis + decision
+
+**Profile (post Phase I, B8_S128_D512_H8, x86 AVX2)**: dwqkv is now 35 %
+of mha_bwd time. It runs `gemm_tn`(x_flat^T, dQKV) → `[D, 3D]`
+intermediate, then 3 ACC_PARAM SIMD passes split + accumulate the
+intermediate's columns into Wq/Wk/Wv grad tensors. The intermediate
+materialisation is `D × 3D × 4 bytes` ≈ 6 MB write + 6 MB read.
+
+**Best-case win from a fused multi-output kernel**: ~3 ms / call on
+B8_S128 (saves the intermediate's write+read traffic). That's ~7 %
+of the current TF gap (-32 % → -25 %). On larger shapes (B1_S2048)
+the per-shape impact is even smaller because dwqkv is only 21 % of
+bwd there, not 35 %.
+
+**Implementation cost**: a correct fused `gemm_tn_3split_acc` is
+either:
+1. A custom multi-output GEMM kernel (~300 LOC, with all the
+   tile-edge / packing / SIMD-ISA-dispatch surface that opt_gemm_tn
+   already has — duplicates ~half of cpu_opt.c's gemm code path).
+2. Adding strided-B support to `opt_gemm_tn` so 3 separate calls
+   can each take a column-strided view of the original interleaved
+   dQKV without an intermediate copy. Touches the gemm hot path —
+   high regression risk for the rest of the suite (27 GEMM cases
+   currently green).
+
+**TF's structural advantage**: TF's `bench_mha_train` comparison is
+bench-fair on the trainable-only side (Axiom's bench in
+`benchmarks/bench_mha.c:124-128` already skips dX-through-QKV-input
+to match), so the remaining gap is genuinely TF's tuned oneDNN
+micro-kernels at the same shape — not a comparison artefact. Closing
+that needs either matching oneDNN's tile-decomposition or accepting
+the gap.
+
+**Decision**: deferred. The 7 % win-share for ~300 LOC of high-risk
+new kernel code is poor ROI compared to the M+N infrastructure work
+and the existing well-tested gemm_tn path. Reopen if a future shape
+emerges where dwqkv is the dominant bottleneck (e.g. very wide D
+with no other contributions), or if Axiom adds an AVX-512 host
+where the same kernel shape lands at higher throughput.
+
+Tracked as task #130 with this rationale; `git log --grep='dwqkv'` for
+follow-up notes when re-explored.
