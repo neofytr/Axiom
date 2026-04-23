@@ -34,6 +34,7 @@
 
 #include <math.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -193,6 +194,26 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
     int64_t rows = B * S;
     int64_t bh   = B * H;
 
+    /* per-stage profile, gated on AX_PROFILE_MHA=1. summed across many
+       calls so the printf cost is amortised. mirrors the mha_backward
+       profile in attention.c so the two paths can be A/B'd directly. */
+    static int prof_enabled = -1;
+    if (prof_enabled < 0)
+        prof_enabled = (getenv("AX_PROFILE_MHA") && getenv("AX_PROFILE_MHA")[0] == '1') ? 1 : 0;
+    static __thread uint64_t pf_qkv=0, pf_split=0, pf_sdpa=0, pf_deint=0,
+                              pf_wo=0, pf_dout=0, pf_wog=0, pf_dattn=0,
+                              pf_hint=0, pf_sdpab=0, pf_dqkv_merge=0,
+                              pf_dwqkv=0, pf_dbqkv=0;
+    static __thread int pf_calls = 0;
+#if defined(__x86_64__) || defined(_M_X64)
+    #define PF_TICK() ((uint64_t)__builtin_ia32_rdtsc())
+#elif defined(__aarch64__)
+    #define PF_TICK() ({ uint64_t _v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(_v)); _v; })
+#else
+    #define PF_TICK() ((uint64_t)0)
+#endif
+    uint64_t pf_t0;
+
     ax_arena_t *arena = get_scratch_arena();
     if (!arena) {
         ax_err_set(AX_ERR_ALLOC, "train_step: scratch arena alloc failed");
@@ -225,7 +246,9 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
 
     ax_tensor_t *qkv = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
     if (!qkv) return AX_ERR_ALLOC;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     if (ax_compute_gemm(&x_flat_v, m->Wqkv_cache, qkv) != AX_OK) return AX_ERR_BACKEND;
+    if (prof_enabled) pf_qkv += PF_TICK() - pf_t0;
 
     /* head-split + (optional) bias add → Qh, Kh, Vh [bh, S, dk] each */
     ax_tensor_t *Qh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
@@ -233,6 +256,7 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
     ax_tensor_t *Vh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!Qh || !Kh || !Vh) return AX_ERR_ALLOC;
 
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     if (m->use_bias) {
         ax_attn_head_interleave_qkv_split_bias(
             (const float *)qkv->storage->data,
@@ -249,6 +273,7 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
             (float *)Vh->storage->data,
             B, S, H, dk, D);
     }
+    if (prof_enabled) pf_split += PF_TICK() - pf_t0;
 
     /* SDPA forward — saves L (always) and optionally P */
     ax_tensor_t *Oh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
@@ -272,6 +297,7 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
     float scale = 1.0f / sqrtf((float)dk);
     float *P_save_ptr = P_save_t ? (float *)P_save_t->storage->data : NULL;
 
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     ax_fused_attention_fwd_save(
         (const float *)Qh->storage->data,
         (const float *)Kh->storage->data,
@@ -280,15 +306,19 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         (float *)L_t->storage->data,
         P_save_ptr,
         bh, S, dk, scale, m->causal);
+    if (prof_enabled) pf_sdpa += PF_TICK() - pf_t0;
 
     /* head-merge → attn_flat [rows, D] */
     ax_tensor_t *attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
     if (!attn_flat) return AX_ERR_ALLOC;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     ax_attn_head_deinterleave(
         (const float *)Oh->storage->data,
         (float *)attn_flat->storage->data, B, S, H, dk);
+    if (prof_enabled) pf_deint += PF_TICK() - pf_t0;
 
     /* output projection: y_flat = attn_flat @ Wo, then (+bo) */
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
     if (m->use_bias) {
         const float *bd = (const float *)m->bo->storage->data;
@@ -309,6 +339,7 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         }
     }
     ax_storage_touch(y_out->storage);
+    if (prof_enabled) pf_wo += PF_TICK() - pf_t0;
 
     /* ============================================================
        BACKWARD
@@ -319,6 +350,7 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
     ax_storage_t dout_flat_st;
     ax_tensor_t *dout_flat;
     ax_tensor_t *dout_owned = NULL;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     if (dout) {
         make_stack_view(&dout_flat_v, &dout_flat_st,
                          (const float *)dout->storage->data, rows, D);
@@ -329,11 +361,13 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         fill_f32((float *)dout_owned->storage->data, 1.0f, rows * D);
         dout_flat = dout_owned;
     }
+    if (prof_enabled) pf_dout += PF_TICK() - pf_t0;
 
     /* step 1 — output projection backward */
 
     /* dWo += attn_flat^T @ dout_flat. direct accumulate via skip_init,
        skipping the scratch alloc + add pass that mha_backward uses. */
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     if (m->Wo->requires_grad) {
         float *dWo = ensure_grad_ptr(m->Wo);
         if (dWo) {
@@ -354,23 +388,30 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         }
     }
 
+    if (prof_enabled) pf_wog += PF_TICK() - pf_t0;
+
     /* dattn = dout_flat @ Wo^T  →  [rows, D] */
     ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
     if (!d_attn_flat) return AX_ERR_ALLOC;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn_flat) != AX_OK) return AX_ERR_BACKEND;
+    if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
 
     /* step 2 — re-interleave heads + SDPA backward */
     ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!dO_head) return AX_ERR_ALLOC;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     ax_attn_head_interleave(
         (const float *)d_attn_flat->storage->data,
         (float *)dO_head->storage->data, B, S, H, dk);
+    if (prof_enabled) pf_hint += PF_TICK() - pf_t0;
 
     ax_tensor_t *dQh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *dKh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *dVh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!dQh || !dKh || !dVh) return AX_ERR_ALLOC;
 
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     ax_fused_attention_bwd_use(
         (const float *)Qh->storage->data,
         (const float *)Kh->storage->data,
@@ -383,16 +424,19 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         (float *)dKh->storage->data,
         (float *)dVh->storage->data,
         bh, S, dk, scale, m->causal);
+    if (prof_enabled) pf_sdpab += PF_TICK() - pf_t0;
 
     /* step 3 — head-deinterleave + merge → [rows, 3D] dQKV */
     ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
     if (!dQKV) return AX_ERR_ALLOC;
+    pf_t0 = prof_enabled ? PF_TICK() : 0;
     ax_attn_head_deinterleave_qkv_merge(
         (const float *)dQh->storage->data,
         (const float *)dKh->storage->data,
         (const float *)dVh->storage->data,
         (float *)dQKV->storage->data,
         B, S, H, dk, D);
+    if (prof_enabled) pf_dqkv_merge += PF_TICK() - pf_t0;
 
     /* step 4 — fused weight grad: dWqkv = x_flat^T @ dQKV → [D, 3D]
        then split columns into dWq / dWk / dWv. same pattern as
@@ -404,7 +448,9 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         int64_t dW_sh[] = {D, 3 * D};
         ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
         if (!dWqkv) return AX_ERR_ALLOC;
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
         if (ax_compute_gemm_tn(&x_flat_v, dQKV, dWqkv) != AX_OK) return AX_ERR_BACKEND;
+        if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
 
         const float *dw = (const float *)dWqkv->storage->data;
         #define ACC_PARAM(W, col_off) do {                                    \
@@ -453,6 +499,37 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
        @tf.function bench: tape.gradient(loss, mha.trainable_variables)
        prunes dX at compile time). callers needing dx should use the
        autograd path. */
+
+    if (prof_enabled) {
+        pf_calls++;
+        if ((pf_calls % 5) == 0) {
+            uint64_t total = pf_qkv + pf_split + pf_sdpa + pf_deint + pf_wo
+                           + pf_dout + pf_wog + pf_dattn + pf_hint + pf_sdpab
+                           + pf_dqkv_merge + pf_dwqkv + pf_dbqkv;
+            if (total > 0) {
+                fprintf(stderr,
+                    "axiom: mha_train_step [B=%ld S=%ld D=%ld H=%ld, %d calls] "
+                    "FWD: qkv=%.0f%% split=%.0f%% sdpa=%.0f%% deint=%.0f%% wo=%.0f%% "
+                    "BWD: dout=%.0f%% wog=%.0f%% dattn=%.0f%% hint=%.0f%% sdpab=%.0f%% "
+                    "merge=%.0f%% dwqkv=%.0f%% dbqkv=%.0f%%\n",
+                    (long)B, (long)S, (long)D, (long)H, pf_calls,
+                    100.0 * (double)pf_qkv         / (double)total,
+                    100.0 * (double)pf_split       / (double)total,
+                    100.0 * (double)pf_sdpa        / (double)total,
+                    100.0 * (double)pf_deint       / (double)total,
+                    100.0 * (double)pf_wo          / (double)total,
+                    100.0 * (double)pf_dout        / (double)total,
+                    100.0 * (double)pf_wog         / (double)total,
+                    100.0 * (double)pf_dattn       / (double)total,
+                    100.0 * (double)pf_hint        / (double)total,
+                    100.0 * (double)pf_sdpab       / (double)total,
+                    100.0 * (double)pf_dqkv_merge  / (double)total,
+                    100.0 * (double)pf_dwqkv       / (double)total,
+                    100.0 * (double)pf_dbqkv       / (double)total);
+            }
+        }
+    }
+    #undef PF_TICK
 
     return AX_OK;
 }
