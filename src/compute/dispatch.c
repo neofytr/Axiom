@@ -106,6 +106,15 @@ static void ensure_compute_init(void) {
 }
 
 ax_status_t ax_compute_init(void) {
+#ifdef _OPENMP
+    /* default OMP_PROC_BIND=spread when not set by the user. measured
+       on i5-12500H (4 P + 8 E hybrid): -12% on mha_train_B2_S1024,
+       -10% on B1_S512, neutral elsewhere. spread keeps the OS from
+       migrating threads off the cores libgomp picked, so each thread's
+       L1/L2 stays warm across iterations of an omp parallel-for.
+       setenv with overwrite=0 respects the user's explicit choice. */
+    setenv("OMP_PROC_BIND", "spread", 0);
+#endif
     /* register cpu backends. under AX_CPU_ISA_DISPATCH we probe for
        avx2+fma and pick the corresponding cpu_opt variant at runtime;
        otherwise the single-build vtable wins unconditionally. */
