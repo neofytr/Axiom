@@ -3911,13 +3911,28 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 /* fused dwqkv weight-grad: dWq += X^T @ dQKV[:, 0:D],
                             dWk += X^T @ dQKV[:, D:2D],
                             dWv += X^T @ dQKV[:, 2D:3D].
+
    replaces the materialise-then-split pattern (gemm_tn into [D, 3D]
-   intermediate, then 3 SIMD ACC passes). saves:
-     - the 3 MB intermediate tensor write, plus
-     - the 3 MB intermediate read by the ACC loop.
-   shares the X^T pack across the 3 outputs (X is read once per (jc, pc)
-   tile in opt_gemm_tn_raw; we just call it 3 times with different B
-   slices and accumulate=true into 3 distinct output tensors). */
+   intermediate, then 3 ACC passes). the proper fused kernel runs ONE
+   gemm with N=3D — preserving full N-axis parallelism — but writes
+   each per-jc tile to one of dWq/dWk/dWv directly, eliminating the
+   12 MB intermediate buffer + its read on the way out.
+
+   the structure mirrors opt_gemm_tn_raw exactly (same 4 parallel
+   strategies, same hybrid CPU dispatch, same JIT micro-kernel reuse)
+   with one substitution: at the per-jc-tile level, the output base
+   pointer + ldc + column offset are computed from `jc / D` (which
+   selects dWq/dWk/dWv) and `jc % D` (the local column). the inner
+   (ir, jr) micro-kernel writes are otherwise byte-identical.
+
+   constraint: jc tile boundaries must align with D boundaries —
+   otherwise a single tile would straddle two output tensors. on every
+   shape we care about (D ∈ {512, 768, 1024} all multiples of the 256
+   nc_eff default), this holds. when it doesn't, we fall back to 3
+   sequential opt_gemm_tn_raw calls (the prior implementation).
+
+   accumulate=true in all paths since callers pass pre-allocated grad
+   tensors with existing values. */
 static ax_status_t opt_dwqkv_split_acc(
     const ax_tensor_t *x_flat,
     const ax_tensor_t *dQKV,
@@ -3943,20 +3958,253 @@ static ax_status_t opt_dwqkv_split_acc(
     if (validate_contig_f32(dWq) < 0 || validate_contig_f32(dWk) < 0 || validate_contig_f32(dWv) < 0)
         return AX_ERR_BACKEND;
 
-    const float *xd = raw_f32(x_flat);
-    const float *qd = raw_f32(dQKV);
+    const float *ad = raw_f32(x_flat);    /* X    [K, D] */
+    const float *bd = raw_f32(dQKV);      /* dQKV [K, 3D] */
+    float *outs[3] = { raw_f32(dWq), raw_f32(dWk), raw_f32(dWv) };
 
-    /* 3 calls into the per-tile core. each: same A (X^T view), strided B
-       (offset Q/K/V slice with row stride 3*D), contiguous output (D x D)
-       with accumulate=true. ldb=3*D selects the right column block per
-       call; ldc=D because each dW is a fresh contiguous tensor. */
-    ax_status_t st;
-    st = opt_gemm_tn_raw(xd, D, qd + 0 * D, 3 * D, raw_f32(dWq), D, D, D, K, true);
-    if (st != AX_OK) return st;
-    st = opt_gemm_tn_raw(xd, D, qd + 1 * D, 3 * D, raw_f32(dWk), D, D, D, K, true);
-    if (st != AX_OK) return st;
-    st = opt_gemm_tn_raw(xd, D, qd + 2 * D, 3 * D, raw_f32(dWv), D, D, D, K, true);
-    return st;
+    int64_t m = D, n = 3 * D, k = K;
+    int64_t lda = D, ldb = 3 * D, ldc = D;
+
+    /* small-shape fast path — single-thread scalar fallback */
+    if (m * n * k < 100000) {
+        for (int64_t p = 0; p < k; p++) {
+            const float *bp = bd + p * ldb;
+            const float *ap = ad + p * lda;
+            for (int64_t i = 0; i < m; i++) {
+                float ai = ap[i];
+                /* walk the full N=3D, dispatching per-j to the right dest */
+                for (int64_t j = 0; j < n; j++) {
+                    int64_t dest_idx = j / D;
+                    int64_t j_local = j - dest_idx * D;
+                    outs[dest_idx][i * ldc + j_local] += ai * bp[j];
+                }
+            }
+        }
+        return AX_OK;
+    }
+
+    pack_b_cache_invalidate();
+
+    if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
+
+    int64_t total_flops_est = 2 * m * n * k;
+    int max_threads = ax_gemm_threads_for_shape(m, n, k);
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
+    int64_t nc_eff = ax_adaptive_nc(n, max_threads);
+
+    /* require D % nc_eff == 0 so jc tiles never straddle dWq/dWk/dWv
+       boundaries — else fall back to 3 sequential gemm calls. on the
+       shapes we ship this never triggers (D ∈ {512, 768, 1024}, nc_eff
+       defaults to 256, all clean divisions). */
+    if (D % nc_eff != 0) {
+        ax_status_t st;
+        st = opt_gemm_tn_raw(ad, lda, bd + 0 * D, ldb, outs[0], ldc, D, D, k, true);
+        if (st != AX_OK) return st;
+        st = opt_gemm_tn_raw(ad, lda, bd + 1 * D, ldb, outs[1], ldc, D, D, k, true);
+        if (st != AX_OK) return st;
+        st = opt_gemm_tn_raw(ad, lda, bd + 2 * D, ldb, outs[2], ldc, D, D, k, true);
+        return st;
+    }
+
+    int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
+    int64_t n_ic_tiles = (m + GEMM_MC - 1) / GEMM_MC;
+    int64_t n_mr_tiles = (m + GEMM_MR - 1) / GEMM_MR;
+    int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
+    int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
+
+    int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
+    int64_t n_jc_full = (n + nc_full - 1) / nc_full;
+    bool use_hybrid = (max_threads > 1)
+                      && (n_jc_full < max_threads)
+                      && (n_jc_full * n_ic_tiles >= max_threads);
+    bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
+    bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
+    bool use_fine_par = !use_hybrid && !use_jc_par && !use_ic_par && (max_threads > 1)
+                        && (m <= GEMM_MC) && (fine_units >= 4)
+                        && (total_flops_est > 1000000);
+    int gemm_threads = 1;
+    if (use_hybrid) {
+        gemm_threads = max_threads;
+        nc_eff = nc_full;
+        n_jc_tiles = n_jc_full;
+        /* re-check the alignment invariant under the hybrid override */
+        if (D % nc_eff != 0) {
+            ax_status_t st;
+            st = opt_gemm_tn_raw(ad, lda, bd + 0 * D, ldb, outs[0], ldc, D, D, k, true);
+            if (st != AX_OK) return st;
+            st = opt_gemm_tn_raw(ad, lda, bd + 1 * D, ldb, outs[1], ldc, D, D, k, true);
+            if (st != AX_OK) return st;
+            st = opt_gemm_tn_raw(ad, lda, bd + 2 * D, ldb, outs[2], ldc, D, D, k, true);
+            return st;
+        }
+    } else if (use_jc_par) {
+        gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
+    } else if (use_ic_par) {
+        gemm_threads = (int)(n_ic_tiles < (int64_t)max_threads ? n_ic_tiles : (int64_t)max_threads);
+    } else if (use_fine_par) {
+        gemm_threads = (int)(fine_units < (int64_t)max_threads ? fine_units : (int64_t)max_threads);
+    }
+    (void)gemm_threads;
+
+    /* helper macro: select the dest output base pointer + column offset
+       based on the jc value. assumes D % nc_eff == 0 (checked above). */
+    #define DEST_FOR_JC(jc, dst_base, col_off)               \
+        do {                                                 \
+            int64_t _di = (jc) / D;                          \
+            (col_off) = (jc) - _di * D;                      \
+            (dst_base) = outs[_di];                          \
+        } while (0)
+
+    if (use_hybrid) {
+        int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
+        #ifdef _OPENMP
+        #pragma omp parallel num_threads(gemm_threads)
+        #endif
+        {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            int64_t last_jct = -1;
+            int64_t last_pct = -1;
+
+            #ifdef _OPENMP
+            #pragma omp for collapse(3) schedule(static)
+            #endif
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                        if (!pack_a_buf || !pack_b_buf) continue;
+                        int64_t jc = jct * nc_eff;
+                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                        int64_t pc = pct * kc_max;
+                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                        int64_t ic = ict * GEMM_MC;
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                        if (jct != last_jct || pct != last_pct) {
+                            pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
+                            last_jct = jct;
+                            last_pct = pct;
+                        }
+                        pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
+
+                        float *od_dest; int64_t jc_local;
+                        DEST_FOR_JC(jc, od_dest, jc_local);
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od_dest + (ic + ir) * ldc + (jc_local + jr), ldc, mr, nr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_jc_par) {
+        #ifdef _OPENMP
+        #pragma omp parallel for num_threads(gemm_threads) schedule(dynamic, 1)
+        #endif
+        for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            if (!pack_a_buf || !pack_b_buf) continue;
+
+            int64_t jc = jct * nc_eff;
+            int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            float *od_dest; int64_t jc_local;
+            DEST_FOR_JC(jc, od_dest, jc_local);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
+                for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                         od_dest + (ic + ir) * ldc + (jc_local + jr), ldc, mr, nr);
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_fine_par) {
+        float *main_pack_b = tl_pack_b_buf;
+        float *main_pack_a = tl_pack_a_buf;
+        for (int64_t jc = 0; jc < n; jc += nc_eff) {
+            int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            float *od_dest; int64_t jc_local;
+            DEST_FOR_JC(jc, od_dest, jc_local);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                int64_t mc = m;
+                int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
+                pack_a_t(ad + pc * lda, lda, mc_pack, kc, mc, main_pack_a);
+                int64_t ir_tiles = mc_pack / GEMM_MR;
+                int64_t jr_tiles = nc_pack / GEMM_NR;
+                #ifdef _OPENMP
+                #pragma omp parallel for num_threads(gemm_threads) schedule(static) collapse(2)
+                #endif
+                for (int64_t irt = 0; irt < ir_tiles; irt++) {
+                    for (int64_t jrt = 0; jrt < jr_tiles; jrt++) {
+                        int64_t ir = irt * GEMM_MR;
+                        int64_t jr = jrt * GEMM_NR;
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                        micro_kernel(kc, main_pack_a + ir * kc, main_pack_b + jr * kc,
+                                     od_dest + ir * ldc + (jc_local + jr), ldc, mr, nr);
+                    }
+                }
+            }
+        }
+    } else {
+        float *main_pack_b = tl_pack_b_buf;
+        for (int64_t jc = 0; jc < n; jc += nc_eff) {
+            int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            float *od_dest; int64_t jc_local;
+            DEST_FOR_JC(jc, od_dest, jc_local);
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
+                const float *pack_b_buf = main_pack_b;
+                #ifdef _OPENMP
+                #pragma omp parallel for num_threads(gemm_threads) schedule(static) if(use_ic_par)
+                #endif
+                for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                    ensure_tl_pack_bufs();
+                    float *pack_a_buf = tl_pack_a_buf;
+                    if (!pack_a_buf) continue;
+                    int64_t ic = ict * GEMM_MC;
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                         od_dest + (ic + ir) * ldc + (jc_local + jr), ldc, mr, nr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pack_b_cache_invalidate();
+    #undef DEST_FOR_JC
+    return AX_OK;
 }
 
 /* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias.
