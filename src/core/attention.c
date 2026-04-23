@@ -666,27 +666,27 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
         const float *dw_data = (const float *)dWqkv->storage->data;
         /* dWqkv row i: [dWq[i,:] | dWk[i,:] | dWv[i,:]], each D wide.
-           we iterate rows and accumulate the three column slices into
-           the three param-grad tensors. (a fused single-pass version
-           that read the [3D] source row once and wrote 3 dests was
-           tried but regressed B8_S128 — each thread's working-set blew
-           past L1 with 3 dests open at once.) */
-        #define ACC_PARAM(W, col_off) do {                                     \
-            if ((W)->requires_grad) {                                          \
-                float *dp = param_grad_ptr(W);                                 \
-                if (dp) {                                                      \
-                    _Pragma("omp parallel for schedule(static)")               \
-                    for (int64_t i = 0; i < D; i++)                            \
-                        accumulate_f32(dw_data + i * 3 * D + (col_off),        \
-                                       dp + i * D, D);                         \
-                    ax_storage_touch((W)->grad->storage);                      \
-                }                                                              \
-            }                                                                  \
-        } while (0)
-        ACC_PARAM(m->Wq, 0);
-        ACC_PARAM(m->Wk, D);
-        ACC_PARAM(m->Wv, 2 * D);
-        #undef ACC_PARAM
+           single-pass version — read each [3D] source row once, write
+           to all 3 dest grad tensors. earlier comment in this file
+           said this regressed B8_S128 due to L1 working set, but with
+           OMP_PROC_BIND=spread (e111821) keeping per-thread cache
+           warm AND the three accumulate_f32 calls being SIMD-tight,
+           re-trying. saves 2 omp parallel-region setups per call vs
+           the prior 3-pass; also reads dWqkv once (12 MB at B8_S128)
+           instead of 3x with strided stride 3D. */
+        float *dWq_g = m->Wq->requires_grad ? param_grad_ptr(m->Wq) : NULL;
+        float *dWk_g = m->Wk->requires_grad ? param_grad_ptr(m->Wk) : NULL;
+        float *dWv_g = m->Wv->requires_grad ? param_grad_ptr(m->Wv) : NULL;
+        #pragma omp parallel for schedule(static)
+        for (int64_t i = 0; i < D; i++) {
+            const float *src = dw_data + i * 3 * D;
+            if (dWq_g) accumulate_f32(src,           dWq_g + i * D, D);
+            if (dWk_g) accumulate_f32(src + D,       dWk_g + i * D, D);
+            if (dWv_g) accumulate_f32(src + 2 * D,   dWv_g + i * D, D);
+        }
+        if (dWq_g) ax_storage_touch(m->Wq->grad->storage);
+        if (dWk_g) ax_storage_touch(m->Wk->grad->storage);
+        if (dWv_g) ax_storage_touch(m->Wv->grad->storage);
     }
 
     /* ================================================================
