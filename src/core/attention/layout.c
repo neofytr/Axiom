@@ -26,7 +26,7 @@ void ax_attn_head_interleave(const float *src, float *dst,
                               int64_t B, int64_t S, int64_t H, int64_t dk)
 {
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int64_t b = 0; b < B; b++) {
         for (int64_t h = 0; h < H; h++) {
@@ -43,7 +43,7 @@ void ax_attn_head_deinterleave(const float *src, float *dst,
                                 int64_t B, int64_t S, int64_t H, int64_t dk)
 {
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int64_t b = 0; b < B; b++) {
         for (int64_t s = 0; s < S; s++) {
@@ -62,7 +62,7 @@ void ax_attn_head_deinterleave_slot(const float *src, float *dst,
 {
     (void)H;
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int64_t b = 0; b < B; b++) {
         for (int64_t s = 0; s < S; s++) {
@@ -83,7 +83,7 @@ void ax_attn_head_deinterleave_qkv_merge(const float *srcQ, const float *srcK,
     int64_t dst_cols = 3 * D;
     size_t dk_bytes = (size_t)dk * sizeof(float);
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int64_t b = 0; b < B; b++) {
         for (int64_t s = 0; s < S; s++) {
@@ -103,7 +103,7 @@ void ax_attn_head_interleave_from_slot(const float *src, float *dst,
                                         int64_t src_cols, int64_t col_off)
 {
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int64_t b = 0; b < B; b++) {
         for (int64_t h = 0; h < H; h++) {
@@ -124,7 +124,7 @@ void ax_attn_head_interleave_qkv_split(const float *src,
     int64_t src_cols = 3 * D;
     size_t dk_bytes = (size_t)dk * sizeof(float);
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int64_t b = 0; b < B; b++) {
         for (int64_t h = 0; h < H; h++) {
@@ -148,7 +148,7 @@ void ax_attn_head_interleave_qkv_split_bias(const float *src, const float *bias,
     int64_t TC = AX_VF32_WIDTH;
     int64_t ve = dk - (dk % TC);
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    #pragma omp parallel for collapse(2) schedule(static)
 #endif
     for (int64_t b = 0; b < B; b++) {
         for (int64_t h = 0; h < H; h++) {

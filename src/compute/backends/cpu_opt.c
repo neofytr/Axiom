@@ -2507,15 +2507,18 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 
     if (use_hybrid) {
         /* hybrid jc+pc+ic for opt_gemm. structure: collapse(3) over (jct, pct,
-           ict). dynamic schedule with chunk = n_ic_tiles preserves pack_b
-           cache reuse within a chunk (cache keyed on (jct, pct) — within a
-           chunk these are constant since one chunk = n_ic_tiles contiguous
-           iterations of ict with fixed (jct, pct)). between chunks, fast
-           P-cores grab additional chunks from the dynamic queue, giving
-           implicit weighted distribution on hybrid CPUs. same pattern as
-           opt_gemm_tn_raw (bc12ad5) + opt_gemm_nt (e80703b). opt_gemm was
-           missed from the latter commit's stated scope (commit message
-           said "gemm/gemm_nt" but diff only touched gemm_nt). */
+           ict). pc-as-second-outer ensures within a thread's contiguous chunk
+           of work, (jct, pct) stays constant across many ict iterations,
+           making the pack_b cache hit consistently.
+
+           NOTE: schedule(dynamic, n_ic_tiles) was tried (matching bc12ad5 /
+           e80703b pattern on opt_gemm_tn_raw / opt_gemm_nt) but regressed
+           B8_S128 mha_train by ~17% on 2026-04-24. for the forward y gemm
+           at [1024, 512, 512], nc_eff=256 gives n_jc_full=2 and n_pc_tiles=2,
+           so total chunks = 2 * 2 = 4 — far fewer than NT=16, leaving 12
+           threads idle. static schedule spreads all 60 (jct, pct, ict)
+           iterations across 16 threads ~evenly. kept as static until a
+           work-count-adaptive chunk formula is derived. */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
         #ifdef _OPENMP
         #pragma omp parallel num_threads(gemm_threads)
@@ -2528,7 +2531,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
+            #pragma omp for collapse(3) schedule(static)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
@@ -4071,12 +4074,10 @@ static ax_status_t opt_dwqkv_split_acc(
         } while (0)
 
     if (use_hybrid) {
-        /* dynamic schedule(chunk = n_ic_tiles): same pack_b-cache-preserving
-           pattern as opt_gemm_tn_raw / opt_gemm / opt_gemm_nt use_hybrid.
-           this entry point was the first to land use_hybrid (408600e) but
-           didn't yet have the dynamic treatment because that came later on
-           the base gemm paths. applying it here keeps dwqkv_split_acc (33%
-           of bwd on B8_S128) on the same hybrid CPU distribution. */
+        /* kept as schedule(static); see opt_gemm use_hybrid for the
+           rationale of why dynamic-chunk hurts low-iteration-count cases
+           on this CPU (forward y gemm with n_jc_full=2, n_pc_tiles=2,
+           only 4 chunks for 16 threads). */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
         #ifdef _OPENMP
         #pragma omp parallel num_threads(gemm_threads)
@@ -4089,7 +4090,7 @@ static ax_status_t opt_dwqkv_split_acc(
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
+            #pragma omp for collapse(3) schedule(static)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
