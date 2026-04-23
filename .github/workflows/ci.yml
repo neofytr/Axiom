@@ -239,7 +239,11 @@ jobs:
           cd build
           # filter: keep only axiom source files; drop /usr/include + tests
           lcov --capture --directory . --output-file coverage.info --quiet
+          # --ignore-errors unused: newer lcov 2.x errors when an exclude
+          # pattern matches nothing (e.g. */benchmarks/* if no benchmark
+          # binaries were built into the coverage tree). harmless here.
           lcov --remove coverage.info '/usr/*' '*/tests/*' '*/benchmarks/*' \
+               --ignore-errors unused \
                --output-file coverage.info --quiet
           lcov --list coverage.info | tee coverage.summary
       - name: gate on MIN_COVERAGE_PCT
