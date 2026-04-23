@@ -654,19 +654,15 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         pf_t0 = prof_enabled ? PF_TICK() : 0;
         if (ax_compute_gemm_tn(x_flat_for_bwd, dQKV, dWqkv) != AX_OK) return;
         if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
-        /* A (dwqkv perf work): tried manual pretranspose (avoids the
-           opt_gemm_tn 2-GFLOPS gate) → REGRESSED. standalone bench:
-             gemm_TN (current):           3.0 ms (538 GFLOPS)
-             transpose + gemm_NN:         4.7 ms
-             gemm_NN-only (no transpose): 3.1 ms
-           the per-call transpose costs ~1.5 ms (strided write thrashes
-           cache); gemm_NN at this shape (M=512 N=1536 K=1024) is no
-           faster than gemm_TN. on this CPU dwqkv is ALREADY at peak
-           BW — closing the mha_train gap to TF here would need either
-           (a) tile-fusion of dwqkv into the head-deinterleave step or
-           (b) bench-fairness: TF's @tf.function prunes dX-through-QKV
-           which saves ~3 ms; matching that on the bench harness side
-           closes most of the gap. neither is a kernel change. */
+        /* perf note: a fused path that calls 3 strided-B gemms via
+           ax_compute_dwqkv_split_acc was tried (split_acc lives in cpu_opt.c
+           + dispatch.c, hooked behind AX_DWQKV_FUSED=1). on i5-12500H AVX2
+           it regresses 1-10% across most shapes — splitting the gemm into
+           3 N=D calls loses jc-tile parallelism vs the single N=3D call,
+           and the 3 separate pack_a passes outweigh the saved intermediate
+           BW. infrastructure kept for future hosts where the trade-off
+           may flip (e.g. AVX-512 with bigger micro-kernels) or for a real
+           multi-output micro-kernel that retains N=3D scheduling. */
 
         const float *dw_data = (const float *)dWqkv->storage->data;
         /* dWqkv row i: [dWq[i,:] | dWk[i,:] | dWv[i,:]], each D wide.

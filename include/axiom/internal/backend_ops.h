@@ -64,6 +64,22 @@ struct ax_backend_ops {
        NULL when unimplemented. */
     ax_status_t (*gemm_tn)(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+    /* optional: fused dwqkv weight grad — three accumulating gemm_TN ops
+       sharing the X^T pack. signatures:
+         dWq += x_flat^T @ dQKV[:, 0:D]
+         dWk += x_flat^T @ dQKV[:, D:2D]
+         dWv += x_flat^T @ dQKV[:, 2D:3D]
+       writes directly into the three weight-grad tensors instead of
+       materialising an intermediate [D, 3D] buffer that's later split.
+       saves the intermediate's write+read traffic at MHA backward. all
+       five tensors must be contiguous fp32. NULL when unimplemented —
+       attention.c falls back to gemm_tn + 3-way SIMD accumulator. */
+    ax_status_t (*dwqkv_split_acc)(const ax_tensor_t *x_flat,
+                                    const ax_tensor_t *dQKV,
+                                    ax_tensor_t *dWq,
+                                    ax_tensor_t *dWk,
+                                    ax_tensor_t *dWv);
+
     /* optional: fused matmul + relu. out = relu(a @ b + bias).
        bias may be NULL for matmul+relu without bias.
        applies max(0, x) during the gemm writeback step, saving a full

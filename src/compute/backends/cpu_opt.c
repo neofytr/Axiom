@@ -3593,74 +3593,34 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 /* transposed-a gemm: out = a^T @ b.
    shape contract: a is [k, m], b is [k, n], out is [m, n].
    reuses the tile loop with pack_a_t in place of pack_a. */
-static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
-    if (!a || !b || !out) { ax_err_set(AX_ERR_NULL_ARG, "gemm_tn: NULL"); return AX_ERR_NULL_ARG; }
-    if (a->dtype != AX_FLOAT32 || b->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
-        return AX_ERR_DTYPE_MISMATCH;
-    if (a->ndim != 2 || b->ndim != 2 || out->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
-
-    int64_t k = a->shape[0], m = a->shape[1];
-    int64_t n = b->shape[1];
-    if (b->shape[0] != k || out->shape[0] != m || out->shape[1] != n) return AX_ERR_SHAPE_MISMATCH;
-    if (validate_contig_f32(a) < 0 || validate_contig_f32(b) < 0 || validate_contig_f32(out) < 0)
-        return AX_ERR_BACKEND;
-
-    const float *ad = raw_f32(a);  /* [k, m] — walked as if transposed */
-    const float *bd = raw_f32(b);
-    float *od = raw_f32(out);
-
+/* internal core: same body as opt_gemm_tn but with raw pointers + explicit
+   lda/ldb/ldc strides and an explicit `accumulate` flag. lets fused entries
+   (e.g. opt_dwqkv_split_acc) drive the gemm directly with strided B views
+   and an additive output. for the standard contiguous wrapper:
+     lda = m, ldb = n, ldc = n, accumulate = !tl_gemm_skip_init.
+   when accumulate is false, the row-by-row memset zeroes [m, n] starting
+   at od + i*ldc — caller must ensure ldc >= n so adjacent rows don't
+   overlap. T-pre dispatch and validation live in the wrapper, never here. */
+static ax_status_t opt_gemm_tn_raw(
+    const float *ad, int64_t lda,
+    const float *bd, int64_t ldb,
+    float *od, int64_t ldc,
+    int64_t m, int64_t n, int64_t k,
+    bool accumulate)
+{
     pack_b_cache_invalidate();
 
-    /* T-pre: pre-transpose A from [k,m] → [m,k] when the GEMM is large
-       enough AND skewed enough (n >> m) that the saved pack_a_t overhead
-       outweighs the transpose write traffic. measured: helps mha dwqkv
-       shape (m=1024, n=3072, k=512, 3 GFLOPS) +13%, hurts smaller skewed
-       shapes (m=512, n=2048, k=512, 1 GFLOPS) -11% because transpose
-       cost (2 BW passes over A) is fixed but savings scale with flops.
-       criteria: flops >= 2 GFLOPS, n >= 2m, A fits the budget. */
-    int64_t at_bytes = (int64_t)m * (int64_t)k * (int64_t)sizeof(float);
-    int64_t flops = 2 * m * n * k;
-    bool can_pretrans = (at_bytes <= ax_tn_pretranspose_budget_bytes)
-                        && (flops >= 2000000000LL)
-                        && (m >= 8 && k >= 8)
-                        && (n >= 2 * m);
-    if (can_pretrans) {
-        float *atbuf = ax_tls_grow(&tl_tn_pretranspose, &tl_tn_pretranspose_bytes, at_bytes);
-        if (atbuf) {
-            transpose_kxm_to_mxk(ad, k, m, atbuf);
-            ax_storage_t at_st = {0};
-            at_st.data = atbuf;
-            at_st.size_bytes = (size_t)at_bytes;
-            atomic_store(&at_st.refcount, 0);
-            at_st.device = AX_DEVICE_CPU;
-            at_st.is_arena_temp = true;
-            at_st.generation = 1;
-            ax_tensor_t at_tv = {0};
-            at_tv.storage = &at_st;
-            at_tv.ndim = 2;
-            at_tv.dtype = AX_FLOAT32;
-            at_tv.shape[0] = m;
-            at_tv.shape[1] = k;
-            at_tv.strides[0] = k;
-            at_tv.strides[1] = 1;
-            return opt_gemm(&at_tv, b, out);
-        }
-    }
-
     if (m * n * k < 100000) {
-        /* honor skip_init: pre-zero only when not accumulating; then ALWAYS
-           accumulate into oi (no p==0 overwrite branch). otherwise callers
-           that use skip_init=true to add multiple gemm_tn results into one
-           buffer get only the LAST call's output. */
-        if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
-        /* scalar-simd inner: out[i,j] = sum_p a[p,i] * b[p,j].
-           iterate p outer, (i,j) inner to keep b[p,:] contiguous. */
+        if (!accumulate) {
+            for (int64_t i = 0; i < m; i++)
+                memset(od + i * ldc, 0, (size_t)n * sizeof(float));
+        }
         for (int64_t p = 0; p < k; p++) {
-            const float *bp = bd + p * n;
-            const float *ap = ad + p * m;
+            const float *bp = bd + p * ldb;
+            const float *ap = ad + p * lda;
             for (int64_t i = 0; i < m; i++) {
                 float ai = ap[i];
-                float *oi = od + i * n;
+                float *oi = od + i * ldc;
                 ax_vf32 va = ax_vf32_set1(ai);
                 int64_t j = 0;
                 int64_t vec_end = n - (n % AX_VF32_WIDTH);
@@ -3673,7 +3633,10 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
 
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
-    if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
+    if (!accumulate) {
+        for (int64_t i = 0; i < m; i++)
+            memset(od + i * ldc, 0, (size_t)n * sizeof(float));
+    }
 
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
@@ -3756,17 +3719,17 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
                         int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
                         if (jct != last_jct || pct != last_pct) {
-                            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
+                            pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
                             last_jct = jct;
                             last_pct = pct;
                         }
-                        pack_a_t(ad + pc * m + ic, m, mc_pack, kc, mc, pack_a_buf);
+                        pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
                         for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                             int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                             for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                                 int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
                                 micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                             od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
                             }
                         }
                     }
@@ -3788,17 +3751,17 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
             for (int64_t pc = 0; pc < k; pc += kc_max) {
                 int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
-                pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                     int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                    pack_a_t(ad + pc * m + ic, m, mc_pack, kc, mc, pack_a_buf);
+                    pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
                     for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                         int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                         for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                             int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
                             micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                         od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                         od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
                         }
                     }
                 }
@@ -3815,8 +3778,8 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
                 int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 int64_t mc = m;
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, main_pack_b);
-                pack_a_t(ad + pc * m, m, mc_pack, kc, mc, main_pack_a);
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
+                pack_a_t(ad + pc * lda, lda, mc_pack, kc, mc, main_pack_a);
                 int64_t ir_tiles = mc_pack / GEMM_MR;
                 int64_t jr_tiles = nc_pack / GEMM_NR;
                 #ifdef _OPENMP
@@ -3829,7 +3792,7 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
                         int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                         int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
                         micro_kernel(kc, main_pack_a + ir * kc, main_pack_b + jr * kc,
-                                     od + ir * n + (jc + jr), n, mr, nr);
+                                     od + ir * ldc + (jc + jr), ldc, mr, nr);
                     }
                 }
             }
@@ -3844,7 +3807,7 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
             int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
             for (int64_t pc = 0; pc < k; pc += kc_max) {
                 int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
-                pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, main_pack_b);
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
                 const float *pack_b_buf = main_pack_b;
                 #ifdef _OPENMP
                 #pragma omp parallel for num_threads(gemm_threads) schedule(static) if(use_ic_par)
@@ -3856,13 +3819,13 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
                     int64_t ic = ict * GEMM_MC;
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                     int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                    pack_a_t(ad + pc * m + ic, m, mc_pack, kc, mc, pack_a_buf);
+                    pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
                     for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                         int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                         for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                             int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
                             micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                         od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                         od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
                         }
                     }
                 }
@@ -3871,6 +3834,116 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
     pack_b_cache_invalidate();
     return AX_OK;
+}
+
+/* public gemm_tn entry: validates contig + handles T-pre dispatch, then
+   delegates the per-tile work to opt_gemm_tn_raw. T-pre stays here (not
+   in _raw) because it materialises a full A^T copy and dispatches to
+   opt_gemm — the strided-B fused entries can't take that path. */
+static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out) {
+    if (!a || !b || !out) { ax_err_set(AX_ERR_NULL_ARG, "gemm_tn: NULL"); return AX_ERR_NULL_ARG; }
+    if (a->dtype != AX_FLOAT32 || b->dtype != AX_FLOAT32 || out->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (a->ndim != 2 || b->ndim != 2 || out->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t k = a->shape[0], m = a->shape[1];
+    int64_t n = b->shape[1];
+    if (b->shape[0] != k || out->shape[0] != m || out->shape[1] != n) return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(a) < 0 || validate_contig_f32(b) < 0 || validate_contig_f32(out) < 0)
+        return AX_ERR_BACKEND;
+
+    const float *ad = raw_f32(a);
+    const float *bd = raw_f32(b);
+    float *od = raw_f32(out);
+
+    /* T-pre: pre-transpose A from [k,m] → [m,k] when the GEMM is large
+       enough AND skewed enough (n >> m) that the saved pack_a_t overhead
+       outweighs the transpose write traffic. measured: helps mha dwqkv
+       shape (m=1024, n=3072, k=512, 3 GFLOPS) +13%, hurts smaller skewed
+       shapes (m=512, n=2048, k=512, 1 GFLOPS) -11% because transpose
+       cost (2 BW passes over A) is fixed but savings scale with flops.
+       criteria: flops >= 2 GFLOPS, n >= 2m, A fits the budget. */
+    int64_t at_bytes = (int64_t)m * (int64_t)k * (int64_t)sizeof(float);
+    int64_t flops = 2 * m * n * k;
+    bool can_pretrans = (at_bytes <= ax_tn_pretranspose_budget_bytes)
+                        && (flops >= 2000000000LL)
+                        && (m >= 8 && k >= 8)
+                        && (n >= 2 * m);
+    if (can_pretrans) {
+        float *atbuf = ax_tls_grow(&tl_tn_pretranspose, &tl_tn_pretranspose_bytes, at_bytes);
+        if (atbuf) {
+            transpose_kxm_to_mxk(ad, k, m, atbuf);
+            ax_storage_t at_st = {0};
+            at_st.data = atbuf;
+            at_st.size_bytes = (size_t)at_bytes;
+            atomic_store(&at_st.refcount, 0);
+            at_st.device = AX_DEVICE_CPU;
+            at_st.is_arena_temp = true;
+            at_st.generation = 1;
+            ax_tensor_t at_tv = {0};
+            at_tv.storage = &at_st;
+            at_tv.ndim = 2;
+            at_tv.dtype = AX_FLOAT32;
+            at_tv.shape[0] = m;
+            at_tv.shape[1] = k;
+            at_tv.strides[0] = k;
+            at_tv.strides[1] = 1;
+            return opt_gemm(&at_tv, b, out);
+        }
+    }
+
+    return opt_gemm_tn_raw(ad, m, bd, n, od, n, m, n, k, !tl_gemm_skip_init);
+}
+
+/* fused dwqkv weight-grad: dWq += X^T @ dQKV[:, 0:D],
+                            dWk += X^T @ dQKV[:, D:2D],
+                            dWv += X^T @ dQKV[:, 2D:3D].
+   replaces the materialise-then-split pattern (gemm_tn into [D, 3D]
+   intermediate, then 3 SIMD ACC passes). saves:
+     - the 3 MB intermediate tensor write, plus
+     - the 3 MB intermediate read by the ACC loop.
+   shares the X^T pack across the 3 outputs (X is read once per (jc, pc)
+   tile in opt_gemm_tn_raw; we just call it 3 times with different B
+   slices and accumulate=true into 3 distinct output tensors). */
+static ax_status_t opt_dwqkv_split_acc(
+    const ax_tensor_t *x_flat,
+    const ax_tensor_t *dQKV,
+    ax_tensor_t *dWq, ax_tensor_t *dWk, ax_tensor_t *dWv)
+{
+    if (!x_flat || !dQKV || !dWq || !dWk || !dWv) {
+        ax_err_set(AX_ERR_NULL_ARG, "dwqkv_split_acc: NULL");
+        return AX_ERR_NULL_ARG;
+    }
+    if (x_flat->dtype != AX_FLOAT32 || dQKV->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
+    if (dWq->dtype != AX_FLOAT32 || dWk->dtype != AX_FLOAT32 || dWv->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (x_flat->ndim != 2 || dQKV->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    if (dWq->ndim != 2 || dWk->ndim != 2 || dWv->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t K = x_flat->shape[0];
+    int64_t D = x_flat->shape[1];
+    if (dQKV->shape[0] != K || dQKV->shape[1] != 3 * D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWq->shape[0] != D || dWq->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWk->shape[0] != D || dWk->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWv->shape[0] != D || dWv->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(x_flat) < 0 || validate_contig_f32(dQKV) < 0) return AX_ERR_BACKEND;
+    if (validate_contig_f32(dWq) < 0 || validate_contig_f32(dWk) < 0 || validate_contig_f32(dWv) < 0)
+        return AX_ERR_BACKEND;
+
+    const float *xd = raw_f32(x_flat);
+    const float *qd = raw_f32(dQKV);
+
+    /* 3 calls into the per-tile core. each: same A (X^T view), strided B
+       (offset Q/K/V slice with row stride 3*D), contiguous output (D x D)
+       with accumulate=true. ldb=3*D selects the right column block per
+       call; ldc=D because each dW is a fresh contiguous tensor. */
+    ax_status_t st;
+    st = opt_gemm_tn_raw(xd, D, qd + 0 * D, 3 * D, raw_f32(dWq), D, D, D, K, true);
+    if (st != AX_OK) return st;
+    st = opt_gemm_tn_raw(xd, D, qd + 1 * D, 3 * D, raw_f32(dWk), D, D, D, K, true);
+    if (st != AX_OK) return st;
+    st = opt_gemm_tn_raw(xd, D, qd + 2 * D, 3 * D, raw_f32(dWv), D, D, D, K, true);
+    return st;
 }
 
 /* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias.
@@ -4267,6 +4340,7 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .gemm_ex    = opt_gemm_ex,
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
+    .dwqkv_split_acc = opt_dwqkv_split_acc,
     .add_relu   = opt_add_relu,
     .axpy       = opt_axpy,
     .softmax_rowwise = opt_softmax_rowwise,

@@ -417,6 +417,35 @@ int ax_compute_has_gemm_relu(void) { ensure_compute_init(); return (active_ops &
 int ax_compute_has_gemm_nt(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_nt) ? 1 : 0; }
 int ax_compute_has_gemm_tn(void) { ensure_compute_init(); return (active_ops && active_ops->gemm_tn) ? 1 : 0; }
 
+/* fused dwqkv weight-grad: 3 accumulating gemm_TNs sharing the X^T pack.
+   no view materialisation, no [D, 3D] intermediate. backends that lack
+   the slot return AX_ERR_NOT_IMPLEMENTED so attention.c can fall back to
+   the materialise+split path. */
+ax_status_t ax_compute_dwqkv_split_acc(const ax_tensor_t *x_flat,
+                                        const ax_tensor_t *dQKV,
+                                        ax_tensor_t *dWq,
+                                        ax_tensor_t *dWk,
+                                        ax_tensor_t *dWv)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->dwqkv_split_acc) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "dwqkv_split_acc not implemented in %s",
+                   active_ops ? active_ops->name : "none");
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    ax_status_t st = active_ops->dwqkv_split_acc(x_flat, dQKV, dWq, dWk, dWv);
+    if (st == AX_OK) {
+        if (dWq && dWq->storage) ax_storage_touch(dWq->storage);
+        if (dWk && dWk->storage) ax_storage_touch(dWk->storage);
+        if (dWv && dWv->storage) ax_storage_touch(dWv->storage);
+    }
+    return st;
+}
+int ax_compute_has_dwqkv_split_acc(void) {
+    ensure_compute_init();
+    return (active_ops && active_ops->dwqkv_split_acc) ? 1 : 0;
+}
+
 /* fused-scaling gemm: out = alpha * (a @ b) + beta * out. */
 ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
                                 float alpha, float beta, ax_tensor_t *out)

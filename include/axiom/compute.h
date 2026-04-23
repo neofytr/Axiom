@@ -120,6 +120,21 @@ ax_status_t ax_compute_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 /* out = a^T @ b. same fallback contract as gemm_nt. */
 ax_status_t ax_compute_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_tensor_t *out);
 
+/* fused dwqkv weight-grad: dWq += x_flat^T @ dQKV[:, 0:D],
+                            dWk += x_flat^T @ dQKV[:, D:2D],
+                            dWv += x_flat^T @ dQKV[:, 2D:3D].
+   single-pass equivalent of `gemm_tn(x_flat, dQKV) → [D, 3D]` followed by
+   three SIMD column-slice accumulators into dWq/dWk/dWv. saves the
+   intermediate's read+write traffic at MHA backward. all five tensors
+   contiguous fp32; x_flat=[K, D], dQKV=[K, 3D], dW*=[D, D]. returns
+   AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
+ax_status_t ax_compute_dwqkv_split_acc(const ax_tensor_t *x_flat,
+                                        const ax_tensor_t *dQKV,
+                                        ax_tensor_t *dWq,
+                                        ax_tensor_t *dWk,
+                                        ax_tensor_t *dWv);
+int ax_compute_has_dwqkv_split_acc(void);
+
 /* fused matmul+relu: out = relu(a @ b + bias). bias may be NULL.
    returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
 ax_status_t ax_compute_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,
