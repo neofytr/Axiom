@@ -131,6 +131,15 @@ ax_status_t ax_compute_init(void) {
         register_device_owner(backends[i]);
     }
 
+#ifdef _OPENMP
+    /* enable nested parallelism — required for I.1.b sdpa_bwd path that
+       runs an inner omp-for over the kj loop while already inside the
+       outer per-head omp parallel region. only activates when n_inner>1
+       (max_threads / BH); when BH saturates the thread pool, the inner
+       region runs single-threaded with no overhead via if(...) clause. */
+    omp_set_max_active_levels(2);
+#endif
+
     /* select the optimized backend by default (falls back to naive internally) */
     active_id = AX_BACKEND_CPU_SIMD;
     active_ops = backends[AX_BACKEND_CPU_SIMD];
