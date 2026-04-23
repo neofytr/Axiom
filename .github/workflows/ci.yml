@@ -131,6 +131,55 @@ jobs:
           echo "ok: no stdio symbols in embedded build"
 
   # ====================================================================
+  # valgrind memcheck on a curated subset of tests. catches leaks and
+  # invalid-memory bugs that ASan can miss (e.g. uninitialised reads
+  # from heap blocks that ASan only spots on free). built with
+  # AX_OPENMP=OFF + AX_NO_AUTOTUNE=1 to keep the (~30x slowdown of
+  # memcheck) under the 600 s/test budget.
+  #
+  # subset rationale — tests are picked to exercise allocator + jit
+  # encoder + error-handling paths in a few seconds each. compute-
+  # heavy tests (test_compute, test_attention, test_grad_verify,
+  # test_optim, test_lr_sched) blow the budget, or report 'possibly
+  # lost' noise from process-lifetime per-thread pack buffers in
+  # cpu_opt.c (ensure_tl_pack_bufs) that would force suppressing
+  # axiom's own allocations — masking real future leaks. asan + the
+  # main test job already cover those code paths.
+  # ====================================================================
+  valgrind:
+    name: valgrind (memcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install valgrind
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq valgrind
+      - name: build (RelWithDebInfo, no openmp)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAX_OPENMP=OFF ..
+          # only build the binaries we'll actually run under valgrind
+          cmake --build . -j$(nproc) --target \
+            test_memory test_error test_jit_arm64_bytes
+      - name: memcheck
+        run: |
+          cd build
+          # AX_NO_AUTOTUNE=1 + OMP_NUM_THREADS=1 keep startup probes
+          # off so each binary fits comfortably under the 600 s budget
+          # (locally these run in ~0.3 s each under valgrind).
+          export AX_NO_AUTOTUNE=1
+          export OMP_NUM_THREADS=1
+          for t in test_memory test_error test_jit_arm64_bytes; do
+            echo "::group::valgrind $t"
+            timeout 600 valgrind \
+              --leak-check=full \
+              --error-exitcode=1 \
+              --suppressions=../scripts/valgrind.supp \
+              --num-callers=20 \
+              ./$t
+            echo "::endgroup::"
+          done
+
+  # ====================================================================
   # cppcheck warnings + the portability scan (catches x86-only
   # intrinsics outside __x86_64__ guards before they reach a cross-
   # arch build — three regressions in a row had this shape).

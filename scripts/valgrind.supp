@@ -1,0 +1,91 @@
+# axiom valgrind suppressions
+#
+# scope: silence noise from the C runtime, dynamic loader, and openmp init
+# so the leak report shows axiom-attributable bytes only. anything that
+# resolves into src/ or tests/ is NOT suppressed.
+#
+# format reference: valgrind manual chapter 4.7.
+#   {  name
+#      tool:kind         (Memcheck:Leak for our cases)
+#      match-leak-kinds: (definite|indirect|possible|reachable, comma-list)
+#      ...               (call-stack pattern; '...' = any depth)
+#      fun:* / obj:*     (frame matchers, top-of-stack first)
+#   }
+
+# glibc dynamic linker: dlopen / _dl_init allocations are kept alive for
+# the lifetime of the process and never freed. textbook ld.so behaviour;
+# every binary linked against libc reports it.
+{
+   ld_so_dlopen_reachable
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:_dl_*
+}
+{
+   ld_so_dlopen_indirect
+   Memcheck:Leak
+   match-leak-kinds: reachable,indirect
+   ...
+   obj:*/ld-linux-*.so*
+}
+{
+   libc_dlopen_init
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   fun:dlopen*
+}
+
+# libgomp / libomp thread-pool init. defensive: the valgrind job builds
+# with AX_OPENMP=OFF so libgomp shouldn't be linked, but if a future
+# refactor pulls it in we don't want the noise.
+{
+   libgomp_init
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   obj:*/libgomp.so*
+}
+{
+   libomp_init
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   obj:*/libomp.so*
+}
+{
+   libgomp_team_create
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:gomp_team_start
+}
+
+# pthread tls block — once-allocated per thread, never freed.
+{
+   pthread_create_tls
+   Memcheck:Leak
+   match-leak-kinds: possible,reachable
+   ...
+   fun:allocate_dtv
+   ...
+   fun:pthread_create*
+}
+
+# generic shared-object reachable bytes that never resolve into our code.
+# guarded by 'reachable' only — definite/indirect leaks are still flagged.
+{
+   so_reachable_no_user_frame
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:/usr/lib/*.so*
+}
+{
+   so_reachable_no_user_frame_multiarch
+   Memcheck:Leak
+   match-leak-kinds: reachable
+   ...
+   obj:/usr/lib/*/*.so*
+}
