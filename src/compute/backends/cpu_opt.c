@@ -5570,18 +5570,60 @@ typedef void (*ax_attn_bwd_kj_fn_t)(
     float *pa, float *pb,
     float *dQ_dest, float *dK, float *dV);
 
-static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack) {
-    static int env_resolved = 0;
-    static int env_fused = 0;
-    if (!env_resolved) {
+/* pick the kj-block impl. dispatch:
+     AX_SDPA_FUSED=1  → force fused
+     AX_SDPA_FUSED=0  → force materialized
+     unset            → shape-dispatched: fused when BH != NT, materialized
+                        when BH == NT (the sole regression case per plan.md,
+                        where each thread owns exactly one head with no inner
+                        parallelism so the fused kernel's 190 KB stack
+                        pressure isn't amortized across calls).
+
+   fused bench deltas measured post-OMP_PROC_BIND wins (see plan.md / F4 doc):
+     B8_S128  (BH=64, NT=16): -10% (win)
+     B4_S512  (BH=48, NT=16): -2%  (win)
+     B2_S1024 (BH=24, NT=16): -1%  (win)
+     B1_S512  (BH=16, NT=16): +12% (LOSS → dispatch to materialized)
+     B1_S2048 (BH=12, NT=16): -1%  (win — inner parallelism amortizes stack)
+
+   on AVX-512 hosts (not available locally) the fused 14x32 kernel may have
+   a different stack pressure profile; revisit the BH == NT dispatch rule
+   when bench data from an AVX-512 runner is available. */
+static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
+    /* cache env parse once. -2 = uninitialised, -1 = auto,
+       0 = force off, 1 = force on. */
+    static int env_mode = -2;
+    if (env_mode == -2) {
         const char *env = getenv("AX_SDPA_FUSED");
-        env_fused = (env && env[0] == '1') ? 1 : 0;
-        env_resolved = 1;
+        if (env) {
+            if (env[0] == '1') env_mode = 1;
+            else if (env[0] == '0') env_mode = 0;
+            else env_mode = -1;
+        } else {
+            env_mode = -1;
+        }
     }
-    /* fused path requires use_prepack=true (drops messy non-prepack
-       fallback code that had layout bugs). dispatcher transparently
-       falls back to materialized when prepack is unavailable. */
-    if (env_fused && use_prepack) {
+
+    int use_fused;
+    if (env_mode == 1) {
+        use_fused = 1;
+    } else if (env_mode == 0) {
+        use_fused = 0;
+    } else {
+#ifdef _OPENMP
+        int nt = omp_get_max_threads();
+        /* avoid fused only when each thread owns exactly one head and no
+           inner parallelism kicks in — that's exactly BH == NT because
+           ax_attn_bwd_inner_threads returns ceil(NT/BH) which is 1 iff
+           BH >= NT. BH > NT is fine (outer loop amortizes); BH < NT
+           spawns inner threads that amortize. */
+        use_fused = (BH != (int64_t)nt);
+#else
+        use_fused = 1;
+#endif
+    }
+
+    if (use_fused && use_prepack) {
         return (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block_fused;
     }
     return (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block;
@@ -5618,7 +5660,8 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                            const float *dO, const float *L, const float *Di,
                            float *dQ, float *dK, float *dV,
                            int64_t S, int64_t dk, float scale, bool causal,
-                           const float *P_saved_head, int n_inner)
+                           const float *P_saved_head, int n_inner,
+                           int64_t BH)
 {
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -5679,7 +5722,7 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
        use_prepack=true (otherwise non-prepack fallback paths in the
        fused function would need to exist; we drop them and route to
        the materialized variant when prepack is unavailable). */
-    ax_attn_bwd_kj_fn_t kj_impl = ax_attn_bwd_get_impl(use_prepack);
+    ax_attn_bwd_kj_fn_t kj_impl = ax_attn_bwd_get_impl(use_prepack, BH);
 
     /* I.1.b: per-(head, kj) parallel path. when n_inner > 1 we
        have spare threads after the outer per-head omp_for; spawn
@@ -5847,7 +5890,7 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
                            dQ + h * head_sz, dK + h * head_sz, dV + h * head_sz,
                            S, dk, scale, causal,
                            P_saved ? P_saved + h * pscale_sz : NULL,
-                           n_inner);
+                           n_inner, BH);
         }
     done:;
     }
