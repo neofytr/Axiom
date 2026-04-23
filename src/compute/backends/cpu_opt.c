@@ -5521,7 +5521,15 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
         if (!Di) goto done;
 
 #ifdef _OPENMP
-        #pragma omp for schedule(static)
+        /* dynamic with chunk=1 lets faster threads (P-cores at 4.5 GHz)
+           grab more heads than slower threads (E-cores at 1.8 GHz). on
+           the i5-12500H hybrid the speed spread is ~1.75x, so static
+           scheduling left fast threads idle waiting for slow ones to
+           finish their evenly-divided share. dynamic implicitly
+           weights the distribution by core speed. only meaningful when
+           BH > NT (more heads than threads); when BH ≤ NT the loop
+           bodies map 1:1 so static and dynamic are equivalent. */
+        #pragma omp for schedule(dynamic, 1)
 #endif
         for (int64_t h = 0; h < BH; h++) {
             const float *dOh = dO + h * head_sz;
