@@ -4,6 +4,12 @@
    implementations referenced here through internal.h. */
 
 #include "internal.h"
+/* k.4: ax_cuda_extension_t + register/get APIs. cuda_init_hook below
+   takes the table's address (so we need a tentative declaration
+   visible at that point). the actual definition + initializer lives
+   further down with the op extern decls. */
+#include "axiom/internal/cuda_extension.h"
+extern const ax_cuda_extension_t ax_cuda_ext_table;
 
 /* ── cublas handle (one per process, shared across gemm + any other
       cublas-using op). created eagerly in cuda_init_hook so first
@@ -230,8 +236,10 @@ extern ax_status_t cuda_conv_gemm_batched(const ax_tensor_t *,
 
 /* the extension table — populated at module load. shared across all
    threads (read-only after init); registered with the dispatch
-   subsystem during cuda_init_hook. */
-static const ax_cuda_extension_t ax_cuda_ext_table = {
+   subsystem during cuda_init_hook. forward-declared at the top of
+   this file as `extern const` so cuda_init_hook can take its address
+   before the op-pointer extern decls are visible. */
+const ax_cuda_extension_t ax_cuda_ext_table = {
     .head_interleave_qkv_split        = ax_cuda_head_interleave_qkv_split,
     .head_interleave_qkv_split_bias   = ax_cuda_head_interleave_qkv_split_bias,
     .head_interleave                  = ax_cuda_head_interleave,
