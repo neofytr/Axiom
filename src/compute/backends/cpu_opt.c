@@ -3597,7 +3597,10 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
    lda/ldb/ldc strides and an explicit `accumulate` flag. lets fused entries
    (e.g. opt_dwqkv_split_acc) drive the gemm directly with strided B views
    and an additive output. for the standard contiguous wrapper:
-     lda = m, ldb = n, ldc = n, accumulate = !tl_gemm_skip_init.
+     lda = m, ldb = n, ldc = n, accumulate = tl_gemm_skip_init
+   (skip_init=true means "don't pre-zero, accumulate into existing C" —
+   that matches accumulate=true here; skip_init=false means default
+   overwrite, i.e. memset C to zero first → accumulate=false).
    when accumulate is false, the row-by-row memset zeroes [m, n] starting
    at od + i*ldc — caller must ensure ldc >= n so adjacent rows don't
    overlap. T-pre dispatch and validation live in the wrapper, never here. */
@@ -3892,7 +3895,7 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
         }
     }
 
-    return opt_gemm_tn_raw(ad, m, bd, n, od, n, m, n, k, !tl_gemm_skip_init);
+    return opt_gemm_tn_raw(ad, m, bd, n, od, n, m, n, k, tl_gemm_skip_init);
 }
 
 /* fused dwqkv weight-grad: dWq += X^T @ dQKV[:, 0:D],
