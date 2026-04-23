@@ -122,15 +122,42 @@ lives in L1 throughout the dWo + dattn computation.
 Estimated win: 1-3 % (eliminates one full attn_flat / dattn DRAM
 round-trip per layer call).
 
-### F.4.3: tile-fused input projection (Wqkv recompute)
+### F.4.3: tile-fused input projection (Wqkv recompute) — DEFERRED
 
-Per-`(qi, kj)` tile, recompute Qh/Kh/Vh slices from `X * Wqkv` instead
-of carrying the full Qh/Kh/Vh arena tensors. Trades the Q/K/V
-intermediate for extra recompute on each tile visit.
+**Status: deferred.** The per-tile recompute cost exceeds the BW
+saving on this CPU. Analysis for the worst-case shape
+(B=1, S=2048, D=768, H=12, Bq=Bk=32):
 
-Net win depends on whether the BW saved exceeds the recompute cost.
-On large-S shapes (where Q/K/V are big) the BW saving dominates; on
-small-S shapes the recompute may outweigh.
+| quantity | value |
+|---|---|
+| Qh/Kh/Vh full materialisation (one projection) | 2 * rows * D² = 2 * 2048 * 768² ≈ 2.4 Gflops |
+| Full Wqkv projection (Q+K+V combined) | 3 * 2.4 = 7.2 Gflops |
+| Per-tile Q recompute | 2 * Bq * D * dk = 3.15 Mflops |
+| Q recomputes per head for outer-qi inner-kj loop | S/Bq = 64 (once per qi tile) |
+| K (or V) recomputes per head | (S/Bq) * (S/Bk) = 64 * 64 = 4096 |
+| Extra Q/K/V recompute per head | 64 + 2 * 4096 tile-ops * 3.15 Mflops ≈ 26 Gflops |
+| Extra across H=12 heads | 312 Gflops |
+| Wall clock of extra recompute @ ~500 GFLOPS aggregate peak | ~620 ms |
+| BW saved by skipping Qh/Kh/Vh materialisation (3 * rows * D floats) | ~18 MB |
+| Wall clock saved @ 40 GB/s DRAM BW | ~0.45 ms |
+
+Net: **+620 ms flops cost versus ~0.45 ms BW saving** on the big
+shape. Even accounting for the recomputed K/V staying cache-hot
+across the qi dimension (so only the first qi iteration truly hits
+DRAM for K/V), the flops penalty is orders of magnitude over the
+BW win on AVX2 hardware without tensor-core acceleration.
+
+FA-2's per-tile recompute on GPU pays off because GPU flops are
+essentially free relative to HBM BW (e.g., A100: 312 TFLOPS tensor
+fp16 vs 2 TB/s HBM → flops/BW ratio ~150 ops/byte); on CPU AVX2 the
+ratio is ~10 ops/byte, flipping the tradeoff.
+
+**Path forward:** skip standalone F.4.3. F.4.4's monolithic per-tile
+loop still eliminates the full Qh/Kh/Vh materialisation for the
+fwd+bwd shared tile workspace (the point at which the data is
+in-register already for SDPA fwd and the same tile gets reused for
+SDPA bwd). The BW win there comes from fwd→bwd register/L1 reuse,
+not from skipping the projection itself.
 
 ### F.4.4: full FA-2 fwd+bwd in one pass
 
