@@ -2507,9 +2507,15 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 
     if (use_hybrid) {
         /* hybrid jc+pc+ic for opt_gemm. structure: collapse(3) over (jct, pct,
-           ict). pc-as-second-outer ensures within a thread's contiguous chunk
-           of work, (jct, pct) stays constant across many ict iterations,
-           making the pack_b cache hit consistently. */
+           ict). dynamic schedule with chunk = n_ic_tiles preserves pack_b
+           cache reuse within a chunk (cache keyed on (jct, pct) — within a
+           chunk these are constant since one chunk = n_ic_tiles contiguous
+           iterations of ict with fixed (jct, pct)). between chunks, fast
+           P-cores grab additional chunks from the dynamic queue, giving
+           implicit weighted distribution on hybrid CPUs. same pattern as
+           opt_gemm_tn_raw (bc12ad5) + opt_gemm_nt (e80703b). opt_gemm was
+           missed from the latter commit's stated scope (commit message
+           said "gemm/gemm_nt" but diff only touched gemm_nt). */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
         #ifdef _OPENMP
         #pragma omp parallel num_threads(gemm_threads)
@@ -2522,7 +2528,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(static)
+            #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
