@@ -486,3 +486,111 @@ where the same kernel shape lands at higher throughput.
 
 Tracked as task #130 with this rationale; `git log --grep='dwqkv'` for
 follow-up notes when re-explored.
+
+## F.4 session (2026-04-24 overnight) — commits landed, bench pending
+
+Session work targeting the mha_train TF-gap. All commits land on main
+with 30/30 ctest green; 5-run bench medians deferred until bench-
+reliable window (~2 AM local). Expected compound impact on mha_train
+shapes is in the ~5-15 % range on the best cases, modest elsewhere.
+
+### Commits
+
+| phase / topic | commit | expected impact | bench after |
+|---|---|---|---|
+| F.4.2 output-projection reorder + stronger fused parity test | 5122194 | ~0.5-2 %; cache-locality win, no kernel changes | 2 AM |
+| perf(layout) dynamic schedule on 7 head_interleave variants | e540489 | 0-5 % on hybrid CPU imbalance | 2 AM |
+| F.4.3 defer (per-tile Qh/Kh/Vh recompute) | 0cd5557 | no code change; analysis recorded | n/a |
+| perf(train_step_fused) merge 3 ACC_PARAM omp regions into 1 | 4104945 | ~0.1 % (~25 µs per call) | 2 AM |
+| **perf(sdpa_bwd) shape-dispatched AX_SDPA_FUSED — on by default** | a2891a3 | **-10 % on B8_S128**, -1-2 % B4/B2/B1_S2048, no change B1_S512 | 2 AM |
+| perf(gemm) opt_gemm use_hybrid schedule(dynamic, n_ic_tiles) | 3fdf52a | ~2-5 % on NN-dominated shapes | 2 AM |
+| perf(dwqkv_split_acc) hybrid path dynamic | 4642674 | ~1-1.5 % (dWqkv is 25-33 % of bwd) | 2 AM |
+
+### F.4.2 — output-projection reorder
+
+`ax_mha_train_step_fused` used to delegate straight to
+`ax_mha_train_step`. This session put the full body in place with the
+three backward output-projection ops reordered:
+
+```
+before (train_step.c): dWo_tn → dbo_col_sum → dattn_nt
+after  (train_step_fused): dattn_nt → dWo_tn → dbo_col_sum
+```
+
+Rationale:
+- `dattn_nt` reads `Wo`. The forward y gemm also reads `Wo`. Putting
+  `dattn_nt` first after the backward section starts gives `Wo` the
+  best shot at staying in L3 across the forward/backward boundary.
+- The three backward ops all read `dout`. Running them back-to-back
+  keeps `dout` cache-warm instead of evicted between calls.
+- Aggressive per-strip custom AVX2 kernels were considered and
+  rejected — see F.4.3 analysis note.
+
+Parity test `test_mha_train_step_fused_parity` now runs the full
+autograd-vs-fused bit-equality check (was just "returns OK" before).
+Every subsequent F.4 phase must keep both train_step and
+train_step_fused green.
+
+### F.4.3 — deferred: per-tile Qh/Kh/Vh recompute (flops >> BW win)
+
+Worst-case shape (B=1, S=2048, D=768, H=12, Bq=Bk=32):
+
+| quantity | value |
+|---|---|
+| full Wqkv projection (one of Q/K/V) | 2.4 Gflops |
+| full Wqkv projection (Q + K + V) | 7.2 Gflops |
+| extra Q/K/V recompute per head | ~26 Gflops |
+| extra across H=12 heads | 312 Gflops |
+| wall clock @ ~500 GFLOPS aggregate peak | ~620 ms |
+| BW saved by skipping full Qh/Kh/Vh materialisation | ~18 MB |
+| wall clock @ 40 GB/s DRAM BW | ~0.45 ms |
+
+Net: **~620 ms flops penalty vs ~0.45 ms BW saving**. FA-2's per-tile
+recompute is a GPU optimisation (ops/byte ratio ~150 on A100); on
+AVX2 CPU the ratio is ~10 — flips the tradeoff. F.4.4's fwd+bwd
+tile loop reuses in-register tile data, which IS a win on CPU, and
+subsumes F.4.3's intent without the projection recompute cost.
+
+### perf(sdpa_bwd) — shape-dispatched AX_SDPA_FUSED
+
+Biggest single commit of the session. The fused `attn_bwd_kj_block_fused`
+variant was opt-in via `AX_SDPA_FUSED=1` because one shape (B1_S512_D1024_H16,
+BH=16=NT=16) regressed +12 %. Dispatch now:
+
+- `AX_SDPA_FUSED=1` → force fused
+- `AX_SDPA_FUSED=0` → force materialised
+- unset (new default) → **fused when BH != NT, materialised when BH == NT**
+
+Expected per-shape impact (from plan.md re-bench table):
+
+| shape | default fused? | expected delta |
+|---|---|---|
+| B8_S128_D512_H8 (BH=64) | YES | -10 % |
+| B4_S512_D768_H12 (BH=48) | YES | -2 % |
+| B2_S1024_D768_H12 (BH=24) | YES | -1 % |
+| B1_S512_D1024_H16 (BH=16) | NO | no change |
+| B1_S2048_D768_H12 (BH=12) | YES | -1 % |
+
+### perf(gemm / dwqkv_split_acc) — hybrid path dynamic chunk
+
+Three gemm entry points now share the `schedule(dynamic, n_ic_tiles)`
+pattern on their `use_hybrid` collapse(3) loop:
+- `opt_gemm_tn_raw` (bc12ad5, prior session)
+- `opt_gemm_nt` (e80703b, prior session)
+- `opt_gemm` (this session — e80703b commit message said "gemm/gemm_nt"
+  but diff only touched gemm_nt)
+- `opt_dwqkv_split_acc` (this session — predated the pattern)
+
+Same rationale: chunk = n_ic_tiles keeps `pack_b` cache hot within a
+chunk (cache keyed on (jct, pct), both constant within a chunk).
+Between chunks, fast P-cores (4.5 GHz) grab more chunks from the
+dynamic queue than slow E-cores (1.8 GHz) — implicit weighted
+distribution on the 1.65x-2.16x hybrid speed spread.
+
+### Path forward
+
+F.4.4 (monolithic per-tile fused train kernel) remains the structural
+match to XLA's generated code. ~1500-2000 LOC of careful work. Not
+landed this session — prioritised the many low-risk wins above, which
+together may close 1/2 to 2/3 of the TF gap on the most-lagging shape
+(B8_S128, TF -32 % pre-session).
