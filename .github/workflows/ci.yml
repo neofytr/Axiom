@@ -197,3 +197,85 @@ jobs:
           cppcheck --enable=warning,portability --error-exitcode=0 \
                    --suppress=missingIncludeSystem \
                    -I include src/ 2>&1 | tail -30 || true
+
+  # ====================================================================
+  # M.6: gcov / lcov line-coverage report. builds with --coverage
+  # (gcc adds -fprofile-arcs -ftest-coverage), runs the full ctest
+  # suite, then aggregates into one HTML report uploaded as artefact.
+  # also fails the job if line coverage drops below MIN_COVERAGE_PCT
+  # so we get a quality gate, not just a vanity number.
+  # ====================================================================
+  coverage:
+    name: coverage (gcov+lcov)
+    runs-on: ubuntu-latest
+    env:
+      MIN_COVERAGE_PCT: "70"
+    steps:
+      - uses: actions/checkout@v4
+      - name: install lcov
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lcov
+      - name: build with --coverage
+        run: |
+          mkdir build && cd build
+          # Debug + --coverage: gcc emits .gcno files alongside object
+          # files; tests' execution writes .gcda files at exit. avoid
+          # ISA dispatch (would compile cpu_opt 3x and inflate the
+          # gcov output without measuring different lines).
+          cmake -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_C_FLAGS="--coverage -O0 -g" \
+                -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
+                ..
+          cmake --build . -j$(nproc)
+      - name: run tests
+        run: |
+          cd build
+          # ctest produces .gcda files for every test that ran. failures
+          # don't gate the coverage report — we still want the partial
+          # picture so devs can see what slipped — but fail-on-tests-fail
+          # at the very end via the saved exit code.
+          ctest -j$(nproc) --output-on-failure --timeout 600 || echo "TEST_FAILED" > .test_failed
+      - name: aggregate with lcov
+        run: |
+          cd build
+          # filter: keep only axiom source files; drop /usr/include + tests
+          lcov --capture --directory . --output-file coverage.info --quiet
+          lcov --remove coverage.info '/usr/*' '*/tests/*' '*/benchmarks/*' \
+               --output-file coverage.info --quiet
+          lcov --list coverage.info | tee coverage.summary
+      - name: gate on MIN_COVERAGE_PCT
+        run: |
+          cd build
+          # parse `Total:|TOTAL` row from lcov --list output for line%
+          pct=$(grep -oE 'Total:\|.*' coverage.summary | grep -oE '[0-9.]+%' | head -1 | tr -d '%')
+          if [ -z "$pct" ]; then
+            # newer lcov uses different format; try alternative parse
+            pct=$(awk '/lines\.*:/ {print $2}' coverage.summary | tr -d '%')
+          fi
+          echo "line coverage: $pct%  (gate: ≥${MIN_COVERAGE_PCT}%)"
+          # bash arithmetic compare on floats: pad to int (×100) and compare
+          gate100=$(echo "$MIN_COVERAGE_PCT * 100" | bc)
+          got100=$(printf "%.0f" $(echo "$pct * 100" | bc))
+          if [ "$got100" -lt "$gate100" ]; then
+            echo "FAIL: coverage $pct% < gate ${MIN_COVERAGE_PCT}%"
+            exit 1
+          fi
+          echo "ok: coverage gate passed"
+      - name: html report
+        run: |
+          cd build
+          genhtml coverage.info --output-directory coverage_html --quiet
+      - name: upload artefact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            build/coverage.info
+            build/coverage.summary
+            build/coverage_html
+      - name: re-fail if tests failed
+        run: |
+          if [ -f build/.test_failed ]; then
+            echo "ctest had failures — see earlier step"
+            exit 1
+          fi
