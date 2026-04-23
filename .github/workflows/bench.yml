@@ -53,10 +53,17 @@ jobs:
             host: ubuntu-latest
             tf-pkg: tensorflow-cpu
             apt: ""
+            # ISA dispatch only on x86 — produces avx512/avx2/scalar variants
+            # of cpu_opt at build time, runtime picks. on arm64 cmake would
+            # try to compile the cpu_opt variants with -mavx512f / -mavx2 /
+            # -mno-avx2 which arm64 gcc rejects → bench (arm64-neon) failure
+            # in run 24815595700.
+            cmake-extra: "-DAX_CPU_ISA_DISPATCH=ON"
           - isa: arm64-neon
             host: ubuntu-24.04-arm
             tf-pkg: tensorflow
             apt: "build-essential cmake libomp-dev python3-pip"
+            cmake-extra: ""
     steps:
       - uses: actions/checkout@v4
 
@@ -83,10 +90,10 @@ jobs:
       - name: install tensorflow
         run: pip install --quiet ${{ matrix.tf-pkg }} numpy
 
-      - name: build axiom (release, ISA dispatch)
+      - name: build axiom
         run: |
           mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake-extra }} ..
           cmake --build . -j$(nproc)
 
       # ----------------------------------------------------------------
