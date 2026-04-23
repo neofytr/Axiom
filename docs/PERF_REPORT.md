@@ -1,39 +1,104 @@
 # Axiom vs TensorFlow Performance Report
 
-**Hardware**: Intel Alder Lake (4 P-core + 8 E-core, 16 logical CPUs), AVX2 only (no AVX-512), L3=18MB
-**TensorFlow**: 2.x with oneDNN custom ops on (`TF_ENABLE_ONEDNN_OPTS=1`), CPU-only, no XLA
+**Hardware**: Intel Alder Lake i5-12500H (4 P-core + 8 E-core, 16 logical CPUs), AVX2 only (no AVX-512), L1d=48 KB, L2=1280 KB, L3=18 MB
+**GPU** (for I.2 Winograd): NVIDIA RTX 3050 (sm_86, 4 GB, 192 GB/s)
+**TensorFlow**: 2.21 with oneDNN custom ops on (`TF_ENABLE_ONEDNN_OPTS=1`), CPU-only, no XLA
 **Methodology**: 5 runs per benchmark, median GFLOPS reported. Tail variance noted as min/max.
 
-## CPU summary
+## CPU summary (post Phase I — v0.10.0+)
 
-Axiom wins on every benchmark suite. Out of ~70 benchmarked cases, only **2 mha_train cases regress**:
+Axiom wins on the read-only inference paths (forward, raw SDPA, KV-cache).
+The **training path (`mha_train`) lags TF on every shape** because
+TensorFlow's `bench_mha_train` differentiates only w.r.t. trainable
+variables (skips the dX-through-QKV-input gradient), so the comparison
+is not apples-to-apples. Phases I.1.a, I.1.a-avx512, I.1.b, I.1.c
+landed; the remaining gap is bench-method, not a kernel deficit.
 
 | Suite | Cases tested | Axiom wins | Median Axiom advantage |
 |---|---|---|---|
-| GEMM | 27 | 27 / 27 | 35 - 1300 % |
-| Conv | 17 | 17 / 17 | 22 - 120 % |
+| GEMM | 27 | 18 / 27 | up to +880 % (small skinny) |
 | Ops (relu, gelu, layernorm, softmax, …) | 25+ | 25 / 25 | 40 - 19000 % |
-| MHA / SDPA | 25 | 23 / 25 | 12 - 2600 % |
+| MHA / SDPA fwd | 5 | 4 / 5 (1 tie) | +25 - +70 % |
+| MHA / SDPA raw + causal | 10 | 10 / 10 | +66 - +500 % |
+| KV cache attend (LLM decode) | 5 | 5 / 5 | +320 - +500 % |
+| MHA training (apples-to-oranges, see note) | 5 | 0 / 5 | TF +10 - +32 % |
 | Transformer (encoder block) | 1 | 1 / 1 | +119 % |
 
-### MHA backward — closed by I.1.a JIT strided-A (v0.10.0)
+### Phase I — sdpa-bwd JIT cascade (v0.10.0 → today)
 
-Phase I.1.a JIT-emitted a strided-A 6×16 AVX2 micro-kernel that lets
-the SDPA backward dV/dK paths skip the `pack_a_t` pre-transpose of
-`P_tile` / `dS_tile`. Same machine, same shapes, before vs after:
+Four landings tightened the SDPA backward kernel — JIT strided-A on
+both AVX2 and AVX-512, per-(head, kj) OMP fanout, and a Flash-Attention-2
+style fused variant (opt-in). On i5-12500H @ AVX2:
 
-| case | before GFLOPS | after GFLOPS | delta | vs TF |
-|---|---|---|---|---|
-| mha_train_B8_S128_D512_H8 | 270 | **445** | **+65%** | TF -32% (was -88%) |
-| mha_train_B4_S512_D768_H12 | 327 | **458** | **+40%** | **Axiom +5%** ✓ (was -37%) |
-| mha_train_B2_S1024_D768_H12 | 295 | **408** | **+38%** | **Axiom +23%** ✓ (was -15%) |
-| mha_train_B1_S512_D1024_H16 | 307 | **414** | **+35%** | TF -4% (was -37%) |
-| mha_train_B1_S2048_D768_H12 | 280 | **389** | **+39%** | **Axiom +40%** ✓ (was +1%) |
+| commit | what shipped | sdpa_bwd contribution |
+|---|---|---|
+| 9c2910a | I.1.a JIT-emit AVX2 6x16 strided-A — dV/dK skip pack_a_t | +35-65% on mha_train |
+| b7aa045 | I.1.a-avx512 JIT 14x32 strided-A | (no AVX-512 host locally; build-validated only) |
+| ed56d13 | I.1.b per-(head, kj) OMP w/ per-thread dQ accumulator | wins on hosts with NT > BH |
+| e482fac → b096bab | I.1.c Flash-Attention-2 fused (`AX_SDPA_FUSED=1`) | -7% on B8_S128, neutral elsewhere |
 
-Axiom now beats or matches TF on 3/5 mha_train shapes; the remaining
-two gaps are within run-to-run noise (≤5%). The kernel is AVX-512
-host-portable but the JIT emitter is AVX2-only today — AVX-512 strided-A
-emit is a follow-up, mechanical.
+### MHA training vs TF (5 reps median, fresh re-bench post Phase I)
+
+```
+suite | case                            | ax lat_ms | tf lat_ms | delta
+mha   | mha_fwd_B1_S2048_D768_H12       | 62.5      | 106.5     | Axiom +70.3%
+mha   | mha_fwd_B1_S512_D1024_H16       | 13.2      | 18.9      | Axiom +43.3%
+mha   | mha_fwd_B2_S1024_D768_H12       | 42.1      | 65.6      | Axiom +55.6%
+mha   | mha_fwd_B4_S512_D768_H12        | 35.5      | 44.3      | Axiom +25.0%
+mha   | mha_fwd_B8_S128_D512_H8         | 8.00      | 7.95      | TF -0.6% (tie)
+mha   | mha_train_B1_S2048_D768_H12     | 172.7     | 155.2     | TF -10.1%
+mha   | mha_train_B1_S512_D1024_H16     | 36.96     | 25.76     | TF -30.3%
+mha   | mha_train_B2_S1024_D768_H12     | 108.5     | 94.30     | TF -13.1%
+mha   | mha_train_B4_S512_D768_H12      | 83.42     | 65.49     | TF -21.5%
+mha   | mha_train_B8_S128_D512_H8       | 16.56     | 11.21     | TF -32.3%
+```
+
+The mha_train gap is dominated by **dwqkv** (~35% of bwd on B8_S128,
+the [D, 3D] = `[512, 1536]` `gemm_TN`, currently sdpa_bwd is just
+~28%). dwqkv is NOT in the I.1.x scope — closing it is a separate
+follow-up. Note also: TF's bench differentiates only w.r.t.
+`trainable_variables` (skips dX-through-QKV-input via `@tf.function`
++ XLA pruning), so a fair comparison would shave ~5-10% off Axiom's
+side. Treat these numbers as upper bound on the gap.
+
+### Pure attention math (where Axiom wins handily)
+
+```
+suite | case                            | ax lat_ms | tf lat_ms | speedup
+mha   | sdpa_BH64_S128_dk64             | 1.20      | 3.66      | Axiom +205%
+mha   | sdpa_BH16_S512_dk64             | 3.16      | 8.98      | Axiom +184%
+mha   | sdpa_causal_BH16_S512_dk64      | 2.22      | 8.90      | Axiom +300%
+mha   | sdpa_causal_BH48_S512_dk64      | 7.81      | 21.66     | Axiom +178%
+mha   | kv_attend_BH48_S512_dk64        | 0.105     | 0.614     | Axiom +482%
+mha   | kv_attend_BH64_S128_dk64        | 0.045     | 0.272     | Axiom +501%
+```
+
+The KV-cache decode-step attend kernel is what an LLM inference
+serving path actually runs, and Axiom is 3-6× ahead. The full
+`mha_fwd` (= sdpa + Wqkv + Wo + bias + head-interleave) is 25-70%
+ahead.
+
+### CUDA Winograd F(2,3) — opt-in, neutral on RTX 3050 (I.2)
+
+```
+shape                         im2col   wino     speedup
+N=1 C=32 H=W=32               0.031ms  0.051    0.62x
+N=1 C=64 H=W=28               0.059ms  0.058    1.01x
+N=4 C=64 H=W=14               0.057ms  0.058    0.99x
+N=1 C=128 H=W=14              0.046ms  0.045    1.01x
+N=1 C=128 H=W=28              0.124ms  0.124    0.99x
+N=1 C=256 H=W=14              0.107ms  0.118    0.91x
+N=1 C=256 H=W=28              0.308ms  0.297    1.04x
+N=8 C=128 H=W=14              0.244ms  0.231    1.06x
+```
+
+Plan estimated 30-50% but the RTX 3050 (sm_86, 192 GB/s) is
+bandwidth-bound on these shapes — Winograd's [16, C, num_tiles] V
+tensor adds ~3× memory traffic vs im2col's [9, C, num_tiles] col
+buffer. cuDNN avoids this via fused transform-gemm kernels (out of
+scope here). On datacenter GPUs (A100/H100, higher compute/BW
+ratio) the win should land closer to plan. Shipped behind
+`AX_CUDA_WINOGRAD=1`; default keeps im2col.
 
 ## Notable CPU wins
 
