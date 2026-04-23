@@ -330,6 +330,96 @@ failing since April 17. Pre-dates this work; tracked as Phase G.
 | C5 | Multi-stream pipeline (overlap H2D, compute, D2H) for inference loops | 10-15 % throughput gain on inference |
 | C6 | Optional: cuDNN convolution backend if license-compatible | fastest conv path |
 
+## F: ax_mha_train_step — fused fwd+bwd API (in progress)
+
+### Why it exists
+
+`bench_mha_train` lags TF by 10-32% on every shape. PERF_REPORT
+previously attributed this to "TF prunes dX via @tf.function" but
+that's only the smaller half. The larger half is **TF's
+@tf.function(jit_compile=True) wraps the entire forward + backward in
+ONE XLA-compiled function**:
+
+```python
+@tf.function(jit_compile=True)
+def step():
+    with tf.GradientTape() as tape:
+        out = mha(x, x)
+        loss = tf.reduce_sum(out)
+    grads = tape.gradient(loss, mha.trainable_variables)
+    return grads[0]
+```
+
+XLA fuses across stages — the dQ/dK/dV/dWqkv/dWo grads come out of one
+mega-kernel where intermediates live in registers/L1 across stage
+transitions. our autograd path runs each stage as a separate kernel
+through the per-op tape, so cache lines bounce through L3 between
+e.g. `gemm_tn → ACC_PARAM → next gemm`.
+
+### F.0 + F.1 + F.2: scaffolding (commit 623ea45)
+
+Public API: `ax_mha_train_step(layer, x, dout, y_out)`. Skips the
+autograd tape — runs the same compute primitives but with
+intermediates in a per-thread arena and direct-write to weight grads
+via `ax_gemm_set_skip_init(true)`. Bypasses graph creation, ctx
+marshalling, tape walk.
+
+5-run medians (i5-12500H AVX2) of mha_train (autograd) vs new fused
+path:
+
+| shape                            | autograd ms | fused ms | delta |
+|----------------------------------|-------------|----------|-------|
+| mha_train_B8_S128_D512_H8        | 19.6        | 20.5     | +5%   |
+| mha_train_B4_S512_D768_H12       | 91.8        | 93.3     | +2%   |
+| mha_train_B2_S1024_D768_H12      | 122.4       | 123.2    | tie   |
+| mha_train_B1_S512_D1024_H16      | 40.1        | 38.9     | -3%   |
+| mha_train_B1_S2048_D768_H12      | 185.5       | 182.8    | -1.5% |
+
+**Honest reading**: roughly tied. The autograd overhead on this
+hardware is small (the existing forward arena + ax_grad_fn are tight),
+so just bypassing the tape doesn't move the needle. Run-to-run
+variance on this Alder Lake hybrid CPU is 5-15% — within that
+window everywhere except B1_S512 which shows a clean -3%.
+
+The win this phase **does** unlock is structural:
+
+- a `test_mha_train_step_parity` correctness test that flushed out a
+  pre-existing **gemm_tn skip_init wrapper inversion** (commit
+  bea0bc5) — `opt_gemm_tn` was passing `!tl_gemm_skip_init` as the
+  accumulate flag instead of `tl_gemm_skip_init`. all 30 ctest passed
+  under the broken wrapper because most callers freshly allocate
+  destinations from a pool that often returns zeroed memory; the
+  parity test compared two paths that exercised both branches and
+  caught the divergence.
+- a clear API for the next phase (F.3) where each cross-stage
+  fusion lands as an incremental commit on top of `ax_mha_train_step`
+  without disturbing the autograd path.
+
+### F.3: cross-stage tile fusion (next)
+
+Fusion candidates with estimated BW savings on B8_S128 (12 MB qkv,
+30 GB/s effective DRAM):
+
+| fusion | intermediate eliminated | est. saving | est. % of mha_train |
+|---|---|---|---|
+| F.3.a | qkv [rows, 3D] (gemm + head_split) | 12 MB | ~2-3% |
+| F.3.c | dWqkv [D, 3D] (multi-output gemm_TN) | 12 MB | ~2-3% |
+| F.3.f | dout reused for wo_grad + dattn | 2 MB | ~0.5% |
+| F.3.d | d_attn_flat (gemm_NT + head_interleave) | 2 MB | ~0.5% |
+| F.3.e | Oh (sdpa_fwd + head_deinterleave) | 2 MB | ~0.5% |
+
+Compounded ceiling: ~7-10% on B8_S128. Still leaves a 20%+ gap to TF
+because XLA also gets:
+- per-tile fusion across all stages (not just adjacent pairs) —
+  needs a custom mha-train mega-kernel like FA-2 has for sdpa
+- better register allocation across stage boundaries (compiler-only)
+
+**Path to actual TF parity**: a fully-fused mha-train kernel that
+processes a `(qi, kj)` strip through `Qh@Kh^T → softmax → @Vh →
+Wo gemm → loss → dWo + dattn → dQh/dKh/dVh → dWqkv` in one cache-
+resident pass. ~2000 LOC of careful work, beyond a single session.
+Tracked as task #140 (F.4).
+
 ## A (deferred): dwqkv fused kernel — analysis + decision
 
 **Profile (post Phase I, B8_S128_D512_H8, x86 AVX2)**: dwqkv is now 35 %
