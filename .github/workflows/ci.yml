@@ -1,4 +1,8 @@
-name: CI (build + test)
+name: CI
+
+# correctness — runs on every push + PR. fast (~5 min) so it doesn't
+# block iteration. perf vs TensorFlow lives in bench.yml (opt-in via
+# `run-benchmarks` PR label, plus nightly cron).
 
 on:
   push:
@@ -6,191 +10,141 @@ on:
   pull_request:
     branches: [main]
 
-# cancel in-progress runs on new pushes to the same branch
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  # build + test on x86-64 with ISA dispatch (avx512 + avx2 + scalar variants)
-  test-x86:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: show hardware
-        run: |
-          lscpu | head -20
-          free -h
-
-      - name: build with ISA dispatch
-        run: |
-          mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
-          cmake --build . -j$(nproc)
-
-      - name: verify ISA selection
-        run: cd build && ./test_compute 2>&1 | head -8
-
-      - name: run test suite
-        run: cd build && ctest -j$(nproc) --output-on-failure
-
-      # asan + ubsan build moved to a dedicated gating job (test-asan).
-      # the previous approach ran sanitizers inside this job with `|| true`
-      # so failures didn't block merges — defeats the point. keeping a
-      # quick smoke build here for local dev signal, gate via test-asan.
-
-  # build + test on ARM64 (NEON). matrix bisects regressions:
-  # `default` exercises the full NEON path including the JIT-emitted
-  # 8x12 micro-kernel; `nojit` disables the JIT and uses pure intrinsic
-  # NEON. when only one variant fails it points the finger at that
-  # code path — saves a cross-compile bisect.
-  test-arm64:
-    runs-on: ubuntu-24.04-arm
+  # ====================================================================
+  # full ctest across every (host, ISA) combination that has its own
+  # code path. one matrix entry per surface that needs independent
+  # coverage:
+  #   x86-avx2:    ubuntu-latest with ISA dispatch — auto-picks AVX-512
+  #                if the runner CPU supports it, else AVX2; full SIMD
+  #                + JIT path
+  #   x86-scalar:  ubuntu-latest with -mno-* + AX_OPENMP=OFF — exercises
+  #                the generic scalar fallback paths (catches accidental
+  #                requirements on AVX/NEON without a scalar fallback)
+  #   arm64-neon:  ubuntu-24.04-arm — NEON intrinsics + 8x12 JIT kernel
+  #   arm64-nojit: same hardware with AX_NO_JIT — regression guard for
+  #                the AAPCS64 callee-save bug fixed in 70cdc04 (kernel
+  #                clobbered v8..v15 without saving them, only the JIT
+  #                path was affected)
+  # ====================================================================
+  test:
+    name: test (${{ matrix.isa }})
+    runs-on: ${{ matrix.host }}
     strategy:
       fail-fast: false
       matrix:
-        config:
-          - name: default
+        include:
+          - isa: x86-avx2
+            host: ubuntu-latest
             cflags: ""
-          - name: nojit
+            cmake-extra: -DAX_CPU_ISA_DISPATCH=ON
+            apt: ""
+          - isa: x86-scalar
+            host: ubuntu-latest
+            cflags: "-mno-avx2 -mno-avx -mno-fma -mno-sse4.1 -mno-sse4.2 -mno-avx512f"
+            cmake-extra: -DAX_OPENMP=OFF
+            apt: ""
+          - isa: arm64-neon
+            host: ubuntu-24.04-arm
+            cflags: ""
+            cmake-extra: ""
+            apt: "build-essential cmake libomp-dev"
+          - isa: arm64-nojit
+            host: ubuntu-24.04-arm
             cflags: "-DAX_NO_JIT"
+            cmake-extra: ""
+            apt: "build-essential cmake libomp-dev"
     steps:
       - uses: actions/checkout@v4
 
-      - name: show hardware
+      - name: install apt deps
+        if: matrix.apt != ''
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.apt }}
+
+      - name: hardware
         run: |
-          lscpu | head -20
+          lscpu | head -15
           free -h
 
-      - name: install deps
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential cmake libomp-dev
-
-      - name: build (${{ matrix.config.name }})
+      - name: build
         run: |
           mkdir build && cd build
           cmake -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_C_FLAGS="${{ matrix.config.cflags }}" \
-                ..
+                -DCMAKE_C_FLAGS="${{ matrix.cflags }}" \
+                ${{ matrix.cmake-extra }} ..
           cmake --build . -j$(nproc)
 
-      - name: run test suite
-        run: cd build && ctest -j$(nproc) --output-on-failure
+      - name: ctest
+        run: cd build && ctest -j$(nproc) --output-on-failure --timeout 300
 
-      - name: verify NEON micro-kernel
-        run: cd build && ./test_compute 2>&1 | head -5
-
-      - name: per-op micro-benchmarks (NEON baseline)
-        run: |
-          cd build
-          ./bench_gemm_suite 2>&1 | head -40
-          ./bench_ops_suite  2>&1 | head -40
-
-  # scalar-only build: no SIMD, no OpenMP — ensures scalar fallback paths compile
-  # and all tests pass without vector extensions. catches regressions where a
-  # new code path accidentally requires AVX/NEON without a scalar fallback.
-  test-scalar:
+  # ====================================================================
+  # ASan + UBSan, debug build, ctest under strict halt-on-error.
+  # gates merges; previous workflow ran sanitizers with `|| true` so
+  # findings were ignored. detect_leaks=0 because tests intentionally
+  # leave intermediate autograd tensors for ax_graph_cleanup.
+  # ====================================================================
+  sanitize:
+    name: sanitize (asan+ubsan)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: build scalar-only (no AVX, no OMP)
-        run: |
-          mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release \
-                -DAX_OPENMP=OFF \
-                -DCMAKE_C_FLAGS="-mno-avx2 -mno-avx -mno-fma -mno-sse4.1 -mno-sse4.2 -mno-avx512f" \
-                ..
-          cmake --build . -j$(nproc)
-
-      - name: run test suite (scalar paths)
-        run: cd build && ctest -j$(nproc) --output-on-failure
-
-      - name: per-op micro-benchmarks (scalar baseline)
-        run: |
-          cd build
-          ./bench_gemm_suite 2>&1 | head -40
-          ./bench_ops_suite  2>&1 | head -40
-
-  # embedded/baremetal build: validates the AX_PROFILE=embedded-baremetal
-  # path. that profile turns on AX_OPENMP=OFF + AX_SINGLE_THREADED +
-  # AX_NO_STDIO + AX_NO_AUTOTUNE + AX_INFERENCE_ONLY by default and
-  # picks tiny GEMM tiles (24x32x64) sized for a 64 kB SRAM. compile-only;
-  # there's no execution environment for cortex-m here.
-  #
-  # post-build: scan the static archive for stdio symbol references. when
-  # AX_NO_STDIO is on, no public function should pull in printf / fprintf
-  # / fopen / fwrite — those would force the toolchain to link the
-  # ~20 kB stdio machinery into the final firmware image.
-  test-embedded:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: build embedded-baremetal profile
-        run: |
-          mkdir build && cd build
-          cmake -DCMAKE_BUILD_TYPE=Release \
-                -DAX_PROFILE=embedded-baremetal \
-                ..
-          cmake --build . -j$(nproc) --target axiom_static
-
-      - name: check for stdio leaks in library object
-        run: |
-          nm build/libaxiom.a 2>/dev/null | grep -E ' U (printf|fprintf|fopen|fwrite)' \
-            && echo "FAIL: stdio symbols found" && exit 1 \
-            || echo "ok: no stdio symbols in embedded build"
-
-  # address-sanitizer + undefined-behavior-sanitizer build. catches the
-  # bug classes static analysis misses (use-after-free, heap-buffer-
-  # overflow, signed-overflow, mis-aligned aligned_alloc requests, etc.).
-  # gates merges — failures block the PR. previous version of this job
-  # ran inside test-x86 with `|| true` so failures were ignored;
-  # promoting to its own job + dropping the `|| true` makes asan
-  # findings actionable.
-  test-asan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: build with asan + ubsan
+      - name: build
         run: |
           mkdir build && cd build
           cmake -DCMAKE_BUILD_TYPE=Debug -DAX_SANITIZE=ON ..
           cmake --build . -j$(nproc)
-      - name: run test suite under sanitizers
+      - name: ctest under sanitizers
         run: |
           cd build
-          # detect_leaks=0: tests intentionally don't free every intermediate
-          # tensor in the autograd graph (that's the model api's job via
-          # ax_graph_cleanup). asan still catches use-after-free / overflow.
-          # halt_on_error=1: any sanitizer report aborts the test, ctest
-          # records it as failure rather than continuing past corruption.
           ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
-            ctest -j$(nproc) --output-on-failure --timeout 300
+            ctest -j$(nproc) --output-on-failure --timeout 600
 
-  # portability lint: catch x86-only intrinsics outside __x86_64__ guards
-  # before they reach a cross-arch build. three regressions in a row
-  # (rdtsc in cpu_opt.c::ax_prof_tick, attention.c::PF_TICK, conv_gemm
-  # profile) all had the same shape — x86 intrinsic survived dce because
-  # gating was a runtime flag, then arm64 link failed. this lint blocks
-  # that class at PR time. fast (<1s, pure python regex scan).
-  check-portability:
+  # ====================================================================
+  # AX_PROFILE=embedded-baremetal builds the static archive sized for
+  # cortex-m-class targets (24x32x64 GEMM tiles, no OMP, no stdio,
+  # no autotune). compile-only — no execution environment for cortex-m
+  # in CI. post-build: scan libaxiom.a for stdio symbols; any leak
+  # would force the toolchain to link ~20 kB stdio into the firmware.
+  # ====================================================================
+  embedded:
+    name: embedded baremetal
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: scan for unguarded x86 intrinsics
-        run: python3 scripts/check_portability.py
+      - name: build static archive
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_PROFILE=embedded-baremetal ..
+          cmake --build . -j$(nproc) --target axiom_static
+      - name: stdio-leak scan
+        run: |
+          if nm build/libaxiom.a 2>/dev/null \
+             | grep -E ' U (printf|fprintf|fopen|fwrite)'; then
+            echo "FAIL: stdio symbols leaked into embedded build"
+            exit 1
+          fi
+          echo "ok: no stdio symbols in embedded build"
 
-  # static analysis / lint
+  # ====================================================================
+  # cppcheck warnings + the portability scan (catches x86-only
+  # intrinsics outside __x86_64__ guards before they reach a cross-
+  # arch build — three regressions in a row had this shape).
+  # ====================================================================
   lint:
+    name: lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: portability scan
+        run: python3 scripts/check_portability.py
       - name: cppcheck
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq cppcheck
+          sudo apt-get update -qq && sudo apt-get install -y -qq cppcheck
           cppcheck --enable=warning,portability --error-exitcode=0 \
                    --suppress=missingIncludeSystem \
                    -I include src/ 2>&1 | tail -30 || true

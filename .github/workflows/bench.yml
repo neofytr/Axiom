@@ -1,0 +1,267 @@
+name: Bench (vs TensorFlow)
+
+# perf comparison vs TensorFlow on multiple ISAs.
+#
+# triggers — opt-in, NOT every push:
+#   - PR label `run-benchmarks` added       → runs once
+#   - schedule (nightly 03:00 UTC)          → authoritative trend
+#   - workflow_dispatch (manual run)        → ad-hoc
+#
+# why opt-in: a full bench costs ~30 min × N matrix entries; running on
+# every PR clogs the queue and wastes runner-minutes on doc/refactor
+# changes that can't move the needle. correctness still gates every
+# push via ci.yml.
+#
+# coverage: each matrix entry is ONE job that builds Axiom + installs
+# TF once, then runs every suite (parity, gemm, ops, conv, mha,
+# training, stress) as steps. parity gates the rest. summarize.py
+# --strict exits non-zero on any case >REGRESSION_PCT slower than TF.
+# autotune regression check (was its own workflow) is a step at the end.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [labeled]
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGRESSION_PCT: "10"
+  AUTOTUNE_REGRESSION_FRAC: "0.80"  # autotune must hit >=80% of no-autotune
+
+jobs:
+  bench:
+    # only run for the right label / schedule / manual trigger; ignore
+    # other PR label events so we don't bench on a `bug` label add.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'run-benchmarks')
+    name: bench (${{ matrix.isa }})
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - isa: x86-avx2
+            host: ubuntu-latest
+            tf-pkg: tensorflow-cpu
+            apt: ""
+          - isa: arm64-neon
+            host: ubuntu-24.04-arm
+            tf-pkg: tensorflow
+            apt: "build-essential cmake libomp-dev python3-pip"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: hardware profile
+        run: |
+          {
+            echo "## host: ${{ matrix.isa }}"
+            echo ""
+            echo '### CPU'
+            echo '```'
+            lscpu | grep -E '(Model name|Architecture|CPU\(s\)|Thread|Core|Socket|L1d|L2|L3|MHz|Flags)' | head -25
+            echo '```'
+            echo ''
+            echo '### memory'
+            echo '```'
+            free -h
+            echo '```'
+          } | tee hardware.md
+
+      - name: install apt deps
+        if: matrix.apt != ''
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.apt }}
+
+      - name: install tensorflow
+        run: pip install --quiet ${{ matrix.tf-pkg }} numpy
+
+      - name: build axiom (release, ISA dispatch)
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc)
+
+      # ----------------------------------------------------------------
+      # 0. CALIBRATE — autotuner output for the record. not a gate.
+      # ----------------------------------------------------------------
+      - name: calibrate
+        if: always()
+        run: |
+          AX_GEMM_CALIBRATE=1 ./build/bench_gemm_suite 2>calib_stderr.log 1>/dev/null || true
+          {
+            echo '## calibration'
+            echo ''
+            echo '```'
+            grep -E '^axiom:' calib_stderr.log | head -30
+            echo '```'
+          } > calib_summary.md
+
+      # ----------------------------------------------------------------
+      # 1. PARITY — must pass before speed comparison is meaningful.
+      # tf_parity.py exits non-zero on max_err > threshold.
+      # ----------------------------------------------------------------
+      - name: parity
+        id: parity
+        run: |
+          ./build/bench_parity | tee parity_axiom.txt
+          python3 benchmarks/tf_parity.py | tee parity_tf.txt
+
+      # ----------------------------------------------------------------
+      # 2..7. SPEED — Axiom vs TF, summarize.py --strict gates per-suite.
+      # `if: always()` means one slow suite doesn't suppress the others;
+      # the rollup at the end fails the job if any suite regressed.
+      # ----------------------------------------------------------------
+      - name: gemm vs tf
+        if: always() && steps.parity.outcome == 'success'
+        run: |
+          ./build/bench_gemm_suite | tee axiom_gemm.txt
+          python3 benchmarks/tf_gemm_suite.py | tee tf_gemm.txt
+          python3 benchmarks/summarize.py axiom_gemm.txt tf_gemm.txt \
+            --threshold $REGRESSION_PCT --strict | tee gemm_summary.md
+
+      - name: ops vs tf
+        if: always() && steps.parity.outcome == 'success'
+        run: |
+          ./build/bench_ops_suite | tee axiom_ops.txt
+          python3 benchmarks/tf_ops_suite.py | tee tf_ops.txt
+          python3 benchmarks/summarize.py axiom_ops.txt tf_ops.txt \
+            --threshold $REGRESSION_PCT --strict | tee ops_summary.md
+
+      - name: conv vs tf
+        if: always() && steps.parity.outcome == 'success'
+        run: |
+          timeout 1200 ./build/bench_conv_suite | tee axiom_conv.txt
+          timeout 1200 python3 benchmarks/tf_conv_suite.py | tee tf_conv.txt
+          python3 benchmarks/summarize.py axiom_conv.txt tf_conv.txt \
+            --threshold $REGRESSION_PCT --strict | tee conv_summary.md
+
+      - name: mha vs tf
+        if: always() && steps.parity.outcome == 'success'
+        run: |
+          ./build/bench_mha 3 | tee axiom_mha.txt
+          python3 benchmarks/tf_mha.py 3 | tee tf_mha.txt
+          python3 benchmarks/summarize.py axiom_mha.txt tf_mha.txt \
+            --threshold $REGRESSION_PCT --strict | tee mha_summary.md
+
+      - name: stress vs tf
+        if: always() && steps.parity.outcome == 'success'
+        run: |
+          timeout 1200 ./build/bench_stress | tee axiom_stress.txt
+          timeout 1200 python3 benchmarks/tf_stress.py | tee tf_stress.txt
+          python3 benchmarks/summarize.py axiom_stress.txt tf_stress.txt \
+            --threshold $REGRESSION_PCT --strict | tee stress_summary.md
+
+      # training is heavier — runs the four model bench binaries +
+      # their TF sidecars. mnist data fetched once, cached by the run.
+      # VGG skipped on arm — too slow to fit in the 90-min job budget.
+      - name: training vs tf
+        if: always() && steps.parity.outcome == 'success'
+        run: |
+          mkdir -p examples/data && cd examples/data
+          for f in train-images-idx3-ubyte train-labels-idx1-ubyte \
+                   t10k-images-idx3-ubyte t10k-labels-idx1-ubyte; do
+            [ -f "$f" ] && continue
+            curl -sL -O "https://storage.googleapis.com/cvdf-datasets/mnist/${f}.gz"
+            gunzip "${f}.gz"
+          done
+          cd ../..
+
+          echo '## small MLP'   > training_summary.md
+          ./build/ax_mnist | tee axiom_mlp_small.txt
+          python3 benchmarks/tf_mnist.py | tee tf_mlp_small.txt
+
+          echo '## wide MLP (14.4M)' >> training_summary.md
+          timeout 1800 ./build/bench_wide train | tee axiom_mlp_wide.txt
+          timeout 1800 python3 benchmarks/tf_wide.py train | tee tf_mlp_wide.txt
+
+          if [ "${{ matrix.isa }}" = "x86-avx2" ]; then
+            echo '## VGG (8M)' >> training_summary.md
+            timeout 3600 ./build/bench_vgg train | tee axiom_vgg.txt || true
+            timeout 3600 python3 benchmarks/tf_vgg.py | tee tf_vgg.txt || true
+          else
+            echo '## VGG (skipped on arm — exceeds 90-min budget)' >> training_summary.md
+          fi
+
+          echo '## mini transformer' >> training_summary.md
+          ./build/bench_transformer | tee axiom_transformer.txt
+          python3 benchmarks/tf_transformer.py | tee tf_transformer.txt
+          python3 benchmarks/summarize.py axiom_transformer.txt tf_transformer.txt \
+            --threshold $REGRESSION_PCT --strict >> training_summary.md
+
+      # ----------------------------------------------------------------
+      # 8. AUTOTUNE REGRESSION GATE — same gemm bench with autotune ON
+      # vs OFF. autotune must hit >=80% of no-autotune baseline; if not,
+      # something in the calibration tables is mis-tuned for this CPU.
+      # was its own workflow; folded in here.
+      # ----------------------------------------------------------------
+      - name: autotune regression gate
+        if: always()
+        run: |
+          ./build/bench_gemm_suite | grep -E "^RESULT" > auto.txt
+          AX_NO_AUTOTUNE=1 ./build/bench_gemm_suite | grep -E "^RESULT" > base.txt
+          python3 - <<'PY' | tee autotune_summary.md
+          import os, sys
+          frac = float(os.environ.get("AUTOTUNE_REGRESSION_FRAC", "0.80"))
+          fail = 0
+          print("## autotune vs no-autotune\n")
+          print("| case | autotune | baseline | ratio |")
+          print("|---|---|---|---|")
+          with open("auto.txt") as fa, open("base.txt") as fb:
+              for la, lb in zip(fa, fb):
+                  ka = la.split(); kb = lb.split()
+                  # tail format: "... <gflops> GFLOPS" or "... <gflops>"
+                  ga = float(ka[-2]) if ka[-1] == "GFLOPS" else float(ka[-1])
+                  gb = float(kb[-2]) if kb[-1] == "GFLOPS" else float(kb[-1])
+                  case = " ".join(ka[1:4]) if len(ka) > 4 else ka[1]
+                  ratio = ga / gb if gb > 0 else 0
+                  flag = "FAIL" if ratio < frac else "ok"
+                  if ratio < frac: fail = 1
+                  print(f"| {case} | {ga:.1f} | {gb:.1f} | {ratio:.2f} {flag} |")
+          if fail:
+              print(f"\nautotune fell below {frac*100:.0f}% of baseline — investigate")
+              sys.exit(1)
+          PY
+
+      # ----------------------------------------------------------------
+      # 9. ROLL-UP — single REPORT.md per matrix entry, also written
+      # into the GitHub Actions job summary so reviewers see it inline
+      # without downloading the artifact.
+      # ----------------------------------------------------------------
+      - name: build report
+        if: always()
+        run: |
+          {
+            echo "# Axiom benchmarks — ${{ matrix.isa }}"
+            echo ""
+            echo "_baseline: TensorFlow CPU on the same runner_"
+            echo ""
+            cat hardware.md
+            echo ""
+            for md in calib_summary.md gemm_summary.md ops_summary.md \
+                      conv_summary.md mha_summary.md training_summary.md \
+                      stress_summary.md autotune_summary.md; do
+              [ -f "$md" ] || continue
+              cat "$md"
+              echo ""
+            done
+          } > REPORT.md
+          cat REPORT.md >> $GITHUB_STEP_SUMMARY
+
+      - name: upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.isa }}
+          path: |
+            REPORT.md
+            hardware.md
+            *.txt
+            *_summary.md

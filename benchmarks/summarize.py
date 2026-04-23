@@ -74,6 +74,9 @@ def main():
     p.add_argument("--threshold", type=float, default=5.0,
                    help="percent gap below which we don't flag")
     p.add_argument("--markdown", action="store_true", default=True)
+    p.add_argument("--strict", action="store_true",
+                   help="exit 1 if any case is >threshold slower than tf — "
+                        "used by ci to gate merges on regressions")
     args = p.parse_args()
 
     ax = parse_results(args.axiom)
@@ -139,6 +142,8 @@ def main():
         print("|---|---|---|---|---|")
         for (s, c, m, a, t) in regressions:
             print(f"| {s} | {c} | {m} | {fmt_value(a, m)} | {fmt_value(t, m)} |")
+        if args.strict:
+            sys.exit(1)
     else:
         print("\n_No regressions >{}% detected._\n".format(args.threshold))
 
