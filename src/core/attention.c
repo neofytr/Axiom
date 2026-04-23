@@ -632,11 +632,8 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 cache reuse on x_flat (single pass over it vs three).
        ================================================================ */
     bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad || m->Wv->requires_grad;
+    bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad && m->Wv->requires_grad;
     if (any_wqkv_grad) {
-        int64_t dW_sh[] = {D, 3 * D};
-        ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
-        if (!dWqkv) return;
-
         /* T1.3: x_flat = stack-view of input data (forward never copied).
            input is alive because the autograd graph holds a ref via
            self->inputs[0]. fall back to ctx->x_flat if forward chose
@@ -651,42 +648,63 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         }
         if (!x_flat_for_bwd) return;
 
-        pf_t0 = prof_enabled ? PF_TICK() : 0;
-        if (ax_compute_gemm_tn(x_flat_for_bwd, dQKV, dWqkv) != AX_OK) return;
-        if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
-        /* perf note: a fused path that calls 3 strided-B gemms via
-           ax_compute_dwqkv_split_acc was tried (split_acc lives in cpu_opt.c
-           + dispatch.c, hooked behind AX_DWQKV_FUSED=1). on i5-12500H AVX2
-           it regresses 1-10% across most shapes — splitting the gemm into
-           3 N=D calls loses jc-tile parallelism vs the single N=3D call,
-           and the 3 separate pack_a passes outweigh the saved intermediate
-           BW. infrastructure kept for future hosts where the trade-off
-           may flip (e.g. AVX-512 with bigger micro-kernels) or for a real
-           multi-output micro-kernel that retains N=3D scheduling. */
+        /* fast path: shape-dispatched fused multi-output dwqkv kernel.
+           ax_compute_dwqkv_split_acc (commit 408600e) writes the gemm
+           output directly to dWq/dWk/dWv with accumulate, eliminating
+           the 12 MB [D, 3D] intermediate. measured -9% on B1_S512
+           (D=1024) where the intermediate doesn't fit L3 well; +5%
+           regression on B8_S128 / B1_S2048 (D≤768) where the
+           intermediate fits L3 cheaply and per-jc dest dispatch adds
+           overhead. so gate on D >= 1024.
 
-        const float *dw_data = (const float *)dWqkv->storage->data;
-        /* dWqkv row i: [dWq[i,:] | dWk[i,:] | dWv[i,:]], each D wide.
-           single-pass version — read each [3D] source row once, write
-           to all 3 dest grad tensors. earlier comment in this file
-           said this regressed B8_S128 due to L1 working set, but with
-           OMP_PROC_BIND=spread (e111821) keeping per-thread cache
-           warm AND the three accumulate_f32 calls being SIMD-tight,
-           re-trying. saves 2 omp parallel-region setups per call vs
-           the prior 3-pass; also reads dWqkv once (12 MB at B8_S128)
-           instead of 3x with strided stride 3D. */
-        float *dWq_g = m->Wq->requires_grad ? param_grad_ptr(m->Wq) : NULL;
-        float *dWk_g = m->Wk->requires_grad ? param_grad_ptr(m->Wk) : NULL;
-        float *dWv_g = m->Wv->requires_grad ? param_grad_ptr(m->Wv) : NULL;
-        #pragma omp parallel for schedule(static)
-        for (int64_t i = 0; i < D; i++) {
-            const float *src = dw_data + i * 3 * D;
-            if (dWq_g) accumulate_f32(src,           dWq_g + i * D, D);
-            if (dWk_g) accumulate_f32(src + D,       dWk_g + i * D, D);
-            if (dWv_g) accumulate_f32(src + 2 * D,   dWv_g + i * D, D);
+           additional gates: requires all three of Wq/Wk/Wv to need
+           grads (the kernel doesn't support partial — fall back if
+           only some need grads), and requires the backend to expose
+           the entry. */
+        if (all_wqkv_grad && D >= 1024 && ax_compute_has_dwqkv_split_acc()) {
+            float *dq_init = param_grad_ptr(m->Wq);
+            float *dk_init = param_grad_ptr(m->Wk);
+            float *dv_init = param_grad_ptr(m->Wv);
+            (void)dq_init; (void)dk_init; (void)dv_init;
+            if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
+                pf_t0 = prof_enabled ? PF_TICK() : 0;
+                if (ax_compute_dwqkv_split_acc(x_flat_for_bwd, dQKV,
+                                                m->Wq->grad, m->Wk->grad,
+                                                m->Wv->grad) != AX_OK) return;
+                if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
+                goto dwqkv_done;
+            }
         }
-        if (dWq_g) ax_storage_touch(m->Wq->grad->storage);
-        if (dWk_g) ax_storage_touch(m->Wk->grad->storage);
-        if (dWv_g) ax_storage_touch(m->Wv->grad->storage);
+
+        /* fallback: materialize then split (one gemm_TN into [D, 3D]
+           intermediate, then a single-pass SIMD scatter into the 3
+           grad tensors). default for D < 1024, partial-grad cases,
+           and backends without the fused entry. */
+        {
+            int64_t dW_sh[] = {D, 3 * D};
+            ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
+            if (!dWqkv) return;
+
+            pf_t0 = prof_enabled ? PF_TICK() : 0;
+            if (ax_compute_gemm_tn(x_flat_for_bwd, dQKV, dWqkv) != AX_OK) return;
+            if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
+
+            const float *dw_data = (const float *)dWqkv->storage->data;
+            float *dWq_g = m->Wq->requires_grad ? param_grad_ptr(m->Wq) : NULL;
+            float *dWk_g = m->Wk->requires_grad ? param_grad_ptr(m->Wk) : NULL;
+            float *dWv_g = m->Wv->requires_grad ? param_grad_ptr(m->Wv) : NULL;
+            #pragma omp parallel for schedule(static)
+            for (int64_t i = 0; i < D; i++) {
+                const float *src = dw_data + i * 3 * D;
+                if (dWq_g) accumulate_f32(src,           dWq_g + i * D, D);
+                if (dWk_g) accumulate_f32(src + D,       dWk_g + i * D, D);
+                if (dWv_g) accumulate_f32(src + 2 * D,   dWv_g + i * D, D);
+            }
+            if (dWq_g) ax_storage_touch(m->Wq->grad->storage);
+            if (dWk_g) ax_storage_touch(m->Wk->grad->storage);
+            if (dWv_g) ax_storage_touch(m->Wv->grad->storage);
+        }
+        dwqkv_done: ;
     }
 
     /* ================================================================
