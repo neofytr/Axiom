@@ -90,7 +90,28 @@ measurements were mixed; with the OMP_PROC_BIND=spread + dynamic-head
 schedule wins this iteration, re-bench to see if the fused variant
 now wins consistently.
 
-If yes, this is a free 5-7 % win on B8_S128 with no new code.
+**Re-bench result (5-run medians, post OMP_PROC_BIND wins)**:
+
+| shape                            | default | FUSED | delta |
+|----------------------------------|---------|-------|-------|
+| mha_train_B8_S128_D512_H8        | 23.5    | 21.1  | -10%  |
+| mha_train_B4_S512_D768_H12       | 106     | 104   | -2%   |
+| mha_train_B2_S1024_D768_H12      | 146     | 144   | -1%   |
+| mha_train_B1_S512_D1024_H16      | 48.5    | 54.2  | **+12%** |
+| mha_train_B1_S2048_D768_H12      | 215     | 212   | -1%   |
+
+B1_S512_D1024_H16 (BH=16, dk=64, S=512) regresses cleanly. Hypothesis:
+this shape has BH == NT exactly so each thread owns one head — the
+fused kernel's MR-strip stack-array approach (P/dP/dS in stack)
+allocates ~190 KB stack per head call, and on this shape each thread
+bears that stack pressure once per call. The materialised path uses
+TLS heap buffers shared across calls so the per-call stack pressure
+is lower.
+
+Defer this phase — the cross-shape variance means it shouldn't be a
+blanket default. Either:
+- shape-dispatched (use FUSED only when BH > NT or stack budget OK),
+- or revisit after F.4.4 (whose per-tile design subsumes this choice).
 
 ### F.4.2: tile-fused output projection
 
