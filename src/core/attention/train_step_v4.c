@@ -355,31 +355,6 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
         if (!dbq_acc) return AX_ERR_ALLOC;
     }
 
-    /* Phase D: output-projection fwd/bwd fused into the qi-block loop.
-       per iteration, after SDPA fwd fills attn_flat[qi..qi_end]:
-         y[qi..qi_end]   = attn_flat[qi..qi_end] @ Wo + bo   (per-batch)
-         dWo            += attn_flat[qi..qi_end]^T @ dout[qi..qi_end]  (skip_init)
-         dbo            += colsum(dout[qi..qi_end])
-       attn_flat[qi-block] stays L2-hot between SDPA fwd and these reads
-       (~bq*D floats — fits comfortably), and dout[qi-block] is hot for
-       the consecutive d_attn gemm_nt + dWo gemm_tn + dbo colsum reads.
-       vs Phase C's post-loop full-rows ops, this eliminates the L3/RAM
-       rewalk of attn_flat (8 MB on B=2, S=1024, D=768 — exceeds L2). */
-    bool need_wo_grad   = m->Wo->requires_grad;
-    bool need_bo_grad   = m->use_bias && m->bo && m->bo->requires_grad;
-    float *dbo_acc = NULL;
-    const float *bo_data = NULL;
-    if (need_wo_grad) {
-        if (!ensure_grad_ptr(m->Wo)) return AX_ERR_ALLOC;
-    }
-    if (need_bo_grad) {
-        dbo_acc = ensure_grad_ptr(m->bo);
-        if (!dbo_acc) return AX_ERR_ALLOC;
-    }
-    if (m->use_bias) {
-        bo_data = (const float *)m->bo->storage->data;
-    }
-
     for (int64_t qi = 0; qi < S; qi += qi_block) {
         int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
         int64_t bq = qi_end - qi;
@@ -394,69 +369,21 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
             P_save_ptr,
             B, S, H, dk, qi, qi_end, scale, m->causal);
 
-        /* (2) per-batch output-projection fwd + bwd, sharing the hot
-              attn_flat[qi..qi_end] and dout[qi..qi_end] blocks.
-                a. y[b, qi..qi_end] = attn_flat[b, qi..qi_end] @ Wo + bo
-                b. d_attn[b, qi..qi_end] = dout[b, qi..qi_end] @ Wo^T
-                c. dWo += attn_flat[b, qi..qi_end]^T @ dout[b, qi..qi_end]
-                d. dbo += colsum(dout[b, qi..qi_end])
-              sub-blocks are contiguous [bq, D] within each batch b. */
+        /* (2) d_attn[b, qi..qi_end, :] = dout[b, qi..qi_end, :] @ Wo^T
+              sub-blocks are contiguous [bq, D] within each batch b, so B
+              separate gemm_nt calls — no row stride mismatch. */
         for (int64_t b = 0; b < B; b++) {
-            const float *af_ptr   = (const float *)attn_flat->storage->data
-                                    + b * S * D + qi * D;
             const float *dout_ptr = (const float *)dout_flat->storage->data
                                     + b * S * D + qi * D;
-            float *y_ptr          = (float *)y_flat_v.storage->data
-                                    + b * S * D + qi * D;
-            float *dattn_ptr      = (float *)d_attn->storage->data
-                                    + b * S * D + qi * D;
-            ax_tensor_t af_v, dout_v, y_v, dattn_v;
-            ax_storage_t af_s, dout_s, y_s, dattn_s;
-            make_stack_view(&af_v,    &af_s,    af_ptr,    bq, D);
-            make_stack_view(&dout_v,  &dout_s,  dout_ptr,  bq, D);
-            make_stack_view(&y_v,     &y_s,     y_ptr,     bq, D);
-            make_stack_view(&dattn_v, &dattn_s, dattn_ptr, bq, D);
-
-            /* (a) y = attn_flat @ Wo  (overwrite — per-batch block is
-               self-contained; bias added in scalar pass below). */
-            if (ax_compute_gemm(&af_v, m->Wo, &y_v) != AX_OK)
-                return AX_ERR_BACKEND;
-            if (bo_data) {
-                int64_t de = D - (D % AX_VF32_WIDTH);
-#ifdef _OPENMP
-                #pragma omp parallel for schedule(static)
-#endif
-                for (int64_t r = 0; r < bq; r++) {
-                    float *row = y_ptr + r * D;
-                    int64_t c = 0;
-                    for (; c < de; c += AX_VF32_WIDTH) {
-                        ax_vf32 v = ax_vf32_loadu(row + c);
-                        ax_vf32 bv = ax_vf32_loadu(bo_data + c);
-                        ax_vf32_storeu(row + c, ax_vf32_add(v, bv));
-                    }
-                    for (; c < D; c++) row[c] += bo_data[c];
-                }
-            }
-
-            /* (b) d_attn = dout @ Wo^T  (overwrite) */
+            float *dattn_ptr = (float *)d_attn->storage->data
+                               + b * S * D + qi * D;
+            ax_tensor_t dout_v, dattn_v;
+            ax_storage_t dout_st, dattn_st;
+            make_stack_view(&dout_v,  &dout_st,  dout_ptr,  bq, D);
+            make_stack_view(&dattn_v, &dattn_st, dattn_ptr, bq, D);
             if (ax_compute_gemm_nt(&dout_v, m->Wo, &dattn_v) != AX_OK)
                 return AX_ERR_BACKEND;
-
-            /* (c) dWo += attn_flat^T @ dout (accumulate via skip_init) */
-            if (need_wo_grad) {
-                ax_gemm_set_skip_init(true);
-                ax_status_t s = ax_compute_gemm_tn(&af_v, &dout_v, m->Wo->grad);
-                ax_gemm_set_skip_init(false);
-                if (s != AX_OK) return s;
-            }
-
-            /* (d) dbo += colsum(dout) */
-            if (dbo_acc) {
-                col_sum_acc(dout_ptr, dbo_acc, bq, D);
-            }
         }
-        if (need_wo_grad) ax_storage_touch(m->Wo->grad->storage);
-        if (dbo_acc)      ax_storage_touch(m->bo->grad->storage);
 
         /* (3) head_interleave d_attn[:, qi..qi_end, :] → dO_head */
         head_interleave_qi_range(
@@ -526,12 +453,52 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
         (void)bq;
     }
 
-    /* y was written per-qi-block inside the loop (Phase D) — just mark
-       the output storage as generation-bumped so downstream readers see
-       the fresh data. */
+    /* (6) fwd y = attn_flat @ Wo + bo (full-rows — all attn_flat rows are
+       filled by now). */
+    if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
+    if (m->use_bias) {
+        const float *bd = (const float *)m->bo->storage->data;
+        float *od = (float *)y_flat_v.storage->data;
+        int64_t de = D - (D % AX_VF32_WIDTH);
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int64_t r = 0; r < rows; r++) {
+            float *row = od + r * D;
+            int64_t c = 0;
+            for (; c < de; c += AX_VF32_WIDTH) {
+                ax_vf32 v = ax_vf32_loadu(row + c);
+                ax_vf32 b = ax_vf32_loadu(bd + c);
+                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
+            }
+            for (; c < D; c++) row[c] += bd[c];
+        }
+    }
     ax_storage_touch(y_out->storage);
 
-    /* dWk / dWv / dbk / dbv from dKh, dVh (now finalised after
+    /* (6) dWo += attn_flat^T @ dout (full-rows). accumulates into existing
+       grad — caller is expected to have zero_grad'd before the train step. */
+    if (m->Wo->requires_grad) {
+        float *dWo = ensure_grad_ptr(m->Wo);
+        if (dWo) {
+            ax_gemm_set_skip_init(true);
+            ax_status_t s = ax_compute_gemm_tn(attn_flat, dout_flat, m->Wo->grad);
+            ax_gemm_set_skip_init(false);
+            if (s != AX_OK) return s;
+            ax_storage_touch(m->Wo->grad->storage);
+        }
+    }
+
+    /* (7) dbo += colsum(dout) */
+    if (m->use_bias && m->bo->requires_grad) {
+        float *dbo = ensure_grad_ptr(m->bo);
+        if (dbo) {
+            col_sum_acc((const float *)dout_flat->storage->data, dbo, rows, D);
+            ax_storage_touch(m->bo->grad->storage);
+        }
+    }
+
+    /* (9) Phase C: dWk / dWv / dbk / dbv from dKh, dVh (now finalised after
        the qi-block loop — the bwd primitive cross-qi accumulates into
        them, so they only become valid here).
 
