@@ -4929,10 +4929,14 @@ fallback_materialise:
    (vs 3x in the unfused case), Wo is read once per strip (vs 2x for
    the y + dattn ops separately).
 
-   simple AVX2 inner loops (no pack_a / pack_b / micro_kernel) — keeps
-   the kernel ~250 LOC and self-contained. flops/sec is lower than
-   tuned opt_gemm (estimate ~50% of peak) but the cache benefit on
-   strips that fit L2 compensates for typical mha_train shapes. */
+   v2 implementation: uses pack_a / pack_b / pack_a_t / pack_b_t and the
+   JIT 6x16 / 14x32 micro_kernel (same packed-gemm path as opt_gemm /
+   opt_gemm_nt / opt_gemm_tn). Wo is pre-packed ONCE in both b and b_t
+   forms before the strip loop and shared read-only across all threads;
+   the per-strip per-thread pack buffers (attn_a, dout_a, attn_at,
+   dout_b) are allocated alongside the dWo_tl / dbo_tl accumulators in
+   one contiguous thread_pool. matches opt_gemm's flops/sec on each of
+   the 3 sub-gemms while preserving the per-strip cache locality. */
 
 #define MHA_OUTPROJ_BQ 32
 
@@ -4989,16 +4993,73 @@ static ax_status_t opt_mha_output_proj_fused(
     if (max_threads < 1) max_threads = 1;
     if ((int64_t)max_threads > n_strips) max_threads = (int)n_strips;
 
-    /* per-thread accumulators: dWo_tl [D*D], dbo_tl [D].
-       large for D=1024 (4MB per thread × 16 = 64MB) but unavoidable
-       without atomic-add contention. allocated once per call from
-       a single contiguous block so threads can address by tid offset. */
-    size_t dWo_tl_floats = (size_t)D * (size_t)D;
-    size_t dbo_tl_floats = (size_t)D;
-    size_t total_floats  = (size_t)max_threads * (dWo_tl_floats + dbo_tl_floats);
-    float *thread_pool = (float *)ax_aligned_alloc(total_floats * sizeof(float), 64);
-    if (!thread_pool) return AX_ERR_ALLOC;
-    memset(thread_pool, 0, total_floats * sizeof(float));
+    /* tile dimensions for Wo packings (same convention as opt_gemm) */
+    int64_t kc_max = (D <= AX_GEMM_MAX_KC) ? D : GEMM_KC;
+    int64_t nc_eff = ax_adaptive_nc(D, max_threads);
+    if (nc_eff < GEMM_NR) nc_eff = (D < GEMM_NR) ? D : GEMM_NR;
+    int64_t n_jc_tiles = (D + nc_eff - 1) / nc_eff;
+    int64_t n_pc_tiles = (D + kc_max - 1) / kc_max;
+    int64_t bq_pack    = ((Bq + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+    /* pre-pack Wo in both b (NN, op 1) and b_t (NT, op 2) forms.
+       shared read-only across all threads/strips for the duration of
+       this call. memory: 2 * n_jc_tiles * n_pc_tiles * (NC * KC) floats —
+       on D=768 nc_eff=256 kc_max=256 this is 2 * 9 * 65536 = ~4.7 MB. */
+    int64_t per_tile_floats = nc_eff * kc_max;
+    int64_t Wo_pack_floats_each = (int64_t)n_jc_tiles * n_pc_tiles * per_tile_floats;
+    float *Wo_pack_buf = (float *)ax_aligned_alloc(
+        2 * (size_t)Wo_pack_floats_each * sizeof(float), 64);
+    if (!Wo_pack_buf) return AX_ERR_ALLOC;
+    float *Wo_b_pack  = Wo_pack_buf;
+    float *Wo_bt_pack = Wo_pack_buf + Wo_pack_floats_each;
+
+    for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+        int64_t jc = jct * nc_eff;
+        int64_t nc = (jc + nc_eff <= D) ? nc_eff : (D - jc);
+        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+        for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+            int64_t pc = pct * kc_max;
+            int64_t kc = (pc + kc_max <= D) ? kc_max : (D - pc);
+            int64_t tile_idx = jct * n_pc_tiles + pct;
+            float *b_buf  = Wo_b_pack  + tile_idx * per_tile_floats;
+            float *bt_buf = Wo_bt_pack + tile_idx * per_tile_floats;
+
+            /* op 1 (NN): Wo as B[k=D, n=D]; tile [pc..pc+kc, jc..jc+nc] */
+            pack_b(Wo_d + pc * D + jc, D, kc, nc_pack, nc, b_buf);
+            /* op 2 (NT): Wo as B[n=D, k=D]; pack_b_t reads at [jc..jc+nc, pc..pc+kc] */
+            pack_b_t(Wo_d + jc * D + pc, D, kc, nc_pack, nc, bt_buf);
+        }
+    }
+
+    /* per-thread pool layout (one contiguous block, sliced by tid):
+         dWo_tl       [D * D]
+         dbo_tl       [D]
+         pack_attn_a  [bq_pack * kc_max]            (op 1 A pack, per pc tile)
+         pack_dout_a  [bq_pack * kc_max]            (op 2 A pack, per pc tile)
+         pack_attn_at [GEMM_MC * Bq]                (op 3 A^T pack, per ic tile)
+         pack_dout_b  [nc_eff * Bq]                 (op 3 B pack, per jc tile) */
+    int64_t dWo_tl_floats       = D * D;
+    int64_t dbo_tl_floats       = D;
+    int64_t pack_attn_a_floats  = bq_pack * kc_max;
+    int64_t pack_dout_a_floats  = bq_pack * kc_max;
+    int64_t pack_attn_at_floats = GEMM_MC * Bq;
+    int64_t pack_dout_b_floats  = nc_eff * Bq;
+    int64_t per_thread_floats   = dWo_tl_floats + dbo_tl_floats
+                                + pack_attn_a_floats + pack_dout_a_floats
+                                + pack_attn_at_floats + pack_dout_b_floats;
+    int64_t total_thread_floats = (int64_t)max_threads * per_thread_floats;
+    float *thread_pool = (float *)ax_aligned_alloc(
+        (size_t)total_thread_floats * sizeof(float), 64);
+    if (!thread_pool) {
+        ax_aligned_free(Wo_pack_buf);
+        return AX_ERR_ALLOC;
+    }
+    /* zero only the dWo_tl / dbo_tl regions; pack buffers will be
+       freshly populated on each strip iteration. */
+    for (int t = 0; t < max_threads; t++) {
+        memset(thread_pool + (int64_t)t * per_thread_floats, 0,
+               (size_t)(dWo_tl_floats + dbo_tl_floats) * sizeof(float));
+    }
 
 #ifdef _OPENMP
     #pragma omp parallel num_threads(max_threads)
@@ -5009,8 +5070,13 @@ static ax_status_t opt_mha_output_proj_fused(
 #else
         int tid = 0;
 #endif
-        float *dWo_tl = thread_pool + (size_t)tid * (dWo_tl_floats + dbo_tl_floats);
-        float *dbo_tl = dWo_tl + dWo_tl_floats;
+        float *base         = thread_pool + (int64_t)tid * per_thread_floats;
+        float *dWo_tl       = base;
+        float *dbo_tl       = dWo_tl       + dWo_tl_floats;
+        float *pack_attn_a  = dbo_tl       + dbo_tl_floats;
+        float *pack_dout_a  = pack_attn_a  + pack_attn_a_floats;
+        float *pack_attn_at = pack_dout_a  + pack_dout_a_floats;
+        float *pack_dout_b  = pack_attn_at + pack_attn_at_floats;
 
 #ifdef _OPENMP
         #pragma omp for schedule(dynamic, 1)
@@ -5018,88 +5084,112 @@ static ax_status_t opt_mha_output_proj_fused(
         for (int64_t qs = 0; qs < n_strips; qs++) {
             int64_t qi = qs * Bq;
             int64_t bq = (qi + Bq <= rows) ? Bq : (rows - qi);
+            int64_t bq_pack_act = ((bq + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
             const float *attn_strip = attn_d + qi * D;
             const float *dout_strip = dout_d + qi * D;
             float *y_strip     = y_d + qi * D;
             float *dattn_strip = dattn_d + qi * D;
 
-            /* op 1: y_strip = attn_strip @ Wo + bo
-               broadcast bias into y_strip (or zero), then accumulate.
-               inner SIMD across D cols, k-outer for dot accumulation. */
-            for (int64_t i = 0; i < bq; i++) {
-                if (bo_d) memcpy(y_strip + i * D, bo_d, (size_t)D * sizeof(float));
-                else      memset(y_strip + i * D, 0, (size_t)D * sizeof(float));
+            /* init y_strip with bo broadcast (or zero); init dattn_strip
+               to zero. micro_kernel ADDS to dst, so initial values are
+               the gemm's "C += A @ B" starting point. */
+            if (bo_d) {
+                for (int64_t i = 0; i < bq; i++)
+                    memcpy(y_strip + i * D, bo_d, (size_t)D * sizeof(float));
+            } else {
+                memset(y_strip, 0, (size_t)bq * (size_t)D * sizeof(float));
             }
-            for (int64_t i = 0; i < bq; i++) {
-                float *yi = y_strip + i * D;
-                const float *ai = attn_strip + i * D;
-                for (int64_t k = 0; k < D; k++) {
-                    float a = ai[k];
-                    const float *wo_row = Wo_d + k * D;
-                    int64_t j = 0;
-#if defined(AX_HAS_SIMD)
-                    ax_vf32 va = ax_vf32_set1(a);
-                    int64_t ve = D - (D % AX_VF32_WIDTH);
-                    for (; j < ve; j += AX_VF32_WIDTH) {
-                        ax_vf32 vy = ax_vf32_loadu(yi + j);
-                        ax_vf32 vw = ax_vf32_loadu(wo_row + j);
-                        ax_vf32_storeu(yi + j, ax_vf32_fmadd(va, vw, vy));
+            memset(dattn_strip, 0, (size_t)bq * (size_t)D * sizeof(float));
+
+            /* OP 1: y_strip += attn_strip @ Wo (NN, packed micro_kernel)
+               outer loop pc (K dim of contraction), inner jc (N dim). */
+            for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                int64_t pc = pct * kc_max;
+                int64_t kc = (pc + kc_max <= D) ? kc_max : (D - pc);
+                pack_a(attn_strip + pc, D, bq_pack_act, kc, bq, pack_attn_a);
+
+                for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                    int64_t jc = jct * nc_eff;
+                    int64_t nc = (jc + nc_eff <= D) ? nc_eff : (D - jc);
+                    int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                    int64_t tile_idx = jct * n_pc_tiles + pct;
+                    const float *Wo_pkt = Wo_b_pack + tile_idx * per_tile_floats;
+
+                    for (int64_t ir = 0; ir < bq_pack_act; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= bq) ? GEMM_MR : (bq > ir ? bq - ir : 0);
+                        if (mr <= 0) break;
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc > jr ? nc - jr : 0);
+                            if (nr <= 0) break;
+                            micro_kernel(kc, pack_attn_a + ir * kc, Wo_pkt + jr * kc,
+                                         y_strip + ir * D + jc + jr, D, mr, nr);
+                        }
                     }
-#endif
-                    for (; j < D; j++) yi[j] += a * wo_row[j];
                 }
             }
 
-            /* op 2: dattn_strip = dout_strip @ Wo^T
-               dattn[i, j] = sum_k dout[i, k] * Wo[j, k]
-               for each (i, j), SIMD inner product over k. */
-            for (int64_t i = 0; i < bq; i++) {
-                const float *di_row = dout_strip + i * D;
-                float *dai_row = dattn_strip + i * D;
-                for (int64_t j = 0; j < D; j++) {
-                    const float *wo_row = Wo_d + j * D;
-                    float acc = 0.0f;
-                    int64_t k = 0;
-#if defined(AX_HAS_SIMD)
-                    ax_vf32 va = ax_vf32_zero();
-                    int64_t ve = D - (D % AX_VF32_WIDTH);
-                    for (; k < ve; k += AX_VF32_WIDTH) {
-                        ax_vf32 vd = ax_vf32_loadu(di_row + k);
-                        ax_vf32 vw = ax_vf32_loadu(wo_row + k);
-                        va = ax_vf32_fmadd(vd, vw, va);
+            /* OP 2: dattn_strip += dout_strip @ Wo^T (NT, packed micro_kernel) */
+            for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                int64_t pc = pct * kc_max;
+                int64_t kc = (pc + kc_max <= D) ? kc_max : (D - pc);
+                pack_a(dout_strip + pc, D, bq_pack_act, kc, bq, pack_dout_a);
+
+                for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                    int64_t jc = jct * nc_eff;
+                    int64_t nc = (jc + nc_eff <= D) ? nc_eff : (D - jc);
+                    int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                    int64_t tile_idx = jct * n_pc_tiles + pct;
+                    const float *Wo_t_pkt = Wo_bt_pack + tile_idx * per_tile_floats;
+
+                    for (int64_t ir = 0; ir < bq_pack_act; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= bq) ? GEMM_MR : (bq > ir ? bq - ir : 0);
+                        if (mr <= 0) break;
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc > jr ? nc - jr : 0);
+                            if (nr <= 0) break;
+                            micro_kernel(kc, pack_dout_a + ir * kc, Wo_t_pkt + jr * kc,
+                                         dattn_strip + ir * D + jc + jr, D, mr, nr);
+                        }
                     }
-                    acc = ax_vf32_hsum(va);
-#endif
-                    for (; k < D; k++) acc += di_row[k] * wo_row[k];
-                    dai_row[j] = acc;
                 }
             }
 
-            /* op 3: dWo_tl += attn_strip^T @ dout_strip
-               dWo[i, j] += sum_k attn_strip[k, i] * dout_strip[k, j]
-               outer-k loop, broadcast attn_strip[k, i], SIMD across j. */
-            for (int64_t k = 0; k < bq; k++) {
-                const float *ak_row = attn_strip + k * D;
-                const float *dk_row = dout_strip + k * D;
-                for (int64_t i = 0; i < D; i++) {
-                    float a = ak_row[i];
-                    float *dWo_row = dWo_tl + i * D;
-                    int64_t j = 0;
-#if defined(AX_HAS_SIMD)
-                    ax_vf32 va = ax_vf32_set1(a);
-                    int64_t ve = D - (D % AX_VF32_WIDTH);
-                    for (; j < ve; j += AX_VF32_WIDTH) {
-                        ax_vf32 vd = ax_vf32_loadu(dk_row + j);
-                        ax_vf32 vw = ax_vf32_loadu(dWo_row + j);
-                        ax_vf32_storeu(dWo_row + j, ax_vf32_fmadd(va, vd, vw));
+            /* OP 3: dWo_tl += attn_strip^T @ dout_strip (TN, packed micro_kernel)
+               m=D, n=D, k=bq. k=bq is small (<=Bq=32) and fits in one
+               kc tile, so no pc loop. outer jc (N tiles), inner ic (M tiles).
+               pack_b(dout_strip) per jc tile (reused across all ic tiles).
+               pack_a_t(attn_strip) per ic tile. */
+            int64_t kc_op3 = bq;
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                int64_t jc = jct * nc_eff;
+                int64_t nc = (jc + nc_eff <= D) ? nc_eff : (D - jc);
+                int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+                pack_b(dout_strip + jc, D, kc_op3, nc_pack, nc, pack_dout_b);
+
+                for (int64_t ic = 0; ic < D; ic += GEMM_MC) {
+                    int64_t mc = (ic + GEMM_MC <= D) ? GEMM_MC : (D - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                    pack_a_t(attn_strip + ic, D, mc_pack, kc_op3, mc, pack_attn_at);
+
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc > ir ? mc - ir : 0);
+                        if (mr <= 0) break;
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc > jr ? nc - jr : 0);
+                            if (nr <= 0) break;
+                            micro_kernel(kc_op3,
+                                         pack_attn_at + ir * kc_op3,
+                                         pack_dout_b + jr * kc_op3,
+                                         dWo_tl + (ic + ir) * D + jc + jr, D, mr, nr);
+                        }
                     }
-#endif
-                    for (; j < D; j++) dWo_row[j] += a * dk_row[j];
                 }
             }
 
-            /* op 4: dbo_tl += col_sum(dout_strip)
-               cheap per-strip reduction. */
+            /* OP 4: dbo_tl += col_sum(dout_strip) (cheap SIMD reduction) */
             if (dbo_d) {
                 for (int64_t k = 0; k < bq; k++) {
                     const float *dk_row = dout_strip + k * D;
@@ -5118,16 +5208,15 @@ static ax_status_t opt_mha_output_proj_fused(
         }
     } /* omp parallel */
 
-    /* reduce per-thread dWo_tl / dbo_tl into the shared accumulators.
-       parallel over D rows of dWo (disjoint writes). */
+    /* reduce per-thread dWo_tl / dbo_tl into the shared accumulators. */
 #ifdef _OPENMP
     #pragma omp parallel for schedule(static)
 #endif
     for (int64_t i = 0; i < D; i++) {
+        float *dst = dWo_d + i * D;
         for (int t = 0; t < max_threads; t++) {
-            const float *src = thread_pool + (size_t)t * (dWo_tl_floats + dbo_tl_floats)
-                             + (size_t)i * (size_t)D;
-            float *dst = dWo_d + i * D;
+            const float *src = thread_pool + (int64_t)t * per_thread_floats
+                             + i * D;
             int64_t j = 0;
 #if defined(AX_HAS_SIMD)
             int64_t ve = D - (D % AX_VF32_WIDTH);
@@ -5142,7 +5231,7 @@ static ax_status_t opt_mha_output_proj_fused(
     }
     if (dbo_d) {
         for (int t = 0; t < max_threads; t++) {
-            const float *src = thread_pool + (size_t)t * (dWo_tl_floats + dbo_tl_floats)
+            const float *src = thread_pool + (int64_t)t * per_thread_floats
                              + dWo_tl_floats;
             int64_t j = 0;
 #if defined(AX_HAS_SIMD)
@@ -5158,6 +5247,7 @@ static ax_status_t opt_mha_output_proj_fused(
     }
 
     ax_aligned_free(thread_pool);
+    ax_aligned_free(Wo_pack_buf);
     return AX_OK;
 }
 
