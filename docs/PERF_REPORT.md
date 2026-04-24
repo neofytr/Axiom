@@ -114,6 +114,44 @@ path to close the remaining gap but would be ~1500 LOC of careful
 work with uncertain payoff (per-tile gemm overhead risks eating the
 BW savings on AVX2 — see F.4.3 analysis in docs/F4_FUSED_MHA_TRAIN.md).
 
+### Recommended training entry points (post 2026-04-25)
+
+For production training code, prefer the `train_step` entries over
+the `ax_layer_forward + ax_backward` autograd pattern — they skip
+autograd tape overhead (graph alloc, traversal, cleanup per step)
+and on some shapes use more aggressive fusions (F.3.a, F.4.4 Phase E
+auto-dispatcher) that the autograd forward's tensor/refcount pattern
+precludes.
+
+Measured 7-run median (2026-04-25, bg-noise, i5-12500H AVX2):
+
+| shape               | autograd | train_step | train_step_v4 | TF     |
+|---------------------|----------|------------|---------------|--------|
+| B8_S128_D512_H8     | 18.9     | 17.7       | 18.9          | 11.2   |
+| B4_S512_D768_H12    | 82.1     | 83.0       | 84.2          | 65.5   |
+| B2_S1024_D768_H12   | 111.4    | 110.0      | 111.0         | 94.3   |
+| B1_S512_D1024_H16   | 50.2     | 40.0       | 40.3          | 25.8   |
+| B1_S2048_D768_H12   | 175.5    | 171.5      | 171.3         | 155.2  |
+
+`train_step_v4` wins on large-S (hoisted qi-block driver), `train_step`
+wins on small-S. Both beat the autograd path by 5-20 % depending on
+shape. The `B1_S512` row shows the biggest delta (50 ms → 40 ms,
+-20 %) because the autograd tape overhead amortises worst on a
+single-batch-big-D shape.
+
+### Env overrides landed this session
+
+- `AX_V4_HOIST=1` — wrap qi-block loop in ONE omp parallel region.
+- `AX_V4_FUSED_BH=1` — combined fwd+bwd per-(qi-block, bh) kernel
+  (implies `AX_V4_HOIST`). auto-enabled by shape dispatcher when
+  `S * dk * sizeof(float) ≤ 32 KB AND BH >= max_threads`.
+- `AX_V4_AUTO=0` — disable the shape dispatcher (force legacy path).
+- `AX_V4_QI_BLOCK=<n>` — force multi-qi-block (default: single-iter).
+- `AX_NO_F3A=1` / `AX_NO_F3D=1` / `AX_NO_F3E=1` — disable respective
+  fused primitives in autograd MHA (debug/bisect).
+- `AX_GEMM_CALIBRATE=1` — run extended tile sweep on startup (now
+  includes mha-representative probes).
+
 ### Pure attention math (where Axiom wins handily)
 
 ```
