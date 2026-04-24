@@ -61,6 +61,59 @@ follow-up. Note also: TF's bench differentiates only w.r.t.
 + XLA pruning), so a fair comparison would shave ~5-10% off Axiom's
 side. Treat these numbers as upper bound on the gap.
 
+### 2026-04-25 overnight — close the autograd MHA gap
+
+Over the 2026-04-24/25 session, the autograd MHA training path caught
+up to the `train_step_fused` / `train_step_v4` paths' use of the F.3.x
+kernel family (commits landed months earlier but never wired into the
+autograd entry point `ax_layer_forward(mha) + ax_backward`).
+
+Changes shipped:
+  - F.3.e — autograd forward writes SDPA output directly into attn_flat
+    (skips Oh [BH, S, dk] intermediate + head_deinterleave pass).
+    backward companion reads O strided from attn_flat.
+  - F.3.d — autograd backward fuses `dattn = dOut @ Wo^T` with
+    head_interleave in one kernel call, skipping d_attn_flat [rows, D]
+    intermediate + the subsequent layout pass.
+  - dWo direct accumulation via `ax_gemm_set_skip_init(true)` — drops
+    the [D, D] scratch + the separate accumulate pass that was the
+    original two-step pattern.
+  - F.4.4 Phase E primitives (hoisted single-region qi-block driver +
+    combined fwd+bwd per-(qi-block, bh) kernel) + shape-dispatched
+    auto-enable in `train_step_v4`. opt-in for the autograd path via
+    `AX_V4_HOIST=1 AX_V4_FUSED_BH=1` once validated.
+  - `gemm calibrate` probe set extended to include mha-representative
+    shapes (qkv fwd on B8_S128 + B4_S512) under extended-sweep mode.
+    baseline tile config (MC=48 NC=256 KC=256) still wins ≥6% on this
+    host, but the added probes let calibration make a data-driven call
+    on future hosts.
+  - F.3.a attempted in autograd forward but REGRESSED B8_S128 by +20%;
+    reverted with a comment. train_step_v4 continues to use F.3.a
+    directly (its arena allocation pattern meshes with F.3.a better
+    than autograd's refcount pattern).
+
+All changes are general — no machine-specific tuning baked in.
+gated behind `AX_NO_F3D=1 / AX_NO_F3E=1` env flags for debugging and
+fallback if a future host regresses.
+
+Measured 7-run median autograd `mha_train` (main bench row):
+
+| shape               | before  | after   | Δ        | TF     | remaining gap |
+|---------------------|---------|---------|----------|--------|---------------|
+| B8_S128_D512_H8     | 20.85   | 18.39   | -11.8 %  | 11.21  | +64 %         |
+| B4_S512_D768_H12    | 84.48   | 80.77   | -4.4 %   | 65.49  | +23 %         |
+| B2_S1024_D768_H12   | 111.58  | 109.46  | -1.9 %   | 94.30  | +16 %         |
+| B1_S512_D1024_H16   | 49.83   | 47.36   | -5.0 %   | 25.76  | +84 %         |
+| B1_S2048_D768_H12   | 174.66  | 171.07  | -2.1 %   | 155.20 | +10 %         |
+
+The remaining TF gap is now almost entirely raw-compute efficiency
+(oneDNN's hand-tuned assembly micro-kernels vs Axiom's pure-C
+micro_kernel + JIT) rather than structural fusion gaps. plan.md's
+Phase E "monolithic per-(qi, kj) kernel" is still the theoretical
+path to close the remaining gap but would be ~1500 LOC of careful
+work with uncertain payoff (per-tile gemm overhead risks eating the
+BW savings on AVX2 — see F.4.3 analysis in docs/F4_FUSED_MHA_TRAIN.md).
+
 ### Pure attention math (where Axiom wins handily)
 
 ```
