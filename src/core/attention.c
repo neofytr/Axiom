@@ -297,22 +297,18 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
 
     /* P_save (post-mask pre-softmax scores) speeds up backward by skipping
        the QK^T recompute. cost is BH*S*S floats (~4 MB on B8 H8 S128).
-       only allocate when:
-       1. P fits comfortably in cache (≤ ~half L3, threshold 8 MB),
-       2. recompute cost dominates per-head fixed overhead — i.e. dk is
-          large enough that the saved Q@Kt GEMM is non-trivial relative to
-          the softmax-from-saved scan. for very small workloads (S ≤ 128
-          AND dk ≤ 64), the fixed bwd overhead (5 GEMMs per head + the
-          memory write of 4 MB in fwd) outweighs the saved GEMM, so skip.
+       only allocate when P fits comfortably in cache (≤ ~half L3, threshold
+       8 MB). earlier code also skipped when (S ≤ 128 AND dk ≤ 64) on the
+       theory that the recompute GEMM is cheap at that size; re-measurement
+       on 2026-04-25 shows save_p wins -3.5 % on B8_S128_D512_H8 (which
+       previously hit that exclusion) — the saved QK^T recompute is still
+       about 20 % of per-head bwd work even at S=128, enough to beat the
+       per-fwd 4 MB P-save write. the small-shape exclusion was removed.
        AX_MHA_SAVE_P=1 forces save on (debug); AX_MHA_SAVE_P=0 forces off. */
     ax_tensor_t *P_save_t = NULL;
     int64_t bh = B * H;
     int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
     bool save_enabled = (record && p_save_bytes <= (int64_t)8 * 1024 * 1024);
-    /* heuristic: skip when both S and dk are small — with the BLIS path
-       the recompute GEMM is cheap enough that the save-write overhead
-       in forward eats the gains. */
-    if (save_enabled && S <= 128 && dk <= 64) save_enabled = false;
     const char *env = getenv("AX_MHA_SAVE_P");
     if (env) save_enabled = (env[0] == '1');
     if (save_enabled) {
