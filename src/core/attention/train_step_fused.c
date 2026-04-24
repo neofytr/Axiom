@@ -321,11 +321,20 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
     if (!dO_head) return AX_ERR_ALLOC;
 
     /* F.4.2 proper / F.3.f: strip-fused fwd y + bwd output projection.
-       single pass over qi strips computes y, dWo, dbo, dattn together,
-       sharing dout cache lines and Wo cache residency across all four
-       ops. requires Wo->requires_grad (grad accumulator non-NULL) — the
-       fallback handles inference-style cases where Wo isn't trained. */
-    bool can_use_outproj_fused = m->Wo->requires_grad
+       opt-in via AX_F42_PROPER=1 — current cpu_opt implementation uses
+       unpacked AVX2 inner loops that hit ~50% of opt_gemm's packed-
+       micro_kernel throughput, so default-on would regress on every
+       train_step. opt-in lets users measure on their workload + revisit
+       once the kernel is rewritten with micro_kernel access. */
+    static int env_f42_resolved = 0;
+    static int env_f42 = 0;
+    if (!env_f42_resolved) {
+        const char *e = getenv("AX_F42_PROPER");
+        env_f42 = (e && e[0] == '1') ? 1 : 0;
+        env_f42_resolved = 1;
+    }
+    bool can_use_outproj_fused = env_f42
+                               && m->Wo->requires_grad
                                && ax_compute_has_mha_output_proj_fused();
 
     if (can_use_outproj_fused) {
