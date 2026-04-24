@@ -180,6 +180,35 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
                                   const ax_tensor_t *dout,
                                   ax_tensor_t *y_out);
 
+/* F.4.4 Phase A: per-qi-block SDPA fwd/bwd primitives.
+
+   the F.4.4 driver loops over qi-blocks externally; for each block it
+   calls these primitives with qi_start/qi_end specifying the row
+   range. different qi-blocks own disjoint rows so concurrent block
+   calls are independent for fwd. for bwd, dK / dV are accumulated
+   across blocks (caller-zeroed before the first block call); dQ
+   rows in [qi_start, qi_end) are overwritten per call.
+
+   shapes match ax_fused_attention_fwd_save_to_flat /
+   ax_fused_attention_bwd_use_from_flat respectively, with
+   qi_start, qi_end inserted between the (B, S, H, dk) shape group
+   and the (scale, causal) tail. */
+void ax_fused_attention_fwd_save_to_flat_qi_block(
+    const float *Q, const float *K, const float *V,
+    float *attn_flat, float *L, float *P_save,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal);
+
+void ax_fused_attention_bwd_use_from_flat_qi_block(
+    const float *Q, const float *K, const float *V,
+    const float *attn_flat, const float *dO, const float *L,
+    const float *P_saved,
+    float *dQ, float *dK, float *dV,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal);
+
 /* ================================================================
    SDPA PRIMITIVE — raw compute, use when you manage Q/K/V yourself
    ================================================================ */

@@ -5938,14 +5938,24 @@ static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
    classic Oh layout); when out_stride > dk (typically D = H*dk), output
    is strided to match a wider [S, D] attn_flat layout — F.3.e fused
    path eliminates the global Oh tensor + head_deinterleave pass.
-   row_max, row_sum are [S] working buffers (caller allocates + initializes
-   to -FLT_MAX / 0). L may be NULL to skip logsumexp writeout (inference). */
+
+   F.4.4 Phase A: qi_start, qi_end specify a sub-range of Q rows to
+   process. when qi_start == 0 and qi_end == S, behaviour is identical
+   to the pre-Phase-A full-S call. when qi_end - qi_start < S, only
+   that qi-block's rows of out / row_max / row_sum / L / P_save_head
+   are touched — different qi-blocks own disjoint rows so per-block
+   calls are independent and can be parallelised by the F.4.4 driver.
+
+   row_max, row_sum are [S] working buffers (caller allocates and the
+   per-block call only initialises [qi_start, qi_end) entries).
+   L may be NULL to skip logsumexp writeout (inference). */
 static void attn_fwd_head(const float *Q, const float *K, const float *V,
                            float *out, int64_t out_stride,
                            float *L, float *row_max, float *row_sum,
                            int64_t S, int64_t dk, float scale,
                            bool causal, const int8_t *pad_mask,
-                           float *P_save_head)
+                           float *P_save_head,
+                           int64_t qi_start, int64_t qi_end)
 {
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -5959,21 +5969,29 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
     float *V_packed  = ax_tls_grow(&tl_sdpa_v_packed,  &tl_sdpa_v_bytes,  v_want);
     if (!Kt_packed || !V_packed) return;
 
-    for (int64_t i = 0; i < S; i++) { row_max[i] = -FLT_MAX; row_sum[i] = 0.0f; }
-    /* zero out's strided rows. when out_stride == dk this is one
-       contiguous memset; when out_stride > dk we zero only the dk
-       cells per row owned by this head (the surrounding columns belong
-       to other heads writing concurrently into the same attn_flat). */
-    if (out_stride == dk) {
-        memset(out, 0, (size_t)(S * dk) * sizeof(float));
-    } else {
-        for (int64_t i = 0; i < S; i++) {
-            memset(out + i * out_stride, 0, (size_t)dk * sizeof(float));
-        }
+    /* clamp + sanity */
+    if (qi_end > S) qi_end = S;
+    if (qi_start < 0) qi_start = 0;
+    if (qi_start >= qi_end) return;
+
+    /* init only this qi-block's rows. different qi-blocks own disjoint
+       row ranges so concurrent block calls don't race on these slots. */
+    for (int64_t i = qi_start; i < qi_end; i++) {
+        row_max[i] = -FLT_MAX;
+        row_sum[i] = 0.0f;
     }
-    /* zero P_save head buffer once: causal-masked tiles skip the inner
-       store, and unmasked future regions need to read 0 in backward. */
-    if (P_save_head) memset(P_save_head, 0, (size_t)(S * S) * sizeof(float));
+    /* zero out's strided rows, only for [qi_start, qi_end). */
+    for (int64_t i = qi_start; i < qi_end; i++) {
+        memset(out + i * out_stride, 0, (size_t)dk * sizeof(float));
+    }
+    /* zero P_save head rows for [qi_start, qi_end) only. when called
+       per-qi-block, each block owns its own row range so partial zero
+       is sufficient. when qi_start == 0 && qi_end == S, this is the
+       full-buffer zero from the pre-Phase-A code path. */
+    if (P_save_head) {
+        memset(P_save_head + qi_start * S, 0,
+               (size_t)((qi_end - qi_start) * S) * sizeof(float));
+    }
 
     for (int64_t kj = 0; kj < S; kj += ATTN_BK) {
         int64_t Bk = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
@@ -5984,8 +6002,8 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
         attn_scale_packed(Kt_packed, dk * Bk_np, scale);  /* bake 1/√dk into Kt */
         pack_b(V + kj * dk, dk, Bk, dk_np, dk, V_packed);
 
-        for (int64_t qi = 0; qi < S; qi += ATTN_BQ) {
-            int64_t Bq = (qi + ATTN_BQ <= S) ? ATTN_BQ : (S - qi);
+        for (int64_t qi = qi_start; qi < qi_end; qi += ATTN_BQ) {
+            int64_t Bq = (qi + ATTN_BQ <= qi_end) ? ATTN_BQ : (qi_end - qi);
 
             /* causal: skip this (qi, kj) if entire block is in the future */
             if (causal && qi + Bq - 1 < kj) continue;
@@ -5998,9 +6016,9 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
         }
     }
 
-    /* final normalization: out[i] /= row_sum[i], L[i] = row_max[i] + log(row_sum[i])
-       walk row by row at out_stride to handle both Oh and attn_flat layouts. */
-    for (int64_t i = 0; i < S; i++) {
+    /* final normalization for [qi_start, qi_end) only:
+       out[i] /= row_sum[i], L[i] = row_max[i] + log(row_sum[i]). */
+    for (int64_t i = qi_start; i < qi_end; i++) {
         float rs = row_sum[i];
         if (rs > 0.0f) {
             float inv = 1.0f / rs;
@@ -6062,7 +6080,8 @@ void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
                            out + h * head_sz, /* out_stride */ dk,
                            L ? L + h * S : NULL,
                            row_max, row_sum, S, dk, scale, causal, pad_mask,
-                           P_save ? P_save + h * pscale_sz : NULL);
+                           P_save ? P_save + h * pscale_sz : NULL,
+                           /* qi_start */ 0, /* qi_end */ S);
         }
     done:;
     }
@@ -6107,9 +6126,59 @@ void AX_SYM(ax_cpu_sdpa_fwd_to_flat)(const float *Q, const float *K, const float
                            out_slot, /* out_stride */ D,
                            L ? L + bh * S : NULL,
                            row_max, row_sum, S, dk, scale, causal, pad_mask,
-                           P_save ? P_save + bh * pscale_sz : NULL);
+                           P_save ? P_save + bh * pscale_sz : NULL,
+                           /* qi_start */ 0, /* qi_end */ S);
         }
     done:;
+    }
+}
+
+/* F.4.4 Phase A: per-qi-block fused SDPA forward writing to attn_flat.
+   processes only [qi_start, qi_end) Q rows for ALL (b, h). called once per
+   qi-block by the F.4.4 driver — different qi-blocks own disjoint
+   row ranges so concurrent block calls are independent.
+
+   semantics: same per-block init/normalise as attn_fwd_head's qi-range
+   path. row_max/row_sum/L/attn_flat/P_save rows for [qi_start, qi_end)
+   are owned by THIS call; rows outside the range are unread/unwritten.
+   the F.4.4 driver calls this once per qi-block in a serial outer loop
+   (the (b, h) inner parallel below handles head-level parallelism). */
+void AX_SYM(ax_cpu_sdpa_fwd_to_flat_qi_block)(
+    const float *Q, const float *K, const float *V,
+    float *attn_flat, float *L,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal, const int8_t *pad_mask,
+    float *P_save)
+{
+    int64_t BH = B * H;
+    int64_t D  = H * dk;
+    int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;
+
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        int64_t want = (int64_t)S * (int64_t)sizeof(float);
+        float *row_max = ax_tls_grow(&tl_sdpa_row_max, &tl_sdpa_row_max_S, want);
+        float *row_sum = ax_tls_grow(&tl_sdpa_row_sum, &tl_sdpa_row_sum_S, want);
+        if (!row_max || !row_sum) goto done_qi;
+
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t bh = 0; bh < BH; bh++) {
+            int64_t b = bh / H, h = bh % H;
+            float *out_slot = attn_flat + b * S * D + h * dk;
+            attn_fwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                           out_slot, /* out_stride */ D,
+                           L ? L + bh * S : NULL,
+                           row_max, row_sum, S, dk, scale, causal, pad_mask,
+                           P_save ? P_save + bh * pscale_sz : NULL,
+                           qi_start, qi_end);
+        }
+    done_qi:;
     }
 }
 
@@ -6182,7 +6251,8 @@ static inline void attn_bwd_kj_block(
     float *Kt_packed, float *Vt_packed, float *K_packed,
     float *P_tile, float *dP_tile, float *dS_tile,
     float *pa, float *pb,
-    float *dQ_dest, float *dK, float *dV)
+    float *dQ_dest, float *dK, float *dV,
+    int64_t qi_start, int64_t qi_end)
 {
     int64_t Bk    = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
     int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -6202,8 +6272,8 @@ static inline void attn_bwd_kj_block(
     pack_b_t(V + kj * dk, dk, dk, Bk_np, Bk, Vt_packed);
     pack_b(K + kj * dk, dk, Bk, dk_np, dk, K_packed);
 
-    for (int64_t qi = 0; qi < S; qi += ATTN_BQ) {
-        int64_t Bq = (qi + ATTN_BQ <= S) ? ATTN_BQ : (S - qi);
+    for (int64_t qi = qi_start; qi < qi_end; qi += ATTN_BQ) {
+        int64_t Bq = (qi + ATTN_BQ <= qi_end) ? ATTN_BQ : (qi_end - qi);
         int64_t Bq_p = ((Bq + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
         /* causal: skip this (qi, kj) if entire block is in future */
@@ -6459,7 +6529,8 @@ static inline void attn_bwd_kj_block_fused(
     float *Kt_packed, float *Vt_packed, float *K_packed,
     float *P_tile, float *dP_tile, float *dS_tile,
     float *pa, float *pb,
-    float *dQ_dest, float *dK, float *dV)
+    float *dQ_dest, float *dK, float *dV,
+    int64_t qi_start, int64_t qi_end)
 {
     int64_t Bk    = (kj + ATTN_BK <= S) ? ATTN_BK : (S - kj);
     int64_t Bk_np = ((Bk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -6478,8 +6549,8 @@ static inline void attn_bwd_kj_block_fused(
     pack_b_t(V + kj * dk, dk, dk, Bk_np, Bk, Vt_packed);
     pack_b(K + kj * dk, dk, Bk, dk_np, dk, K_packed);
 
-    for (int64_t qi = 0; qi < S; qi += ATTN_BQ) {
-        int64_t Bq   = (qi + ATTN_BQ <= S) ? ATTN_BQ : (S - qi);
+    for (int64_t qi = qi_start; qi < qi_end; qi += ATTN_BQ) {
+        int64_t Bq   = (qi + ATTN_BQ <= qi_end) ? ATTN_BQ : (qi_end - qi);
         if (causal && qi + Bq - 1 < kj) continue;
 
         /* per-strip GEMM kernel for dV / dK — kc=GEMM_MR full tile.
@@ -6696,7 +6767,8 @@ typedef void (*ax_attn_bwd_kj_fn_t)(
     float *Kt_packed, float *Vt_packed, float *K_packed,
     float *P_tile, float *dP_tile, float *dS_tile,
     float *pa, float *pb,
-    float *dQ_dest, float *dK, float *dV);
+    float *dQ_dest, float *dK, float *dV,
+    int64_t qi_start, int64_t qi_end);
 
 /* pick the kj-block impl. dispatch:
      AX_SDPA_FUSED=1     → force fused
@@ -6807,8 +6879,12 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                            float *dQ, float *dK, float *dV,
                            int64_t S, int64_t dk, float scale, bool causal,
                            const float *P_saved_head, int n_inner,
-                           int64_t BH)
+                           int64_t BH,
+                           int64_t qi_start, int64_t qi_end)
 {
+    if (qi_end > S) qi_end = S;
+    if (qi_start < 0) qi_start = 0;
+    if (qi_start >= qi_end) return;
     int64_t dk_np = ((dk + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bk_np_max = ((ATTN_BK + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
     int64_t Bq_p_max = ((ATTN_BQ + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
@@ -6854,8 +6930,17 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
     float *Q_pb  = ax_tls_grow(&tl_bwd_q_pb,  &tl_bwd_q_pb_bytes,  S_pb_bytes);
     float *dO_pa = ax_tls_grow(&tl_bwd_dO_pa, &tl_bwd_dO_pa_bytes, S_pa_bytes);
     float *dO_pb = ax_tls_grow(&tl_bwd_dO_pb, &tl_bwd_dO_pb_bytes, S_pb_bytes);
+    /* prepack uses `Q_pa + (qi + ir) * dk` and `dO_pa + (qi + ir) * dk`
+       to address MR-strip boundaries in the pack_a output. this requires
+       both ATTN_BQ and qi_start to be MR-aligned so every (qi + ir)
+       lands at a strip start. qi_start == 0 gives full-S parity; non-zero
+       qi_start from the F.4.4 qi-block entry must itself be MR-aligned
+       (driver uses ATTN_BQ-sized blocks, which are). when mis-aligned we
+       fall back to on-the-fly pack_a of just the current MR-strip — same
+       logic the path already has for when prepack buffers fail to alloc. */
     bool use_prepack = (Q_pa && Q_pb && dO_pa && dO_pb)
-                       && (ATTN_BQ % GEMM_MR == 0);
+                       && (ATTN_BQ % GEMM_MR == 0)
+                       && (qi_start % GEMM_MR == 0);
     if (use_prepack) {
         int64_t S_pa_rows = ((S + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
         pack_a(Q,  dk, S_pa_rows, dk, S, Q_pa);
@@ -6885,7 +6970,8 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                               use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                               Kt_packed, Vt_packed, K_packed,
                               P_tile, dP_tile, dS_tile, pa, pb,
-                              dQ, dK, dV);
+                              dQ, dK, dV,
+                              qi_start, qi_end);
         }
     } else {
 #ifdef _OPENMP
@@ -6899,7 +6985,8 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                                   use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                                   Kt_packed, Vt_packed, K_packed,
                                   P_tile, dP_tile, dS_tile, pa, pb,
-                                  dQ, dK, dV);
+                                  dQ, dK, dV,
+                                  qi_start, qi_end);
             }
         } else {
             memset(dQ_pool, 0, (size_t)dq_pool_bytes);
@@ -6935,7 +7022,8 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                                           use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                                           Kt_p_x, Vt_p_x, K_p_x,
                                           P_x, dP_x, dS_x, pa_x, pb_x,
-                                          my_dQ, dK, dV);
+                                          my_dQ, dK, dV,
+                                          qi_start, qi_end);
                     }
                 }
             }
@@ -6964,7 +7052,8 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                               use_prepack, Q_pa, Q_pb, dO_pa, dO_pb,
                               Kt_packed, Vt_packed, K_packed,
                               P_tile, dP_tile, dS_tile, pa, pb,
-                              dQ, dK, dV);
+                              dQ, dK, dV,
+                              qi_start, qi_end);
         }
 #endif
     }
@@ -7036,7 +7125,8 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
                            dQ + h * head_sz, dK + h * head_sz, dV + h * head_sz,
                            S, dk, scale, causal,
                            P_saved ? P_saved + h * pscale_sz : NULL,
-                           n_inner, BH);
+                           n_inner, BH,
+                           /* qi_start */ 0, /* qi_end */ S);
         }
     done:;
     }
@@ -7104,9 +7194,100 @@ void AX_SYM(ax_cpu_sdpa_bwd_from_flat)(const float *Q, const float *K, const flo
                            dQ + bh * head_sz, dK + bh * head_sz, dV + bh * head_sz,
                            S, dk, scale, causal,
                            P_saved ? P_saved + bh * pscale_sz : NULL,
-                           n_inner, BH);
+                           n_inner, BH,
+                           /* qi_start */ 0, /* qi_end */ S);
         }
     done:;
+    }
+}
+
+/* F.4.4 Phase A: per-qi-block SDPA backward reading O strided from
+   attn_flat. processes only [qi_start, qi_end) Q rows for ALL (b, h).
+   the F.4.4 driver calls this once per qi-block.
+
+   semantics:
+     - dQ[qi_start..qi_end] is OVERWRITTEN per call (caller must NOT
+       pre-zero across qi-blocks; each qi-block writes its own range).
+     - dK / dV are ACCUMULATED into across qi-blocks. caller MUST
+       memset dK = dV = 0 once before the first qi-block call.
+     - Di is computed per-qi-block in this function (TLS scratch);
+       only [qi_start, qi_end) entries are used.
+
+   note: dK / dV accumulation across multiple block calls relies on
+   attn_bwd_head's existing per-kj accumulation pattern — each qi
+   contributes additively. with multiple qi-blocks running serially
+   in the F.4.4 driver, the running totals in dK / dV survive across
+   block calls. when run in parallel across qi-blocks (Phase B's
+   structure), need atomic adds OR per-block dK/dV accumulators with
+   final reduction (see Phase B docs). */
+void AX_SYM(ax_cpu_sdpa_bwd_from_flat_qi_block)(
+    const float *Q, const float *K, const float *V,
+    const float *attn_flat, const float *dO, const float *L,
+    float *dQ, float *dK, float *dV,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal, const float *P_saved)
+{
+    int64_t BH = B * H;
+    int64_t D  = H * dk;
+    int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;
+
+    int n_inner = ax_attn_bwd_inner_threads(BH);
+
+    /* zero ONLY this qi-block's range of dQ. dK/dV are accumulated
+       across blocks — caller-zeroed before the first block call. */
+    if (qi_end > S) qi_end = S;
+    if (qi_start < 0) qi_start = 0;
+    if (qi_start >= qi_end) return;
+    int64_t qi_stride_dk = (qi_end - qi_start) * dk;
+    for (int64_t bh = 0; bh < BH; bh++) {
+        memset(dQ + bh * head_sz + qi_start * dk, 0,
+               (size_t)qi_stride_dk * sizeof(float));
+    }
+
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        float *Di = ax_tls_grow(&tl_bwd_di, &tl_bwd_di_bytes,
+                                (int64_t)S * (int64_t)sizeof(float));
+        if (!Di) goto done_qi_b;
+
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t bh = 0; bh < BH; bh++) {
+            int64_t b = bh / H, h = bh % H;
+            const float *dOh = dO + bh * head_sz;
+            const float *attn_flat_h = attn_flat + b * S * D + h * dk;
+
+            /* Di[qi_start..qi_end] = dot(dO[i], O[i]) — strided O read. */
+            for (int64_t i = qi_start; i < qi_end; i++) {
+                const float *do_r = dOh + i * dk;
+                const float *o_r  = attn_flat_h + i * D;
+                float dot = 0;
+                int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+                ax_vf32 vd = ax_vf32_zero();
+                int64_t ve = dk - (dk % AX_VF32_WIDTH);
+                for (; d < ve; d += AX_VF32_WIDTH)
+                    vd = ax_vf32_fmadd(ax_vf32_loadu(do_r + d),
+                                       ax_vf32_loadu(o_r + d), vd);
+                dot = ax_vf32_hsum(vd);
+#endif
+                for (; d < dk; d++) dot += do_r[d] * o_r[d];
+                Di[i] = dot;
+            }
+            attn_bwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                           dOh, L + bh * S, Di,
+                           dQ + bh * head_sz, dK + bh * head_sz, dV + bh * head_sz,
+                           S, dk, scale, causal,
+                           P_saved ? P_saved + bh * pscale_sz : NULL,
+                           n_inner, BH,
+                           qi_start, qi_end);
+        }
+    done_qi_b:;
     }
 }
 

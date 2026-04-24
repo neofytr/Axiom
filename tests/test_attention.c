@@ -1303,6 +1303,224 @@ static void test_output_proj_bwd_fused_parity(void)
     }
 }
 
+/* ================================================================
+   F.4.4 Phase A parity: calling ax_fused_attention_fwd_save_to_flat_qi_block
+   in N qi-block chunks must produce bit-equivalent attn_flat / L / P_save
+   to a single full-S ax_fused_attention_fwd_save_to_flat call.
+   ================================================================ */
+static void test_sdpa_fwd_qi_block_parity(void)
+{
+    struct shape_case { int64_t B, S, H, dk; bool causal; bool save_p; int64_t qi_block; };
+    struct shape_case cases[] = {
+        { 2, 8,   4, 4,  false, true,  4 },   /* tiny, S divisible by qi_block */
+        { 1, 64,  8, 8,  false, true,  16 },  /* multi-block */
+        { 1, 32,  4, 16, true,  false, 8 },   /* causal */
+        { 4, 16,  4, 16, false, true,  8 },   /* batched */
+        { 1, 64,  4, 16, false, true,  21 },  /* qi_block doesn't divide S */
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
+        struct shape_case c = cases[ci];
+        int64_t B = c.B, S = c.S, H = c.H, dk = c.dk;
+        int64_t qi_block = c.qi_block;
+        int64_t BH = B * H, D = H * dk;
+        float scale = 1.0f / sqrtf((float)dk);
+
+        ax_set_seed(44444 + (int)ci);
+        int64_t qkv_sh[]  = {BH, S, dk};
+        int64_t flat_sh[] = {B, S, D};
+        int64_t L_sh[]    = {BH, S};
+        int64_t Psh[]     = {BH, S, S};
+
+        ax_tensor_t *Q = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *K = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *V = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+
+        /* reference: single full-S fwd_save_to_flat call */
+        ax_tensor_t *flat_ref = ax_tensor_create(flat_sh, 3, AX_FLOAT32);
+        ax_tensor_t *L_ref    = ax_tensor_create(L_sh, 2, AX_FLOAT32);
+        ax_tensor_t *P_ref    = c.save_p ? ax_tensor_create(Psh, 3, AX_FLOAT32) : NULL;
+        ax_fused_attention_fwd_save_to_flat(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (float *)flat_ref->storage->data,
+            (float *)L_ref->storage->data,
+            P_ref ? (float *)P_ref->storage->data : NULL,
+            B, S, H, dk, scale, c.causal);
+
+        /* test: multiple qi-block calls covering [0, S) */
+        ax_tensor_t *flat_blk = ax_tensor_create(flat_sh, 3, AX_FLOAT32);
+        ax_tensor_t *L_blk    = ax_tensor_create(L_sh, 2, AX_FLOAT32);
+        ax_tensor_t *P_blk    = c.save_p ? ax_tensor_create(Psh, 3, AX_FLOAT32) : NULL;
+        for (int64_t qi = 0; qi < S; qi += qi_block) {
+            int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
+            ax_fused_attention_fwd_save_to_flat_qi_block(
+                (const float *)Q->storage->data,
+                (const float *)K->storage->data,
+                (const float *)V->storage->data,
+                (float *)flat_blk->storage->data,
+                (float *)L_blk->storage->data,
+                P_blk ? (float *)P_blk->storage->data : NULL,
+                B, S, H, dk, qi, qi_end, scale, c.causal);
+        }
+
+        /* compare attn_flat */
+        int64_t nflat = B * S * D;
+        const float *fr = (const float *)flat_ref->storage->data;
+        const float *fb = (const float *)flat_blk->storage->data;
+        float maxd_o = 0.0f;
+        for (int64_t i = 0; i < nflat; i++) {
+            float d = fabsf(fr[i] - fb[i]);
+            if (d > maxd_o) maxd_o = d;
+        }
+        AX_TEST_ASSERT(maxd_o < 1e-5f, "Phase A fwd qi_block: attn_flat matches full-S");
+
+        int64_t nL = BH * S;
+        const float *Lr = (const float *)L_ref->storage->data;
+        const float *Lb = (const float *)L_blk->storage->data;
+        float maxd_L = 0.0f;
+        for (int64_t i = 0; i < nL; i++) {
+            float d = fabsf(Lr[i] - Lb[i]);
+            if (d > maxd_L) maxd_L = d;
+        }
+        AX_TEST_ASSERT(maxd_L < 1e-5f, "Phase A fwd qi_block: L matches full-S");
+
+        if (c.save_p) {
+            int64_t nP = BH * S * S;
+            const float *Pr = (const float *)P_ref->storage->data;
+            const float *Pb = (const float *)P_blk->storage->data;
+            float maxd_P = 0.0f;
+            for (int64_t i = 0; i < nP; i++) {
+                float d = fabsf(Pr[i] - Pb[i]);
+                if (d > maxd_P) maxd_P = d;
+            }
+            AX_TEST_ASSERT(maxd_P < 1e-5f, "Phase A fwd qi_block: P_save matches full-S");
+        }
+
+        ax_tensor_destroy(Q); ax_tensor_destroy(K); ax_tensor_destroy(V);
+        ax_tensor_destroy(flat_ref); ax_tensor_destroy(L_ref); ax_tensor_destroy(flat_blk);
+        ax_tensor_destroy(L_blk);
+        if (P_ref) ax_tensor_destroy(P_ref);
+        if (P_blk) ax_tensor_destroy(P_blk);
+    }
+}
+
+/* ================================================================
+   F.4.4 Phase A parity: calling ax_fused_attention_bwd_use_from_flat_qi_block
+   in N qi-block chunks must produce bit-equivalent dQ/dK/dV to a single
+   full-S ax_fused_attention_bwd_use_from_flat call.
+
+   note: caller must memset dK = dV = 0 before the first qi-block call;
+   subsequent calls accumulate across blocks. dQ rows per [qi_start,
+   qi_end) are overwritten per call.
+   ================================================================ */
+static void test_sdpa_bwd_qi_block_parity(void)
+{
+    struct shape_case { int64_t B, S, H, dk; bool causal; int64_t qi_block; };
+    struct shape_case cases[] = {
+        { 2, 8,  4, 4,  false, 4 },
+        { 1, 64, 8, 8,  false, 16 },
+        { 1, 32, 4, 16, true,  8 },
+        { 1, 64, 4, 16, false, 21 },
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
+        struct shape_case c = cases[ci];
+        int64_t B = c.B, S = c.S, H = c.H, dk = c.dk;
+        int64_t qi_block = c.qi_block;
+        int64_t BH = B * H, D = H * dk;
+        float scale = 1.0f / sqrtf((float)dk);
+
+        ax_set_seed(55555 + (int)ci);
+        int64_t qkv_sh[]  = {BH, S, dk};
+        int64_t flat_sh[] = {B, S, D};
+        int64_t L_sh[]    = {BH, S};
+        int64_t Psh[]     = {BH, S, S};
+
+        ax_tensor_t *Q = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *K = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *V = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *dO = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+
+        /* fwd to get attn_flat, L, P_saved */
+        ax_tensor_t *attn_flat = ax_tensor_create(flat_sh, 3, AX_FLOAT32);
+        ax_tensor_t *L_t       = ax_tensor_create(L_sh, 2, AX_FLOAT32);
+        ax_tensor_t *P_t       = ax_tensor_create(Psh, 3, AX_FLOAT32);
+        ax_fused_attention_fwd_save_to_flat(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (float *)attn_flat->storage->data,
+            (float *)L_t->storage->data,
+            (float *)P_t->storage->data,
+            B, S, H, dk, scale, c.causal);
+
+        /* reference: single full-S bwd_use_from_flat */
+        ax_tensor_t *dQ_ref = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dK_ref = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dV_ref = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_fused_attention_bwd_use_from_flat(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (const float *)attn_flat->storage->data,
+            (const float *)dO->storage->data,
+            (const float *)L_t->storage->data,
+            (const float *)P_t->storage->data,
+            (float *)dQ_ref->storage->data,
+            (float *)dK_ref->storage->data,
+            (float *)dV_ref->storage->data,
+            B, S, H, dk, scale, c.causal);
+
+        /* test: N qi-block calls. caller zeroes dK/dV once; each call
+           overwrites its dQ rows and accumulates into dK/dV. */
+        ax_tensor_t *dQ_blk = ax_tensor_zeros(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dK_blk = ax_tensor_zeros(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dV_blk = ax_tensor_zeros(qkv_sh, 3, AX_FLOAT32);
+        for (int64_t qi = 0; qi < S; qi += qi_block) {
+            int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
+            ax_fused_attention_bwd_use_from_flat_qi_block(
+                (const float *)Q->storage->data,
+                (const float *)K->storage->data,
+                (const float *)V->storage->data,
+                (const float *)attn_flat->storage->data,
+                (const float *)dO->storage->data,
+                (const float *)L_t->storage->data,
+                (const float *)P_t->storage->data,
+                (float *)dQ_blk->storage->data,
+                (float *)dK_blk->storage->data,
+                (float *)dV_blk->storage->data,
+                B, S, H, dk, qi, qi_end, scale, c.causal);
+        }
+
+        int64_t nel = BH * S * dk;
+        const float *qr = (const float *)dQ_ref->storage->data;
+        const float *qb = (const float *)dQ_blk->storage->data;
+        const float *kr = (const float *)dK_ref->storage->data;
+        const float *kb = (const float *)dK_blk->storage->data;
+        const float *vr = (const float *)dV_ref->storage->data;
+        const float *vb = (const float *)dV_blk->storage->data;
+        float maxQ = 0, maxK = 0, maxV = 0;
+        for (int64_t i = 0; i < nel; i++) {
+            float dq = fabsf(qr[i] - qb[i]);
+            float dk2 = fabsf(kr[i] - kb[i]);
+            float dv = fabsf(vr[i] - vb[i]);
+            if (dq > maxQ) maxQ = dq;
+            if (dk2 > maxK) maxK = dk2;
+            if (dv > maxV) maxV = dv;
+        }
+        AX_TEST_ASSERT(maxQ < 1e-5f, "Phase A bwd qi_block: dQ matches full-S");
+        AX_TEST_ASSERT(maxK < 1e-5f, "Phase A bwd qi_block: dK matches full-S");
+        AX_TEST_ASSERT(maxV < 1e-5f, "Phase A bwd qi_block: dV matches full-S");
+
+        ax_tensor_destroy(Q); ax_tensor_destroy(K); ax_tensor_destroy(V); ax_tensor_destroy(dO);
+        ax_tensor_destroy(attn_flat); ax_tensor_destroy(L_t); ax_tensor_destroy(P_t);
+        ax_tensor_destroy(dQ_ref); ax_tensor_destroy(dK_ref); ax_tensor_destroy(dV_ref);
+        ax_tensor_destroy(dQ_blk); ax_tensor_destroy(dK_blk); ax_tensor_destroy(dV_blk);
+    }
+}
+
 int main(void)
 {
     ax_init();
@@ -1327,6 +1545,8 @@ int main(void)
     AX_RUN_TEST(test_sdpa_bwd_from_flat_parity);
     AX_RUN_TEST(test_mha_output_proj_fused_parity);
     AX_RUN_TEST(test_output_proj_bwd_fused_parity);
+    AX_RUN_TEST(test_sdpa_fwd_qi_block_parity);
+    AX_RUN_TEST(test_sdpa_bwd_qi_block_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();
