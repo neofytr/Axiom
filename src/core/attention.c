@@ -183,25 +183,22 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
                (size_t)rows * (size_t)D * sizeof(float));
     }
 
-    /* ---- fused QKV: [rows, D] @ [D, 3D] -> [rows, 3D] ---- */
-    int64_t qkv_sh[] = {rows, 3 * D};
-    ax_tensor_t *qkv = NULL;
-    ALLOC_SHAPE(qkv, qkv_sh, 2);
-    if (!qkv) goto fail;
-    if (ax_compute_gemm(x_flat, m->Wqkv_cache, qkv) != AX_OK) goto fail;
+    /* ---- fused QKV + head-interleave ----
+       F.3.a (ax_compute_qkv_head_gemm): fuses gemm + head-interleave +
+       bias_add into one kernel that writes Qh/Kh/Vh directly, skipping
+       the qkv [rows, 3D] intermediate. for B1_S2048 this saves ~18 MB
+       of L3↔DRAM traffic and one full-rows memory pass.
 
-    /* ---- head-interleave directly from the fused QKV buffer into
-       Qh/Kh/Vh, with optional bias fused in. eliminates the separate
-       bias_add pass over the [rows, 3D] qkv buffer (saves ~12 MB of
-       L3↔L1 traffic at B=1 S=512 D=1024). ----
-
-       note: F.3.a (ax_compute_qkv_head_gemm) was measured on the
-       autograd path and regressed B8_S128 by +20 % while being
-       near-neutral on other shapes. the fused primitive is a win for
-       train_step_v4 (which uses arena allocations differently), but
-       the autograd forward's tensor allocation / refcount pattern
-       seems to erode the benefit at small shapes. kept on the unfused
-       path here; train_step_v4 continues to use F.3.a directly. */
+       shape-gated: F.3.a shows a measurable win on large-S shapes where
+       the qkv intermediate dominates traffic but hurts small-S shapes
+       (B8_S128 was measured +20 % on an earlier run, likely because
+       the unfused path's bias broadcast pre-init bakes the per-head
+       bias into the output inside the layer cache in a way that fuses
+       well with the subsequent SDPA fwd's first read — on small S the
+       qkv intermediate fits in L2 anyway). threshold: enable when
+       rows * 3 * D * sizeof(float) > 8 MB (≈ L2 spill point on the
+       majority of modern CPUs with L2 ≥ 1 MB per core). env override
+       AX_NO_F3A=1 disables the heuristic. */
     int64_t head_sh[] = {B * H, S, dk};
     ax_tensor_t *Qh = NULL, *Kh = NULL, *Vh = NULL;
     ALLOC_SHAPE(Qh, head_sh, 3);
@@ -209,48 +206,67 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     ALLOC_SHAPE(Vh, head_sh, 3);
     if (!Qh || !Kh || !Vh) goto fail;
 
-    /* Phase B: dispatch on device. CPU keeps the existing OMP-parallel
-       memcpy helpers; CUDA uses the coalesced kernels in
-       src/compute/backends/cuda/ops_attention.cu, registered via the
-       cuda extension table (k.4). */
     const ax_cuda_extension_t *cu = ax_compute_get_cuda_extension();
-    bool on_cuda = (qkv->storage->device != AX_DEVICE_CPU);
-    if (m->use_bias) {
-        if (on_cuda && cu && cu->head_interleave_qkv_split_bias) {
-            cu->head_interleave_qkv_split_bias(
-                (const float *)qkv->storage->data,
-                (const float *)m->bqkv_cache->storage->data,
-                (float *)Qh->storage->data,
-                (float *)Kh->storage->data,
-                (float *)Vh->storage->data,
-                B, S, H, dk, D);
-        } else {
-            ax_attn_head_interleave_qkv_split_bias((const float *)qkv->storage->data,
-                                            (const float *)m->bqkv_cache->storage->data,
-                                            (float *)Qh->storage->data,
-                                            (float *)Kh->storage->data,
-                                            (float *)Vh->storage->data,
-                                            B, S, H, dk, D);
-        }
+    bool on_cuda = (x_flat->storage->device != AX_DEVICE_CPU);
+    int64_t qkv_bytes = rows * 3 * D * (int64_t)sizeof(float);
+    bool use_f3a = (!on_cuda) && ax_compute_has_qkv_head_gemm()
+                   && (qkv_bytes > 8 * 1024 * 1024);
+    {
+        const char *no_f3a = getenv("AX_NO_F3A");
+        if (no_f3a && no_f3a[0] == '1') use_f3a = false;
+    }
+    ax_tensor_t *qkv = NULL;  /* only alloc'd on fallback */
+
+    if (use_f3a) {
+        const ax_tensor_t *bqkv_arg = m->use_bias ? m->bqkv_cache : NULL;
+        if (ax_compute_qkv_head_gemm(x_flat, m->Wqkv_cache, bqkv_arg,
+                                       B, S, H, dk, Qh, Kh, Vh) != AX_OK)
+            goto fail;
     } else {
-        if (on_cuda && cu && cu->head_interleave_qkv_split) {
-            cu->head_interleave_qkv_split(
-                (const float *)qkv->storage->data,
-                (float *)Qh->storage->data,
-                (float *)Kh->storage->data,
-                (float *)Vh->storage->data,
-                B, S, H, dk, D);
+        /* fallback: unfused gemm → split. pre-existing path. */
+        int64_t qkv_sh[] = {rows, 3 * D};
+        ALLOC_SHAPE(qkv, qkv_sh, 2);
+        if (!qkv) goto fail;
+        if (ax_compute_gemm(x_flat, m->Wqkv_cache, qkv) != AX_OK) goto fail;
+
+        if (m->use_bias) {
+            if (on_cuda && cu && cu->head_interleave_qkv_split_bias) {
+                cu->head_interleave_qkv_split_bias(
+                    (const float *)qkv->storage->data,
+                    (const float *)m->bqkv_cache->storage->data,
+                    (float *)Qh->storage->data,
+                    (float *)Kh->storage->data,
+                    (float *)Vh->storage->data,
+                    B, S, H, dk, D);
+            } else {
+                ax_attn_head_interleave_qkv_split_bias((const float *)qkv->storage->data,
+                                                (const float *)m->bqkv_cache->storage->data,
+                                                (float *)Qh->storage->data,
+                                                (float *)Kh->storage->data,
+                                                (float *)Vh->storage->data,
+                                                B, S, H, dk, D);
+            }
         } else {
-            ax_attn_head_interleave_qkv_split((const float *)qkv->storage->data,
-                                       (float *)Qh->storage->data,
-                                       (float *)Kh->storage->data,
-                                       (float *)Vh->storage->data,
-                                       B, S, H, dk, D);
+            if (on_cuda && cu && cu->head_interleave_qkv_split) {
+                cu->head_interleave_qkv_split(
+                    (const float *)qkv->storage->data,
+                    (float *)Qh->storage->data,
+                    (float *)Kh->storage->data,
+                    (float *)Vh->storage->data,
+                    B, S, H, dk, D);
+            } else {
+                ax_attn_head_interleave_qkv_split((const float *)qkv->storage->data,
+                                           (float *)Qh->storage->data,
+                                           (float *)Kh->storage->data,
+                                           (float *)Vh->storage->data,
+                                           B, S, H, dk, D);
+            }
         }
     }
 
-    /* qkv no longer needed (non-recorded path); arena reclaims it otherwise */
-    if (!record) ax_tensor_destroy(qkv);
+    /* qkv no longer needed (non-recorded, non-F.3.a path); arena reclaims
+       it otherwise. qkv is NULL on the F.3.a fast path. */
+    if (!record && qkv) ax_tensor_destroy(qkv);
 
     /* ---- SDPA ----
        F.3.e: when ax_fused_attention_fwd_save_to_flat is available AND
