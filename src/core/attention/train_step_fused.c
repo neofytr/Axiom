@@ -203,37 +203,45 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
     make_stack_view(&y_flat_v, &y_flat_st,
                      (const float *)y_out->storage->data, rows, D);
 
-    /* forward: qkv = x @ Wqkv_cache */
+    /* forward: qkv projection + head-split. F.3.a fused path writes
+       directly to head-interleaved Qh/Kh/Vh, eliminating the qkv
+       intermediate. fall back to gemm + split if backend lacks slot. */
     int64_t qkv_sh[]  = {rows, 3 * D};
     int64_t head_sh[] = {bh, S, dk};
     int64_t L_sh[]    = {bh, S};
     int64_t flat_sh[] = {rows, D};
+    (void)qkv_sh; /* only used in fallback */
 
-    ax_tensor_t *qkv = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
-    if (!qkv) return AX_ERR_ALLOC;
-    if (ax_compute_gemm(&x_flat_v, m->Wqkv_cache, qkv) != AX_OK) return AX_ERR_BACKEND;
-
-    /* head-split + optional bias add */
     ax_tensor_t *Qh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *Kh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *Vh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!Qh || !Kh || !Vh) return AX_ERR_ALLOC;
 
-    if (m->use_bias) {
-        ax_attn_head_interleave_qkv_split_bias(
-            (const float *)qkv->storage->data,
-            (const float *)m->bqkv_cache->storage->data,
-            (float *)Qh->storage->data,
-            (float *)Kh->storage->data,
-            (float *)Vh->storage->data,
-            B, S, H, dk, D);
+    if (ax_compute_has_qkv_head_gemm()) {
+        const ax_tensor_t *bqkv_arg = m->use_bias ? m->bqkv_cache : NULL;
+        if (ax_compute_qkv_head_gemm(&x_flat_v, m->Wqkv_cache, bqkv_arg,
+                                       B, S, H, dk, Qh, Kh, Vh) != AX_OK)
+            return AX_ERR_BACKEND;
     } else {
-        ax_attn_head_interleave_qkv_split(
-            (const float *)qkv->storage->data,
-            (float *)Qh->storage->data,
-            (float *)Kh->storage->data,
-            (float *)Vh->storage->data,
-            B, S, H, dk, D);
+        ax_tensor_t *qkv = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
+        if (!qkv) return AX_ERR_ALLOC;
+        if (ax_compute_gemm(&x_flat_v, m->Wqkv_cache, qkv) != AX_OK) return AX_ERR_BACKEND;
+        if (m->use_bias) {
+            ax_attn_head_interleave_qkv_split_bias(
+                (const float *)qkv->storage->data,
+                (const float *)m->bqkv_cache->storage->data,
+                (float *)Qh->storage->data,
+                (float *)Kh->storage->data,
+                (float *)Vh->storage->data,
+                B, S, H, dk, D);
+        } else {
+            ax_attn_head_interleave_qkv_split(
+                (const float *)qkv->storage->data,
+                (float *)Qh->storage->data,
+                (float *)Kh->storage->data,
+                (float *)Vh->storage->data,
+                B, S, H, dk, D);
+        }
     }
 
     /* SDPA forward */

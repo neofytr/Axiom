@@ -455,6 +455,38 @@ int ax_compute_has_dwqkv_split_acc(void) {
     return (active_ops && active_ops->dwqkv_split_acc) ? 1 : 0;
 }
 
+/* F.3.a fused forward QKV projection + head_interleave_split.
+   computes Qh/Kh/Vh = head_split(X @ Wqkv + bqkv) in one pass.
+   backends that lack the slot return AX_ERR_NOT_IMPLEMENTED so callers
+   can fall back to gemm + ax_attn_head_interleave_qkv_split. */
+ax_status_t ax_compute_qkv_head_gemm(const ax_tensor_t *X,
+                                      const ax_tensor_t *Wqkv,
+                                      const ax_tensor_t *bqkv,
+                                      int64_t B, int64_t S, int64_t H, int64_t dk,
+                                      ax_tensor_t *Qh,
+                                      ax_tensor_t *Kh,
+                                      ax_tensor_t *Vh)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->qkv_head_gemm) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "qkv_head_gemm not implemented in %s",
+                   active_ops ? active_ops->name : "none");
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    ax_status_t st = active_ops->qkv_head_gemm(X, Wqkv, bqkv, B, S, H, dk, Qh, Kh, Vh);
+    if (st == AX_OK) {
+        if (Qh && Qh->storage) ax_storage_touch(Qh->storage);
+        if (Kh && Kh->storage) ax_storage_touch(Kh->storage);
+        if (Vh && Vh->storage) ax_storage_touch(Vh->storage);
+    }
+    return st;
+}
+
+int ax_compute_has_qkv_head_gemm(void) {
+    ensure_compute_init();
+    return (active_ops && active_ops->qkv_head_gemm) ? 1 : 0;
+}
+
 /* fused-scaling gemm: out = alpha * (a @ b) + beta * out. */
 ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
                                 float alpha, float beta, ax_tensor_t *out)

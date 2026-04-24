@@ -238,42 +238,53 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
        FORWARD
        ============================================================ */
 
-    /* qkv = x @ Wqkv_cache  →  [rows, 3D] */
+    /* qkv projection + head-split: prefer F.3.a fused path which writes
+       directly to head-interleaved Qh/Kh/Vh and skips the [rows, 3D] qkv
+       intermediate (~18 MB on B1_S2048_D768). falls back to gemm + split
+       when the backend lacks the fused slot. */
     int64_t qkv_sh[]  = {rows, 3 * D};
     int64_t head_sh[] = {bh, S, dk};
     int64_t L_sh[]    = {bh, S};
     int64_t flat_sh[] = {rows, D};
 
-    ax_tensor_t *qkv = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
-    if (!qkv) return AX_ERR_ALLOC;
-    pf_t0 = prof_enabled ? PF_TICK() : 0;
-    if (ax_compute_gemm(&x_flat_v, m->Wqkv_cache, qkv) != AX_OK) return AX_ERR_BACKEND;
-    if (prof_enabled) pf_qkv += PF_TICK() - pf_t0;
-
-    /* head-split + (optional) bias add → Qh, Kh, Vh [bh, S, dk] each */
     ax_tensor_t *Qh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *Kh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *Vh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!Qh || !Kh || !Vh) return AX_ERR_ALLOC;
 
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    if (m->use_bias) {
-        ax_attn_head_interleave_qkv_split_bias(
-            (const float *)qkv->storage->data,
-            (const float *)m->bqkv_cache->storage->data,
-            (float *)Qh->storage->data,
-            (float *)Kh->storage->data,
-            (float *)Vh->storage->data,
-            B, S, H, dk, D);
+    if (ax_compute_has_qkv_head_gemm()) {
+        const ax_tensor_t *bqkv_arg = m->use_bias ? m->bqkv_cache : NULL;
+        if (ax_compute_qkv_head_gemm(&x_flat_v, m->Wqkv_cache, bqkv_arg,
+                                       B, S, H, dk, Qh, Kh, Vh) != AX_OK)
+            return AX_ERR_BACKEND;
+        if (prof_enabled) pf_qkv += PF_TICK() - pf_t0;
+        /* split is folded into the fused gemm; pf_split stays zero */
     } else {
-        ax_attn_head_interleave_qkv_split(
-            (const float *)qkv->storage->data,
-            (float *)Qh->storage->data,
-            (float *)Kh->storage->data,
-            (float *)Vh->storage->data,
-            B, S, H, dk, D);
+        ax_tensor_t *qkv = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
+        if (!qkv) return AX_ERR_ALLOC;
+        if (ax_compute_gemm(&x_flat_v, m->Wqkv_cache, qkv) != AX_OK) return AX_ERR_BACKEND;
+        if (prof_enabled) pf_qkv += PF_TICK() - pf_t0;
+
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
+        if (m->use_bias) {
+            ax_attn_head_interleave_qkv_split_bias(
+                (const float *)qkv->storage->data,
+                (const float *)m->bqkv_cache->storage->data,
+                (float *)Qh->storage->data,
+                (float *)Kh->storage->data,
+                (float *)Vh->storage->data,
+                B, S, H, dk, D);
+        } else {
+            ax_attn_head_interleave_qkv_split(
+                (const float *)qkv->storage->data,
+                (float *)Qh->storage->data,
+                (float *)Kh->storage->data,
+                (float *)Vh->storage->data,
+                B, S, H, dk, D);
+        }
+        if (prof_enabled) pf_split += PF_TICK() - pf_t0;
     }
-    if (prof_enabled) pf_split += PF_TICK() - pf_t0;
 
     /* SDPA forward — saves L (always) and optionally P */
     ax_tensor_t *Oh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);

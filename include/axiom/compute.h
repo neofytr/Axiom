@@ -135,6 +135,28 @@ ax_status_t ax_compute_dwqkv_split_acc(const ax_tensor_t *x_flat,
                                         ax_tensor_t *dWv);
 int ax_compute_has_dwqkv_split_acc(void);
 
+/* F.3.a fused forward QKV projection + head_interleave_split.
+   computes:
+     qkv = X @ Wqkv (+ bqkv)
+     Qh, Kh, Vh = head_interleave_split(qkv)
+   in one pass, eliminating the [B*S, 3D] qkv intermediate (~18 MB on
+   B1_S2048_D768) and the head_interleave_split layout pass.
+
+   shapes: X=[B*S, D], Wqkv=[D, 3D], bqkv=[3D] or NULL,
+           Qh, Kh, Vh each [B*H, S, dk]   where D = H*dk.
+   Qh/Kh/Vh are OVERWRITTEN (initialised to bias if bqkv != NULL else
+   zero, then gemm accumulates). callers must not pre-populate them.
+   returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot —
+   callers fall back to gemm + ax_attn_head_interleave_qkv_split. */
+ax_status_t ax_compute_qkv_head_gemm(const ax_tensor_t *X,
+                                      const ax_tensor_t *Wqkv,
+                                      const ax_tensor_t *bqkv,
+                                      int64_t B, int64_t S, int64_t H, int64_t dk,
+                                      ax_tensor_t *Qh,
+                                      ax_tensor_t *Kh,
+                                      ax_tensor_t *Vh);
+int ax_compute_has_qkv_head_gemm(void);
+
 /* fused matmul+relu: out = relu(a @ b + bias). bias may be NULL.
    returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
 ax_status_t ax_compute_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,

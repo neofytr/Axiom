@@ -683,6 +683,129 @@ static void test_mha_train_step_fused_parity(void)
     run_train_step_parity(ax_mha_train_step_fused, "train_step_fused");
 }
 
+/* ================================================================
+   test: F.3.a opt_qkv_head_gemm produces bit-for-bit identical Qh/Kh/Vh
+   to the unfused gemm + ax_attn_head_interleave_qkv_split_bias sequence.
+   shapes exercised:
+     (B=2, S=8, D=16, H=4, dk=4) — tiny (scalar-inner-loop path)
+     (B=1, S=64, D=64, H=8, dk=8) — edge MR/batch boundaries
+     (B=4, S=32, D=64, H=4, dk=16) — use_jc_par path
+   tolerance: bit-identical fp32 (both paths do identical accumulation
+   order up to micro_kernel ordering — checking <1e-5 to accommodate
+   any tile-order-dependent reassociation).
+   ================================================================ */
+static void test_qkv_head_gemm_parity(void)
+{
+    struct shape_case { int64_t B, S, D, H; };
+    struct shape_case cases[] = {
+        { 2, 8, 16, 4 },
+        { 1, 64, 64, 8 },
+        { 4, 32, 64, 4 },
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
+        struct shape_case c = cases[ci];
+        int64_t B = c.B, S = c.S, D = c.D, H = c.H;
+        int64_t dk = D / H;
+        int64_t rows = B * S;
+
+        ax_set_seed(7777 + (int)ci);
+        int64_t x_sh[]   = {rows, D};
+        int64_t w_sh[]   = {D, 3 * D};
+        int64_t b_sh[]   = {3 * D};
+        int64_t h_sh[]   = {B * H, S, dk};
+        int64_t qkv_sh[] = {rows, 3 * D};
+
+        ax_tensor_t *X    = ax_tensor_rand(x_sh, 2, -0.1f, 0.1f);
+        ax_tensor_t *Wqkv = ax_tensor_rand(w_sh, 2, -0.1f, 0.1f);
+        ax_tensor_t *bqkv = ax_tensor_rand(b_sh, 1, -0.05f, 0.05f);
+
+        /* reference path: gemm + head_interleave_qkv_split_bias */
+        ax_tensor_t *qkv_ref = ax_tensor_create(qkv_sh, 2, AX_FLOAT32);
+        ax_tensor_t *Qh_ref = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Kh_ref = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Vh_ref = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_status_t s1 = ax_compute_gemm(X, Wqkv, qkv_ref);
+        AX_TEST_ASSERT_EQ((int)s1, (int)AX_OK, "ref gemm ok");
+        extern void ax_attn_head_interleave_qkv_split_bias(const float *, const float *,
+                                                             float *, float *, float *,
+                                                             int64_t, int64_t, int64_t, int64_t,
+                                                             int64_t);
+        ax_attn_head_interleave_qkv_split_bias(
+            (const float *)qkv_ref->storage->data,
+            (const float *)bqkv->storage->data,
+            (float *)Qh_ref->storage->data,
+            (float *)Kh_ref->storage->data,
+            (float *)Vh_ref->storage->data,
+            B, S, H, dk, D);
+
+        /* fused path */
+        ax_tensor_t *Qh_fus = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Kh_fus = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Vh_fus = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_status_t s2 = ax_compute_qkv_head_gemm(X, Wqkv, bqkv, B, S, H, dk,
+                                                    Qh_fus, Kh_fus, Vh_fus);
+        AX_TEST_ASSERT_EQ((int)s2, (int)AX_OK, "fused qkv_head_gemm ok");
+
+        /* compare */
+        int64_t nel = B * H * S * dk;
+        const float *qr = (const float *)Qh_ref->storage->data;
+        const float *kr = (const float *)Kh_ref->storage->data;
+        const float *vr = (const float *)Vh_ref->storage->data;
+        const float *qf = (const float *)Qh_fus->storage->data;
+        const float *kf = (const float *)Kh_fus->storage->data;
+        const float *vf = (const float *)Vh_fus->storage->data;
+        float max_dq = 0.0f, max_dk = 0.0f, max_dv = 0.0f;
+        for (int64_t i = 0; i < nel; i++) {
+            float dq = fabsf(qr[i] - qf[i]);
+            float dk2 = fabsf(kr[i] - kf[i]);
+            float dv = fabsf(vr[i] - vf[i]);
+            if (dq > max_dq) max_dq = dq;
+            if (dk2 > max_dk) max_dk = dk2;
+            if (dv > max_dv) max_dv = dv;
+        }
+        AX_TEST_ASSERT(max_dq < 1e-5f, "Qh matches fused vs unfused");
+        AX_TEST_ASSERT(max_dk < 1e-5f, "Kh matches fused vs unfused");
+        AX_TEST_ASSERT(max_dv < 1e-5f, "Vh matches fused vs unfused");
+
+        /* also test the no-bias path */
+        ax_tensor_t *Qh_ref2 = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Kh_ref2 = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Vh_ref2 = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        extern void ax_attn_head_interleave_qkv_split(const float *,
+                                                        float *, float *, float *,
+                                                        int64_t, int64_t, int64_t, int64_t,
+                                                        int64_t);
+        ax_attn_head_interleave_qkv_split(
+            (const float *)qkv_ref->storage->data,
+            (float *)Qh_ref2->storage->data,
+            (float *)Kh_ref2->storage->data,
+            (float *)Vh_ref2->storage->data,
+            B, S, H, dk, D);
+        ax_tensor_t *Qh_fus2 = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Kh_fus2 = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_tensor_t *Vh_fus2 = ax_tensor_create(h_sh, 3, AX_FLOAT32);
+        ax_status_t s3 = ax_compute_qkv_head_gemm(X, Wqkv, NULL, B, S, H, dk,
+                                                    Qh_fus2, Kh_fus2, Vh_fus2);
+        AX_TEST_ASSERT_EQ((int)s3, (int)AX_OK, "fused qkv_head_gemm no-bias ok");
+        const float *qr2 = (const float *)Qh_ref2->storage->data;
+        const float *qf2 = (const float *)Qh_fus2->storage->data;
+        max_dq = 0.0f;
+        for (int64_t i = 0; i < nel; i++) {
+            float d = fabsf(qr2[i] - qf2[i]);
+            if (d > max_dq) max_dq = d;
+        }
+        AX_TEST_ASSERT(max_dq < 1e-5f, "no-bias Qh matches");
+
+        ax_tensor_destroy(X); ax_tensor_destroy(Wqkv); ax_tensor_destroy(bqkv);
+        ax_tensor_destroy(qkv_ref);
+        ax_tensor_destroy(Qh_ref); ax_tensor_destroy(Kh_ref); ax_tensor_destroy(Vh_ref);
+        ax_tensor_destroy(Qh_fus); ax_tensor_destroy(Kh_fus); ax_tensor_destroy(Vh_fus);
+        ax_tensor_destroy(Qh_ref2); ax_tensor_destroy(Kh_ref2); ax_tensor_destroy(Vh_ref2);
+        ax_tensor_destroy(Qh_fus2); ax_tensor_destroy(Kh_fus2); ax_tensor_destroy(Vh_fus2);
+    }
+}
+
 int main(void)
 {
     ax_init();
@@ -700,6 +823,7 @@ int main(void)
     AX_RUN_TEST(test_sdpa_save_path_parity);
     AX_RUN_TEST(test_mha_train_step_parity);
     AX_RUN_TEST(test_mha_train_step_fused_parity);
+    AX_RUN_TEST(test_qkv_head_gemm_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();

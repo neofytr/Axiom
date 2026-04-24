@@ -80,6 +80,25 @@ struct ax_backend_ops {
                                     ax_tensor_t *dWk,
                                     ax_tensor_t *dWv);
 
+    /* optional: F.3.a fused forward QKV projection + head_interleave_split.
+       computes:
+         qkv = X @ Wqkv (+ bqkv)
+         Qh, Kh, Vh = head_interleave_split(qkv)
+       in one pass, eliminating the [rows, 3D] qkv intermediate. shapes:
+         X      [B*S, D]
+         Wqkv   [D, 3D]
+         bqkv   [3D] or NULL
+         Qh, Kh, Vh   each [B*H, S, dk]   (D = H*dk)
+       writes OVERWRITE Qh/Kh/Vh (callers must not pre-populate). NULL when
+       unimplemented — attention.c falls back to gemm + head_interleave_qkv_split. */
+    ax_status_t (*qkv_head_gemm)(const ax_tensor_t *X,
+                                  const ax_tensor_t *Wqkv,
+                                  const ax_tensor_t *bqkv,
+                                  int64_t B, int64_t S, int64_t H, int64_t dk,
+                                  ax_tensor_t *Qh,
+                                  ax_tensor_t *Kh,
+                                  ax_tensor_t *Vh);
+
     /* optional: fused matmul + relu. out = relu(a @ b + bias).
        bias may be NULL for matmul+relu without bias.
        applies max(0, x) during the gemm writeback step, saving a full

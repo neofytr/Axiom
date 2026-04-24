@@ -3926,6 +3926,19 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     return opt_gemm_tn_raw(ad, m, bd, n, od, n, m, n, k, tl_gemm_skip_init);
 }
 
+/* forward declarations for the attention/layout.c helpers used by the
+   F.3.a fused-kernel fallback path. defined in src/core/attention/layout.c;
+   keeping the prototypes here avoids pulling that internal header into
+   the compute-backend translation unit. */
+extern void ax_attn_head_interleave_qkv_split(const float *src,
+                                                float *dstQ, float *dstK, float *dstV,
+                                                int64_t B, int64_t S, int64_t H, int64_t dk,
+                                                int64_t D);
+extern void ax_attn_head_interleave_qkv_split_bias(const float *src, const float *bias,
+                                                     float *dstQ, float *dstK, float *dstV,
+                                                     int64_t B, int64_t S, int64_t H, int64_t dk,
+                                                     int64_t D);
+
 /* fused dwqkv weight-grad: dWq += X^T @ dQKV[:, 0:D],
                             dWk += X^T @ dQKV[:, D:2D],
                             dWv += X^T @ dQKV[:, 2D:3D].
@@ -4227,6 +4240,385 @@ static ax_status_t opt_dwqkv_split_acc(
     pack_b_cache_invalidate();
     #undef DEST_FOR_JC
     return AX_OK;
+}
+
+/* ================================================================
+   F.3.a: opt_qkv_head_gemm — fused Wqkv forward gemm + head-interleave-split
+
+   computes:    qkv = X @ Wqkv (+ bqkv)
+                Qh, Kh, Vh = head_interleave_split(qkv)
+   in one pass, eliminating the [rows, 3D] qkv intermediate (~18 MB on
+   B1_S2048_D768).
+
+   shapes:
+     X      [rows = B*S, D]
+     Wqkv   [D, 3D]
+     bqkv   [3D] or NULL
+     Qh, Kh, Vh   each [B, H, S, dk] = [B*H, S, dk]
+     where 3D = H*dk*3, D = H*dk
+
+   semantics: writes to Qh/Kh/Vh, OVERWRITING (initialised to bias if
+   bqkv != NULL, else zero, then gemm accumulates). callers must NOT
+   pre-populate Qh/Kh/Vh.
+
+   structure mirrors opt_dwqkv_split_acc (F.3.c) but for the NN forward
+   direction — pack_a (not pack_a_t), output destination is
+   head-interleaved (custom address per row's batch coord) instead of
+   the flat [D, D] layout dwqkv writes to.
+
+   constraints (else falls back to opt_gemm + ax_attn_head_interleave_qkv_split_bias):
+     - D % nc_eff == 0  (dest_idx boundaries align with jc tiles)
+     - dk >= NR && dk % NR == 0  (NR-tile fits within one head)
+   on the shapes we ship (D ∈ {512, 768, 1024}, dk = 64, NR = 16,
+   nc_eff = 256), all constraints hold.
+
+   cross-batch micro-tile handling: when MR rows of a tile span a batch
+   boundary (s + MR > S), the inner micro-kernel writes to a stack
+   buffer and the writeback scatter-adds per-row to the correct
+   head-interleaved destination. all other tiles use the fast path
+   where MR rows are in one batch and the dst pointer is computed once
+   per micro-tile with ldc = dk.
+
+   accumulate: false (qkv overwrites). bias init done before the gemm
+   accumulate loops. */
+static ax_status_t opt_qkv_head_gemm(
+    const ax_tensor_t *X, const ax_tensor_t *Wqkv, const ax_tensor_t *bqkv_opt,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    ax_tensor_t *Qh, ax_tensor_t *Kh, ax_tensor_t *Vh)
+{
+    if (!X || !Wqkv || !Qh || !Kh || !Vh) {
+        ax_err_set(AX_ERR_NULL_ARG, "qkv_head_gemm: NULL");
+        return AX_ERR_NULL_ARG;
+    }
+    if (X->dtype != AX_FLOAT32 || Wqkv->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
+    if (Qh->dtype != AX_FLOAT32 || Kh->dtype != AX_FLOAT32 || Vh->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (X->ndim != 2 || Wqkv->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    if (Qh->ndim != 3 || Kh->ndim != 3 || Vh->ndim != 3) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t rows = X->shape[0];
+    int64_t D    = X->shape[1];
+    if (rows != B * S || D != H * dk) return AX_ERR_SHAPE_MISMATCH;
+    if (Wqkv->shape[0] != D || Wqkv->shape[1] != 3 * D) return AX_ERR_SHAPE_MISMATCH;
+    if (Qh->shape[0] != B*H || Qh->shape[1] != S || Qh->shape[2] != dk) return AX_ERR_SHAPE_MISMATCH;
+    if (Kh->shape[0] != B*H || Kh->shape[1] != S || Kh->shape[2] != dk) return AX_ERR_SHAPE_MISMATCH;
+    if (Vh->shape[0] != B*H || Vh->shape[1] != S || Vh->shape[2] != dk) return AX_ERR_SHAPE_MISMATCH;
+    if (bqkv_opt) {
+        if (bqkv_opt->dtype != AX_FLOAT32 || bqkv_opt->ndim != 1) return AX_ERR_SHAPE_MISMATCH;
+        if (bqkv_opt->shape[0] != 3 * D) return AX_ERR_SHAPE_MISMATCH;
+        if (validate_contig_f32(bqkv_opt) < 0) return AX_ERR_BACKEND;
+    }
+    if (validate_contig_f32(X) < 0 || validate_contig_f32(Wqkv) < 0) return AX_ERR_BACKEND;
+    if (validate_contig_f32(Qh) < 0 || validate_contig_f32(Kh) < 0 || validate_contig_f32(Vh) < 0)
+        return AX_ERR_BACKEND;
+
+    const float *ad = raw_f32(X);
+    const float *bd = raw_f32(Wqkv);
+    const float *bias_d = bqkv_opt ? raw_f32(bqkv_opt) : NULL;
+    float *outs[3] = { raw_f32(Qh), raw_f32(Kh), raw_f32(Vh) };
+
+    int64_t m = rows, n = 3 * D, k = D;
+    int64_t lda = D, ldb = 3 * D;
+    int64_t head_sz = S * dk;
+
+    /* initialise Qh/Kh/Vh to bias broadcast (or zero). gemm then
+       accumulates into them. broadcasting bias by row is cheap and
+       lets the gemm's micro_kernel writeback (which adds to dst)
+       produce the final result without a separate bias-add pass. */
+    if (bias_d) {
+#ifdef _OPENMP
+        #pragma omp parallel for collapse(2) schedule(static)
+#endif
+        for (int64_t b = 0; b < B; b++) {
+            for (int64_t h = 0; h < H; h++) {
+                int64_t bh = b * H + h;
+                const float *bQ_h = bias_d         + h * dk;
+                const float *bK_h = bias_d + D     + h * dk;
+                const float *bV_h = bias_d + 2 * D + h * dk;
+                float *qrow = outs[0] + bh * head_sz;
+                float *krow = outs[1] + bh * head_sz;
+                float *vrow = outs[2] + bh * head_sz;
+                for (int64_t s = 0; s < S; s++) {
+                    memcpy(qrow + s * dk, bQ_h, (size_t)dk * sizeof(float));
+                    memcpy(krow + s * dk, bK_h, (size_t)dk * sizeof(float));
+                    memcpy(vrow + s * dk, bV_h, (size_t)dk * sizeof(float));
+                }
+            }
+        }
+    } else {
+        memset(outs[0], 0, (size_t)(B * H * head_sz) * sizeof(float));
+        memset(outs[1], 0, (size_t)(B * H * head_sz) * sizeof(float));
+        memset(outs[2], 0, (size_t)(B * H * head_sz) * sizeof(float));
+    }
+
+    /* fallback: small shapes use a serial scalar inner loop. */
+    if (m * n * k < 100000) {
+        for (int64_t p = 0; p < k; p++) {
+            const float *bp = bd + p * ldb;
+            for (int64_t i = 0; i < m; i++) {
+                float ai = ad[i * lda + p];
+                int64_t b = i / S, s = i % S;
+                for (int64_t j = 0; j < n; j++) {
+                    int64_t d_idx = j / D;
+                    int64_t j_local = j - d_idx * D;
+                    int64_t h_local = j_local / dk;
+                    int64_t k_local = j_local - h_local * dk;
+                    outs[d_idx][(b * H + h_local) * head_sz + s * dk + k_local] += ai * bp[j];
+                }
+            }
+        }
+        return AX_OK;
+    }
+
+    /* alignment requirements for the fast tiled path */
+    if (dk < GEMM_NR || (dk % GEMM_NR) != 0) {
+        /* dk doesn't tile cleanly with NR — fall back to materialise + split */
+        goto fallback_materialise;
+    }
+
+    pack_b_cache_invalidate();
+    if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
+
+    int max_threads = ax_gemm_threads_for_shape(m, n, k);
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
+    int64_t nc_eff = ax_adaptive_nc(n, max_threads);
+
+    if (D % nc_eff != 0) {
+        /* jc tile boundaries don't align with Q/K/V boundaries — fall back */
+        goto fallback_materialise;
+    }
+
+    int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
+    int64_t n_ic_tiles = (m + GEMM_MC - 1) / GEMM_MC;
+    int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
+    int64_t n_jc_full = (n + nc_full - 1) / nc_full;
+
+    /* parallel-strategy selection mirrors opt_dwqkv_split_acc's
+       (looser hybrid threshold than opt_gemm because the 3D-wide
+       output dominates work). */
+    bool use_hybrid = (max_threads > 1)
+                      && (n_jc_full < max_threads)
+                      && (n_jc_full * n_ic_tiles >= max_threads);
+    bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
+    bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
+
+    int gemm_threads = 1;
+    if (use_hybrid) {
+        gemm_threads = max_threads;
+        nc_eff = nc_full;
+        n_jc_tiles = n_jc_full;
+        if (D % nc_eff != 0) goto fallback_materialise;
+    } else if (use_jc_par) {
+        gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
+    } else if (use_ic_par) {
+        gemm_threads = (int)(n_ic_tiles < (int64_t)max_threads ? n_ic_tiles : (int64_t)max_threads);
+    }
+    (void)gemm_threads;
+
+    /* writeback helper: micro-tile at gemm coords (ic+ir, jc+jr) maps to
+       head-interleaved destination outs[d_idx][bh*S*dk + s*dk + k].
+       d_idx and h_local depend only on (jc + jr) → constant within
+       the (jc, jr) sub-tile. b and s depend on (ic + ir + row_local) —
+       b is constant within the sub-tile if all MR rows are in one batch.
+       fast path: write directly with ldc = dk via micro_kernel.
+       slow path: writes to stack buf, scatters per row to correct dst. */
+    #define QKV_TILE_WRITEBACK(pack_a_buf_, pack_b_buf_, ir_, jr_,         \
+                                ic_, jc_, mr_, nr_, kc_)                    \
+        do {                                                                \
+            int64_t _row_g = (ic_) + (ir_);                                 \
+            int64_t _b = _row_g / S;                                        \
+            int64_t _s = _row_g % S;                                        \
+            int64_t _j_in_n = (jc_) + (jr_);                                \
+            int64_t _d_idx = _j_in_n / D;                                   \
+            int64_t _j_local = _j_in_n - _d_idx * D;                        \
+            int64_t _h = _j_local / dk;                                     \
+            int64_t _k_off = _j_local - _h * dk;                            \
+            if ((_s) + (mr_) <= S) {                                        \
+                /* fast path: one batch, contiguous MR x NR slot */          \
+                float *_base = outs[_d_idx]                                 \
+                             + (_b * H + _h) * head_sz                      \
+                             + _s * dk + _k_off;                            \
+                micro_kernel((kc_), (pack_a_buf_) + (ir_) * (kc_),          \
+                             (pack_b_buf_) + (jr_) * (kc_),                 \
+                             _base, dk, (mr_), (nr_));                      \
+            } else {                                                        \
+                /* slow path: cross-batch tile — micro_kernel into stack    \
+                   buf with ldc = GEMM_NR, then scatter-add per row. buf   \
+                   reset to zero each call so kernel adds-into-zero gives   \
+                   pure gemm result for THIS pc step; outer pc loop's      \
+                   subsequent calls add into dst[] which already contains   \
+                   prior pc steps' contributions. */                        \
+                float _buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64))); \
+                memset(_buf, 0, sizeof(_buf));                              \
+                micro_kernel((kc_), (pack_a_buf_) + (ir_) * (kc_),          \
+                             (pack_b_buf_) + (jr_) * (kc_),                 \
+                             _buf, GEMM_NR, (mr_), (nr_));                  \
+                for (int64_t _rr = 0; _rr < (mr_); _rr++) {                 \
+                    int64_t _rg = (ic_) + (ir_) + _rr;                      \
+                    int64_t _bb = _rg / S, _ss = _rg % S;                   \
+                    float *_dst = outs[_d_idx]                              \
+                                + (_bb * H + _h) * head_sz                  \
+                                + _ss * dk + _k_off;                        \
+                    for (int64_t _cc = 0; _cc < (nr_); _cc++) {             \
+                        _dst[_cc] += _buf[_rr * GEMM_NR + _cc];             \
+                    }                                                       \
+                }                                                           \
+            }                                                               \
+        } while (0)
+
+    if (use_hybrid) {
+        int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
+#ifdef _OPENMP
+        #pragma omp parallel num_threads(gemm_threads)
+#endif
+        {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            int64_t last_jct = -1;
+            int64_t last_pct = -1;
+
+#ifdef _OPENMP
+            #pragma omp for collapse(3) schedule(static)
+#endif
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                        if (!pack_a_buf || !pack_b_buf) continue;
+                        int64_t jc = jct * nc_eff;
+                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                        int64_t pc = pct * kc_max;
+                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                        int64_t ic = ict * GEMM_MC;
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                        if (jct != last_jct || pct != last_pct) {
+                            pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
+                            last_jct = jct; last_pct = pct;
+                        }
+                        pack_a(ad + ic * lda + pc, lda, mc_pack, kc, mc, pack_a_buf);
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                                QKV_TILE_WRITEBACK(pack_a_buf, pack_b_buf,
+                                                   ir, jr, ic, jc, mr, nr, kc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_jc_par) {
+#ifdef _OPENMP
+        #pragma omp parallel for num_threads(gemm_threads) schedule(static)
+#endif
+        for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            if (!pack_a_buf || !pack_b_buf) continue;
+            int64_t jc = jct * nc_eff;
+            int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
+                for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a(ad + ic * lda + pc, lda, mc_pack, kc, mc, pack_a_buf);
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            QKV_TILE_WRITEBACK(pack_a_buf, pack_b_buf,
+                                               ir, jr, ic, jc, mr, nr, kc);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        /* IC-parallel or serial fallback: pack_b once per (jc, pc),
+           parallelize over IC tiles each repacking A. */
+        float *main_pack_b = tl_pack_b_buf;
+        for (int64_t jc = 0; jc < n; jc += nc_eff) {
+            int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
+                const float *pack_b_buf = main_pack_b;
+#ifdef _OPENMP
+                #pragma omp parallel for num_threads(gemm_threads) schedule(static) if(use_ic_par)
+#endif
+                for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                    ensure_tl_pack_bufs();
+                    float *pack_a_buf = tl_pack_a_buf;
+                    if (!pack_a_buf) continue;
+                    int64_t ic = ict * GEMM_MC;
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a(ad + ic * lda + pc, lda, mc_pack, kc, mc, pack_a_buf);
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            QKV_TILE_WRITEBACK(pack_a_buf, pack_b_buf,
+                                               ir, jr, ic, jc, mr, nr, kc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pack_b_cache_invalidate();
+    #undef QKV_TILE_WRITEBACK
+    return AX_OK;
+
+fallback_materialise:
+    /* fallback: standard gemm into a malloc'd qkv intermediate, then
+       call the existing head-interleave-split. used when
+         - dk < GEMM_NR (small heads),
+         - dk % GEMM_NR != 0 (head doesn't tile cleanly), or
+         - D % nc_eff != 0 (jc tiles cross dest_idx boundaries).
+       this matches the pre-F.3.a flow exactly so callers see no
+       behaviour change beyond the fused fast path's perf. */
+    {
+        size_t qkv_bytes = (size_t)rows * (size_t)(3 * D) * sizeof(float);
+        float *qkv_temp = (float *)ax_aligned_alloc(qkv_bytes, 64);
+        if (!qkv_temp) return AX_ERR_ALLOC;
+
+        ax_storage_t st_qkv = {0};
+        atomic_init(&st_qkv.refcount, 0);
+        st_qkv.data = qkv_temp; st_qkv.size_bytes = qkv_bytes;
+        st_qkv.device = AX_DEVICE_CPU; st_qkv.is_arena_temp = true;
+        st_qkv.generation = 1;
+        ax_tensor_t qkv_t = {0};
+        qkv_t.storage = &st_qkv; qkv_t.ndim = 2; qkv_t.dtype = AX_FLOAT32;
+        qkv_t.shape[0] = rows; qkv_t.shape[1] = 3 * D;
+        qkv_t.strides[0] = 3 * D; qkv_t.strides[1] = 1;
+
+        ax_status_t st = opt_gemm(X, Wqkv, &qkv_t);
+        if (st != AX_OK) { ax_aligned_free(qkv_temp); return st; }
+
+        if (bias_d) {
+            ax_attn_head_interleave_qkv_split_bias(
+                qkv_temp, bias_d,
+                outs[0], outs[1], outs[2],
+                B, S, H, dk, D);
+        } else {
+            ax_attn_head_interleave_qkv_split(
+                qkv_temp,
+                outs[0], outs[1], outs[2],
+                B, S, H, dk, D);
+        }
+        ax_aligned_free(qkv_temp);
+        return AX_OK;
+    }
 }
 
 /* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias.
@@ -4624,6 +5016,7 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
     .dwqkv_split_acc = opt_dwqkv_split_acc,
+    .qkv_head_gemm   = opt_qkv_head_gemm,
     .add_relu   = opt_add_relu,
     .axpy       = opt_axpy,
     .softmax_rowwise = opt_softmax_rowwise,
