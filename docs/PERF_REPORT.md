@@ -782,3 +782,43 @@ bypasses the autograd tape entirely AND has the F.3.x primitives
 wired with slightly different orchestration (output projection
 reorder from F.4.2 commit 5122194). The tape-bypass + reorder gains
 compound on top of the F.3.x BW savings.
+
+## Phase F follow-up (2026-04-24 mid-day extension)
+
+User request: "fix F.4.2 proper regression + add F.3.f as standalone +
+plan and implement F.4.4 properly". Three additional commits land:
+
+| commit | item | what shipped |
+|---|---|---|
+| 7cfcedd | **F.4.2 proper v2** | replaced simple AVX2 fmadd inner loops with pack_a / pack_b / pack_a_t / pack_b_t + JIT 6x16 micro_kernel. brings the AX_F42_PROPER=1 regression from 50-160 % down to 5-52 %. still gated behind opt-in — remaining gap is structural (per-thread D*D dWo accumulator zero+reduce overhead, not per-strip fusion benefit). path to default-on documented in commit message: cap max_threads when D*D × NT exceeds ~16 MB, OR column-split dWo accumulator across threads. ~500 LOC additional work to default-on. |
+| 688cfef | **F.3.f standalone** | new public API `ax_compute_output_proj_bwd_fused`. delegates to opt_mha_output_proj_fused with y=NULL, bo=NULL — backend skips op 1 (forward y) entirely, allocates only the b_t Wo packing (skips b form), allocates pack_attn_a conditionally. parity-tested over 4 shapes (with/without dbo). same opt-in caveat as F.4.2 proper since they share the kernel. |
+| def7685 | **F.4.4 scaffold + 6-phase plan** | new entry `ax_mha_train_step_v4` in `src/core/attention/train_step_v4.c`. initial body delegates to `ax_mha_train_step_fused`. parity test `test_mha_train_step_v4_parity` wired through `run_train_step_parity`. `docs/F4_FUSED_MHA_TRAIN.md` F.4.4 section now has the comprehensive 6-phase implementation plan (~2400 LOC, 1-2 weeks): Phase A per-qi-block primitives, Phase B per-block driver, Phase C per-tile dWqkv accumulation, Phase D per-tile output-projection fusion, Phase E per-(qi, kj) tile-level fwd+bwd combined kernel, Phase F bench + iterate. |
+
+### F.4.4 status (after this extension)
+
+The F.4.4 monolithic kernel itself is NOT implemented. The scaffold +
+6-phase plan + every building-block primitive (F.3.a/c/d/e/f + F.4.2
+proper) is in place. Phases A-E are documented with specific scope,
+blockers, and mitigations — ready for a 1-2 week dedicated kernel
+follow-up session.
+
+What this means concretely for the user: `ax_mha_train_step_v4` is
+callable today but is functionally equivalent to
+`ax_mha_train_step_fused`. The F.4.4-class structural wins
+(per-tile dWqkv eliminating ~36 MB intermediates, per-(qi, kj)
+tile-level fwd+bwd combined kernel) are not yet captured.
+
+Honest performance summary after the entire 2026-04-24 session
+(both prior overnight + this extension), still on 5-run medians at
+quiet load:
+
+|                  shape | session-start (b5005f7) | F2 (current HEAD) | TF target | F2 vs TF |
+|---|---|---|---|---|
+| mha_train_B8_S128_D512_H8   | 19.26 | 17.05 | 11.21 | -34 % |
+| mha_train_B4_S512_D768_H12  | 82.17 | 78.46 | 65.49 | -17 % |
+| mha_train_B2_S1024_D768_H12 | 111.00 | 104.20 | 94.30 | -9 % |
+| mha_train_B1_S512_D1024_H16 | 47.48 | 38.74 | 25.76 | -33 % |
+| mha_train_B1_S2048_D768_H12 | 172.97 | 166.30 | 155.20 | -7 % |
+
+Closing the remaining -7 % to -34 % gap requires the F.4.4 monolithic
+kernel work (Phases A-E in the design doc).
