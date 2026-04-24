@@ -974,6 +974,118 @@ static void test_sdpa_fwd_to_flat_parity(void)
     }
 }
 
+/* ================================================================
+   test: F.3.e companion ax_fused_attention_bwd_use_from_flat produces
+   bit-equivalent dQ/dK/dV to the standard ax_fused_attention_bwd_use
+   when fed attn_flat = head_deinterleave(O) of the same forward.
+   ================================================================ */
+static void test_sdpa_bwd_from_flat_parity(void)
+{
+    struct shape_case { int64_t B, S, H, dk; bool causal; };
+    struct shape_case cases[] = {
+        { 2, 8,  4, 4,  false },
+        { 1, 64, 8, 8,  false },
+        { 1, 32, 4, 16, true  },
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
+        struct shape_case c = cases[ci];
+        int64_t B = c.B, S = c.S, H = c.H, dk = c.dk;
+        int64_t BH = B * H, D = H * dk;
+        float scale = 1.0f / sqrtf((float)dk);
+
+        ax_set_seed(11111 + (int)ci);
+        int64_t qkv_sh[]  = {BH, S, dk};
+        int64_t flat_sh[] = {B, S, D};
+        int64_t L_sh[]    = {BH, S};
+        int64_t Psh[]     = {BH, S, S};
+
+        ax_tensor_t *Q = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *K = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *V = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *dO = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+
+        ax_tensor_t *Oh    = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *L_t   = ax_tensor_create(L_sh, 2, AX_FLOAT32);
+        ax_tensor_t *P_t   = ax_tensor_create(Psh, 3, AX_FLOAT32);
+        ax_tensor_t *attn_flat = ax_tensor_create(flat_sh, 3, AX_FLOAT32);
+
+        ax_fused_attention_fwd_save(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (float *)Oh->storage->data,
+            (float *)L_t->storage->data,
+            (float *)P_t->storage->data,
+            BH, S, dk, scale, c.causal);
+        extern void ax_attn_head_deinterleave(const float *, float *,
+                                                int64_t, int64_t, int64_t, int64_t);
+        ax_attn_head_deinterleave(
+            (const float *)Oh->storage->data,
+            (float *)attn_flat->storage->data, B, S, H, dk);
+
+        /* reference: bwd_use with Oh */
+        ax_tensor_t *dQ_ref = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dK_ref = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dV_ref = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_fused_attention_bwd_use(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (const float *)Oh->storage->data,
+            (const float *)dO->storage->data,
+            (const float *)L_t->storage->data,
+            (const float *)P_t->storage->data,
+            (float *)dQ_ref->storage->data,
+            (float *)dK_ref->storage->data,
+            (float *)dV_ref->storage->data,
+            BH, S, dk, scale, c.causal);
+
+        /* fused: bwd_use_from_flat with attn_flat */
+        ax_tensor_t *dQ_fus = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dK_fus = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *dV_fus = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_fused_attention_bwd_use_from_flat(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (const float *)attn_flat->storage->data,
+            (const float *)dO->storage->data,
+            (const float *)L_t->storage->data,
+            (const float *)P_t->storage->data,
+            (float *)dQ_fus->storage->data,
+            (float *)dK_fus->storage->data,
+            (float *)dV_fus->storage->data,
+            B, S, H, dk, scale, c.causal);
+
+        int64_t nel = BH * S * dk;
+        float maxQ = 0.0f, maxK = 0.0f, maxV = 0.0f;
+        const float *qr = (const float *)dQ_ref->storage->data;
+        const float *qf = (const float *)dQ_fus->storage->data;
+        const float *kr = (const float *)dK_ref->storage->data;
+        const float *kf = (const float *)dK_fus->storage->data;
+        const float *vr = (const float *)dV_ref->storage->data;
+        const float *vf = (const float *)dV_fus->storage->data;
+        for (int64_t i = 0; i < nel; i++) {
+            float dq = fabsf(qr[i] - qf[i]);
+            float dk2 = fabsf(kr[i] - kf[i]);
+            float dv = fabsf(vr[i] - vf[i]);
+            if (dq > maxQ) maxQ = dq;
+            if (dk2 > maxK) maxK = dk2;
+            if (dv > maxV) maxV = dv;
+        }
+        AX_TEST_ASSERT(maxQ < 1e-5f, "dQ matches from_flat vs use");
+        AX_TEST_ASSERT(maxK < 1e-5f, "dK matches from_flat vs use");
+        AX_TEST_ASSERT(maxV < 1e-5f, "dV matches from_flat vs use");
+
+        ax_tensor_destroy(Q); ax_tensor_destroy(K); ax_tensor_destroy(V); ax_tensor_destroy(dO);
+        ax_tensor_destroy(Oh); ax_tensor_destroy(L_t); ax_tensor_destroy(P_t);
+        ax_tensor_destroy(attn_flat);
+        ax_tensor_destroy(dQ_ref); ax_tensor_destroy(dK_ref); ax_tensor_destroy(dV_ref);
+        ax_tensor_destroy(dQ_fus); ax_tensor_destroy(dK_fus); ax_tensor_destroy(dV_fus);
+    }
+}
+
 int main(void)
 {
     ax_init();
@@ -994,6 +1106,7 @@ int main(void)
     AX_RUN_TEST(test_qkv_head_gemm_parity);
     AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
     AX_RUN_TEST(test_sdpa_fwd_to_flat_parity);
+    AX_RUN_TEST(test_sdpa_bwd_from_flat_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();

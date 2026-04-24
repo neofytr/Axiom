@@ -6677,6 +6677,74 @@ void AX_SYM(ax_cpu_sdpa_bwd)(const float *Q, const float *K, const float *V,
     }
 }
 
+/* F.3.e companion: SDPA backward where O is read from a [B, S, D]
+   attn_flat layout instead of the per-head [BH, S, dk] Oh tensor.
+   eliminates the Oh allocation when callers also use F.3.e fwd_save_to_flat.
+   only the Di = dot(O, dO) computation differs from ax_cpu_sdpa_bwd —
+   for each head h, O_per_row is at attn_flat + b*S*D + h*dk + i*D
+   (row stride D, dk-wide) instead of Oh + bh*S*dk + i*dk (stride dk).
+   the rest of attn_bwd_head doesn't read O. */
+void AX_SYM(ax_cpu_sdpa_bwd_from_flat)(const float *Q, const float *K, const float *V,
+                                         const float *attn_flat, const float *dO, const float *L,
+                                         float *dQ, float *dK, float *dV,
+                                         int64_t B, int64_t S, int64_t H, int64_t dk, float scale,
+                                         bool causal, const float *P_saved)
+{
+    int64_t BH = B * H;
+    int64_t D  = H * dk;
+    int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;
+
+    int n_inner = ax_attn_bwd_inner_threads(BH);
+
+    memset(dQ, 0, (size_t)(BH * head_sz) * sizeof(float));
+    memset(dK, 0, (size_t)(BH * head_sz) * sizeof(float));
+    memset(dV, 0, (size_t)(BH * head_sz) * sizeof(float));
+
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        float *Di = ax_tls_grow(&tl_bwd_di, &tl_bwd_di_bytes,
+                                (int64_t)S * (int64_t)sizeof(float));
+        if (!Di) goto done;
+
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t bh = 0; bh < BH; bh++) {
+            int64_t b = bh / H, h = bh % H;
+            const float *dOh = dO + bh * head_sz;
+            const float *attn_flat_h = attn_flat + b * S * D + h * dk;
+
+            /* Di[i] = dot(dO[i], O[i]). O read with row stride D. */
+            for (int64_t i = 0; i < S; i++) {
+                const float *do_r = dOh + i * dk;
+                const float *o_r  = attn_flat_h + i * D;
+                float dot = 0;
+                int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+                ax_vf32 vd = ax_vf32_zero();
+                int64_t ve = dk - (dk % AX_VF32_WIDTH);
+                for (; d < ve; d += AX_VF32_WIDTH)
+                    vd = ax_vf32_fmadd(ax_vf32_loadu(do_r + d),
+                                       ax_vf32_loadu(o_r + d), vd);
+                dot = ax_vf32_hsum(vd);
+#endif
+                for (; d < dk; d++) dot += do_r[d] * o_r[d];
+                Di[i] = dot;
+            }
+            attn_bwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                           dOh, L + bh * S, Di,
+                           dQ + bh * head_sz, dK + bh * head_sz, dV + bh * head_sz,
+                           S, dk, scale, causal,
+                           P_saved ? P_saved + bh * pscale_sz : NULL,
+                           n_inner, BH);
+        }
+    done:;
+    }
+}
+
 /* ================================================================
    Rotary Position Embeddings (RoPE)
 

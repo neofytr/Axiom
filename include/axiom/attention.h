@@ -219,6 +219,21 @@ void ax_fused_attention_bwd_use(const float *Q, const float *K, const float *V,
                                  int64_t BH, int64_t S, int64_t dk, float scale,
                                  bool causal);
 
+/* F.3.e companion: SDPA backward reading O from [B, S, D] attn_flat layout.
+   pair with ax_fused_attention_fwd_save_to_flat to eliminate the per-head
+   [BH, S, dk] Oh intermediate from the MHA training path entirely.
+   only the Di = dot(O, dO) computation differs from the standard
+   ax_fused_attention_bwd_use — per-row O read uses stride D into
+   attn_flat instead of stride dk into Oh. dO/dQ/dK/dV remain
+   head-major [BH, S, dk]. */
+void ax_fused_attention_bwd_use_from_flat(const float *Q, const float *K, const float *V,
+                                            const float *attn_flat,
+                                            const float *dO, const float *L,
+                                            const float *P_saved,
+                                            float *dQ, float *dK, float *dV,
+                                            int64_t B, int64_t S, int64_t H, int64_t dk,
+                                            float scale, bool causal);
+
 /* F.3.e fused SDPA forward writing directly into [B, S, D] attn_flat layout.
    eliminates the per-head [BH, S, dk] Oh intermediate AND the
    head_deinterleave pass that converts it to attn_flat in the MHA training

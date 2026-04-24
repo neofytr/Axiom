@@ -286,14 +286,13 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         if (prof_enabled) pf_split += PF_TICK() - pf_t0;
     }
 
-    /* SDPA forward — saves L (always) and optionally P */
-    ax_tensor_t *Oh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
+    /* SDPA forward — saves L (always) and optionally P. F.3.e fused entry
+       writes the per-head Oh contributions directly into attn_flat layout
+       (no Oh tensor materialised) when AX_NO_F3E is unset; the Oh tensor
+       is only allocated for the fallback path. */
     ax_tensor_t *L_t = ax_tensor_arena_create(arena, L_sh, 2, AX_FLOAT32);
-    if (!Oh || !L_t) return AX_ERR_ALLOC;
+    if (!L_t) return AX_ERR_ALLOC;
 
-    /* P_save heuristic: same as mha_forward — small enough to fit in
-       roughly half of L3 (≤ 8 MB), and not the (S≤128 AND dk≤64) corner
-       where recompute beats save on this CPU. */
     ax_tensor_t *P_save_t = NULL;
     int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
     bool save_p = (p_save_bytes <= (int64_t)8 * 1024 * 1024);
@@ -303,30 +302,54 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
     if (save_p) {
         int64_t P_sh[] = {bh, S, S};
         P_save_t = ax_tensor_arena_create(arena, P_sh, 3, AX_FLOAT32);
-        /* alloc failure not fatal — backward will recompute. */
     }
     float scale = 1.0f / sqrtf((float)dk);
     float *P_save_ptr = P_save_t ? (float *)P_save_t->storage->data : NULL;
 
-    pf_t0 = prof_enabled ? PF_TICK() : 0;
-    ax_fused_attention_fwd_save(
-        (const float *)Qh->storage->data,
-        (const float *)Kh->storage->data,
-        (const float *)Vh->storage->data,
-        (float *)Oh->storage->data,
-        (float *)L_t->storage->data,
-        P_save_ptr,
-        bh, S, dk, scale, m->causal);
-    if (prof_enabled) pf_sdpa += PF_TICK() - pf_t0;
+    static int use_f3e_resolved = 0;
+    static int use_f3e = 1;
+    if (!use_f3e_resolved) {
+        const char *e = getenv("AX_NO_F3E");
+        use_f3e = (e && e[0] == '1') ? 0 : 1;
+        use_f3e_resolved = 1;
+    }
 
-    /* head-merge → attn_flat [rows, D] */
+    ax_tensor_t *Oh = NULL;
     ax_tensor_t *attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
     if (!attn_flat) return AX_ERR_ALLOC;
+
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    ax_attn_head_deinterleave(
-        (const float *)Oh->storage->data,
-        (float *)attn_flat->storage->data, B, S, H, dk);
-    if (prof_enabled) pf_deint += PF_TICK() - pf_t0;
+    if (use_f3e) {
+        /* F.3.e: write attn_flat directly, skip Oh + head_deinterleave */
+        ax_fused_attention_fwd_save_to_flat(
+            (const float *)Qh->storage->data,
+            (const float *)Kh->storage->data,
+            (const float *)Vh->storage->data,
+            (float *)attn_flat->storage->data,
+            (float *)L_t->storage->data,
+            P_save_ptr,
+            B, S, H, dk, scale, m->causal);
+        if (prof_enabled) pf_sdpa += PF_TICK() - pf_t0;
+        /* pf_deint stays zero — fused into pf_sdpa */
+    } else {
+        Oh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
+        if (!Oh) return AX_ERR_ALLOC;
+        ax_fused_attention_fwd_save(
+            (const float *)Qh->storage->data,
+            (const float *)Kh->storage->data,
+            (const float *)Vh->storage->data,
+            (float *)Oh->storage->data,
+            (float *)L_t->storage->data,
+            P_save_ptr,
+            bh, S, dk, scale, m->causal);
+        if (prof_enabled) pf_sdpa += PF_TICK() - pf_t0;
+
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
+        ax_attn_head_deinterleave(
+            (const float *)Oh->storage->data,
+            (float *)attn_flat->storage->data, B, S, H, dk);
+        if (prof_enabled) pf_deint += PF_TICK() - pf_t0;
+    }
 
     /* output projection: y_flat = attn_flat @ Wo, then (+bo) */
     pf_t0 = prof_enabled ? PF_TICK() : 0;
@@ -433,18 +456,36 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
     if (!dQh || !dKh || !dVh) return AX_ERR_ALLOC;
 
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    ax_fused_attention_bwd_use(
-        (const float *)Qh->storage->data,
-        (const float *)Kh->storage->data,
-        (const float *)Vh->storage->data,
-        (const float *)Oh->storage->data,
-        (const float *)dO_head->storage->data,
-        (const float *)L_t->storage->data,
-        P_save_ptr,
-        (float *)dQh->storage->data,
-        (float *)dKh->storage->data,
-        (float *)dVh->storage->data,
-        bh, S, dk, scale, m->causal);
+    if (Oh) {
+        /* fallback path: Oh was materialised, use the standard bwd_use */
+        ax_fused_attention_bwd_use(
+            (const float *)Qh->storage->data,
+            (const float *)Kh->storage->data,
+            (const float *)Vh->storage->data,
+            (const float *)Oh->storage->data,
+            (const float *)dO_head->storage->data,
+            (const float *)L_t->storage->data,
+            P_save_ptr,
+            (float *)dQh->storage->data,
+            (float *)dKh->storage->data,
+            (float *)dVh->storage->data,
+            bh, S, dk, scale, m->causal);
+    } else {
+        /* F.3.e companion: Oh was never materialised, read O strided
+           from attn_flat for the Di = dot(O, dO) computation. */
+        ax_fused_attention_bwd_use_from_flat(
+            (const float *)Qh->storage->data,
+            (const float *)Kh->storage->data,
+            (const float *)Vh->storage->data,
+            (const float *)attn_flat->storage->data,
+            (const float *)dO_head->storage->data,
+            (const float *)L_t->storage->data,
+            P_save_ptr,
+            (float *)dQh->storage->data,
+            (float *)dKh->storage->data,
+            (float *)dVh->storage->data,
+            B, S, H, dk, scale, m->causal);
+    }
     if (prof_enabled) pf_sdpab += PF_TICK() - pf_t0;
 
     /* step 3 — head-deinterleave + merge → [rows, 3D] dQKV */

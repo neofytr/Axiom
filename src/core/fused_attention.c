@@ -63,6 +63,22 @@ extern void ax_cpu_sdpa_bwd_scalar(const float *, const float *, const float *,
                                     int64_t, int64_t, int64_t, float, bool,
                                     const float *);
 
+extern void ax_cpu_sdpa_bwd_from_flat_avx512(const float *, const float *, const float *,
+                                               const float *, const float *, const float *,
+                                               float *, float *, float *,
+                                               int64_t, int64_t, int64_t, int64_t,
+                                               float, bool, const float *);
+extern void ax_cpu_sdpa_bwd_from_flat_avx2  (const float *, const float *, const float *,
+                                               const float *, const float *, const float *,
+                                               float *, float *, float *,
+                                               int64_t, int64_t, int64_t, int64_t,
+                                               float, bool, const float *);
+extern void ax_cpu_sdpa_bwd_from_flat_scalar(const float *, const float *, const float *,
+                                               const float *, const float *, const float *,
+                                               float *, float *, float *,
+                                               int64_t, int64_t, int64_t, int64_t,
+                                               float, bool, const float *);
+
 extern void ax_cpu_rope_apply_avx512(float *, float *, const int64_t *,
                                       int64_t, int64_t, int64_t, float);
 extern void ax_cpu_rope_apply_avx2  (float *, float *, const int64_t *,
@@ -95,6 +111,11 @@ extern void ax_cpu_sdpa_bwd(const float *, const float *, const float *,
                              float *, float *, float *,
                              int64_t, int64_t, int64_t, float, bool,
                              const float *);
+extern void ax_cpu_sdpa_bwd_from_flat(const float *, const float *, const float *,
+                                        const float *, const float *, const float *,
+                                        float *, float *, float *,
+                                        int64_t, int64_t, int64_t, int64_t,
+                                        float, bool, const float *);
 extern void ax_cpu_rope_apply(float *, float *, const int64_t *,
                                int64_t, int64_t, int64_t, float);
 extern void ax_cpu_kv_cache_attend(const float *, const float *,
@@ -122,17 +143,23 @@ typedef void (*sdpa_bwd_fn_t)(const float *, const float *, const float *,
                                float *, float *, float *,
                                int64_t, int64_t, int64_t, float, bool,
                                const float *);
+typedef void (*sdpa_bwd_from_flat_fn_t)(const float *, const float *, const float *,
+                                          const float *, const float *, const float *,
+                                          float *, float *, float *,
+                                          int64_t, int64_t, int64_t, int64_t,
+                                          float, bool, const float *);
 typedef void (*rope_fn_t)(float *, float *, const int64_t *,
                            int64_t, int64_t, int64_t, float);
 typedef void (*kv_attend_fn_t)(const float *, const float *,
                                 const float *, float *,
                                 int64_t, int64_t, int64_t, int64_t, float);
 
-static sdpa_fwd_fn_t          g_sdpa_fwd          = NULL;
-static sdpa_fwd_to_flat_fn_t  g_sdpa_fwd_to_flat  = NULL;
-static sdpa_bwd_fn_t          g_sdpa_bwd          = NULL;
-static rope_fn_t              g_rope              = NULL;
-static kv_attend_fn_t         g_kv_attend         = NULL;
+static sdpa_fwd_fn_t              g_sdpa_fwd              = NULL;
+static sdpa_fwd_to_flat_fn_t      g_sdpa_fwd_to_flat      = NULL;
+static sdpa_bwd_fn_t              g_sdpa_bwd              = NULL;
+static sdpa_bwd_from_flat_fn_t    g_sdpa_bwd_from_flat    = NULL;
+static rope_fn_t                  g_rope                  = NULL;
+static kv_attend_fn_t             g_kv_attend             = NULL;
 
 static void resolve_once(void)
 {
@@ -140,30 +167,34 @@ static void resolve_once(void)
 
 #ifdef AX_CPU_ISA_DISPATCH
     if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("fma")) {
-        g_sdpa_fwd         = ax_cpu_sdpa_fwd_avx512;
-        g_sdpa_fwd_to_flat = ax_cpu_sdpa_fwd_to_flat_avx512;
-        g_sdpa_bwd         = ax_cpu_sdpa_bwd_avx512;
-        g_rope             = ax_cpu_rope_apply_avx512;
-        g_kv_attend        = ax_cpu_kv_cache_attend_avx512;
+        g_sdpa_fwd            = ax_cpu_sdpa_fwd_avx512;
+        g_sdpa_fwd_to_flat    = ax_cpu_sdpa_fwd_to_flat_avx512;
+        g_sdpa_bwd            = ax_cpu_sdpa_bwd_avx512;
+        g_sdpa_bwd_from_flat  = ax_cpu_sdpa_bwd_from_flat_avx512;
+        g_rope                = ax_cpu_rope_apply_avx512;
+        g_kv_attend           = ax_cpu_kv_cache_attend_avx512;
     } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-        g_sdpa_fwd         = ax_cpu_sdpa_fwd_avx2;
-        g_sdpa_fwd_to_flat = ax_cpu_sdpa_fwd_to_flat_avx2;
-        g_sdpa_bwd         = ax_cpu_sdpa_bwd_avx2;
-        g_rope             = ax_cpu_rope_apply_avx2;
-        g_kv_attend        = ax_cpu_kv_cache_attend_avx2;
+        g_sdpa_fwd            = ax_cpu_sdpa_fwd_avx2;
+        g_sdpa_fwd_to_flat    = ax_cpu_sdpa_fwd_to_flat_avx2;
+        g_sdpa_bwd            = ax_cpu_sdpa_bwd_avx2;
+        g_sdpa_bwd_from_flat  = ax_cpu_sdpa_bwd_from_flat_avx2;
+        g_rope                = ax_cpu_rope_apply_avx2;
+        g_kv_attend           = ax_cpu_kv_cache_attend_avx2;
     } else {
-        g_sdpa_fwd         = ax_cpu_sdpa_fwd_scalar;
-        g_sdpa_fwd_to_flat = ax_cpu_sdpa_fwd_to_flat_scalar;
-        g_sdpa_bwd         = ax_cpu_sdpa_bwd_scalar;
-        g_rope             = ax_cpu_rope_apply_scalar;
-        g_kv_attend        = ax_cpu_kv_cache_attend_scalar;
+        g_sdpa_fwd            = ax_cpu_sdpa_fwd_scalar;
+        g_sdpa_fwd_to_flat    = ax_cpu_sdpa_fwd_to_flat_scalar;
+        g_sdpa_bwd            = ax_cpu_sdpa_bwd_scalar;
+        g_sdpa_bwd_from_flat  = ax_cpu_sdpa_bwd_from_flat_scalar;
+        g_rope                = ax_cpu_rope_apply_scalar;
+        g_kv_attend           = ax_cpu_kv_cache_attend_scalar;
     }
 #else
-    g_sdpa_fwd         = ax_cpu_sdpa_fwd;
-    g_sdpa_fwd_to_flat = ax_cpu_sdpa_fwd_to_flat;
-    g_sdpa_bwd         = ax_cpu_sdpa_bwd;
-    g_rope             = ax_cpu_rope_apply;
-    g_kv_attend        = ax_cpu_kv_cache_attend;
+    g_sdpa_fwd            = ax_cpu_sdpa_fwd;
+    g_sdpa_fwd_to_flat    = ax_cpu_sdpa_fwd_to_flat;
+    g_sdpa_bwd            = ax_cpu_sdpa_bwd;
+    g_sdpa_bwd_from_flat  = ax_cpu_sdpa_bwd_from_flat;
+    g_rope                = ax_cpu_rope_apply;
+    g_kv_attend           = ax_cpu_kv_cache_attend;
 #endif
 }
 
@@ -229,6 +260,24 @@ void ax_fused_attention_fwd_save_to_flat(const float *Q, const float *K, const f
 {
     resolve_once();
     g_sdpa_fwd_to_flat(Q, K, V, attn_flat, L, B, S, H, dk, scale, causal, NULL, P_save);
+}
+
+/* F.3.e companion: SDPA backward reading O from [B, S, D] attn_flat.
+   together with ax_fused_attention_fwd_save_to_flat, eliminates the Oh
+   tensor entirely from the MHA training path — only the Di = dot(O, dO)
+   loop differs from the standard bwd (per-row O read uses stride D
+   into attn_flat instead of stride dk into Oh). */
+void ax_fused_attention_bwd_use_from_flat(const float *Q, const float *K, const float *V,
+                                            const float *attn_flat,
+                                            const float *dO, const float *L,
+                                            const float *P_saved,
+                                            float *dQ, float *dK, float *dV,
+                                            int64_t B, int64_t S, int64_t H, int64_t dk,
+                                            float scale, bool causal)
+{
+    resolve_once();
+    g_sdpa_bwd_from_flat(Q, K, V, attn_flat, dO, L, dQ, dK, dV,
+                         B, S, H, dk, scale, causal, P_saved);
 }
 
 void ax_fused_attention_bwd_use(const float *Q, const float *K, const float *V,
