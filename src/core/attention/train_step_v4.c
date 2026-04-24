@@ -190,6 +190,18 @@ static inline bool resolve_hoist(void)
     return (e && e[0] == '1');
 }
 
+/* AX_V4_FUSED_BH=1 — Phase E combined kernel. implies AX_V4_HOIST.
+   inside the single parallel region, each qi-block runs ONE
+   #pragma omp for that does fwd→bwd back-to-back per (b, h) on the
+   same thread, halving per-qi-block barriers vs the separate
+   fwd_inner + bwd_inner pair. TLS scratch + attn_flat[qi-block] rows
+   stay L1-hot across the handoff. off by default pending bench. */
+static inline bool resolve_fused_bh(void)
+{
+    const char *e = getenv("AX_V4_FUSED_BH");
+    return (e && e[0] == '1');
+}
+
 ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
                                   const ax_tensor_t *x,
                                   const ax_tensor_t *dout,
@@ -366,6 +378,8 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
     }
 
     bool hoist = resolve_hoist();
+    bool fused_bh = resolve_fused_bh();
+    if (fused_bh) hoist = true;  /* fused_bh implies hoist */
 
     if (hoist) {
         /* Phase E: single parallel region wraps the whole qi-block loop.
@@ -375,7 +389,10 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
            bwd (bwd reads the L / attn_flat that fwd just wrote). between
            iterations the same barrier ensures iter k+1's fwd doesn't
            start until iter k's bwd is done — which matters because bwd
-           ACCUMULATES into dKh/dVh across iters. */
+           ACCUMULATES into dKh/dVh across iters.
+
+           when fused_bh is set, ONE omp-for per iteration does fwd→bwd
+           back-to-back per (b, h) on the same thread (halves barriers). */
 #ifdef _OPENMP
         #pragma omp parallel
 #endif
@@ -383,27 +400,42 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
             for (int64_t qi = 0; qi < S; qi += qi_block) {
                 int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
 
-                ax_fused_attention_fwd_save_to_flat_qi_block_inner(
-                    (const float *)Qh->storage->data,
-                    (const float *)Kh->storage->data,
-                    (const float *)Vh->storage->data,
-                    (float *)attn_flat->storage->data,
-                    (float *)L_t->storage->data,
-                    P_save_ptr,
-                    B, S, H, dk, qi, qi_end, scale, m->causal);
+                if (fused_bh) {
+                    ax_fused_attention_fwd_bwd_qi_block_inner(
+                        (const float *)Qh->storage->data,
+                        (const float *)Kh->storage->data,
+                        (const float *)Vh->storage->data,
+                        (float *)attn_flat->storage->data,
+                        (float *)L_t->storage->data,
+                        P_save_ptr,
+                        (const float *)dO_head->storage->data,
+                        (float *)dQh->storage->data,
+                        (float *)dKh->storage->data,
+                        (float *)dVh->storage->data,
+                        B, S, H, dk, qi, qi_end, scale, m->causal);
+                } else {
+                    ax_fused_attention_fwd_save_to_flat_qi_block_inner(
+                        (const float *)Qh->storage->data,
+                        (const float *)Kh->storage->data,
+                        (const float *)Vh->storage->data,
+                        (float *)attn_flat->storage->data,
+                        (float *)L_t->storage->data,
+                        P_save_ptr,
+                        B, S, H, dk, qi, qi_end, scale, m->causal);
 
-                ax_fused_attention_bwd_use_from_flat_qi_block_inner(
-                    (const float *)Qh->storage->data,
-                    (const float *)Kh->storage->data,
-                    (const float *)Vh->storage->data,
-                    (const float *)attn_flat->storage->data,
-                    (const float *)dO_head->storage->data,
-                    (const float *)L_t->storage->data,
-                    P_save_ptr,
-                    (float *)dQh->storage->data,
-                    (float *)dKh->storage->data,
-                    (float *)dVh->storage->data,
-                    B, S, H, dk, qi, qi_end, scale, m->causal);
+                    ax_fused_attention_bwd_use_from_flat_qi_block_inner(
+                        (const float *)Qh->storage->data,
+                        (const float *)Kh->storage->data,
+                        (const float *)Vh->storage->data,
+                        (const float *)attn_flat->storage->data,
+                        (const float *)dO_head->storage->data,
+                        (const float *)L_t->storage->data,
+                        P_save_ptr,
+                        (float *)dQh->storage->data,
+                        (float *)dKh->storage->data,
+                        (float *)dVh->storage->data,
+                        B, S, H, dk, qi, qi_end, scale, m->causal);
+                }
             }
         }
     } else {

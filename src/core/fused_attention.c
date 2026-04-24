@@ -161,6 +161,37 @@ extern void ax_cpu_sdpa_bwd_from_flat_qi_block_inner_scalar(
     int64_t, int64_t,
     float, bool, const float *);
 
+/* F.4.4 Phase E combined fwd+bwd per (qi-block, bh). caller already
+   inside a parallel region; one inner omp-for runs fwd→bwd for each
+   (b, h). args combine fwd + bwd arg lists:
+     fwd writes  attn_flat[qi-block] + L[qi-block] + P_save[qi-block]
+     bwd reads   dO + L + P_saved (shared with fwd's P_save)
+     bwd writes  dQ[qi-block] (overwrite) + dK/dV (accumulate). */
+extern void ax_cpu_sdpa_fwd_bwd_qi_block_inner_avx512(
+    const float *, const float *, const float *,
+    float *, float *,
+    const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t,
+    float, bool, const int8_t *, float *);
+extern void ax_cpu_sdpa_fwd_bwd_qi_block_inner_avx2  (
+    const float *, const float *, const float *,
+    float *, float *,
+    const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t,
+    float, bool, const int8_t *, float *);
+extern void ax_cpu_sdpa_fwd_bwd_qi_block_inner_scalar(
+    const float *, const float *, const float *,
+    float *, float *,
+    const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t,
+    float, bool, const int8_t *, float *);
+
 extern void ax_cpu_rope_apply_avx512(float *, float *, const int64_t *,
                                       int64_t, int64_t, int64_t, float);
 extern void ax_cpu_rope_apply_avx2  (float *, float *, const int64_t *,
@@ -222,6 +253,14 @@ extern void ax_cpu_sdpa_bwd_from_flat_qi_block_inner(
     int64_t, int64_t, int64_t, int64_t,
     int64_t, int64_t,
     float, bool, const float *);
+extern void ax_cpu_sdpa_fwd_bwd_qi_block_inner(
+    const float *, const float *, const float *,
+    float *, float *,
+    const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t,
+    float, bool, const int8_t *, float *);
 extern void ax_cpu_rope_apply(float *, float *, const int64_t *,
                                int64_t, int64_t, int64_t, float);
 extern void ax_cpu_kv_cache_attend(const float *, const float *,
@@ -269,6 +308,14 @@ typedef void (*sdpa_bwd_from_flat_qi_block_fn_t)(
     int64_t, int64_t,
     float, bool, const float *);
 typedef sdpa_bwd_from_flat_qi_block_fn_t sdpa_bwd_from_flat_qi_block_inner_fn_t;
+typedef void (*sdpa_fwd_bwd_qi_block_inner_fn_t)(
+    const float *, const float *, const float *,
+    float *, float *,
+    const float *,
+    float *, float *, float *,
+    int64_t, int64_t, int64_t, int64_t,
+    int64_t, int64_t,
+    float, bool, const int8_t *, float *);
 typedef void (*rope_fn_t)(float *, float *, const int64_t *,
                            int64_t, int64_t, int64_t, float);
 typedef void (*kv_attend_fn_t)(const float *, const float *,
@@ -283,6 +330,7 @@ static sdpa_bwd_fn_t                         g_sdpa_bwd                         
 static sdpa_bwd_from_flat_fn_t               g_sdpa_bwd_from_flat               = NULL;
 static sdpa_bwd_from_flat_qi_block_fn_t      g_sdpa_bwd_from_flat_qi_block      = NULL;
 static sdpa_bwd_from_flat_qi_block_inner_fn_t g_sdpa_bwd_from_flat_qi_block_inner = NULL;
+static sdpa_fwd_bwd_qi_block_inner_fn_t      g_sdpa_fwd_bwd_qi_block_inner      = NULL;
 static rope_fn_t                             g_rope                             = NULL;
 static kv_attend_fn_t                        g_kv_attend                        = NULL;
 
@@ -300,6 +348,7 @@ static void resolve_once(void)
         g_sdpa_bwd_from_flat                = ax_cpu_sdpa_bwd_from_flat_avx512;
         g_sdpa_bwd_from_flat_qi_block       = ax_cpu_sdpa_bwd_from_flat_qi_block_avx512;
         g_sdpa_bwd_from_flat_qi_block_inner = ax_cpu_sdpa_bwd_from_flat_qi_block_inner_avx512;
+        g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner_avx512;
         g_rope                              = ax_cpu_rope_apply_avx512;
         g_kv_attend                         = ax_cpu_kv_cache_attend_avx512;
     } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
@@ -311,6 +360,7 @@ static void resolve_once(void)
         g_sdpa_bwd_from_flat                = ax_cpu_sdpa_bwd_from_flat_avx2;
         g_sdpa_bwd_from_flat_qi_block       = ax_cpu_sdpa_bwd_from_flat_qi_block_avx2;
         g_sdpa_bwd_from_flat_qi_block_inner = ax_cpu_sdpa_bwd_from_flat_qi_block_inner_avx2;
+        g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner_avx2;
         g_rope                              = ax_cpu_rope_apply_avx2;
         g_kv_attend                         = ax_cpu_kv_cache_attend_avx2;
     } else {
@@ -322,6 +372,7 @@ static void resolve_once(void)
         g_sdpa_bwd_from_flat                = ax_cpu_sdpa_bwd_from_flat_scalar;
         g_sdpa_bwd_from_flat_qi_block       = ax_cpu_sdpa_bwd_from_flat_qi_block_scalar;
         g_sdpa_bwd_from_flat_qi_block_inner = ax_cpu_sdpa_bwd_from_flat_qi_block_inner_scalar;
+        g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner_scalar;
         g_rope                              = ax_cpu_rope_apply_scalar;
         g_kv_attend                         = ax_cpu_kv_cache_attend_scalar;
     }
@@ -334,6 +385,7 @@ static void resolve_once(void)
     g_sdpa_bwd_from_flat                = ax_cpu_sdpa_bwd_from_flat;
     g_sdpa_bwd_from_flat_qi_block       = ax_cpu_sdpa_bwd_from_flat_qi_block;
     g_sdpa_bwd_from_flat_qi_block_inner = ax_cpu_sdpa_bwd_from_flat_qi_block_inner;
+    g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner;
     g_rope                              = ax_cpu_rope_apply;
     g_kv_attend                         = ax_cpu_kv_cache_attend;
 #endif
@@ -494,6 +546,28 @@ void ax_fused_attention_bwd_use_from_flat_qi_block_inner(
                                           B, S, H, dk,
                                           qi_start, qi_end,
                                           scale, causal, P_saved);
+}
+
+/* F.4.4 Phase E: combined fwd+bwd per (qi-block, bh). caller already
+   inside a parallel region; runs fwd → bwd back-to-back for each (b, h)
+   in one omp-for, halving per-qi-block barriers vs the separate
+   fwd_inner + bwd_inner pair and keeping TLS / attn_flat data L1-hot
+   across the handoff. dK / dV accumulate across qi-block calls —
+   caller pre-zeros them ONCE before the enclosing parallel region. */
+void ax_fused_attention_fwd_bwd_qi_block_inner(
+    const float *Q, const float *K, const float *V,
+    float *attn_flat, float *L, float *P_save,
+    const float *dO,
+    float *dQ, float *dK, float *dV,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal)
+{
+    resolve_once();
+    g_sdpa_fwd_bwd_qi_block_inner(Q, K, V, attn_flat, L, dO, dQ, dK, dV,
+                                    B, S, H, dk,
+                                    qi_start, qi_end,
+                                    scale, causal, NULL, P_save);
 }
 
 void ax_fused_attention_bwd_use(const float *Q, const float *K, const float *V,

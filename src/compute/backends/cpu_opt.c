@@ -7408,6 +7408,122 @@ void AX_SYM(ax_cpu_sdpa_bwd_from_flat_qi_block)(
     }
 }
 
+/* F.4.4 Phase E: combined fwd+bwd per-(qi-block, bh) kernel.
+
+   each enclosing-team thread runs fwd → bwd for ONE (b, h) slice
+   back-to-back. structural differences from calling fwd_inner and
+   bwd_inner separately:
+
+     - ONE #pragma omp for inside (vs TWO). halves the per-qi-block
+       barrier count. on a 17-block bwd for S=2048 that's 17 saved
+       barriers ≈ 300-500 µs on a 16-thread team.
+     - fwd's TLS scratch (row_max, row_sum), bwd's TLS scratch (Di,
+       K/V packs, Q_pa prepack) all live in the same thread's L1
+       throughout fwd→bwd for a given (b, h). no cross-thread cache
+       transfer between fwd's producer (thread T) and bwd's consumer
+       (possibly different thread T').
+     - attn_flat[b, :, h*dk..(h+1)*dk] rows written by fwd stay
+       in thread T's L1/L2 for bwd's Di computation (which reads
+       them back). eliminates the "fwd emits, L3/DRAM absorbs,
+       bwd re-reads" round trip per qi-block.
+
+   semantics match the separate fwd_inner + bwd_inner pair (parity test
+   asserts bit-equivalence). the dQ[qi-block] zero is folded into the
+   loop body as before (per-bh before attn_bwd_head).
+
+   constraints:
+     - caller MUST already be inside a #pragma omp parallel region.
+     - caller pre-zeros dK = dV = 0 ONCE before the enclosing region
+       (dK/dV accumulate across qi-blocks via attn_bwd_head's per-kj pattern).
+     - same pack cache (tl_bwd_prepack_*) semantics as bwd-only path. */
+void AX_SYM(ax_cpu_sdpa_fwd_bwd_qi_block_inner)(
+    const float *Q, const float *K, const float *V,
+    float *attn_flat, float *L,
+    const float *dO,
+    float *dQ, float *dK, float *dV,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal, const int8_t *pad_mask,
+    float *P_save)
+{
+    int64_t BH = B * H;
+    int64_t D  = H * dk;
+    int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;
+
+    int n_inner = ax_attn_bwd_inner_threads(BH);
+
+    if (qi_end > S) qi_end = S;
+    if (qi_start < 0) qi_start = 0;
+    if (qi_start >= qi_end) return;
+    int64_t qi_stride_dk = (qi_end - qi_start) * dk;
+
+    /* per-thread scratch for both phases. ax_tls_grow is idempotent on
+       adequate size so subsequent calls in the same thread reuse buffers. */
+    int64_t want_rs = (int64_t)S * (int64_t)sizeof(float);
+    float *row_max = ax_tls_grow(&tl_sdpa_row_max, &tl_sdpa_row_max_S, want_rs);
+    float *row_sum = ax_tls_grow(&tl_sdpa_row_sum, &tl_sdpa_row_sum_S, want_rs);
+    float *Di      = ax_tls_grow(&tl_bwd_di,       &tl_bwd_di_bytes,  want_rs);
+    if (!row_max || !row_sum || !Di) {
+        /* alloc failed on this thread; still must participate in the
+           enclosing omp-for worksharing so the barrier is reached. */
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t bh = 0; bh < BH; bh++) { (void)bh; }
+        return;
+    }
+
+#ifdef _OPENMP
+    #pragma omp for schedule(dynamic, 1)
+#endif
+    for (int64_t bh = 0; bh < BH; bh++) {
+        int64_t b = bh / H, h = bh % H;
+        float *attn_flat_slot = attn_flat + b * S * D + h * dk;
+
+        /* ==== fwd for this (b, h) qi-block ==== */
+        attn_fwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                       attn_flat_slot, /* out_stride */ D,
+                       L ? L + bh * S : NULL,
+                       row_max, row_sum, S, dk, scale, causal, pad_mask,
+                       P_save ? P_save + bh * pscale_sz : NULL,
+                       qi_start, qi_end);
+
+        /* ==== bwd for this (b, h) qi-block — reads the fwd output in L1 ==== */
+        const float *dOh = dO + bh * head_sz;
+
+        /* Di[qi_start..qi_end] = dot(dO[i], O[i]) — O is strided in attn_flat. */
+        for (int64_t i = qi_start; i < qi_end; i++) {
+            const float *do_r = dOh + i * dk;
+            const float *o_r  = attn_flat_slot + i * D;
+            float dot = 0;
+            int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+            ax_vf32 vd = ax_vf32_zero();
+            int64_t ve = dk - (dk % AX_VF32_WIDTH);
+            for (; d < ve; d += AX_VF32_WIDTH)
+                vd = ax_vf32_fmadd(ax_vf32_loadu(do_r + d),
+                                   ax_vf32_loadu(o_r + d), vd);
+            dot = ax_vf32_hsum(vd);
+#endif
+            for (; d < dk; d++) dot += do_r[d] * o_r[d];
+            Di[i] = dot;
+        }
+
+        /* zero this qi-block's dQ slice — same thread will fill it next. */
+        memset(dQ + bh * head_sz + qi_start * dk, 0,
+               (size_t)qi_stride_dk * sizeof(float));
+
+        attn_bwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                       dOh, L + bh * S, Di,
+                       dQ + bh * head_sz, dK + bh * head_sz, dV + bh * head_sz,
+                       S, dk, scale, causal,
+                       P_save ? P_save + bh * pscale_sz : NULL,
+                       n_inner, BH,
+                       qi_start, qi_end);
+    }
+}
+
 /* F.4.4 Phase E: qi-block bwd variant that DOES NOT open its own omp
    parallel region. caller guarantees we are already inside one. companion
    to ax_cpu_sdpa_fwd_to_flat_qi_block_inner.

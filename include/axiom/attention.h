@@ -242,6 +242,24 @@ void ax_fused_attention_bwd_use_from_flat_qi_block_inner(
     int64_t qi_start, int64_t qi_end,
     float scale, bool causal);
 
+/* F.4.4 Phase E: combined fwd+bwd per (qi-block, bh). caller MUST be
+   inside a parallel region. each thread runs fwd → bwd back-to-back
+   for ONE (b, h) slice, keeping TLS scratch + attn_flat[qi-block]
+   rows L1-hot across the handoff. one inner omp-for replaces the
+   fwd_inner + bwd_inner pair — halves barrier count per qi-block.
+
+   dQ[qi_start..qi_end] is OVERWRITTEN; dK / dV accumulate across
+   calls (caller pre-zeros ONCE before the enclosing parallel region).
+   P_save optional; when provided, fwd stores scores for bwd to reuse. */
+void ax_fused_attention_fwd_bwd_qi_block_inner(
+    const float *Q, const float *K, const float *V,
+    float *attn_flat, float *L, float *P_save,
+    const float *dO,
+    float *dQ, float *dK, float *dV,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal);
+
 /* ================================================================
    SDPA PRIMITIVE — raw compute, use when you manage Q/K/V yourself
    ================================================================ */

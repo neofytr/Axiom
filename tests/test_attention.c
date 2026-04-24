@@ -724,6 +724,32 @@ static void test_mha_train_step_v4_hoist_parity(void)
     unsetenv("AX_V4_HOIST");
 }
 
+/* F.4.4 Phase E: combined fwd+bwd per-(qi-block, bh) kernel. each
+   thread runs fwd→bwd back-to-back for ONE (b, h) in a single
+   #pragma omp for (half the barriers of the separate fwd_inner +
+   bwd_inner pair). parity must hold for qi_block = S (the combined
+   kernel still runs a single iteration) and qi_block < S (multiple
+   iterations — the thread-locality benefit that motivates the fusion
+   matters most here). any divergence from the non-fused hoist path
+   is a bug in the combined kernel's fwd→bwd handoff. */
+static void test_mha_train_step_v4_fused_bh_parity(void)
+{
+    setenv("AX_V4_HOIST", "1", 1);
+    setenv("AX_V4_FUSED_BH", "1", 1);
+
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_fbh_fullS");
+
+    setenv("AX_V4_QI_BLOCK", "4", 1);
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_fbh_blk4");
+
+    setenv("AX_V4_QI_BLOCK", "2", 1);
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_fbh_blk2");
+
+    unsetenv("AX_V4_QI_BLOCK");
+    unsetenv("AX_V4_FUSED_BH");
+    unsetenv("AX_V4_HOIST");
+}
+
 /* ================================================================
    test: F.3.a opt_qkv_head_gemm produces bit-for-bit identical Qh/Kh/Vh
    to the unfused gemm + ax_attn_head_interleave_qkv_split_bias sequence.
@@ -1577,6 +1603,7 @@ int main(void)
     AX_RUN_TEST(test_mha_train_step_v4_parity);
     AX_RUN_TEST(test_mha_train_step_v4_qi_block_parity);
     AX_RUN_TEST(test_mha_train_step_v4_hoist_parity);
+    AX_RUN_TEST(test_mha_train_step_v4_fused_bh_parity);
     AX_RUN_TEST(test_qkv_head_gemm_parity);
     AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
     AX_RUN_TEST(test_sdpa_fwd_to_flat_parity);
