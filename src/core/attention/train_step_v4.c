@@ -151,15 +151,28 @@ static void head_interleave_qi_range(const float *d_attn, float *dO_head,
     }
 }
 
-/* qi_block size selection. AX_V4_QI_BLOCK env overrides the default;
-   clamp to [1, S]. default 126 matches ATTN_BQ_DEFAULT (the SDPA
-   kernel's internal tile) so an entire qi-block is one SDPA tile-row
-   on AVX2 (GEMM_MR=6; 126 = 21 MR strips). read each call so tests
-   can toggle it without a restart. */
+/* qi_block size selection.
+
+   default: qi_block = S (single-iter — the qi-block primitive devolves to
+   a full-S call, byte-identical to ax_fused_attention_fwd_save_to_flat /
+   ax_fused_attention_bwd_use_from_flat). no multi-block overhead.
+
+   why single-iter default: multi-block splits pay a non-trivial fixed
+   cost inside the SDPA primitives — attn_fwd_head / attn_bwd_head re-pack
+   Q, dO full-S into their TLS Q_pa / Q_pb / dO_pa / dO_pb buffers on EACH
+   call (packing is per-head-invocation, not cached across calls). with
+   qi_block=126 on S=2048 this is 17 full-S repacks per bwd (~1.7 ms of
+   wasted bandwidth) — wipes out the cache gain from attn_flat[qi-block]
+   L2-reuse. multi-block becomes a win once the primitive learns to
+   hoist its packs across qi-block calls (future work, probably Phase E).
+
+   AX_V4_QI_BLOCK overrides — set <= S to force multi-block (benchmarking
+   / parity testing). read per-call so tests can flip it without restart. */
 static inline int64_t resolve_qi_block(int64_t S)
 {
     const char *e = getenv("AX_V4_QI_BLOCK");
-    int64_t block = (e && e[0]) ? (int64_t)atoll(e) : 126;
+    if (!e || !e[0]) return S;
+    int64_t block = (int64_t)atoll(e);
     if (block < 1) block = 1;
     return block > S ? S : block;
 }
@@ -320,11 +333,29 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
 
     int64_t qi_block = resolve_qi_block(S);
 
+    /* d_attn + head_interleave kept OUTSIDE the qi-block loop to preserve
+       the F.3.d fused (dout @ Wo^T + interleave) full-rows call. splitting
+       this into per-qi-block per-batch gemm_nt + qi-range interleave
+       regressed every bench shape (+9-31%) when measured with the naive
+       split — too much OMP spawn overhead per small gemm_nt. the only
+       thing still per-qi-block is the SDPA fwd→bwd handoff, which is where
+       attn_flat[qi..qi_end] gets the cache-hot reuse. future work: a
+       qi-range F.3.d variant so we can fuse d_attn into the loop without
+       losing the gemm_nt+interleave fusion. */
+    if (ax_compute_has_dattn_head_gemm_nt()) {
+        if (ax_compute_dattn_head_gemm_nt(dout_flat, m->Wo, B, S, H, dk, dO_head) != AX_OK)
+            return AX_ERR_BACKEND;
+    } else {
+        if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn) != AX_OK) return AX_ERR_BACKEND;
+        ax_attn_head_interleave(
+            (const float *)d_attn->storage->data,
+            (float *)dO_head->storage->data, B, S, H, dk);
+    }
+
     for (int64_t qi = 0; qi < S; qi += qi_block) {
         int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
-        int64_t bq = qi_end - qi;
 
-        /* (1) SDPA fwd for [qi, qi_end) → attn_flat rows, L rows, P_save rows */
+        /* (1) SDPA fwd for [qi, qi_end) → attn_flat[qi..qi_end] + L / P_save */
         ax_fused_attention_fwd_save_to_flat_qi_block(
             (const float *)Qh->storage->data,
             (const float *)Kh->storage->data,
@@ -334,31 +365,11 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
             P_save_ptr,
             B, S, H, dk, qi, qi_end, scale, m->causal);
 
-        /* (2) d_attn[b, qi..qi_end, :] = dout[b, qi..qi_end, :] @ Wo^T
-              sub-blocks are contiguous [bq, D] within each batch b, so B
-              separate gemm_nt calls — no row stride mismatch. */
-        for (int64_t b = 0; b < B; b++) {
-            const float *dout_ptr = (const float *)dout_flat->storage->data
-                                    + b * S * D + qi * D;
-            float *dattn_ptr = (float *)d_attn->storage->data
-                               + b * S * D + qi * D;
-            ax_tensor_t dout_v, dattn_v;
-            ax_storage_t dout_st, dattn_st;
-            make_stack_view(&dout_v,  &dout_st,  dout_ptr,  bq, D);
-            make_stack_view(&dattn_v, &dattn_st, dattn_ptr, bq, D);
-            if (ax_compute_gemm_nt(&dout_v, m->Wo, &dattn_v) != AX_OK)
-                return AX_ERR_BACKEND;
-        }
-
-        /* (3) head_interleave d_attn[:, qi..qi_end, :] → dO_head */
-        head_interleave_qi_range(
-            (const float *)d_attn->storage->data,
-            (float *)dO_head->storage->data,
-            B, S, H, dk, qi, qi_end);
-
-        /* (4) SDPA bwd for [qi, qi_end). overwrites dQh rows, accumulates
-              dKh/dVh. reads the attn_flat / L / P_save / dO_head rows
-              just written above — all cache-hot. */
+        /* (2) SDPA bwd for [qi, qi_end). overwrites dQh rows, accumulates
+              dKh/dVh. reads attn_flat[qi..qi_end] / L / P_save / dO_head —
+              attn_flat[qi..qi_end] (just written above) is L2-hot for this
+              call even when the full attn_flat exceeds L2. dO_head is the
+              full pre-computed tensor (stream-through read). */
         ax_fused_attention_bwd_use_from_flat_qi_block(
             (const float *)Qh->storage->data,
             (const float *)Kh->storage->data,
@@ -371,9 +382,8 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
             (float *)dKh->storage->data,
             (float *)dVh->storage->data,
             B, S, H, dk, qi, qi_end, scale, m->causal);
-
-        (void)bq;
     }
+    (void)d_attn;  /* only used in the non-F.3.d fallback above */
 
     /* (5) fwd y = attn_flat @ Wo + bo (full-rows — all attn_flat rows are
        filled by now). */

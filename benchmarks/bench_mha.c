@@ -213,10 +213,11 @@ static void bench_mha_train_fused(const shape_t *s, int iters)
     ax_layer_destroy(mha);
 }
 
-/* F.4: ax_mha_train_step_fused — same setup as bench_mha_train_fused but
-   calls the fully-fused entry. F.4.0 just delegates to ax_mha_train_step
-   so this row matches (F) initially; subsequent F.4.x phases swap the
-   body and this row diverges (target: faster than (F)). */
+/* F.4.4: ax_mha_train_step_v4 — monolithic per-qi-block train kernel.
+   after Phase A-D the body fuses SDPA fwd → output-proj fwd/bwd →
+   head_interleave → SDPA bwd → dWq stream for each qi-block, keeping
+   attn_flat[qi..qi_end] / dO_head[qi..qi_end] cache-hot across the
+   fwd→bwd handoff. target: beat train_step_fused on every shape. */
 static void bench_mha_train_fused2(const shape_t *s, int iters)
 {
     int64_t B = s->B, S = s->S, D = s->D;
@@ -227,12 +228,12 @@ static void bench_mha_train_fused2(const shape_t *s, int iters)
     ax_tensor_t *x = ax_tensor_rand(sh, 3, -0.1f, 0.1f);
     ax_tensor_t *out = ax_tensor_create(sh, 3, AX_FLOAT32);
 
-    ax_mha_train_step_fused(mha, x, NULL, out);
+    ax_mha_train_step_v4(mha, x, NULL, out);
 
     double t = 0;
     for (int i = 0; i < iters; i++) {
         double a = bench_now_s();
-        ax_mha_train_step_fused(mha, x, NULL, out);
+        ax_mha_train_step_v4(mha, x, NULL, out);
         double b = bench_now_s();
         t += (b - a);
     }
@@ -241,10 +242,10 @@ static void bench_mha_train_fused2(const shape_t *s, int iters)
     double fwd_flops = 4.0 * 2.0 * B * S * D * D + 4.0 * B * S * S * D;
     double gflops = 3.0 * fwd_flops / t / 1e9;
 
-    printf("  MHA-train(F2)B=%2ld S=%4ld D=%4ld H=%2d :  %7.3f ms  %8.2f GFLOPS (est)\n",
+    printf("  MHA-train(V4)B=%2ld S=%4ld D=%4ld H=%2d :  %7.3f ms  %8.2f GFLOPS (est)\n",
            B, S, D, H, t * 1e3, gflops);
     char cs[96];
-    snprintf(cs, sizeof(cs), "mha_train_fused2_B%ld_S%ld_D%ld_H%d", (long)B, (long)S, (long)D, H);
+    snprintf(cs, sizeof(cs), "mha_train_v4_B%ld_S%ld_D%ld_H%d", (long)B, (long)S, (long)D, H);
     BENCH_EMIT("mha", cs, "lat_ms", t * 1e3);
     BENCH_EMIT("mha", cs, "gflops", gflops);
 
