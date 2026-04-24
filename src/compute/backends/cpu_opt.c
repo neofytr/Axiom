@@ -910,6 +910,15 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
         { (int64_t)GEMM_MR * 8,  nc_orig,         kc_orig      },
         { (int64_t)GEMM_MR * 16, nc_orig,         kc_orig      },
         { mc_orig,             (int64_t)GEMM_NR * 32, kc_orig  },
+        /* larger MC / KC candidates for fat-B mha shapes — the
+           baseline MC=48 leaves L2 partially unused on 2048 KB hosts;
+           larger MC amortises pack_a cost across more output columns
+           per pack_b reuse. mha qkv fwd has M=rows up to 2048 on our
+           bench shapes, so MC up to 192 is feasible. */
+        { (int64_t)GEMM_MR * 24, nc_orig,         kc_orig      },
+        { mc_orig * 2,         nc_orig,           kc_orig      },
+        { mc_orig,             nc_orig,           kc_orig * 2  },
+        { mc_orig * 2,         nc_orig,           kc_orig * 2  },
     };
     int nc_configs = (int)(sizeof(base_configs) / sizeof(base_configs[0]));
     int nc_extended = (int)(sizeof(extended_configs) / sizeof(extended_configs[0]));
@@ -922,21 +931,40 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
         }
     }
 
-    /* score on a triple of representative shapes that together cover the
-       workload range: medium square (MLP/attention typical), large square
-       (training bulk), and skinny (conv per-sample). picking on small
-       shapes alone biased the chosen tiles to be NC=128 which then
-       cost ~10% on nn_4096² where bigger NC reuses pack_b across more
-       output columns. */
+    /* score on a set of representative shapes that together cover the
+       workload range.
+       default (3 shapes ≈ 250 ms): medium square (MLP/attention typical),
+       large square (training bulk), and skinny (conv per-sample). picking
+       on small shapes alone biased the chosen tiles to be NC=128 which
+       then cost ~10 % on nn_4096² where bigger NC reuses pack_b across
+       more output columns.
+       extended (5 shapes ≈ 500 ms): adds two mha-train-representative
+       shapes (qkv forward on B8_S128 and B4_S512 / B1_S2048). mha GEMMs
+       are "fat B" (N = 3*D ≫ K = D) with row count set by B*S, which
+       is a distinct regime from the square probes and a big fraction of
+       train_step wall time (qkv fwd alone is 18-30 % per profile).
+       scoring with mha shapes ensures the chosen tile config serves the
+       workload we're actually shipping for, not just generic square/conv. */
     struct { int64_t M, N, K; float *A, *B, *C; ax_storage_t sa, sb, sc; ax_tensor_t ta, tb, tc; }
-        sh[3] = { { 512,  512,  512,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
-                  {1024, 1024, 1024,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
-                  { 128,  1152, 512,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} } };
+        sh[8] = {
+            { 512,  512,  512,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+            {1024, 1024, 1024,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+            { 128,  1152, 512,  NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+            { 0, 0, 0, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+            { 0, 0, 0, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+            { 0, 0, 0, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+            { 0, 0, 0, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+            { 0, 0, 0, NULL, NULL, NULL, {0}, {0}, {0}, {0}, {0}, {0} },
+        };
     int n_sh = 3;
     if (extended) {
         sh[0].M = sh[0].N = sh[0].K = 1024;
         sh[1].M = sh[1].N = sh[1].K = 2048;
         sh[2].M = 256; sh[2].N = 3136; sh[2].K = 1152;
+        /* mha-train qkv-forward shapes (NN) — rows=B*S, n=3*D, k=D. */
+        sh[3].M = 1024; sh[3].N = 1536; sh[3].K = 512;   /* B8_S128_D512 */
+        sh[4].M = 2048; sh[4].N = 2304; sh[4].K = 768;   /* B4_S512_D768 / B1_S2048_D768 */
+        n_sh = 5;
     }
     uint32_t s = 2463534242u;
     for (int sh_i = 0; sh_i < n_sh; sh_i++) {
@@ -995,7 +1023,7 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
        sweep because we now run by default. */
     const int warm_iters = 2;
     const int timed_iters = (extended ? 5 : 3);
-    double per_shape_per_config[16][3];
+    double per_shape_per_config[16][8];
     int best_i = 0;            /* baseline (config 0) is implicit baseline */
     double base_score = 1e30;
     double t_start = ax_tile_cal_now_ms();
