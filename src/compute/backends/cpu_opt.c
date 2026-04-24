@@ -171,6 +171,21 @@ AX_TLS float *tl_bwd_q_pa       = NULL; AX_TLS int64_t tl_bwd_q_pa_bytes  = 0;
 AX_TLS float *tl_bwd_q_pb       = NULL; AX_TLS int64_t tl_bwd_q_pb_bytes  = 0;
 AX_TLS float *tl_bwd_dO_pa      = NULL; AX_TLS int64_t tl_bwd_dO_pa_bytes = 0;
 AX_TLS float *tl_bwd_dO_pb      = NULL; AX_TLS int64_t tl_bwd_dO_pb_bytes = 0;
+/* F.4.4 Phase B helper: cache key for the Q_pa / Q_pb / dO_pa / dO_pb
+   prepack. multi-qi-block drivers (ax_cpu_sdpa_bwd_from_flat_qi_block)
+   call attn_bwd_head once per qi-block with the SAME Q, dO pointers —
+   the prepacks are input-dependent only, so repacking each call is
+   pure waste (~1.7 ms per S=2048 bwd). cache keyed on (Q, dO, S, dk)
+   so any of: different head (Q ptr differs), different shape, or
+   buffer realloc (TLS grow gave a new address) triggers a fresh pack. */
+AX_TLS const float *tl_bwd_prepack_Q_ptr  = NULL;
+AX_TLS const float *tl_bwd_prepack_dO_ptr = NULL;
+AX_TLS int64_t      tl_bwd_prepack_S      = 0;
+AX_TLS int64_t      tl_bwd_prepack_dk     = 0;
+AX_TLS float       *tl_bwd_prepack_Qpa    = NULL;
+AX_TLS float       *tl_bwd_prepack_Qpb    = NULL;
+AX_TLS float       *tl_bwd_prepack_dOpa   = NULL;
+AX_TLS float       *tl_bwd_prepack_dOpb   = NULL;
 /* I.1.b: per-thread dQ accumulator pool. allocated by the outer thread
    before spawning the inner kj-parallel team; sized n_inner * S * dk *
    sizeof(float). each inner thread accumulates dQ contributions into
@@ -6942,11 +6957,33 @@ static void attn_bwd_head(const float *Q, const float *K, const float *V,
                        && (ATTN_BQ % GEMM_MR == 0)
                        && (qi_start % GEMM_MR == 0);
     if (use_prepack) {
-        int64_t S_pa_rows = ((S + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-        pack_a(Q,  dk, S_pa_rows, dk, S, Q_pa);
-        pack_a(dO, dk, S_pa_rows, dk, S, dO_pa);
-        pack_b(Q,  dk, S, dk_np, dk, Q_pb);
-        pack_b(dO, dk, S, dk_np, dk, dO_pb);
+        /* cache check: same (Q, dO, S, dk) + same TLS buffer addresses
+           ⇒ packed content still valid from a prior call. skip repack.
+           invalidated on any mismatch — ax_tls_grow realloc changes the
+           buffer address, which also flips the comparison. */
+        bool pack_hit = (tl_bwd_prepack_Q_ptr  == Q)
+                     && (tl_bwd_prepack_dO_ptr == dO)
+                     && (tl_bwd_prepack_S      == S)
+                     && (tl_bwd_prepack_dk     == dk)
+                     && (tl_bwd_prepack_Qpa    == Q_pa)
+                     && (tl_bwd_prepack_Qpb    == Q_pb)
+                     && (tl_bwd_prepack_dOpa   == dO_pa)
+                     && (tl_bwd_prepack_dOpb   == dO_pb);
+        if (!pack_hit) {
+            int64_t S_pa_rows = ((S + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+            pack_a(Q,  dk, S_pa_rows, dk, S, Q_pa);
+            pack_a(dO, dk, S_pa_rows, dk, S, dO_pa);
+            pack_b(Q,  dk, S, dk_np, dk, Q_pb);
+            pack_b(dO, dk, S, dk_np, dk, dO_pb);
+            tl_bwd_prepack_Q_ptr  = Q;
+            tl_bwd_prepack_dO_ptr = dO;
+            tl_bwd_prepack_S      = S;
+            tl_bwd_prepack_dk     = dk;
+            tl_bwd_prepack_Qpa    = Q_pa;
+            tl_bwd_prepack_Qpb    = Q_pb;
+            tl_bwd_prepack_dOpa   = dO_pa;
+            tl_bwd_prepack_dOpb   = dO_pb;
+        }
     }
 
     /* I.1.c: pick the kj-block implementation. fused path requires
