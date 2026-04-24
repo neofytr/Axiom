@@ -151,6 +151,33 @@ single-batch-big-D shape.
   fused primitives in autograd MHA (debug/bisect).
 - `AX_GEMM_CALIBRATE=1` — run extended tile sweep on startup (now
   includes mha-representative probes).
+- `AX_MHA_SAVE_P=0/1` — force P-save off/on for mha autograd bwd.
+  default now enables for B8_S128-class shapes (small BH, 4 MB P-save).
+- `AX_NO_BIAS_FUSE=1` — disable output-projection bias/gemm fusion
+  trick (attempted but reverted in this session; env gate retained
+  for future re-attempts with a better primitive).
+
+### Final 2026-04-25 session perf snapshot (10-run medians, bg-noise)
+
+| shape               | autograd | fused | v4    | TF     | auto vs TF |
+|---------------------|----------|-------|-------|--------|------------|
+| B8_S128_D512_H8     | 17.71    | 18.16 | 18.81 | 11.21  | +58 %      |
+| B4_S512_D768_H12    | 82.79    | 82.87 | 83.06 | 65.49  | +26 %      |
+| B2_S1024_D768_H12   | 110.24   | 109.3 | 110.0 | 94.30  | +17 %      |
+| B1_S512_D1024_H16   | 48.06    | 40.29 | 39.70 | 25.76  | +87 %      |
+| B1_S2048_D768_H12   | 175.29   | 172.0 | 172.9 | 155.20 | +13 %      |
+
+Session-over-session improvement on the autograd path (main
+`mha_train_B*` row): -15 % B8_S128, -3.6 % B1_S512, -1 to -2 % on
+the mid-range shapes. the B1_S2048 path was already within 13 % of
+TF at session start and remains there — the SDPA backward (55 % of
+train time on this shape) is near peak AVX2 throughput without
+hand-tuned assembly.
+
+For B1_S512 specifically, the `train_step` / `train_step_v4` paths
+close more of the gap than the autograd path can (-18 % vs the
+autograd equivalent), because the autograd tape overhead amortises
+worst on a single-batch-big-D shape.
 
 ### Pure attention math (where Axiom wins handily)
 
