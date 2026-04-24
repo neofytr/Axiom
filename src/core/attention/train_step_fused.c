@@ -300,29 +300,8 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
             (float *)attn_flat->storage->data, B, S, H, dk);
     }
 
-    /* forward y = attn_flat @ Wo + bo. reads Wo. */
-    if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
-    if (m->use_bias) {
-        const float *bd = (const float *)m->bo->storage->data;
-        float *od = (float *)y_flat_v.storage->data;
-        int64_t de = D - (D % AX_VF32_WIDTH);
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-#endif
-        for (int64_t r = 0; r < rows; r++) {
-            float *row = od + r * D;
-            int64_t c = 0;
-            for (; c < de; c += AX_VF32_WIDTH) {
-                ax_vf32 v = ax_vf32_loadu(row + c);
-                ax_vf32 b = ax_vf32_loadu(bd + c);
-                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
-            }
-            for (; c < D; c++) row[c] += bd[c];
-        }
-    }
-    ax_storage_touch(y_out->storage);
-
-    /* backward starts. dout view — caller-supplied or default ones. */
+    /* dout view setup (moved before output-projection so F.4.2 proper
+       can fuse fwd y + bwd dWo + bwd dbo + bwd dattn in one strip pass). */
     ax_tensor_t  dout_flat_v;
     ax_storage_t dout_flat_st;
     ax_tensor_t *dout_flat;
@@ -338,51 +317,93 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
         dout_flat = dout_owned;
     }
 
-    /* F.4.2 output-projection reorder.
-       current train_step.c ordering: dWo_tn, dbo_col_sum, dattn_nt.
-       the reorder below is: dattn_nt → dWo_tn → dbo_col_sum.
-       why:
-         1. dattn_nt reads Wo. the forward y gemm also read Wo and
-            y_out's bias add ran in between. Wo may still be in L3
-            for dattn_nt if the deinterleave + dout setup didn't
-            evict it.
-         2. dWo_tn reads dout. dattn_nt also reads dout just before.
-            dout stays warm from dattn_nt's read into dWo_tn's.
-         3. dbo_col_sum reads dout once more; warm from dWo_tn. */
-
-    /* dattn + head_interleave: F.3.d fused path streams dout @ Wo^T
-       directly into dO_head, no d_attn_flat intermediate. */
     ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!dO_head) return AX_ERR_ALLOC;
 
-    if (ax_compute_has_dattn_head_gemm_nt()) {
-        if (ax_compute_dattn_head_gemm_nt(dout_flat, m->Wo, B, S, H, dk, dO_head) != AX_OK)
-            return AX_ERR_BACKEND;
-    } else {
+    /* F.4.2 proper / F.3.f: strip-fused fwd y + bwd output projection.
+       single pass over qi strips computes y, dWo, dbo, dattn together,
+       sharing dout cache lines and Wo cache residency across all four
+       ops. requires Wo->requires_grad (grad accumulator non-NULL) — the
+       fallback handles inference-style cases where Wo isn't trained. */
+    bool can_use_outproj_fused = m->Wo->requires_grad
+                               && ax_compute_has_mha_output_proj_fused();
+
+    if (can_use_outproj_fused) {
         ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
         if (!d_attn_flat) return AX_ERR_ALLOC;
-        if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn_flat) != AX_OK) return AX_ERR_BACKEND;
+        float *dWo = ensure_grad_ptr(m->Wo);
+        if (!dWo) return AX_ERR_ALLOC;
+        ax_tensor_t *bo_arg  = m->use_bias ? m->bo : NULL;
+        ax_tensor_t *dbo_arg = (m->use_bias && m->bo->requires_grad)
+                                 ? (ensure_grad_ptr(m->bo), m->bo->grad) : NULL;
+
+        if (ax_compute_mha_output_proj_fused(
+                attn_flat, m->Wo, bo_arg, dout_flat,
+                &y_flat_v, d_attn_flat, m->Wo->grad, dbo_arg) != AX_OK)
+            return AX_ERR_BACKEND;
+        ax_storage_touch(y_out->storage);
+        ax_storage_touch(m->Wo->grad->storage);
+        if (dbo_arg) ax_storage_touch(m->bo->grad->storage);
+
+        /* head_interleave dattn → dO_head for SDPA backward */
         ax_attn_head_interleave(
             (const float *)d_attn_flat->storage->data,
             (float *)dO_head->storage->data, B, S, H, dk);
-    }
+    } else {
+        /* fallback path: forward y + 3 separate backward ops + head_interleave */
 
-    if (m->Wo->requires_grad) {
-        float *dWo = ensure_grad_ptr(m->Wo);
-        if (dWo) {
-            ax_gemm_set_skip_init(true);
-            ax_status_t s = ax_compute_gemm_tn(attn_flat, dout_flat, m->Wo->grad);
-            ax_gemm_set_skip_init(false);
-            if (s != AX_OK) return s;
-            ax_storage_touch(m->Wo->grad->storage);
+        /* forward y = attn_flat @ Wo + bo */
+        if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
+        if (m->use_bias) {
+            const float *bd = (const float *)m->bo->storage->data;
+            float *od = (float *)y_flat_v.storage->data;
+            int64_t de = D - (D % AX_VF32_WIDTH);
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
+            for (int64_t r = 0; r < rows; r++) {
+                float *row = od + r * D;
+                int64_t c = 0;
+                for (; c < de; c += AX_VF32_WIDTH) {
+                    ax_vf32 v = ax_vf32_loadu(row + c);
+                    ax_vf32 b = ax_vf32_loadu(bd + c);
+                    ax_vf32_storeu(row + c, ax_vf32_add(v, b));
+                }
+                for (; c < D; c++) row[c] += bd[c];
+            }
         }
-    }
+        ax_storage_touch(y_out->storage);
 
-    if (m->use_bias && m->bo->requires_grad) {
-        float *dbo = ensure_grad_ptr(m->bo);
-        if (dbo) {
-            col_sum_acc((const float *)dout_flat->storage->data, dbo, rows, D);
-            ax_storage_touch(m->bo->grad->storage);
+        /* dattn + head_interleave (F.3.d when available) */
+        if (ax_compute_has_dattn_head_gemm_nt()) {
+            if (ax_compute_dattn_head_gemm_nt(dout_flat, m->Wo, B, S, H, dk, dO_head) != AX_OK)
+                return AX_ERR_BACKEND;
+        } else {
+            ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
+            if (!d_attn_flat) return AX_ERR_ALLOC;
+            if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn_flat) != AX_OK) return AX_ERR_BACKEND;
+            ax_attn_head_interleave(
+                (const float *)d_attn_flat->storage->data,
+                (float *)dO_head->storage->data, B, S, H, dk);
+        }
+
+        if (m->Wo->requires_grad) {
+            float *dWo = ensure_grad_ptr(m->Wo);
+            if (dWo) {
+                ax_gemm_set_skip_init(true);
+                ax_status_t s = ax_compute_gemm_tn(attn_flat, dout_flat, m->Wo->grad);
+                ax_gemm_set_skip_init(false);
+                if (s != AX_OK) return s;
+                ax_storage_touch(m->Wo->grad->storage);
+            }
+        }
+
+        if (m->use_bias && m->bo->requires_grad) {
+            float *dbo = ensure_grad_ptr(m->bo);
+            if (dbo) {
+                col_sum_acc((const float *)dout_flat->storage->data, dbo, rows, D);
+                ax_storage_touch(m->bo->grad->storage);
+            }
         }
     }
 

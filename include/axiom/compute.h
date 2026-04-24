@@ -173,6 +173,27 @@ ax_status_t ax_compute_dattn_head_gemm_nt(const ax_tensor_t *dout,
                                             ax_tensor_t *dO_head);
 int ax_compute_has_dattn_head_gemm_nt(void);
 
+/* F.4.2 proper / F.3.f strip-fused MHA output projection (fwd + bwd).
+   single strip-parallel pass over qi tiles that does:
+     y_strip      = attn_strip @ Wo + bo                (forward)
+     dattn_strip  = dout_strip @ Wo^T                   (backward)
+     dWo_acc     += attn_strip^T @ dout_strip           (backward, accumulate)
+     dbo_acc     += col_sum(dout_strip)                  (backward, accumulate)
+   y and dattn are OVERWRITTEN. dWo_acc and dbo_acc are accumulated into
+   (existing values preserved). bo and dbo_acc may be NULL for no-bias.
+   shapes: attn_flat/dout/y/dattn=[B*S, D], Wo=[D, D], bo/dbo=[D],
+           dWo_acc=[D, D].
+   returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
+ax_status_t ax_compute_mha_output_proj_fused(const ax_tensor_t *attn_flat,
+                                               const ax_tensor_t *Wo,
+                                               const ax_tensor_t *bo,
+                                               const ax_tensor_t *dout,
+                                               ax_tensor_t *y,
+                                               ax_tensor_t *dattn,
+                                               ax_tensor_t *dWo_acc,
+                                               ax_tensor_t *dbo_acc);
+int ax_compute_has_mha_output_proj_fused(void);
+
 /* fused matmul+relu: out = relu(a @ b + bias). bias may be NULL.
    returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
 ax_status_t ax_compute_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,

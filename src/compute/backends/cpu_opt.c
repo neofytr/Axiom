@@ -4900,6 +4900,267 @@ fallback_materialise:
     }
 }
 
+/* ================================================================
+   F.4.2 proper / F.3.f: strip-fused MHA output projection (fwd + bwd)
+
+   single strip-parallel pass over qi tiles that performs all four
+   output-projection ops together:
+     y_strip      = attn_strip @ Wo + bo                (forward)
+     dattn_strip  = dout_strip @ Wo^T                   (backward)
+     dWo_partial += attn_strip^T @ dout_strip           (backward, accumulate)
+     dbo_partial += col_sum(dout_strip)                  (backward, accumulate)
+
+   shapes:
+     attn_flat  [rows = B*S, D]
+     Wo         [D, D]
+     bo         [D] or NULL (no bias)
+     dout       [rows, D]
+     y          [rows, D]   — overwritten
+     dattn      [rows, D]   — overwritten
+     dWo_acc    [D, D]      — accumulated into (existing values preserved)
+     dbo_acc    [D]         — accumulated into (existing values preserved); NULL when no bias
+
+   each thread holds private dWo_partial [D, D] and dbo_partial [D]
+   accumulators; final reduction folds them into dWo_acc / dbo_acc.
+
+   per-strip cache profile (Bq=32, D=768): attn_strip + dout_strip = 192 KB
+   (fits L2 per P-core). Wo = 2.3 MB (fits shared L3 across all threads).
+   the 4 ops share these cache lines — dout is read once per strip
+   (vs 3x in the unfused case), Wo is read once per strip (vs 2x for
+   the y + dattn ops separately).
+
+   simple AVX2 inner loops (no pack_a / pack_b / micro_kernel) — keeps
+   the kernel ~250 LOC and self-contained. flops/sec is lower than
+   tuned opt_gemm (estimate ~50% of peak) but the cache benefit on
+   strips that fit L2 compensates for typical mha_train shapes. */
+
+#define MHA_OUTPROJ_BQ 32
+
+static ax_status_t opt_mha_output_proj_fused(
+    const ax_tensor_t *attn_flat, const ax_tensor_t *Wo, const ax_tensor_t *bo_opt,
+    const ax_tensor_t *dout,
+    ax_tensor_t *y, ax_tensor_t *dattn,
+    ax_tensor_t *dWo_acc, ax_tensor_t *dbo_acc_opt)
+{
+    if (!attn_flat || !Wo || !dout || !y || !dattn || !dWo_acc) {
+        ax_err_set(AX_ERR_NULL_ARG, "mha_output_proj_fused: NULL");
+        return AX_ERR_NULL_ARG;
+    }
+    if (attn_flat->dtype != AX_FLOAT32 || Wo->dtype != AX_FLOAT32 ||
+        dout->dtype != AX_FLOAT32 || y->dtype != AX_FLOAT32 ||
+        dattn->dtype != AX_FLOAT32 || dWo_acc->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (bo_opt && bo_opt->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
+    if (dbo_acc_opt && dbo_acc_opt->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
+    if (attn_flat->ndim != 2 || Wo->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    if (dout->ndim != 2 || y->ndim != 2 || dattn->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    if (dWo_acc->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t rows = attn_flat->shape[0];
+    int64_t D    = attn_flat->shape[1];
+    if (Wo->shape[0] != D || Wo->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dout->shape[0] != rows || dout->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (y->shape[0] != rows || y->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dattn->shape[0] != rows || dattn->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWo_acc->shape[0] != D || dWo_acc->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (bo_opt && (bo_opt->ndim != 1 || bo_opt->shape[0] != D)) return AX_ERR_SHAPE_MISMATCH;
+    if (dbo_acc_opt && (dbo_acc_opt->ndim != 1 || dbo_acc_opt->shape[0] != D)) return AX_ERR_SHAPE_MISMATCH;
+
+    if (validate_contig_f32(attn_flat) < 0 || validate_contig_f32(Wo) < 0 ||
+        validate_contig_f32(dout) < 0 || validate_contig_f32(y) < 0 ||
+        validate_contig_f32(dattn) < 0 || validate_contig_f32(dWo_acc) < 0)
+        return AX_ERR_BACKEND;
+    if (bo_opt && validate_contig_f32(bo_opt) < 0) return AX_ERR_BACKEND;
+    if (dbo_acc_opt && validate_contig_f32(dbo_acc_opt) < 0) return AX_ERR_BACKEND;
+
+    const float *attn_d = raw_f32(attn_flat);
+    const float *Wo_d   = raw_f32(Wo);
+    const float *dout_d = raw_f32(dout);
+    const float *bo_d   = bo_opt ? raw_f32(bo_opt) : NULL;
+    float *y_d     = raw_f32(y);
+    float *dattn_d = raw_f32(dattn);
+    float *dWo_d   = raw_f32(dWo_acc);
+    float *dbo_d   = dbo_acc_opt ? raw_f32(dbo_acc_opt) : NULL;
+
+    int64_t Bq = MHA_OUTPROJ_BQ;
+    int64_t n_strips = (rows + Bq - 1) / Bq;
+
+    int max_threads = ax_gemm_threads_for_shape(rows, D, D);
+    if (max_threads < 1) max_threads = 1;
+    if ((int64_t)max_threads > n_strips) max_threads = (int)n_strips;
+
+    /* per-thread accumulators: dWo_tl [D*D], dbo_tl [D].
+       large for D=1024 (4MB per thread × 16 = 64MB) but unavoidable
+       without atomic-add contention. allocated once per call from
+       a single contiguous block so threads can address by tid offset. */
+    size_t dWo_tl_floats = (size_t)D * (size_t)D;
+    size_t dbo_tl_floats = (size_t)D;
+    size_t total_floats  = (size_t)max_threads * (dWo_tl_floats + dbo_tl_floats);
+    float *thread_pool = (float *)ax_aligned_alloc(total_floats * sizeof(float), 64);
+    if (!thread_pool) return AX_ERR_ALLOC;
+    memset(thread_pool, 0, total_floats * sizeof(float));
+
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(max_threads)
+#endif
+    {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num();
+#else
+        int tid = 0;
+#endif
+        float *dWo_tl = thread_pool + (size_t)tid * (dWo_tl_floats + dbo_tl_floats);
+        float *dbo_tl = dWo_tl + dWo_tl_floats;
+
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t qs = 0; qs < n_strips; qs++) {
+            int64_t qi = qs * Bq;
+            int64_t bq = (qi + Bq <= rows) ? Bq : (rows - qi);
+            const float *attn_strip = attn_d + qi * D;
+            const float *dout_strip = dout_d + qi * D;
+            float *y_strip     = y_d + qi * D;
+            float *dattn_strip = dattn_d + qi * D;
+
+            /* op 1: y_strip = attn_strip @ Wo + bo
+               broadcast bias into y_strip (or zero), then accumulate.
+               inner SIMD across D cols, k-outer for dot accumulation. */
+            for (int64_t i = 0; i < bq; i++) {
+                if (bo_d) memcpy(y_strip + i * D, bo_d, (size_t)D * sizeof(float));
+                else      memset(y_strip + i * D, 0, (size_t)D * sizeof(float));
+            }
+            for (int64_t i = 0; i < bq; i++) {
+                float *yi = y_strip + i * D;
+                const float *ai = attn_strip + i * D;
+                for (int64_t k = 0; k < D; k++) {
+                    float a = ai[k];
+                    const float *wo_row = Wo_d + k * D;
+                    int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+                    ax_vf32 va = ax_vf32_set1(a);
+                    int64_t ve = D - (D % AX_VF32_WIDTH);
+                    for (; j < ve; j += AX_VF32_WIDTH) {
+                        ax_vf32 vy = ax_vf32_loadu(yi + j);
+                        ax_vf32 vw = ax_vf32_loadu(wo_row + j);
+                        ax_vf32_storeu(yi + j, ax_vf32_fmadd(va, vw, vy));
+                    }
+#endif
+                    for (; j < D; j++) yi[j] += a * wo_row[j];
+                }
+            }
+
+            /* op 2: dattn_strip = dout_strip @ Wo^T
+               dattn[i, j] = sum_k dout[i, k] * Wo[j, k]
+               for each (i, j), SIMD inner product over k. */
+            for (int64_t i = 0; i < bq; i++) {
+                const float *di_row = dout_strip + i * D;
+                float *dai_row = dattn_strip + i * D;
+                for (int64_t j = 0; j < D; j++) {
+                    const float *wo_row = Wo_d + j * D;
+                    float acc = 0.0f;
+                    int64_t k = 0;
+#if defined(AX_HAS_SIMD)
+                    ax_vf32 va = ax_vf32_zero();
+                    int64_t ve = D - (D % AX_VF32_WIDTH);
+                    for (; k < ve; k += AX_VF32_WIDTH) {
+                        ax_vf32 vd = ax_vf32_loadu(di_row + k);
+                        ax_vf32 vw = ax_vf32_loadu(wo_row + k);
+                        va = ax_vf32_fmadd(vd, vw, va);
+                    }
+                    acc = ax_vf32_hsum(va);
+#endif
+                    for (; k < D; k++) acc += di_row[k] * wo_row[k];
+                    dai_row[j] = acc;
+                }
+            }
+
+            /* op 3: dWo_tl += attn_strip^T @ dout_strip
+               dWo[i, j] += sum_k attn_strip[k, i] * dout_strip[k, j]
+               outer-k loop, broadcast attn_strip[k, i], SIMD across j. */
+            for (int64_t k = 0; k < bq; k++) {
+                const float *ak_row = attn_strip + k * D;
+                const float *dk_row = dout_strip + k * D;
+                for (int64_t i = 0; i < D; i++) {
+                    float a = ak_row[i];
+                    float *dWo_row = dWo_tl + i * D;
+                    int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+                    ax_vf32 va = ax_vf32_set1(a);
+                    int64_t ve = D - (D % AX_VF32_WIDTH);
+                    for (; j < ve; j += AX_VF32_WIDTH) {
+                        ax_vf32 vd = ax_vf32_loadu(dk_row + j);
+                        ax_vf32 vw = ax_vf32_loadu(dWo_row + j);
+                        ax_vf32_storeu(dWo_row + j, ax_vf32_fmadd(va, vd, vw));
+                    }
+#endif
+                    for (; j < D; j++) dWo_row[j] += a * dk_row[j];
+                }
+            }
+
+            /* op 4: dbo_tl += col_sum(dout_strip)
+               cheap per-strip reduction. */
+            if (dbo_d) {
+                for (int64_t k = 0; k < bq; k++) {
+                    const float *dk_row = dout_strip + k * D;
+                    int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+                    int64_t ve = D - (D % AX_VF32_WIDTH);
+                    for (; j < ve; j += AX_VF32_WIDTH) {
+                        ax_vf32 vb = ax_vf32_loadu(dbo_tl + j);
+                        ax_vf32 vd = ax_vf32_loadu(dk_row + j);
+                        ax_vf32_storeu(dbo_tl + j, ax_vf32_add(vb, vd));
+                    }
+#endif
+                    for (; j < D; j++) dbo_tl[j] += dk_row[j];
+                }
+            }
+        }
+    } /* omp parallel */
+
+    /* reduce per-thread dWo_tl / dbo_tl into the shared accumulators.
+       parallel over D rows of dWo (disjoint writes). */
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static)
+#endif
+    for (int64_t i = 0; i < D; i++) {
+        for (int t = 0; t < max_threads; t++) {
+            const float *src = thread_pool + (size_t)t * (dWo_tl_floats + dbo_tl_floats)
+                             + (size_t)i * (size_t)D;
+            float *dst = dWo_d + i * D;
+            int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+            int64_t ve = D - (D % AX_VF32_WIDTH);
+            for (; j < ve; j += AX_VF32_WIDTH) {
+                ax_vf32 va = ax_vf32_loadu(dst + j);
+                ax_vf32 vb = ax_vf32_loadu(src + j);
+                ax_vf32_storeu(dst + j, ax_vf32_add(va, vb));
+            }
+#endif
+            for (; j < D; j++) dst[j] += src[j];
+        }
+    }
+    if (dbo_d) {
+        for (int t = 0; t < max_threads; t++) {
+            const float *src = thread_pool + (size_t)t * (dWo_tl_floats + dbo_tl_floats)
+                             + dWo_tl_floats;
+            int64_t j = 0;
+#if defined(AX_HAS_SIMD)
+            int64_t ve = D - (D % AX_VF32_WIDTH);
+            for (; j < ve; j += AX_VF32_WIDTH) {
+                ax_vf32 va = ax_vf32_loadu(dbo_d + j);
+                ax_vf32 vb = ax_vf32_loadu(src + j);
+                ax_vf32_storeu(dbo_d + j, ax_vf32_add(va, vb));
+            }
+#endif
+            for (; j < D; j++) dbo_d[j] += src[j];
+        }
+    }
+
+    ax_aligned_free(thread_pool);
+    return AX_OK;
+}
+
 /* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias.
    bias is rank-1, numel == in->shape[axis]. single-pass fused write
    to out. broadcast is along `axis` — the stride of the bias lookup
@@ -5295,8 +5556,9 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
     .dwqkv_split_acc = opt_dwqkv_split_acc,
-    .qkv_head_gemm        = opt_qkv_head_gemm,
-    .dattn_head_gemm_nt   = opt_dattn_head_gemm_nt,
+    .qkv_head_gemm           = opt_qkv_head_gemm,
+    .dattn_head_gemm_nt      = opt_dattn_head_gemm_nt,
+    .mha_output_proj_fused   = opt_mha_output_proj_fused,
     .add_relu   = opt_add_relu,
     .axpy       = opt_axpy,
     .softmax_rowwise = opt_softmax_rowwise,

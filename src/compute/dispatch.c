@@ -512,6 +512,40 @@ int ax_compute_has_dattn_head_gemm_nt(void) {
     return (active_ops && active_ops->dattn_head_gemm_nt) ? 1 : 0;
 }
 
+/* F.4.2 proper / F.3.f strip-fused MHA output projection.
+   single pass over qi strips that does fwd y + bwd dWo + dbo + dattn.
+   backends that lack the slot return AX_ERR_NOT_IMPLEMENTED. */
+ax_status_t ax_compute_mha_output_proj_fused(const ax_tensor_t *attn_flat,
+                                               const ax_tensor_t *Wo,
+                                               const ax_tensor_t *bo,
+                                               const ax_tensor_t *dout,
+                                               ax_tensor_t *y,
+                                               ax_tensor_t *dattn,
+                                               ax_tensor_t *dWo_acc,
+                                               ax_tensor_t *dbo_acc)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->mha_output_proj_fused) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "mha_output_proj_fused not implemented in %s",
+                   active_ops ? active_ops->name : "none");
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    ax_status_t st = active_ops->mha_output_proj_fused(attn_flat, Wo, bo, dout,
+                                                         y, dattn, dWo_acc, dbo_acc);
+    if (st == AX_OK) {
+        if (y       && y->storage)       ax_storage_touch(y->storage);
+        if (dattn   && dattn->storage)   ax_storage_touch(dattn->storage);
+        if (dWo_acc && dWo_acc->storage) ax_storage_touch(dWo_acc->storage);
+        if (dbo_acc && dbo_acc->storage) ax_storage_touch(dbo_acc->storage);
+    }
+    return st;
+}
+
+int ax_compute_has_mha_output_proj_fused(void) {
+    ensure_compute_init();
+    return (active_ops && active_ops->mha_output_proj_fused) ? 1 : 0;
+}
+
 /* fused-scaling gemm: out = alpha * (a @ b) + beta * out. */
 ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
                                 float alpha, float beta, ax_tensor_t *out)

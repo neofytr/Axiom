@@ -115,6 +115,26 @@ struct ax_backend_ops {
                                        int64_t B, int64_t S, int64_t H, int64_t dk,
                                        ax_tensor_t *dO_head);
 
+    /* optional: F.4.2 proper / F.3.f strip-fused MHA output projection.
+       single strip-parallel pass over qi tiles that does:
+         y_strip      = attn_strip @ Wo + bo               (forward)
+         dattn_strip  = dout_strip @ Wo^T                  (backward)
+         dWo_acc     += attn_strip^T @ dout_strip          (backward, accumulate)
+         dbo_acc     += col_sum(dout_strip)                 (backward, accumulate)
+       shapes: attn_flat/dout/y/dattn=[B*S, D], Wo=[D, D], bo/dbo=[D] or NULL,
+               dWo_acc=[D, D]. dWo_acc and dbo_acc are accumulated into
+               (existing values preserved). NULL when unimplemented —
+               attention.c falls back to separate gemm + gemm_nt + gemm_tn
+               + col_sum sequence. */
+    ax_status_t (*mha_output_proj_fused)(const ax_tensor_t *attn_flat,
+                                          const ax_tensor_t *Wo,
+                                          const ax_tensor_t *bo,
+                                          const ax_tensor_t *dout,
+                                          ax_tensor_t *y,
+                                          ax_tensor_t *dattn,
+                                          ax_tensor_t *dWo_acc,
+                                          ax_tensor_t *dbo_acc);
+
     /* optional: fused matmul + relu. out = relu(a @ b + bias).
        bias may be NULL for matmul+relu without bias.
        applies max(0, x) during the gemm writeback step, saving a full

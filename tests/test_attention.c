@@ -1086,6 +1086,123 @@ static void test_sdpa_bwd_from_flat_parity(void)
     }
 }
 
+/* ================================================================
+   test: F.4.2 proper / F.3.f opt_mha_output_proj_fused produces
+   bit-equivalent y, dattn, dWo, dbo to the unfused 4-op sequence.
+   ================================================================ */
+static void test_mha_output_proj_fused_parity(void)
+{
+    struct shape_case { int64_t rows, D; bool with_bias; };
+    struct shape_case cases[] = {
+        { 32,  16,  true  },   /* tiny */
+        { 64,  64,  true  },   /* small */
+        { 128, 128, false },   /* medium no-bias */
+        { 256, 64,  true  },   /* multi-strip Bq=32 → 8 strips */
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
+        struct shape_case c = cases[ci];
+        int64_t rows = c.rows, D = c.D;
+
+        ax_set_seed(22222 + (int)ci);
+        int64_t flat_sh[]   = {rows, D};
+        int64_t Wo_sh[]     = {D, D};
+        int64_t bo_sh[]     = {D};
+
+        ax_tensor_t *attn = ax_tensor_rand(flat_sh, 2, -0.1f, 0.1f);
+        ax_tensor_t *Wo   = ax_tensor_rand(Wo_sh, 2, -0.1f, 0.1f);
+        ax_tensor_t *bo   = c.with_bias ? ax_tensor_rand(bo_sh, 1, -0.05f, 0.05f) : NULL;
+        ax_tensor_t *dout = ax_tensor_rand(flat_sh, 2, -0.1f, 0.1f);
+
+        /* reference path: 4 separate ops */
+        ax_tensor_t *y_ref     = ax_tensor_create(flat_sh, 2, AX_FLOAT32);
+        ax_tensor_t *dattn_ref = ax_tensor_create(flat_sh, 2, AX_FLOAT32);
+        ax_tensor_t *dWo_ref   = ax_tensor_zeros(Wo_sh, 2, AX_FLOAT32);
+        ax_tensor_t *dbo_ref   = c.with_bias ? ax_tensor_zeros(bo_sh, 1, AX_FLOAT32) : NULL;
+
+        /* y = attn @ Wo + bo */
+        ax_status_t s1 = ax_compute_gemm(attn, Wo, y_ref);
+        AX_TEST_ASSERT_EQ((int)s1, (int)AX_OK, "ref gemm ok");
+        if (c.with_bias) {
+            const float *bd = (const float *)bo->storage->data;
+            float *yd = (float *)y_ref->storage->data;
+            for (int64_t r = 0; r < rows; r++)
+                for (int64_t j = 0; j < D; j++)
+                    yd[r * D + j] += bd[j];
+        }
+        /* dattn = dout @ Wo^T */
+        ax_status_t s2 = ax_compute_gemm_nt(dout, Wo, dattn_ref);
+        AX_TEST_ASSERT_EQ((int)s2, (int)AX_OK, "ref gemm_nt ok");
+        /* dWo += attn^T @ dout */
+        extern void ax_gemm_set_skip_init(bool);
+        ax_gemm_set_skip_init(true);
+        ax_status_t s3 = ax_compute_gemm_tn(attn, dout, dWo_ref);
+        ax_gemm_set_skip_init(false);
+        AX_TEST_ASSERT_EQ((int)s3, (int)AX_OK, "ref gemm_tn ok");
+        /* dbo += col_sum(dout) */
+        if (c.with_bias) {
+            const float *dd = (const float *)dout->storage->data;
+            float *dbd = (float *)dbo_ref->storage->data;
+            for (int64_t j = 0; j < D; j++) {
+                float s = 0.0f;
+                for (int64_t r = 0; r < rows; r++) s += dd[r * D + j];
+                dbd[j] += s;
+            }
+        }
+
+        /* fused */
+        ax_tensor_t *y_fus     = ax_tensor_create(flat_sh, 2, AX_FLOAT32);
+        ax_tensor_t *dattn_fus = ax_tensor_create(flat_sh, 2, AX_FLOAT32);
+        ax_tensor_t *dWo_fus   = ax_tensor_zeros(Wo_sh, 2, AX_FLOAT32);
+        ax_tensor_t *dbo_fus   = c.with_bias ? ax_tensor_zeros(bo_sh, 1, AX_FLOAT32) : NULL;
+
+        ax_status_t s4 = ax_compute_mha_output_proj_fused(
+            attn, Wo, bo, dout, y_fus, dattn_fus, dWo_fus, dbo_fus);
+        AX_TEST_ASSERT_EQ((int)s4, (int)AX_OK, "fused mha_output_proj ok");
+
+        /* compare */
+        int64_t n_y = rows * D;
+        int64_t n_w = D * D;
+        const float *yr = (const float *)y_ref->storage->data;
+        const float *yf = (const float *)y_fus->storage->data;
+        const float *dar = (const float *)dattn_ref->storage->data;
+        const float *daf = (const float *)dattn_fus->storage->data;
+        const float *dwr = (const float *)dWo_ref->storage->data;
+        const float *dwf = (const float *)dWo_fus->storage->data;
+        float maxY = 0, maxDA = 0, maxDW = 0;
+        for (int64_t i = 0; i < n_y; i++) {
+            float a = fabsf(yr[i] - yf[i]);
+            float b = fabsf(dar[i] - daf[i]);
+            if (a > maxY)  maxY  = a;
+            if (b > maxDA) maxDA = b;
+        }
+        for (int64_t i = 0; i < n_w; i++) {
+            float a = fabsf(dwr[i] - dwf[i]);
+            if (a > maxDW) maxDW = a;
+        }
+        AX_TEST_ASSERT(maxY  < 1e-4f, "y matches fused vs unfused");
+        AX_TEST_ASSERT(maxDA < 1e-4f, "dattn matches fused vs unfused");
+        AX_TEST_ASSERT(maxDW < 1e-4f, "dWo matches fused vs unfused");
+        if (c.with_bias) {
+            const float *dbr = (const float *)dbo_ref->storage->data;
+            const float *dbf = (const float *)dbo_fus->storage->data;
+            float maxDB = 0;
+            for (int64_t j = 0; j < D; j++) {
+                float a = fabsf(dbr[j] - dbf[j]);
+                if (a > maxDB) maxDB = a;
+            }
+            AX_TEST_ASSERT(maxDB < 1e-4f, "dbo matches fused vs unfused");
+        }
+
+        ax_tensor_destroy(attn); ax_tensor_destroy(Wo); ax_tensor_destroy(dout);
+        if (bo) ax_tensor_destroy(bo);
+        ax_tensor_destroy(y_ref); ax_tensor_destroy(dattn_ref); ax_tensor_destroy(dWo_ref);
+        if (dbo_ref) ax_tensor_destroy(dbo_ref);
+        ax_tensor_destroy(y_fus); ax_tensor_destroy(dattn_fus); ax_tensor_destroy(dWo_fus);
+        if (dbo_fus) ax_tensor_destroy(dbo_fus);
+    }
+}
+
 int main(void)
 {
     ax_init();
@@ -1107,6 +1224,7 @@ int main(void)
     AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
     AX_RUN_TEST(test_sdpa_fwd_to_flat_parity);
     AX_RUN_TEST(test_sdpa_bwd_from_flat_parity);
+    AX_RUN_TEST(test_mha_output_proj_fused_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();
