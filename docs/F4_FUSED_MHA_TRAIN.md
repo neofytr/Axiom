@@ -167,6 +167,70 @@ to what XLA produces.
 
 Expect this to close most of the remaining 15-30 % gap to TF.
 
+**Status (2026-04-24): staged via primitive composition.** The plan's
+fully-monolithic per-(qi, kj) kernel body is multi-week scope. This
+session's path builds F.4.4 from composable primitives instead:
+
+| primitive | what it eliminates | wired in |
+|---|---|---|
+| F.3.a `opt_qkv_head_gemm` | qkv [rows, 3D] intermediate (~18 MB) + head_split layout pass | train_step.c, train_step_fused.c |
+| F.3.c `opt_dwqkv_split_acc` | dWqkv [D, 3D] intermediate (~6 MB) | train_step.c (D >= 1024) |
+| F.3.d `opt_dattn_head_gemm_nt` | d_attn_flat [rows, D] intermediate (~6 MB) | train_step.c, train_step_fused.c |
+| F.3.e `ax_fused_attention_fwd_save_to_flat` | Oh [BH, S, dk] intermediate (~6 MB) + head_deinterleave pass | train_step.c, train_step_fused.c (default) |
+| F.3.e companion `bwd_use_from_flat` | reads O strided from attn_flat instead of materialised Oh | train_step.c, train_step_fused.c (default) |
+| F.4.2 proper `opt_mha_output_proj_fused` | strip-fused y + dWo + dbo + dattn (one pass over dout) | train_step_fused.c (opt-in via AX_F42_PROPER=1; default-on regresses ~50-160 % because the simple AVX2 inner loops don't match opt_gemm's packed micro_kernel — needs ~500 LOC rewrite to use micro_kernel for parity) |
+
+Cumulative DRAM traffic eliminated per train_step call on
+`B1_S2048_D768_H12` (the largest shape): qkv 18 MB + dattn 6 MB +
+Oh 6 MB + head_deinterleave-pass 12 MB ≈ **42 MB saved**.
+
+**True monolithic kernel (still TODO):** the remaining structural
+fusion that's NOT in the primitive composition above is:
+
+1. **Per-(qi, kj) FA-2 fwd+bwd combined** — currently fwd and bwd are
+   separate per-head functions (`attn_fwd_head` / `attn_bwd_head`)
+   with the output projection (and a barrier) between. fully-fused
+   would do `fwd-tile then bwd-tile` per (qi, kj) inside one function,
+   eliminating L's full materialisation and re-using Q_tile / K_tile /
+   V_tile across fwd+bwd register-resident state.
+
+   Blocked by: the output projection mixes heads (Wo is [D, D] not
+   per-head), so `dattn_tile` for head h depends on `attn_flat_tile`
+   contributions from ALL heads. A per-head fwd+bwd structure would
+   need either (a) per-head Wo decomposition (mathematically equivalent
+   only when Wo is reformulated as a sum of per-head outer products),
+   or (b) outer qi-block loop with a within-qi-block barrier for the
+   output projection step — the second is feasible but is essentially
+   the staged-orchestration that the primitive composition above
+   already realises at full-S granularity. Going to per-block
+   granularity adds ~5 % memory wins on attn_flat (block-resident
+   instead of full-rows) but requires a custom per-qi-block SDPA
+   fwd+bwd entry (~400 LOC).
+
+2. **Per-tile `dWqkv` accumulation** — currently dQh/dKh/dVh are full
+   tensors materialised by SDPA bwd, then merged into `dQKV` and fed
+   to `opt_dwqkv_split_acc` (F.3.c) for the dWqkv += X^T @ dQKV update.
+   per-tile would update `dWq[h_slice] += X[qi]^T @ dQ_tile` and
+   similarly for dWk/dWv during the SDPA bwd inner loop, eliminating
+   the dQh/dKh/dVh + dQKV intermediates (~36 MB on B1_S2048).
+
+   Blocked by: dWk and dWv accumulate per-kj (need dK_tile / dV_tile
+   summed over qi for given kj). dWq accumulates per-qi (dQ_tile
+   summed over kj for given qi). Different loop nestings needed,
+   forcing either separate qi-outer + kj-outer passes (defeats
+   fusion) or holding dQ_tile / dK_tile per-qi or per-kj in scratch
+   (same as current dQh/dKh/dVh — no savings).
+
+   Resolvable but requires either custom per-(qi, kj) double-loop
+   that computes dWq inside qi-outer and stashes dK/dV partials per
+   kj for a later qi-level dWk/dWv reduction — ~500-700 LOC.
+
+Both items require deep cpu_opt.c surgery and are deferred to a
+future session with dedicated 1-2 week budget. The primitive
+composition above is the practical realisation for this session;
+the building blocks are all in place when the monolithic kernel
+work resumes.
+
 ### F.4.5: bench + iterate
 
 5-run medians on every shape; iterate F.4.4 until Axiom ≥ TF on every

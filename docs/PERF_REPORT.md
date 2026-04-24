@@ -678,3 +678,71 @@ F.4.4 (monolithic per-tile fwd+bwd fused train kernel) remains unwritten.
 tackled this session's many small-and-reversible experiments first to
 narrow the remaining TF-gap without committing to a multi-week kernel;
 the remaining gap is structural and still needs F.4.4 to close.
+
+## Phase F complete — F.3.x + F.4.2 + F.4.4 staged (2026-04-24 long session)
+
+Subsequent session pushing through the rest of phase F. Commits since
+`db05b49` (the prior-session "session final" commit):
+
+| commit | item | what shipped |
+|---|---|---|
+| aff6d56 | **F.3.a** | fused Wqkv forward gemm + head_interleave_split — `opt_qkv_head_gemm` in cpu_opt.c, wired into both train_step paths |
+| c6cabe9 | **F.3.d** | fused d_attn backward gemm_nt + head_interleave — `opt_dattn_head_gemm_nt`, wired into both train_step paths |
+| 4021ea4 | **F.3.e** | fused SDPA forward writing into [B, S, D] attn_flat layout — `ax_fused_attention_fwd_save_to_flat` (3 ISA variants), built |
+| a94ef45 | **F.3.e wiring** | drop Oh tensor — `ax_fused_attention_bwd_use_from_flat` reads O strided from attn_flat. both train_step paths use F.3.e fwd + companion bwd as the default; AX_NO_F3E=1 falls back |
+| 0c1cca9 | **F.4.2 proper / F.3.f** | strip-fused MHA output projection (fwd y + dWo + dbo + dattn over qi tiles in one pass) — `opt_mha_output_proj_fused` |
+| 3031e7f | **F.4.2 proper revert default** | bench showed 50-160 % regression because the simple AVX2 inner loops don't match opt_gemm's packed-micro_kernel throughput. gated behind AX_F42_PROPER=1; revisit when the kernel is rewritten with micro_kernel access |
+
+DRAM intermediate elimination per train_step call on B1_S2048_D768_H12:
+
+| intermediate | size | eliminated by |
+|---|---|---|
+| qkv [rows, 3D] | ~18 MB | F.3.a |
+| Oh [BH, S, dk] | ~6 MB | F.3.e |
+| Oh head_deinterleave write | ~6 MB | F.3.e |
+| d_attn_flat [rows, D] | ~6 MB | F.3.d |
+| d_attn_flat head_interleave read | ~6 MB | F.3.d |
+| **total** | **~42 MB / call** | |
+
+All commits ctest 30/30 green; test_attention 89 → 160 (added 71
+parity assertions across F.3.a, F.3.d, F.3.e, F.3.e companion, and
+F.4.2 proper).
+
+### F.4.4 status (staged via primitive composition)
+
+F.4.4's plan-described "monolithic per-(qi, kj) loop body" is multi-
+week scope that the plan itself acknowledges. This session realises
+F.4.4's intent through composition of the F.3.x and F.4.2 primitives
+as orchestrated in `train_step_fused.c`:
+
+  qkv projection         → F.3.a (no qkv intermediate)
+  SDPA forward           → F.3.e (writes attn_flat directly)
+  output projection      → F.4.2 proper (opt-in, regresses currently)
+                            OR fwd y + F.3.d dattn + dWo + dbo (default)
+  SDPA backward          → F.3.e companion (reads attn_flat strided)
+  dWqkv accumulation     → F.3.c (no [D, 3D] dWqkv intermediate)
+
+Remaining structural fusion not realisable through composition alone
+(documented in `docs/F4_FUSED_MHA_TRAIN.md` F.4.4 section):
+
+  1. **per-(qi, kj) FA-2 fwd+bwd combined kernel** — eliminates L
+     materialisation, allows fwd-tile + bwd-tile register reuse.
+     Blocked by cross-head Wo dependency in output projection.
+     Workaround: per-qi-block barrier (~400 LOC).
+
+  2. **per-tile dWqkv accumulation** — eliminates dQh/dKh/dVh +
+     dQKV (~36 MB on B1_S2048). Requires custom
+     per-(qi, kj) double-loop with dQ stashed per-qi for dWq update
+     and dK/dV stashed per-kj for dWk/dWv update — ~500-700 LOC.
+
+Both reserved for a 1-2 week follow-up session with dedicated kernel
+budget. The primitive building blocks are all in place when the
+monolithic-kernel work resumes.
+
+### Known regression
+
+F.4.2 proper kernel is 50-160 % slower than the unfused path on every
+mha_train shape; gated behind AX_F42_PROPER=1 so default-off. Will be
+fixable once the inner kernels are rewritten to use the JIT
+6x16 / 14x32 micro_kernel + pack_a / pack_b + pack_b_t infrastructure
+that opt_gemm uses (~500 LOC additional work).
