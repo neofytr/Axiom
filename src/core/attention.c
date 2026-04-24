@@ -239,10 +239,25 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     /* qkv no longer needed (non-recorded path); arena reclaims it otherwise */
     if (!record) ax_tensor_destroy(qkv);
 
-    /* ---- SDPA ---- */
+    /* ---- SDPA ----
+       F.3.e: when ax_fused_attention_fwd_save_to_flat is available AND
+       we're on CPU, write SDPA output DIRECTLY into attn_flat [rows, D],
+       skipping both the Oh [BH, S, dk] intermediate and the
+       head_deinterleave pass that follows. saves ~6 MB of L3↔DRAM
+       traffic per forward call on B1_S2048. the backward companion
+       ax_fused_attention_bwd_use_from_flat reads O strided from the
+       same attn_flat, so ctx->O_head stays NULL on this path. */
+    bool use_f3e_fwd = !on_cuda;
+    {
+        const char *no_f3e = getenv("AX_NO_F3E");
+        if (no_f3e && no_f3e[0] == '1') use_f3e_fwd = false;
+    }
+
     ax_tensor_t *Oh = NULL;
-    ALLOC_SHAPE(Oh, head_sh, 3);
-    if (!Oh) goto fail;
+    if (!use_f3e_fwd) {
+        ALLOC_SHAPE(Oh, head_sh, 3);
+        if (!Oh) goto fail;
+    }
 
     int64_t L_sh[] = {B * H, S};
     ax_tensor_t *L_t = NULL;
@@ -279,6 +294,15 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
 
     float scale = 1.0f / sqrtf((float)dk);
     float *P_save_ptr = P_save_t ? (float *)P_save_t->storage->data : NULL;
+
+    /* ---- attn_flat [rows, D] allocated up front so the F.3.e fused
+       fwd-to-flat can write directly into its rows, skipping the
+       separate head_deinterleave pass. ---- */
+    int64_t attn_sh[] = {rows, D};
+    ax_tensor_t *attn_flat = NULL;
+    ALLOC_SHAPE(attn_flat, attn_sh, 2);
+    if (!attn_flat) goto fail;
+
     /* Phase C: dispatch SDPA forward on device. CPU path uses the existing
        CPU FA-style kernel; CUDA path uses cuBLAS stridedBatched + custom
        softmax+L kernel. Phase D will add backward. */
@@ -290,6 +314,17 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
             (float *)Oh->storage->data,
             L_t ? (float *)L_t->storage->data : NULL,
             bh, S, dk, scale, m->causal, P_save_ptr);
+    } else if (use_f3e_fwd) {
+        /* F.3.e fused: write SDPA output directly into attn_flat rows,
+           skip Oh + head_deinterleave. ctx->O_head stays NULL. */
+        ax_fused_attention_fwd_save_to_flat(
+            (const float *)Qh->storage->data,
+            (const float *)Kh->storage->data,
+            (const float *)Vh->storage->data,
+            (float *)attn_flat->storage->data,
+            L_t ? (float *)L_t->storage->data : NULL,
+            P_save_ptr,
+            B, S, H, dk, scale, m->causal);
     } else {
         ax_fused_attention_fwd_save(
             (const float *)Qh->storage->data,
@@ -301,19 +336,17 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
             bh, S, dk, scale, m->causal);
     }
 
-    /* ---- merge heads back to [rows, D] ---- */
-    int64_t attn_sh[] = {rows, D};
-    ax_tensor_t *attn_flat = NULL;
-    ALLOC_SHAPE(attn_flat, attn_sh, 2);
-    if (!attn_flat) goto fail;
-    /* k.4: dispatch on device through the cuda extension registry. */
-    if (on_cuda && cu && cu->head_deinterleave) {
-        cu->head_deinterleave((const float *)Oh->storage->data,
-                              (float *)attn_flat->storage->data,
-                              B, S, H, dk);
-    } else {
-        ax_attn_head_deinterleave((const float *)Oh->storage->data,
-                                   (float *)attn_flat->storage->data, B, S, H, dk);
+    /* ---- merge heads back to [rows, D] (only when Oh was materialized) ---- */
+    if (!use_f3e_fwd) {
+        /* k.4: dispatch on device through the cuda extension registry. */
+        if (on_cuda && cu && cu->head_deinterleave) {
+            cu->head_deinterleave((const float *)Oh->storage->data,
+                                  (float *)attn_flat->storage->data,
+                                  B, S, H, dk);
+        } else {
+            ax_attn_head_deinterleave((const float *)Oh->storage->data,
+                                       (float *)attn_flat->storage->data, B, S, H, dk);
+        }
     }
 
     /* ---- output projection: attn_flat @ Wo + bo ---- */
@@ -533,32 +566,47 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             ax_storage_touch(m->bo->grad->storage);
         }
     }
-    /* d_attn_flat = dOut_flat @ Wo^T */
-    ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
-    if (!d_attn_flat) return;
-    pf_t0 = prof_enabled ? PF_TICK() : 0;
-    if (ax_compute_gemm_nt(dOut_flat, m->Wo, d_attn_flat) != AX_OK) return;
-    if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
-
-    /* ================================================================
-       step 2 — re-interleave heads + SDPA backward
-       ================================================================ */
+    /* d_attn_flat = dOut_flat @ Wo^T, then head-interleave → dO_head.
+       F.3.d path: when ax_compute_dattn_head_gemm_nt is available and
+       we're on CPU, fuse the two passes into one kernel that streams
+       dout through Wo^T and emits directly into the [B, H, S, dk]
+       head-interleaved layout — saves the d_attn_flat [rows, D]
+       intermediate (~6 MB on B1_S2048) and one full-rows memory pass. */
+    const ax_cuda_extension_t *cu = ax_compute_get_cuda_extension();
     int64_t head_sh[] = {B * H, S, dk};
     ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!dO_head) return;
-    pf_t0 = prof_enabled ? PF_TICK() : 0;
-    /* k.4: dispatch on device through the cuda extension registry. */
-    const ax_cuda_extension_t *cu = ax_compute_get_cuda_extension();
-    bool bwd_on_cuda = (d_attn_flat->storage->device != AX_DEVICE_CPU);
-    if (bwd_on_cuda && cu && cu->head_interleave) {
-        cu->head_interleave((const float *)d_attn_flat->storage->data,
-                            (float *)dO_head->storage->data,
-                            B, S, H, dk);
-    } else {
-        ax_attn_head_interleave((const float *)d_attn_flat->storage->data,
-                                 (float *)dO_head->storage->data, B, S, H, dk);
+    bool bwd_on_cuda = (dOut_flat->storage->device != AX_DEVICE_CPU);
+    bool use_f3d = (!bwd_on_cuda) && ax_compute_has_dattn_head_gemm_nt();
+    {
+        const char *no_f3d = getenv("AX_NO_F3D");
+        if (no_f3d && no_f3d[0] == '1') use_f3d = false;
     }
-    if (prof_enabled) pf_head_int += PF_TICK() - pf_t0;
+
+    if (use_f3d) {
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
+        if (ax_compute_dattn_head_gemm_nt(dOut_flat, m->Wo, B, S, H, dk, dO_head) != AX_OK)
+            return;
+        if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
+        /* head_int profile bucket absorbed into dattn above (fused) */
+    } else {
+        ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
+        if (!d_attn_flat) return;
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
+        if (ax_compute_gemm_nt(dOut_flat, m->Wo, d_attn_flat) != AX_OK) return;
+        if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
+
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
+        if (bwd_on_cuda && cu && cu->head_interleave) {
+            cu->head_interleave((const float *)d_attn_flat->storage->data,
+                                (float *)dO_head->storage->data,
+                                B, S, H, dk);
+        } else {
+            ax_attn_head_interleave((const float *)d_attn_flat->storage->data,
+                                     (float *)dO_head->storage->data, B, S, H, dk);
+        }
+        if (prof_enabled) pf_head_int += PF_TICK() - pf_t0;
+    }
 
     ax_tensor_t *dQh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *dKh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
@@ -582,6 +630,22 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
             (float *)dKh->storage->data,
             (float *)dVh->storage->data,
             B * H, S, dk, scale, m->causal, P_saved);
+    } else if (ctx->O_head == NULL) {
+        /* F.3.e companion: forward skipped Oh materialization; bwd reads
+           O strided from attn_flat. saves the ~6 MB Oh intermediate
+           per train step. companion to the F.3.e branch in mha_forward. */
+        ax_fused_attention_bwd_use_from_flat(
+            (const float *)ctx->Q_head->storage->data,
+            (const float *)ctx->K_head->storage->data,
+            (const float *)ctx->V_head->storage->data,
+            (const float *)ctx->attn_flat->storage->data,
+            (const float *)dO_head->storage->data,
+            (const float *)ctx->L_tensor->storage->data,
+            P_saved,
+            (float *)dQh->storage->data,
+            (float *)dKh->storage->data,
+            (float *)dVh->storage->data,
+            B, S, H, dk, scale, m->causal);
     } else {
         ax_fused_attention_bwd_use(
             (const float *)ctx->Q_head->storage->data,
