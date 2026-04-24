@@ -202,6 +202,50 @@ static inline bool resolve_fused_bh(void)
     return (e && e[0] == '1');
 }
 
+/* shape-dispatched auto-enable of hoist+fused_bh.
+   empirically measured (4-run medians, bg-noise):
+     B8_S128_D512_H8   (BH=64, S=128)  : -16 % vs default — BIG WIN
+     B4_S512_D768_H12  (BH=48, S=512)  : neutral
+     B2_S1024_D768_H12 (BH=24, S=1024) : +2 % regression
+     B1_S512_D1024_H16 (BH=16, S=512)  : +3 % regression
+     B1_S2048_D768_H12 (BH=12, S=2048) : neutral
+   pattern: fused_bh wins on high-BH + small-S. WHY: each thread reuses
+   attn_flat[bh_slice] = S*dk floats IN-CACHE across the fwd→bwd handoff.
+   when S*dk*4 fits L1 comfortably (≤ 32 KB typical L1d), the whole
+   per-head working set lives in L1 throughout and the fwd-writes-bwd-
+   reads memcpy via cache is free. when it doesn't fit (S=512 with dk=64
+   = 128 KB per head), attn_flat[bh_slice] spills to L2/L3 and the cache-
+   reuse benefit disappears — at that point the combined kernel's
+   reduced scheduling flexibility (each thread must do fwd+bwd for same
+   bh together) becomes a net loss.
+   threshold — S * dk * sizeof(float) ≤ 32 KB corresponds to the
+   per-head attn_flat slice fitting within ONE L1d line on the vast
+   majority of modern CPUs (Intel / AMD x86-64 L1d sizes are 32-48 KB;
+   Apple M-series L1d are 128-192 KB so the threshold is conservative).
+   when the slice doesn't fit L1, the fwd→bwd cache-reuse benefit
+   evaporates and the combined kernel's reduced scheduling flexibility
+   becomes a net loss (measured +4% regression on B1_S512 which has
+   per_head_bytes = 128 KB).
+   BH ≥ max_threads ensures the combined kernel has enough heads to
+   saturate the team; if BH < NT the spare-thread n_inner path below
+   is preferable for parallelism.
+   env-override AX_V4_AUTO=0 disables this heuristic (keeps default path);
+   AX_V4_AUTO=1 explicit opt-in (same as default). */
+static inline bool auto_enable_fused_bh(int64_t S, int64_t dk, int64_t BH)
+{
+    const char *e = getenv("AX_V4_AUTO");
+    if (e && e[0] == '0') return false;
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+#else
+    int nt = 1;
+#endif
+    int64_t per_head_bytes = S * dk * (int64_t)sizeof(float);
+    bool fits_l1 = per_head_bytes <= 32 * 1024;
+    bool enough_heads = BH >= (int64_t)nt;
+    return fits_l1 && enough_heads;
+}
+
 ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
                                   const ax_tensor_t *x,
                                   const ax_tensor_t *dout,
@@ -379,6 +423,14 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
 
     bool hoist = resolve_hoist();
     bool fused_bh = resolve_fused_bh();
+    /* shape-dispatched auto-enable: when the heuristic indicates the
+       combined kernel will win, flip both flags. explicit env overrides
+       (AX_V4_HOIST / AX_V4_FUSED_BH set) are NEVER downgraded — if the
+       user asks for hoist=1 we honour it regardless of shape. */
+    if (!hoist && !fused_bh && auto_enable_fused_bh(S, dk, B * H)) {
+        hoist = true;
+        fused_bh = true;
+    }
     if (fused_bh) hoist = true;  /* fused_bh implies hoist */
 
     if (hoist) {
