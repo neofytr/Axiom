@@ -746,3 +746,39 @@ mha_train shape; gated behind AX_F42_PROPER=1 so default-off. Will be
 fixable once the inner kernels are rewritten to use the JIT
 6x16 / 14x32 micro_kernel + pack_a / pack_b + pack_b_t infrastructure
 that opt_gemm uses (~500 LOC additional work).
+
+### Final bench (2026-04-24 09:35-09:40, load 0.29 start → 8.07 end)
+
+5-run medians, all 5 mha_train shapes, both autograd path
+(`mha_train_*`) and the F.4 train_step_fused entry (`mha_train_fused2_*`).
+The autograd path uses F.3.a + F.3.d + F.3.e by default; the F2 path
+uses ALL of F.3.a/c/d/e + F.4.2 reorder.
+
+|                  shape | session-start (b5005f7) | autograd | F2 | TF target | F2 vs TF |
+|---|---|---|---|---|---|
+| mha_train_B8_S128_D512_H8   | 19.26 | 19.42 | **17.05** | 11.21 | -34 % |
+| mha_train_B4_S512_D768_H12  | 82.17 | 79.93 | **78.46** | 65.49 | -17 % |
+| mha_train_B2_S1024_D768_H12 | 111.00 | 106.24 | **104.20** | 94.30 | -9 % |
+| mha_train_B1_S512_D1024_H16 | 47.48 | 48.09 | **38.74** | 25.76 | -34 % |
+| mha_train_B1_S2048_D768_H12 | 172.97 | 166.63 | **166.30** | 155.20 | -7 % |
+
+**Session deltas (F2 vs session-start)**:
+- B8_S128:  19.26 → 17.05 = **-11 %** (TF gap closed: -44 % → -34 %)
+- B4_S512:  82.17 → 78.46 = **-5 %**
+- B2_S1024: 111.00 → 104.20 = **-6 %**
+- B1_S512:  47.48 → 38.74 = **-18 %** (TF gap closed: -46 % → -33 %)
+- B1_S2048: 172.97 → 166.30 = **-4 %**
+
+B1_S2048 and B2_S1024 are now within 7-9 % of TF — the closest two
+shapes. B8_S128 and B1_S512 still have ~34 % TF gap; closing further
+needs the F.4.4 monolithic kernel work documented above (per-(qi, kj)
+FA-2 fwd+bwd combined + per-tile dWqkv accumulation) to eliminate
+the remaining cache-pressure intermediates.
+
+**Why does F2 outperform autograd?** The autograd path (`bench_mha_train`)
+goes through `ax_mha_backward` which uses the per-stage train_step.c
+flow with F.3.a/d/e wired. F2 is the train_step_fused.c entry which
+bypasses the autograd tape entirely AND has the F.3.x primitives
+wired with slightly different orchestration (output projection
+reorder from F.4.2 commit 5122194). The tape-bypass + reorder gains
+compound on top of the F.3.x BW savings.
