@@ -702,6 +702,28 @@ static void test_mha_train_step_v4_qi_block_parity(void)
     unsetenv("AX_V4_QI_BLOCK");
 }
 
+/* F.4.4 Phase E: hoisted omp parallel region driver. the hoisted path
+   replaces 2*N team spawn/joins per train step with ONE enclosing
+   parallel region around the full qi-block loop. this test covers both
+   qi_block = S (one iteration; still uses _inner primitives inside one
+   region) and qi_block < S (multiple iterations — where the spawn-cost
+   savings matter). any divergence from the non-hoisted path is a bug
+   in the barrier / accumulation structure of the hoisted driver. */
+static void test_mha_train_step_v4_hoist_parity(void)
+{
+    setenv("AX_V4_HOIST", "1", 1);
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_hoist_fullS");
+
+    setenv("AX_V4_QI_BLOCK", "4", 1);
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_hoist_blk4");
+
+    setenv("AX_V4_QI_BLOCK", "2", 1);
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_hoist_blk2");
+
+    unsetenv("AX_V4_QI_BLOCK");
+    unsetenv("AX_V4_HOIST");
+}
+
 /* ================================================================
    test: F.3.a opt_qkv_head_gemm produces bit-for-bit identical Qh/Kh/Vh
    to the unfused gemm + ax_attn_head_interleave_qkv_split_bias sequence.
@@ -1554,6 +1576,7 @@ int main(void)
     AX_RUN_TEST(test_mha_train_step_fused_parity);
     AX_RUN_TEST(test_mha_train_step_v4_parity);
     AX_RUN_TEST(test_mha_train_step_v4_qi_block_parity);
+    AX_RUN_TEST(test_mha_train_step_v4_hoist_parity);
     AX_RUN_TEST(test_qkv_head_gemm_parity);
     AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
     AX_RUN_TEST(test_sdpa_fwd_to_flat_parity);

@@ -209,6 +209,39 @@ void ax_fused_attention_bwd_use_from_flat_qi_block(
     int64_t qi_start, int64_t qi_end,
     float scale, bool causal);
 
+/* F.4.4 Phase E: inner variants — assume caller is already inside a
+   #pragma omp parallel region. same I/O semantics as the non-inner
+   variants; the internal #pragma omp for uses the enclosing team.
+   lets train_step_v4's hoisted driver wrap the entire qi-block loop
+   in ONE parallel region (one spawn/join instead of 2*N).
+
+   contract:
+     - both variants must be called from EVERY thread of the enclosing
+       team (they contain a #pragma omp for whose implicit barrier is
+       hit by every thread).
+     - the implicit barrier at the end of each inner omp for gives the
+       caller a free synchronisation between a fwd call and a bwd call
+       issued inside the same qi-block iteration.
+     - pre-zeroing requirements identical to the non-inner variants:
+       dK/dV zeroed once BEFORE entering the parallel region; dQ is
+       zeroed inside the bwd inner via per-bh memset in the worksharing
+       loop. */
+void ax_fused_attention_fwd_save_to_flat_qi_block_inner(
+    const float *Q, const float *K, const float *V,
+    float *attn_flat, float *L, float *P_save,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal);
+
+void ax_fused_attention_bwd_use_from_flat_qi_block_inner(
+    const float *Q, const float *K, const float *V,
+    const float *attn_flat, const float *dO, const float *L,
+    const float *P_saved,
+    float *dQ, float *dK, float *dV,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal);
+
 /* ================================================================
    SDPA PRIMITIVE — raw compute, use when you manage Q/K/V yourself
    ================================================================ */

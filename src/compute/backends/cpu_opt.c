@@ -6197,6 +6197,58 @@ void AX_SYM(ax_cpu_sdpa_fwd_to_flat_qi_block)(
     }
 }
 
+/* F.4.4 Phase E: qi-block fwd variant that DOES NOT open its own omp
+   parallel region. caller guarantees we are already inside one. this
+   lets the train_step_v4 hoisted driver put one big parallel region
+   around the entire qi-block loop so we pay the team spawn/join once
+   per train step instead of 2*N times (N = number of qi-blocks). same
+   semantics as ax_cpu_sdpa_fwd_to_flat_qi_block otherwise. the implicit
+   barrier at the end of the inner #pragma omp for synchronises threads
+   between fwd and bwd inside the same qi-block iteration so attn_flat
+   / L rows written by fwd are visible to bwd on every thread. */
+void AX_SYM(ax_cpu_sdpa_fwd_to_flat_qi_block_inner)(
+    const float *Q, const float *K, const float *V,
+    float *attn_flat, float *L,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal, const int8_t *pad_mask,
+    float *P_save)
+{
+    int64_t BH = B * H;
+    int64_t D  = H * dk;
+    int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;
+
+    int64_t want = (int64_t)S * (int64_t)sizeof(float);
+    float *row_max = ax_tls_grow(&tl_sdpa_row_max, &tl_sdpa_row_max_S, want);
+    float *row_sum = ax_tls_grow(&tl_sdpa_row_sum, &tl_sdpa_row_sum_S, want);
+    if (!row_max || !row_sum) {
+        /* alloc failed on this thread; still need to participate in the
+           enclosing omp-for worksharing so the barrier is reached.
+           iterate as a no-op — output rows remain as prior iterations
+           left them, but we can't correct bad inputs here. */
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t bh = 0; bh < BH; bh++) { (void)bh; }
+        return;
+    }
+
+#ifdef _OPENMP
+    #pragma omp for schedule(dynamic, 1)
+#endif
+    for (int64_t bh = 0; bh < BH; bh++) {
+        int64_t b = bh / H, h = bh % H;
+        float *out_slot = attn_flat + b * S * D + h * dk;
+        attn_fwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                       out_slot, /* out_stride */ D,
+                       L ? L + bh * S : NULL,
+                       row_max, row_sum, S, dk, scale, causal, pad_mask,
+                       P_save ? P_save + bh * pscale_sz : NULL,
+                       qi_start, qi_end);
+    }
+}
+
 /* ================================================================
    backward pass
 
@@ -7325,6 +7377,86 @@ void AX_SYM(ax_cpu_sdpa_bwd_from_flat_qi_block)(
                            qi_start, qi_end);
         }
     done_qi_b:;
+    }
+}
+
+/* F.4.4 Phase E: qi-block bwd variant that DOES NOT open its own omp
+   parallel region. caller guarantees we are already inside one. companion
+   to ax_cpu_sdpa_fwd_to_flat_qi_block_inner.
+
+   dQ zeroing for [qi_start, qi_end) rows is folded INTO the bh compute
+   loop — each thread zeros its own assigned bh-slice immediately before
+   computing on it, so no separate zero loop / barrier is required.
+   dK / dV accumulate across qi-block calls as in the non-inner variant —
+   caller pre-zeros dK = dV = 0 before entering the parallel region. */
+void AX_SYM(ax_cpu_sdpa_bwd_from_flat_qi_block_inner)(
+    const float *Q, const float *K, const float *V,
+    const float *attn_flat, const float *dO, const float *L,
+    float *dQ, float *dK, float *dV,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    int64_t qi_start, int64_t qi_end,
+    float scale, bool causal, const float *P_saved)
+{
+    int64_t BH = B * H;
+    int64_t D  = H * dk;
+    int64_t head_sz = S * dk;
+    int64_t pscale_sz = S * S;
+
+    int n_inner = ax_attn_bwd_inner_threads(BH);
+
+    if (qi_end > S) qi_end = S;
+    if (qi_start < 0) qi_start = 0;
+    if (qi_start >= qi_end) return;
+    int64_t qi_stride_dk = (qi_end - qi_start) * dk;
+
+    float *Di = ax_tls_grow(&tl_bwd_di, &tl_bwd_di_bytes,
+                            (int64_t)S * (int64_t)sizeof(float));
+    if (!Di) {
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t bh = 0; bh < BH; bh++) { (void)bh; }
+        return;
+    }
+
+#ifdef _OPENMP
+    #pragma omp for schedule(dynamic, 1)
+#endif
+    for (int64_t bh = 0; bh < BH; bh++) {
+        int64_t b = bh / H, h = bh % H;
+        const float *dOh = dO + bh * head_sz;
+        const float *attn_flat_h = attn_flat + b * S * D + h * dk;
+
+        /* zero ONLY this bh's dQ slice for [qi_start, qi_end). done
+           inline so the write is on the thread that will immediately
+           read it back — the data is L1-hot when attn_bwd_head runs. */
+        memset(dQ + bh * head_sz + qi_start * dk, 0,
+               (size_t)qi_stride_dk * sizeof(float));
+
+        /* Di[qi_start..qi_end] = dot(dO[i], O[i]) — strided O read. */
+        for (int64_t i = qi_start; i < qi_end; i++) {
+            const float *do_r = dOh + i * dk;
+            const float *o_r  = attn_flat_h + i * D;
+            float dot = 0;
+            int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+            ax_vf32 vd = ax_vf32_zero();
+            int64_t ve = dk - (dk % AX_VF32_WIDTH);
+            for (; d < ve; d += AX_VF32_WIDTH)
+                vd = ax_vf32_fmadd(ax_vf32_loadu(do_r + d),
+                                   ax_vf32_loadu(o_r + d), vd);
+            dot = ax_vf32_hsum(vd);
+#endif
+            for (; d < dk; d++) dot += do_r[d] * o_r[d];
+            Di[i] = dot;
+        }
+        attn_bwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                       dOh, L + bh * S, Di,
+                       dQ + bh * head_sz, dK + bh * head_sz, dV + bh * head_sz,
+                       S, dk, scale, causal,
+                       P_saved ? P_saved + bh * pscale_sz : NULL,
+                       n_inner, BH,
+                       qi_start, qi_end);
     }
 }
 

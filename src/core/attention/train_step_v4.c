@@ -177,6 +177,19 @@ static inline int64_t resolve_qi_block(int64_t S)
     return block > S ? S : block;
 }
 
+/* AX_V4_HOIST=1 — Phase E driver. wrap the qi-block loop in ONE
+   #pragma omp parallel region, call _inner fwd/bwd variants inside.
+   removes 2*N team spawn/join per train step (N = number of qi-blocks)
+   and preserves thread-locality across fwd→bwd handoff inside each
+   qi-block iteration. default off pending bench validation. read per
+   call so parity tests can flip the flag without process restart;
+   getenv is cheap (pointer comparison after the first lookup). */
+static inline bool resolve_hoist(void)
+{
+    const char *e = getenv("AX_V4_HOIST");
+    return (e && e[0] == '1');
+}
+
 ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
                                   const ax_tensor_t *x,
                                   const ax_tensor_t *dout,
@@ -352,36 +365,79 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
             (float *)dO_head->storage->data, B, S, H, dk);
     }
 
-    for (int64_t qi = 0; qi < S; qi += qi_block) {
-        int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
+    bool hoist = resolve_hoist();
 
-        /* (1) SDPA fwd for [qi, qi_end) → attn_flat[qi..qi_end] + L / P_save */
-        ax_fused_attention_fwd_save_to_flat_qi_block(
-            (const float *)Qh->storage->data,
-            (const float *)Kh->storage->data,
-            (const float *)Vh->storage->data,
-            (float *)attn_flat->storage->data,
-            (float *)L_t->storage->data,
-            P_save_ptr,
-            B, S, H, dk, qi, qi_end, scale, m->causal);
+    if (hoist) {
+        /* Phase E: single parallel region wraps the whole qi-block loop.
+           inside each iteration, _inner fwd/bwd use the enclosing team's
+           #pragma omp for worksharing. the implicit barrier at the end
+           of each inner omp for synchronises threads between fwd and
+           bwd (bwd reads the L / attn_flat that fwd just wrote). between
+           iterations the same barrier ensures iter k+1's fwd doesn't
+           start until iter k's bwd is done — which matters because bwd
+           ACCUMULATES into dKh/dVh across iters. */
+#ifdef _OPENMP
+        #pragma omp parallel
+#endif
+        {
+            for (int64_t qi = 0; qi < S; qi += qi_block) {
+                int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
 
-        /* (2) SDPA bwd for [qi, qi_end). overwrites dQh rows, accumulates
-              dKh/dVh. reads attn_flat[qi..qi_end] / L / P_save / dO_head —
-              attn_flat[qi..qi_end] (just written above) is L2-hot for this
-              call even when the full attn_flat exceeds L2. dO_head is the
-              full pre-computed tensor (stream-through read). */
-        ax_fused_attention_bwd_use_from_flat_qi_block(
-            (const float *)Qh->storage->data,
-            (const float *)Kh->storage->data,
-            (const float *)Vh->storage->data,
-            (const float *)attn_flat->storage->data,
-            (const float *)dO_head->storage->data,
-            (const float *)L_t->storage->data,
-            P_save_ptr,
-            (float *)dQh->storage->data,
-            (float *)dKh->storage->data,
-            (float *)dVh->storage->data,
-            B, S, H, dk, qi, qi_end, scale, m->causal);
+                ax_fused_attention_fwd_save_to_flat_qi_block_inner(
+                    (const float *)Qh->storage->data,
+                    (const float *)Kh->storage->data,
+                    (const float *)Vh->storage->data,
+                    (float *)attn_flat->storage->data,
+                    (float *)L_t->storage->data,
+                    P_save_ptr,
+                    B, S, H, dk, qi, qi_end, scale, m->causal);
+
+                ax_fused_attention_bwd_use_from_flat_qi_block_inner(
+                    (const float *)Qh->storage->data,
+                    (const float *)Kh->storage->data,
+                    (const float *)Vh->storage->data,
+                    (const float *)attn_flat->storage->data,
+                    (const float *)dO_head->storage->data,
+                    (const float *)L_t->storage->data,
+                    P_save_ptr,
+                    (float *)dQh->storage->data,
+                    (float *)dKh->storage->data,
+                    (float *)dVh->storage->data,
+                    B, S, H, dk, qi, qi_end, scale, m->causal);
+            }
+        }
+    } else {
+        for (int64_t qi = 0; qi < S; qi += qi_block) {
+            int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
+
+            /* (1) SDPA fwd for [qi, qi_end) → attn_flat[qi..qi_end] + L / P_save */
+            ax_fused_attention_fwd_save_to_flat_qi_block(
+                (const float *)Qh->storage->data,
+                (const float *)Kh->storage->data,
+                (const float *)Vh->storage->data,
+                (float *)attn_flat->storage->data,
+                (float *)L_t->storage->data,
+                P_save_ptr,
+                B, S, H, dk, qi, qi_end, scale, m->causal);
+
+            /* (2) SDPA bwd for [qi, qi_end). overwrites dQh rows, accumulates
+                  dKh/dVh. reads attn_flat[qi..qi_end] / L / P_save / dO_head —
+                  attn_flat[qi..qi_end] (just written above) is L2-hot for this
+                  call even when the full attn_flat exceeds L2. dO_head is the
+                  full pre-computed tensor (stream-through read). */
+            ax_fused_attention_bwd_use_from_flat_qi_block(
+                (const float *)Qh->storage->data,
+                (const float *)Kh->storage->data,
+                (const float *)Vh->storage->data,
+                (const float *)attn_flat->storage->data,
+                (const float *)dO_head->storage->data,
+                (const float *)L_t->storage->data,
+                P_save_ptr,
+                (float *)dQh->storage->data,
+                (float *)dKh->storage->data,
+                (float *)dVh->storage->data,
+                B, S, H, dk, qi, qi_end, scale, m->causal);
+        }
     }
     (void)d_attn;  /* only used in the non-F.3.d fallback above */
 
