@@ -87,6 +87,11 @@ static inline void mha_make_stack_view(ax_tensor_t *tv, ax_storage_t *st,
     tv->strides[1]   = 1;
 }
 
+/* forward decl — same semantics as train_step_fused.c: tell the gemm
+   backends to accumulate into dst rather than overwrite. defined in
+   src/compute/dispatch.c. */
+extern void ax_gemm_set_skip_init(bool v);
+
 typedef struct {
     ax_mha_t *layer;
     int64_t B, S, D, H, dk;
@@ -552,17 +557,20 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     /* ================================================================
        step 1 — output projection backward
        ================================================================ */
-    /* grad_Wo += attn_flat^T @ dOut_flat   (single [D, rows] @ [rows, D] gemm) */
+    /* grad_Wo += attn_flat^T @ dOut_flat   (single [D, rows] @ [rows, D] gemm).
+       uses ax_gemm_set_skip_init(true) so the gemm accumulates directly
+       into m->Wo->grad, eliminating the scratch [D, D] intermediate and
+       the separate accumulate_f32 pass (~1 MB traffic on D=1024, ~4 MB
+       on D=1024). same pattern train_step_fused / train_step_v4 use. */
     if (m->Wo->requires_grad) {
-        int64_t wo_sh[] = {D, D};
-        ax_tensor_t *scratch = ax_tensor_arena_create(arena, wo_sh, 2, AX_FLOAT32);
-        if (!scratch) return;
         float *dWo = param_grad_ptr(m->Wo);
         if (dWo) {
             pf_t0 = prof_enabled ? PF_TICK() : 0;
-            ax_compute_gemm_tn(ctx->attn_flat, dOut_flat, scratch);
+            ax_gemm_set_skip_init(true);
+            ax_status_t s = ax_compute_gemm_tn(ctx->attn_flat, dOut_flat, m->Wo->grad);
+            ax_gemm_set_skip_init(false);
             if (prof_enabled) pf_wo_grad += PF_TICK() - pf_t0;
-            accumulate_f32((const float *)scratch->storage->data, dWo, D * D);
+            if (s != AX_OK) return;
             ax_storage_touch(m->Wo->grad->storage);
         }
     }
