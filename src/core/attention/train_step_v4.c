@@ -320,41 +320,6 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
 
     int64_t qi_block = resolve_qi_block(S);
 
-    /* Phase C: per-qi-block dWq accumulation. dQh[b*H+h, qi..qi_end, :] is
-       final after each bwd call (dQ is overwritten per block, not
-       accumulated), so we can deinterleave it into a [bq, D] layout per
-       batch and immediately gemm_tn into dWq — no full-S dQKV buffer.
-       dWk/dWv still need full-S dKh/dVh (cross-qi accumulation inside the
-       bwd primitive), so they're handled after the loop.
-
-       the deinterleave buffer is sized for the largest possible qi-block
-       (bq_max = qi_block) and reused across iterations. */
-    int64_t bq_max = qi_block;
-    int64_t db_sh1[] = {3 * D};
-    (void)db_sh1;  /* silences unused when bias branch doesn't fire */
-    float *dQh_batch_buf = NULL;
-    ax_tensor_t *dQh_batch_view = NULL;
-    ax_storage_t *dQh_batch_st = NULL;
-    bool need_wq_grad = m->Wq->requires_grad;
-    bool need_bq_grad = m->use_bias && m->bq && m->bq->requires_grad;
-    if (need_wq_grad || need_bq_grad) {
-        int64_t buf_sh[] = {bq_max, D};
-        ax_tensor_t *dQh_buf_t = ax_tensor_arena_create(arena, buf_sh, 2, AX_FLOAT32);
-        if (!dQh_buf_t) return AX_ERR_ALLOC;
-        dQh_batch_buf = (float *)dQh_buf_t->storage->data;
-        dQh_batch_view = dQh_buf_t;
-    }
-    /* ensure grad buffers exist for the streaming accumulator path (skip_init
-       on gemm_tn requires a non-null dst tensor). */
-    if (need_wq_grad) {
-        if (!ensure_grad_ptr(m->Wq)) return AX_ERR_ALLOC;
-    }
-    float *dbq_acc = NULL;
-    if (need_bq_grad) {
-        dbq_acc = ensure_grad_ptr(m->bq);
-        if (!dbq_acc) return AX_ERR_ALLOC;
-    }
-
     for (int64_t qi = 0; qi < S; qi += qi_block) {
         int64_t qi_end = (qi + qi_block <= S) ? (qi + qi_block) : S;
         int64_t bq = qi_end - qi;
@@ -407,53 +372,10 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
             (float *)dVh->storage->data,
             B, S, H, dk, qi, qi_end, scale, m->causal);
 
-        /* (5) Phase C: stream dWq / dbq from dQh[qi..qi_end] while it's
-              cache-hot. per-batch: deinterleave the H head-strips into a
-              [bq, D] block, gemm_tn X[b, qi..qi_end]^T @ buf → dWq
-              (accumulate). buf is reused across iterations. */
-        if (dQh_batch_buf) {
-            dQh_batch_view->shape[0] = bq;
-            dQh_batch_view->storage->size_bytes =
-                (size_t)(bq * D) * sizeof(float);
-            const float *dQh_data = (const float *)dQh->storage->data;
-            const float *x_data   = (const float *)x_flat_v.storage->data;
-            size_t dk_bytes = (size_t)dk * sizeof(float);
-            for (int64_t b = 0; b < B; b++) {
-                /* head_deinterleave dQh[b*H+h, qi+s, :] → buf[s, h*dk:]. */
-#ifdef _OPENMP
-                #pragma omp parallel for collapse(2) schedule(static)
-#endif
-                for (int64_t s_rel = 0; s_rel < bq; s_rel++) {
-                    for (int64_t h = 0; h < H; h++) {
-                        const float *src = dQh_data
-                            + (b * H + h) * S * dk + (qi + s_rel) * dk;
-                        float *dst = dQh_batch_buf + s_rel * D + h * dk;
-                        memcpy(dst, src, dk_bytes);
-                    }
-                }
-                if (need_wq_grad) {
-                    ax_tensor_t x_sub;
-                    ax_storage_t x_sub_st;
-                    const float *x_ptr = x_data + b * S * D + qi * D;
-                    make_stack_view(&x_sub, &x_sub_st, x_ptr, bq, D);
-                    ax_gemm_set_skip_init(true);
-                    ax_status_t s = ax_compute_gemm_tn(&x_sub, dQh_batch_view,
-                                                         m->Wq->grad);
-                    ax_gemm_set_skip_init(false);
-                    if (s != AX_OK) return s;
-                }
-                if (need_bq_grad) {
-                    col_sum_acc(dQh_batch_buf, dbq_acc, bq, D);
-                }
-            }
-            if (need_wq_grad) ax_storage_touch(m->Wq->grad->storage);
-            if (need_bq_grad) ax_storage_touch(m->bq->grad->storage);
-        }
-
         (void)bq;
     }
 
-    /* (6) fwd y = attn_flat @ Wo + bo (full-rows — all attn_flat rows are
+    /* (5) fwd y = attn_flat @ Wo + bo (full-rows — all attn_flat rows are
        filled by now). */
     if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
     if (m->use_bias) {
@@ -498,66 +420,66 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
         }
     }
 
-    /* (9) Phase C: dWk / dWv / dbk / dbv from dKh, dVh (now finalised after
-       the qi-block loop — the bwd primitive cross-qi accumulates into
-       them, so they only become valid here).
+    /* (8) head_deinterleave merge dQh/dKh/dVh → dQKV [rows, 3D] */
+    ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
+    if (!dQKV) return AX_ERR_ALLOC;
+    ax_attn_head_deinterleave_qkv_merge(
+        (const float *)dQh->storage->data,
+        (const float *)dKh->storage->data,
+        (const float *)dVh->storage->data,
+        (float *)dQKV->storage->data,
+        B, S, H, dk, D);
 
-       head_deinterleave dKh → dKV_flat[:, 0..D], dVh → dKV_flat[:, D..2D]
-       into a single [rows, 2D] buffer, one gemm_tn: dWkv = x^T @ dKV_flat
-       ([D, 2D]), split and accumulate into Wk/Wv grads. memory vs the
-       Phase B dQKV[rows, 3D] path: saves the [rows, D] Q partition
-       (~B*S*D floats; ~6 MB on B=2, S=1024, D=768). */
-    bool need_wkv_grad  = m->Wk->requires_grad || m->Wv->requires_grad;
-    bool need_bkv_grad  = m->use_bias && ((m->bk && m->bk->requires_grad) ||
-                                           (m->bv && m->bv->requires_grad));
-    if (need_wkv_grad || need_bkv_grad) {
-        int64_t dKV_sh[] = {rows, 2 * D};
-        ax_tensor_t *dKV_flat = ax_tensor_arena_create(arena, dKV_sh, 2, AX_FLOAT32);
-        if (!dKV_flat) return AX_ERR_ALLOC;
+    /* (9) dWqkv = x^T @ dQKV, split → dWq / dWk / dWv (accumulate into grads) */
+    bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad ||
+                         m->Wv->requires_grad;
+    if (any_wqkv_grad) {
+        int64_t dW_sh[] = {D, 3 * D};
+        ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
+        if (!dWqkv) return AX_ERR_ALLOC;
+        if (ax_compute_gemm_tn(&x_flat_v, dQKV, dWqkv) != AX_OK) return AX_ERR_BACKEND;
 
-        float *dKV_ptr = (float *)dKV_flat->storage->data;
-        ax_attn_head_deinterleave_slot((const float *)dKh->storage->data,
-                                         dKV_ptr, B, S, H, dk, 2 * D, 0);
-        ax_attn_head_deinterleave_slot((const float *)dVh->storage->data,
-                                         dKV_ptr, B, S, H, dk, 2 * D, D);
-
-        if (need_wkv_grad) {
-            int64_t dW_sh[] = {D, 2 * D};
-            ax_tensor_t *dWkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
-            if (!dWkv) return AX_ERR_ALLOC;
-            if (ax_compute_gemm_tn(&x_flat_v, dKV_flat, dWkv) != AX_OK)
-                return AX_ERR_BACKEND;
-
-            const float *dw = (const float *)dWkv->storage->data;
-            float *dp_k = m->Wk->requires_grad ? ensure_grad_ptr(m->Wk) : NULL;
-            float *dp_v = m->Wv->requires_grad ? ensure_grad_ptr(m->Wv) : NULL;
+        const float *dw = (const float *)dWqkv->storage->data;
+        float *dp_q = m->Wq->requires_grad ? ensure_grad_ptr(m->Wq) : NULL;
+        float *dp_k = m->Wk->requires_grad ? ensure_grad_ptr(m->Wk) : NULL;
+        float *dp_v = m->Wv->requires_grad ? ensure_grad_ptr(m->Wv) : NULL;
 
 #ifdef _OPENMP
-            #pragma omp parallel for schedule(static)
+        #pragma omp parallel for schedule(static)
 #endif
-            for (int64_t i = 0; i < D; i++) {
-                if (dp_k) acc_f32(dw + i * 2 * D,     dp_k + i * D, D);
-                if (dp_v) acc_f32(dw + i * 2 * D + D, dp_v + i * D, D);
-            }
-            if (dp_k) ax_storage_touch(m->Wk->grad->storage);
-            if (dp_v) ax_storage_touch(m->Wv->grad->storage);
+        for (int64_t i = 0; i < D; i++) {
+            if (dp_q) acc_f32(dw + i * 3 * D,         dp_q + i * D, D);
+            if (dp_k) acc_f32(dw + i * 3 * D + D,     dp_k + i * D, D);
+            if (dp_v) acc_f32(dw + i * 3 * D + 2 * D, dp_v + i * D, D);
         }
 
-        if (need_bkv_grad) {
-            int64_t db_sh[] = {2 * D};
-            ax_tensor_t *dbkv = ax_tensor_arena_zeros(arena, db_sh, 1, AX_FLOAT32);
-            if (!dbkv) return AX_ERR_ALLOC;
-            col_sum_acc(dKV_ptr, (float *)dbkv->storage->data, rows, 2 * D);
-            const float *db = (const float *)dbkv->storage->data;
-            if (m->bk && m->bk->requires_grad) {
-                float *dp = ensure_grad_ptr(m->bk);
-                if (dp) { acc_f32(db,     dp, D); ax_storage_touch(m->bk->grad->storage); }
-            }
-            if (m->bv && m->bv->requires_grad) {
-                float *dp = ensure_grad_ptr(m->bv);
-                if (dp) { acc_f32(db + D, dp, D); ax_storage_touch(m->bv->grad->storage); }
-            }
-        }
+        if (dp_q) ax_storage_touch(m->Wq->grad->storage);
+        if (dp_k) ax_storage_touch(m->Wk->grad->storage);
+        if (dp_v) ax_storage_touch(m->Wv->grad->storage);
+    }
+
+    /* (10) dbqkv = colsum(dQKV), split → dbq / dbk / dbv */
+    if (m->use_bias && (m->bq->requires_grad || m->bk->requires_grad ||
+                         m->bv->requires_grad)) {
+        int64_t db_sh[] = {3 * D};
+        ax_tensor_t *dbqkv = ax_tensor_arena_zeros(arena, db_sh, 1, AX_FLOAT32);
+        if (!dbqkv) return AX_ERR_ALLOC;
+        col_sum_acc((const float *)dQKV->storage->data,
+                     (float *)dbqkv->storage->data, rows, 3 * D);
+        const float *db = (const float *)dbqkv->storage->data;
+        #define ACC_BIAS(W, col_off) do {                                     \
+            if ((W)->requires_grad) {                                         \
+                float *dp = ensure_grad_ptr(W);                               \
+                if (dp) {                                                     \
+                    acc_f32(db + (col_off), dp, D);                           \
+                    ax_storage_touch((W)->grad->storage);                     \
+                }                                                             \
+            }                                                                 \
+        } while (0)
+        ACC_BIAS(m->bq, 0);
+        ACC_BIAS(m->bk, D);
+        ACC_BIAS(m->bv, 2 * D);
+        #undef ACC_BIAS
     }
 
     return AX_OK;
