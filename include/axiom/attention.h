@@ -170,6 +170,16 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
                                      const ax_tensor_t *dout,
                                      ax_tensor_t *y_out);
 
+/* F.4.4 monolithic train kernel — multi-phase implementation landing
+   site (see docs/F4_FUSED_MHA_TRAIN.md "F.4.4 phased implementation
+   plan"). same signature/contract as ax_mha_train_step. each F.4.4
+   phase swaps progressively more of the body in place; initial scaffold
+   delegates to ax_mha_train_step_fused. */
+ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
+                                  const ax_tensor_t *x,
+                                  const ax_tensor_t *dout,
+                                  ax_tensor_t *y_out);
+
 /* ================================================================
    SDPA PRIMITIVE — raw compute, use when you manage Q/K/V yourself
    ================================================================ */

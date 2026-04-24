@@ -165,6 +165,7 @@ set(AXIOM_SOURCES
     src/core/attention/cache.c
     src/core/attention/train_step.c
     src/core/attention/train_step_fused.c
+    src/core/attention/train_step_v4.c
     src/core/fused_attention.c
     src/core/rng.c
     src/core/quantize.c

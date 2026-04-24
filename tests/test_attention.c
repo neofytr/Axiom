@@ -683,6 +683,11 @@ static void test_mha_train_step_fused_parity(void)
     run_train_step_parity(ax_mha_train_step_fused, "train_step_fused");
 }
 
+static void test_mha_train_step_v4_parity(void)
+{
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4");
+}
+
 /* ================================================================
    test: F.3.a opt_qkv_head_gemm produces bit-for-bit identical Qh/Kh/Vh
    to the unfused gemm + ax_attn_head_interleave_qkv_split_bias sequence.
@@ -1315,6 +1320,7 @@ int main(void)
     AX_RUN_TEST(test_sdpa_save_path_parity);
     AX_RUN_TEST(test_mha_train_step_parity);
     AX_RUN_TEST(test_mha_train_step_fused_parity);
+    AX_RUN_TEST(test_mha_train_step_v4_parity);
     AX_RUN_TEST(test_qkv_head_gemm_parity);
     AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
     AX_RUN_TEST(test_sdpa_fwd_to_flat_parity);

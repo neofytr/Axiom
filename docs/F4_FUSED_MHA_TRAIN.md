@@ -167,6 +167,169 @@ to what XLA produces.
 
 Expect this to close most of the remaining 15-30 % gap to TF.
 
+#### F.4.4 phased implementation plan
+
+The plan-described monolithic per-(qi, kj) tile loop is ~2000 LOC of
+kernel work. Decomposed into 7 atomic phases, each with its own
+parity test and ctest gate. Phases land in order; each is shippable
+on its own (possibly behind an env flag) so we never have a half-
+written kernel sitting on main.
+
+**Phase A: per-qi-block SDPA fwd/bwd primitives (~500 LOC each)**
+
+The plan-described tile loop runs `for qi-block { for kj { fwd; bwd; ... } }`
+but the current `attn_fwd_head` / `attn_bwd_head` process the FULL S
+range of qi inside one head call. Phase A exposes per-qi-block entry
+points so the F.4.4 outer loop can drive them at block granularity:
+
+  - `attn_fwd_qi_block(Q, K, V, attn_flat, L, P_save, qi_start, qi_end, ...)`
+    runs the kj-outer loop for the [qi_start, qi_end) range of one head
+    only. uses F.3.e's strided-output writes into attn_flat[qi_block].
+
+  - `attn_bwd_qi_block(Q, K, V, attn_flat, dO, L, P_saved, dQ, dK_acc, dV_acc,
+                       qi_start, qi_end, ...)` similarly, writes
+    dQh[qi_block] and accumulates dKh/dVh full (per-(thread, kj)
+    partials reduced at the end).
+
+  Phase A doesn't change the algorithm — same total flops, same
+  intermediates, just exposed at finer granularity. Parity-tested
+  against the existing `attn_fwd_head` / `attn_bwd_head` by running
+  one block at a time through both APIs.
+
+**Phase B: per-qi-block driver in train_step (~400 LOC)**
+
+New entry `ax_mha_train_step_v4` in `train_step_v4.c` that orchestrates
+the existing primitives at per-qi-block granularity:
+
+  for each qi_block:
+    - F.3.a/F.3.e/F.3.c primitives compute Qh/Kh/Vh slices needed
+    - call `attn_fwd_qi_block` for each head → attn_flat[qi_block]
+    - F.4.2 proper / F.3.f for output projection on this block
+    - call `attn_bwd_qi_block` for each head → dQh[qi_block], accum dKh/dVh
+  
+  - reduce dKh/dVh across qi_blocks → standard dQKV merge + F.3.c
+
+Parity test runs full-flow against `ax_mha_train_step_fused`. Bench
+to verify per-qi-block scheduling doesn't regress vs full-S scheduling
+(early hypothesis: ~1-3 % win on memory-bound shapes from smaller
+working set per parallel iteration, possibly neutral on compute-bound).
+
+**Phase C: per-tile dWqkv accumulation (~600 LOC)**
+
+The biggest remaining structural intermediate elimination. Currently
+SDPA bwd produces dQh/dKh/dVh ([BH, S, dk] each, ~6 MB on B1_S2048),
+then `dQKV` merges them ([rows, 3D], ~18 MB), then `opt_dwqkv_split_acc`
+computes `dWq/dWk/dWv += X^T @ dQKV`. F.4.4 phase C eliminates the
+dQh/dKh/dVh + dQKV intermediates by streaming the dWqkv updates
+directly inside the SDPA bwd inner loop:
+
+  for kj-block:
+    init dV_tile = 0, dK_tile = 0
+    for qi-block:
+      ... existing FA-2 bwd math ...
+      dQ_tile_qi += dS_tile @ K_tile  (per-qi-block accumulator)
+      dV_tile += P_tile^T @ dO_tile
+      dK_tile += dS_tile^T @ Q_tile
+    # kj-block done — accumulate per-tile dWk/dWv into shared accumulators
+    dWk[h_slice] += X[kj]^T @ dK_tile  (per-thread partial)
+    dWv[h_slice] += X[kj]^T @ dV_tile
+
+  for qi-block:
+    # qi-block done — accumulate per-tile dWq into shared accumulators
+    dWq[h_slice] += X[qi]^T @ dQ_tile_qi
+
+  reduce per-thread dWq/dWk/dWv partials.
+
+Saves ~18 MB on B1_S2048 (the dQKV intermediate) plus ~18 MB
+(dQh+dKh+dVh) per train_step call. The dQ_tile_qi accumulator stays
+~Bq*dk per qi-block per head (~64 KB on Bq=32, dk=64) — fits in L1.
+
+Implementation as new SDPA bwd variant
+`attn_bwd_qi_block_with_wqkv_accum` that takes X, Wq/Wk/Wv slice
+pointers, dWq/dWk/dWv per-thread partial pointers; output dQh is no
+longer needed (replaced by per-tile dWq updates). Backend wiring +
+public API.
+
+**Phase D: per-tile output-projection fusion across qi-block boundary
+(~300 LOC)**
+
+Currently F.4.2 proper does the output projection in its own strip
+loop, separate from SDPA fwd/bwd. Phase D fuses output projection
+INTO the per-qi-block driver from Phase B — for each qi-block:
+SDPA fwd → output projection → SDPA bwd, all sharing the qi-block's
+attn_flat / dout / dattn cache lines.
+
+This requires per-qi-block versions of the F.4.2 proper kernel —
+just do the strip-fused work for ONE strip (the qi-block) and call
+that inline. Cache benefit: attn_flat[qi_block] is fresh from SDPA
+fwd write, immediately consumed by output proj ops without going
+through L3.
+
+**Phase E: per-(qi, kj) tile-level fwd+bwd combined kernel (~500 LOC)**
+
+The deepest fusion. Currently SDPA fwd and SDPA bwd are SEPARATE
+function calls per qi-block (Phase A); each does its own kj-outer
+loop. Phase E combines them into ONE function per qi-block:
+
+  for kj-block:
+    # FWD inner work for this (qi-block, kj-block) tile
+    pack K_tile, V_tile
+    Q_tile already packed
+    for qi-strip in qi-block:
+      compute S_tile = Q_strip @ K_tile^T
+      online softmax (accumulating O_strip per qi-strip)
+    
+    # BWD inner work for this (qi-block, kj-block) tile
+    # P_tile already in registers from fwd step
+    dV_tile += P_tile^T @ dO_tile
+    ... etc
+
+Eliminates L materialization between fwd and bwd: each (qi, kj) tile's
+softmax state stays in registers across fwd and bwd phases. Saves
+the L tensor (small but accessed twice — once written in fwd, once
+read in bwd).
+
+**Phase F: bench + iterate (~100 LOC)**
+
+5-run medians on all 5 mha_train shapes. Compare:
+  - baseline (current train_step_fused, F.3.x integrated)
+  - F.4.4 staged (Phases A-D)
+  - F.4.4 full (Phases A-E)
+
+Iterate on tile sizes, parallelism strategies until F.4.4 ≥ TF on
+every mha_train shape.
+
+#### Realistic time + risk budget
+
+Total: ~2400 LOC across 6 phases (A-F). At 200-400 LOC/day for
+careful kernel work with parity tests, this is **2-3 weeks of focused
+work**. The plan-acknowledged "multi-week" estimate is correct.
+
+Risks:
+  - Phase A's per-qi-block exposure may regress vs full-S in
+    parallelism scheduling (qi-block tiles less work than full S
+    per parallel for iteration). Mitigation: keep both APIs, choose
+    at runtime based on shape.
+  - Phase C's per-tile dWqkv reduction across qi-blocks may have
+    cache-thrash from per-thread dWq/dWk/dWv partials (D*D each).
+    Mitigation: use the same column-split trick proposed in F.4.2
+    proper's "structural fixes still required" note.
+  - Phase E's combined fwd+bwd may trip on the cross-head Wo
+    dependency — per-qi-block barrier may be needed mid-kernel.
+
+#### What this session shipped vs the F.4.4 phased plan
+
+This session ships the **building blocks** (F.3.a/c/d/e + F.4.2 proper +
+F.3.f) that Phases A-D would compose. Phase A's per-qi-block primitive
+extraction, Phase B's driver, Phase C's per-tile dWqkv accumulation,
+Phase D's intra-block fusion, and Phase E's combined fwd+bwd kernel
+are documented but not implemented — they are the multi-week follow-up.
+
+A scaffold entry point `ax_mha_train_step_v4` is added in
+`src/core/attention/train_step_v4.c` that initially delegates to
+`ax_mha_train_step_fused` and serves as the future-Phase-B-and-beyond
+landing site. Parity test wires through.
+
 **Status (2026-04-24): staged via primitive composition.** The plan's
 fully-monolithic per-(qi, kj) kernel body is multi-week scope. This
 session's path builds F.4.4 from composable primitives instead:
