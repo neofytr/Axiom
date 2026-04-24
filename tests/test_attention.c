@@ -865,6 +865,115 @@ static void test_dattn_head_gemm_nt_parity(void)
     }
 }
 
+/* ================================================================
+   test: F.3.e ax_fused_attention_fwd_save_to_flat produces bit-equivalent
+   attn_flat (and L, P_save) to ax_fused_attention_fwd_save +
+   ax_attn_head_deinterleave.
+   ================================================================ */
+static void test_sdpa_fwd_to_flat_parity(void)
+{
+    struct shape_case { int64_t B, S, H, dk; bool causal; bool save_p; };
+    struct shape_case cases[] = {
+        { 2, 8,  4, 4,  false, true  },
+        { 1, 64, 8, 8,  false, true  },
+        { 1, 32, 4, 16, true,  false },
+        { 4, 16, 4, 16, false, true  },
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
+        struct shape_case c = cases[ci];
+        int64_t B = c.B, S = c.S, H = c.H, dk = c.dk;
+        int64_t BH = B * H, D = H * dk;
+        float scale = 1.0f / sqrtf((float)dk);
+
+        ax_set_seed(9999 + (int)ci);
+        int64_t qkv_sh[]  = {BH, S, dk};
+        int64_t flat_sh[] = {B, S, D};
+        int64_t L_sh[]    = {BH, S};
+        int64_t Psh[]     = {BH, S, S};
+
+        ax_tensor_t *Q = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *K = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+        ax_tensor_t *V = ax_tensor_rand(qkv_sh, 3, -0.1f, 0.1f);
+
+        /* reference: fwd_save → Oh, then head_deinterleave → attn_flat_ref */
+        ax_tensor_t *Oh_ref       = ax_tensor_create(qkv_sh, 3, AX_FLOAT32);
+        ax_tensor_t *L_ref        = ax_tensor_create(L_sh, 2, AX_FLOAT32);
+        ax_tensor_t *Pref         = c.save_p ? ax_tensor_create(Psh, 3, AX_FLOAT32) : NULL;
+        ax_tensor_t *attn_flat_ref = ax_tensor_create(flat_sh, 3, AX_FLOAT32);
+
+        ax_fused_attention_fwd_save(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (float *)Oh_ref->storage->data,
+            (float *)L_ref->storage->data,
+            Pref ? (float *)Pref->storage->data : NULL,
+            BH, S, dk, scale, c.causal);
+
+        extern void ax_attn_head_deinterleave(const float *, float *,
+                                                int64_t, int64_t, int64_t, int64_t);
+        ax_attn_head_deinterleave(
+            (const float *)Oh_ref->storage->data,
+            (float *)attn_flat_ref->storage->data, B, S, H, dk);
+
+        /* fused: fwd_save_to_flat → attn_flat_fus directly */
+        ax_tensor_t *L_fus  = ax_tensor_create(L_sh, 2, AX_FLOAT32);
+        ax_tensor_t *Pfus   = c.save_p ? ax_tensor_create(Psh, 3, AX_FLOAT32) : NULL;
+        ax_tensor_t *attn_flat_fus = ax_tensor_create(flat_sh, 3, AX_FLOAT32);
+
+        ax_fused_attention_fwd_save_to_flat(
+            (const float *)Q->storage->data,
+            (const float *)K->storage->data,
+            (const float *)V->storage->data,
+            (float *)attn_flat_fus->storage->data,
+            (float *)L_fus->storage->data,
+            Pfus ? (float *)Pfus->storage->data : NULL,
+            B, S, H, dk, scale, c.causal);
+
+        /* compare attn_flat */
+        int64_t nflat = B * S * D;
+        const float *fr = (const float *)attn_flat_ref->storage->data;
+        const float *ff = (const float *)attn_flat_fus->storage->data;
+        float maxd_o = 0.0f;
+        for (int64_t i = 0; i < nflat; i++) {
+            float d = fabsf(fr[i] - ff[i]);
+            if (d > maxd_o) maxd_o = d;
+        }
+        AX_TEST_ASSERT(maxd_o < 1e-5f, "attn_flat matches fused vs unfused");
+
+        /* compare L */
+        int64_t nL = BH * S;
+        const float *Lr = (const float *)L_ref->storage->data;
+        const float *Lf = (const float *)L_fus->storage->data;
+        float maxd_L = 0.0f;
+        for (int64_t i = 0; i < nL; i++) {
+            float d = fabsf(Lr[i] - Lf[i]);
+            if (d > maxd_L) maxd_L = d;
+        }
+        AX_TEST_ASSERT(maxd_L < 1e-5f, "L matches fused vs unfused");
+
+        /* compare P_save (optional) */
+        if (c.save_p) {
+            int64_t nP = BH * S * S;
+            const float *Pr = (const float *)Pref->storage->data;
+            const float *Pf = (const float *)Pfus->storage->data;
+            float maxd_P = 0.0f;
+            for (int64_t i = 0; i < nP; i++) {
+                float d = fabsf(Pr[i] - Pf[i]);
+                if (d > maxd_P) maxd_P = d;
+            }
+            AX_TEST_ASSERT(maxd_P < 1e-5f, "P_save matches fused vs unfused");
+        }
+
+        ax_tensor_destroy(Q); ax_tensor_destroy(K); ax_tensor_destroy(V);
+        ax_tensor_destroy(Oh_ref); ax_tensor_destroy(L_ref); ax_tensor_destroy(attn_flat_ref);
+        ax_tensor_destroy(L_fus); ax_tensor_destroy(attn_flat_fus);
+        if (Pref) ax_tensor_destroy(Pref);
+        if (Pfus) ax_tensor_destroy(Pfus);
+    }
+}
+
 int main(void)
 {
     ax_init();
@@ -884,6 +993,7 @@ int main(void)
     AX_RUN_TEST(test_mha_train_step_fused_parity);
     AX_RUN_TEST(test_qkv_head_gemm_parity);
     AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
+    AX_RUN_TEST(test_sdpa_fwd_to_flat_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();

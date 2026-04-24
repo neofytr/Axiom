@@ -5472,9 +5472,15 @@ static inline void attn_apply_pad_mask(float *sr, int64_t kj, int64_t Bk,
    Kt_packed must be pre-scaled by 1/√dk.
    Bq, Bk are the actual tile dimensions (may be less than ATTN_BQ/BK on edges).
    qi_base, kj_base are absolute positions within the sequence (for masking). */
+/* per-(qi block) tile for one head. writes Bq rows of dk-wide output
+   to out_qi[r * out_stride + k]. out_stride defaults to dk (contiguous
+   per-head Oh layout); F.3.e callers pass D = H*dk to write directly
+   into the [B, S, D] attn_flat layout, eliminating the global Oh
+   tensor + head_deinterleave pass. */
 static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
                                       const float *Kt_packed, const float *V_packed,
-                                      float *out_qi, float *row_max_qi, float *row_sum_qi,
+                                      float *out_qi, int64_t out_stride,
+                                      float *row_max_qi, float *row_sum_qi,
                                       int64_t Bq, int64_t Bk, int64_t dk_np,
                                       int64_t qi_base, int64_t kj_base,
                                       bool causal, const int8_t *pad_mask,
@@ -5542,29 +5548,36 @@ static inline void attn_fwd_tile_mr(const float *Q_qi, int64_t dk,
         /* 3. online softmax + output correction (fused per row) */
         for (int64_t r = 0; r < mr; r++) {
             attn_fwd_softmax_row(score_strip + r * Bk,
-                                  out_qi + (ir + r) * dk,
+                                  out_qi + (ir + r) * out_stride,
                                   row_max_qi + ir + r,
                                   row_sum_qi + ir + r,
                                   Bk, dk);
         }
 
-        /* 4. V multiply: out[MR, dk] += score_strip[MR, Bk] @ V_packed[Bk, dk] */
+        /* 4. V multiply: out[MR, dk] += score_strip[MR, Bk] @ V_packed[Bk, dk]
+           writes are at out_qi[ir+r, k] with row stride out_stride. */
         pack_a(score_strip, Bk, mr_p, Bk, mr, a_s);
         (void)dk_p;
         for (int64_t jr = 0; jr < dk_np; jr += GEMM_NR) {
             int64_t nr = (jr + GEMM_NR <= dk) ? GEMM_NR : (dk > jr ? dk - jr : 0);
             if (nr <= 0) break;
             micro_kernel(Bk, a_s, V_packed + jr * Bk,
-                         out_qi + ir * dk + jr, dk, mr, nr);
+                         out_qi + ir * out_stride + jr, out_stride, mr, nr);
         }
     }
 }
 
-/* per-head forward pass. Q/K/V/out are [S, dk] contiguous for this head.
-   row_max, row_sum are [S] working buffers (caller allocates + initializes to
-   -FLT_MAX / 0). L may be NULL to skip logsumexp writeout (inference). */
+/* per-head forward pass. Q/K/V are [S, dk] contiguous for this head.
+   out is the per-head output destination; out_stride is the row stride
+   in floats. when out_stride == dk, output is contiguous [S, dk] (the
+   classic Oh layout); when out_stride > dk (typically D = H*dk), output
+   is strided to match a wider [S, D] attn_flat layout — F.3.e fused
+   path eliminates the global Oh tensor + head_deinterleave pass.
+   row_max, row_sum are [S] working buffers (caller allocates + initializes
+   to -FLT_MAX / 0). L may be NULL to skip logsumexp writeout (inference). */
 static void attn_fwd_head(const float *Q, const float *K, const float *V,
-                           float *out, float *L, float *row_max, float *row_sum,
+                           float *out, int64_t out_stride,
+                           float *L, float *row_max, float *row_sum,
                            int64_t S, int64_t dk, float scale,
                            bool causal, const int8_t *pad_mask,
                            float *P_save_head)
@@ -5582,7 +5595,17 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
     if (!Kt_packed || !V_packed) return;
 
     for (int64_t i = 0; i < S; i++) { row_max[i] = -FLT_MAX; row_sum[i] = 0.0f; }
-    memset(out, 0, (size_t)(S * dk) * sizeof(float));
+    /* zero out's strided rows. when out_stride == dk this is one
+       contiguous memset; when out_stride > dk we zero only the dk
+       cells per row owned by this head (the surrounding columns belong
+       to other heads writing concurrently into the same attn_flat). */
+    if (out_stride == dk) {
+        memset(out, 0, (size_t)(S * dk) * sizeof(float));
+    } else {
+        for (int64_t i = 0; i < S; i++) {
+            memset(out + i * out_stride, 0, (size_t)dk * sizeof(float));
+        }
+    }
     /* zero P_save head buffer once: causal-masked tiles skip the inner
        store, and unmasked future regions need to read 0 in backward. */
     if (P_save_head) memset(P_save_head, 0, (size_t)(S * S) * sizeof(float));
@@ -5603,18 +5626,20 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
             if (causal && qi + Bq - 1 < kj) continue;
 
             attn_fwd_tile_mr(Q + qi * dk, dk, Kt_packed, V_packed,
-                              out + qi * dk, row_max + qi, row_sum + qi,
+                              out + qi * out_stride, out_stride,
+                              row_max + qi, row_sum + qi,
                               Bq, Bk, dk_np, qi, kj, causal, pad_mask,
                               P_save_head, S);
         }
     }
 
-    /* final normalization: out[i] /= row_sum[i], L[i] = row_max[i] + log(row_sum[i]) */
+    /* final normalization: out[i] /= row_sum[i], L[i] = row_max[i] + log(row_sum[i])
+       walk row by row at out_stride to handle both Oh and attn_flat layouts. */
     for (int64_t i = 0; i < S; i++) {
         float rs = row_sum[i];
         if (rs > 0.0f) {
             float inv = 1.0f / rs;
-            float *o = out + i * dk;
+            float *o = out + i * out_stride;
             int64_t d = 0;
 #if defined(AX_HAS_SIMD)
             ax_vf32 vi = ax_vf32_set1(inv);
@@ -5635,6 +5660,12 @@ static void attn_fwd_head(const float *Q, const float *K, const float *V,
    scratch for row_max/row_sum is TLS so we don't malloc 2 * nthreads
    times per call — sdpa_fwd ran on a hot training loop allocates
    thousands of times per epoch otherwise. */
+void AX_SYM(ax_cpu_sdpa_fwd_to_flat)(const float *Q, const float *K, const float *V,
+                                       float *attn_flat, float *L,
+                                       int64_t B, int64_t S, int64_t H, int64_t dk,
+                                       float scale, bool causal, const int8_t *pad_mask,
+                                       float *P_save);
+
 void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
                               float *out, float *L,
                               int64_t BH, int64_t S, int64_t dk, float scale,
@@ -5663,9 +5694,55 @@ void AX_SYM(ax_cpu_sdpa_fwd)(const float *Q, const float *K, const float *V,
 #endif
         for (int64_t h = 0; h < BH; h++) {
             attn_fwd_head(Q + h * head_sz, K + h * head_sz, V + h * head_sz,
-                           out + h * head_sz, L ? L + h * S : NULL,
+                           out + h * head_sz, /* out_stride */ dk,
+                           L ? L + h * S : NULL,
                            row_max, row_sum, S, dk, scale, causal, pad_mask,
                            P_save ? P_save + h * pscale_sz : NULL);
+        }
+    done:;
+    }
+}
+
+/* F.3.e fused SDPA forward writing directly into [B, S, D] = [B, S, H*dk]
+   attn_flat layout. eliminates the per-head Oh contiguous tensor and the
+   subsequent head_deinterleave pass. each head h's per-row output writes
+   are strided by D — the D-wide row is shared across all H heads, so
+   different heads write disjoint dk-wide column slots into the same row.
+
+   per (b, h) parallel: head's slot is attn_flat + b * S * D + h * dk;
+   row stride is D; dk-wide writes per row. row_max/row_sum are TLS per
+   thread, sized S floats. */
+void AX_SYM(ax_cpu_sdpa_fwd_to_flat)(const float *Q, const float *K, const float *V,
+                                       float *attn_flat, float *L,
+                                       int64_t B, int64_t S, int64_t H, int64_t dk,
+                                       float scale, bool causal, const int8_t *pad_mask,
+                                       float *P_save)
+{
+    int64_t BH = B * H;
+    int64_t D  = H * dk;
+    int64_t head_sz = S * dk;          /* per-head Q/K/V slice */
+    int64_t pscale_sz = S * S;          /* per-head P_save stride */
+
+#ifdef _OPENMP
+    #pragma omp parallel
+#endif
+    {
+        int64_t want = (int64_t)S * (int64_t)sizeof(float);
+        float *row_max = ax_tls_grow(&tl_sdpa_row_max, &tl_sdpa_row_max_S, want);
+        float *row_sum = ax_tls_grow(&tl_sdpa_row_sum, &tl_sdpa_row_sum_S, want);
+        if (!row_max || !row_sum) goto done;
+
+#ifdef _OPENMP
+        #pragma omp for schedule(dynamic, 1)
+#endif
+        for (int64_t bh = 0; bh < BH; bh++) {
+            int64_t b = bh / H, h = bh % H;
+            float *out_slot = attn_flat + b * S * D + h * dk;
+            attn_fwd_head(Q + bh * head_sz, K + bh * head_sz, V + bh * head_sz,
+                           out_slot, /* out_stride */ D,
+                           L ? L + bh * S : NULL,
+                           row_max, row_sum, S, dk, scale, causal, pad_mask,
+                           P_save ? P_save + bh * pscale_sz : NULL);
         }
     done:;
     }

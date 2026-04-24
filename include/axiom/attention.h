@@ -219,6 +219,26 @@ void ax_fused_attention_bwd_use(const float *Q, const float *K, const float *V,
                                  int64_t BH, int64_t S, int64_t dk, float scale,
                                  bool causal);
 
+/* F.3.e fused SDPA forward writing directly into [B, S, D] attn_flat layout.
+   eliminates the per-head [BH, S, dk] Oh intermediate AND the
+   head_deinterleave pass that converts it to attn_flat in the MHA training
+   path. each of B*H heads' per-row output is strided by D = H*dk; the
+   dk-wide slot for head h lives at attn_flat[b*S*D + h*dk] and adjacent
+   heads' slots fill the rest of each row.
+
+   shapes: Q/K/V are [BH = B*H, S, dk] head-major (same as the standard
+   fwd primitives). attn_flat is [B, S, D] = [B*S, H*dk]. L is
+   [BH, S] log-sum-exp; P_save is the optional [BH, S, S] post-mask
+   pre-softmax score buffer for the backward pass.
+
+   the head_deinterleave pass that follows the standard fwd_save call
+   becomes a no-op when this entry is used — saves ~6 MB of redundant
+   read+write traffic on B1_S2048_D768 and similar shapes. */
+void ax_fused_attention_fwd_save_to_flat(const float *Q, const float *K, const float *V,
+                                           float *attn_flat, float *L, float *P_save,
+                                           int64_t B, int64_t S, int64_t H, int64_t dk,
+                                           float scale, bool causal);
+
 /* ================================================================
    KV CACHE — for autoregressive inference
    ================================================================ */
