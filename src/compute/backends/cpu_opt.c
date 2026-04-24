@@ -4943,45 +4943,48 @@ fallback_materialise:
 static ax_status_t opt_mha_output_proj_fused(
     const ax_tensor_t *attn_flat, const ax_tensor_t *Wo, const ax_tensor_t *bo_opt,
     const ax_tensor_t *dout,
-    ax_tensor_t *y, ax_tensor_t *dattn,
+    ax_tensor_t *y_opt, ax_tensor_t *dattn,
     ax_tensor_t *dWo_acc, ax_tensor_t *dbo_acc_opt)
 {
-    if (!attn_flat || !Wo || !dout || !y || !dattn || !dWo_acc) {
+    if (!attn_flat || !Wo || !dout || !dattn || !dWo_acc) {
         ax_err_set(AX_ERR_NULL_ARG, "mha_output_proj_fused: NULL");
         return AX_ERR_NULL_ARG;
     }
     if (attn_flat->dtype != AX_FLOAT32 || Wo->dtype != AX_FLOAT32 ||
-        dout->dtype != AX_FLOAT32 || y->dtype != AX_FLOAT32 ||
-        dattn->dtype != AX_FLOAT32 || dWo_acc->dtype != AX_FLOAT32)
+        dout->dtype != AX_FLOAT32 || dattn->dtype != AX_FLOAT32 ||
+        dWo_acc->dtype != AX_FLOAT32)
         return AX_ERR_DTYPE_MISMATCH;
+    if (y_opt && y_opt->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
     if (bo_opt && bo_opt->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
     if (dbo_acc_opt && dbo_acc_opt->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
     if (attn_flat->ndim != 2 || Wo->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
-    if (dout->ndim != 2 || y->ndim != 2 || dattn->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    if (dout->ndim != 2 || dattn->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    if (y_opt && y_opt->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
     if (dWo_acc->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
 
     int64_t rows = attn_flat->shape[0];
     int64_t D    = attn_flat->shape[1];
     if (Wo->shape[0] != D || Wo->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
     if (dout->shape[0] != rows || dout->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
-    if (y->shape[0] != rows || y->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (y_opt && (y_opt->shape[0] != rows || y_opt->shape[1] != D)) return AX_ERR_SHAPE_MISMATCH;
     if (dattn->shape[0] != rows || dattn->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
     if (dWo_acc->shape[0] != D || dWo_acc->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
     if (bo_opt && (bo_opt->ndim != 1 || bo_opt->shape[0] != D)) return AX_ERR_SHAPE_MISMATCH;
     if (dbo_acc_opt && (dbo_acc_opt->ndim != 1 || dbo_acc_opt->shape[0] != D)) return AX_ERR_SHAPE_MISMATCH;
 
     if (validate_contig_f32(attn_flat) < 0 || validate_contig_f32(Wo) < 0 ||
-        validate_contig_f32(dout) < 0 || validate_contig_f32(y) < 0 ||
+        validate_contig_f32(dout) < 0 ||
         validate_contig_f32(dattn) < 0 || validate_contig_f32(dWo_acc) < 0)
         return AX_ERR_BACKEND;
+    if (y_opt && validate_contig_f32(y_opt) < 0) return AX_ERR_BACKEND;
     if (bo_opt && validate_contig_f32(bo_opt) < 0) return AX_ERR_BACKEND;
     if (dbo_acc_opt && validate_contig_f32(dbo_acc_opt) < 0) return AX_ERR_BACKEND;
 
     const float *attn_d = raw_f32(attn_flat);
     const float *Wo_d   = raw_f32(Wo);
     const float *dout_d = raw_f32(dout);
-    const float *bo_d   = bo_opt ? raw_f32(bo_opt) : NULL;
-    float *y_d     = raw_f32(y);
+    const float *bo_d   = (y_opt && bo_opt) ? raw_f32(bo_opt) : NULL;
+    float *y_d     = y_opt ? raw_f32(y_opt) : NULL;
     float *dattn_d = raw_f32(dattn);
     float *dWo_d   = raw_f32(dWo_acc);
     float *dbo_d   = dbo_acc_opt ? raw_f32(dbo_acc_opt) : NULL;
@@ -5001,17 +5004,20 @@ static ax_status_t opt_mha_output_proj_fused(
     int64_t n_pc_tiles = (D + kc_max - 1) / kc_max;
     int64_t bq_pack    = ((Bq + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
-    /* pre-pack Wo in both b (NN, op 1) and b_t (NT, op 2) forms.
-       shared read-only across all threads/strips for the duration of
-       this call. memory: 2 * n_jc_tiles * n_pc_tiles * (NC * KC) floats —
-       on D=768 nc_eff=256 kc_max=256 this is 2 * 9 * 65536 = ~4.7 MB. */
+    /* pre-pack Wo: b form (NN, op 1) only when y is being computed,
+       b_t form (NT, op 2) always. shared read-only across all
+       threads/strips. memory: (1 + has_y) * n_jc_tiles * n_pc_tiles *
+       (NC * KC) floats — on D=768 nc_eff=256 kc_max=256 this is
+       (1 + has_y) * 9 * 65536 = ~2.4 MB without y, ~4.7 MB with y. */
+    bool has_y = (y_d != NULL);
     int64_t per_tile_floats = nc_eff * kc_max;
     int64_t Wo_pack_floats_each = (int64_t)n_jc_tiles * n_pc_tiles * per_tile_floats;
+    int64_t total_wo_floats = (has_y ? 2 : 1) * Wo_pack_floats_each;
     float *Wo_pack_buf = (float *)ax_aligned_alloc(
-        2 * (size_t)Wo_pack_floats_each * sizeof(float), 64);
+        (size_t)total_wo_floats * sizeof(float), 64);
     if (!Wo_pack_buf) return AX_ERR_ALLOC;
-    float *Wo_b_pack  = Wo_pack_buf;
-    float *Wo_bt_pack = Wo_pack_buf + Wo_pack_floats_each;
+    float *Wo_bt_pack = Wo_pack_buf;
+    float *Wo_b_pack  = has_y ? (Wo_pack_buf + Wo_pack_floats_each) : NULL;
 
     for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
         int64_t jc = jct * nc_eff;
@@ -5021,26 +5027,28 @@ static ax_status_t opt_mha_output_proj_fused(
             int64_t pc = pct * kc_max;
             int64_t kc = (pc + kc_max <= D) ? kc_max : (D - pc);
             int64_t tile_idx = jct * n_pc_tiles + pct;
-            float *b_buf  = Wo_b_pack  + tile_idx * per_tile_floats;
             float *bt_buf = Wo_bt_pack + tile_idx * per_tile_floats;
 
-            /* op 1 (NN): Wo as B[k=D, n=D]; tile [pc..pc+kc, jc..jc+nc] */
-            pack_b(Wo_d + pc * D + jc, D, kc, nc_pack, nc, b_buf);
-            /* op 2 (NT): Wo as B[n=D, k=D]; pack_b_t reads at [jc..jc+nc, pc..pc+kc] */
+            /* op 2 (NT): Wo as B[n=D, k=D]; pack_b_t at [jc..jc+nc, pc..pc+kc] */
             pack_b_t(Wo_d + jc * D + pc, D, kc, nc_pack, nc, bt_buf);
+            if (has_y) {
+                float *b_buf = Wo_b_pack + tile_idx * per_tile_floats;
+                /* op 1 (NN): Wo as B[k=D, n=D]; tile [pc..pc+kc, jc..jc+nc] */
+                pack_b(Wo_d + pc * D + jc, D, kc, nc_pack, nc, b_buf);
+            }
         }
     }
 
     /* per-thread pool layout (one contiguous block, sliced by tid):
          dWo_tl       [D * D]
          dbo_tl       [D]
-         pack_attn_a  [bq_pack * kc_max]            (op 1 A pack, per pc tile)
+         pack_attn_a  [bq_pack * kc_max]            (op 1 A pack, per pc tile; only when has_y)
          pack_dout_a  [bq_pack * kc_max]            (op 2 A pack, per pc tile)
          pack_attn_at [GEMM_MC * Bq]                (op 3 A^T pack, per ic tile)
          pack_dout_b  [nc_eff * Bq]                 (op 3 B pack, per jc tile) */
     int64_t dWo_tl_floats       = D * D;
     int64_t dbo_tl_floats       = D;
-    int64_t pack_attn_a_floats  = bq_pack * kc_max;
+    int64_t pack_attn_a_floats  = has_y ? (bq_pack * kc_max) : 0;
     int64_t pack_dout_a_floats  = bq_pack * kc_max;
     int64_t pack_attn_at_floats = GEMM_MC * Bq;
     int64_t pack_dout_b_floats  = nc_eff * Bq;
@@ -5088,42 +5096,47 @@ static ax_status_t opt_mha_output_proj_fused(
 
             const float *attn_strip = attn_d + qi * D;
             const float *dout_strip = dout_d + qi * D;
-            float *y_strip     = y_d + qi * D;
+            float *y_strip     = has_y ? (y_d + qi * D) : NULL;
             float *dattn_strip = dattn_d + qi * D;
 
             /* init y_strip with bo broadcast (or zero); init dattn_strip
                to zero. micro_kernel ADDS to dst, so initial values are
                the gemm's "C += A @ B" starting point. */
-            if (bo_d) {
-                for (int64_t i = 0; i < bq; i++)
-                    memcpy(y_strip + i * D, bo_d, (size_t)D * sizeof(float));
-            } else {
-                memset(y_strip, 0, (size_t)bq * (size_t)D * sizeof(float));
+            if (has_y) {
+                if (bo_d) {
+                    for (int64_t i = 0; i < bq; i++)
+                        memcpy(y_strip + i * D, bo_d, (size_t)D * sizeof(float));
+                } else {
+                    memset(y_strip, 0, (size_t)bq * (size_t)D * sizeof(float));
+                }
             }
             memset(dattn_strip, 0, (size_t)bq * (size_t)D * sizeof(float));
 
             /* OP 1: y_strip += attn_strip @ Wo (NN, packed micro_kernel)
+               skipped when y is NULL (F.3.f bwd-only mode).
                outer loop pc (K dim of contraction), inner jc (N dim). */
-            for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
-                int64_t pc = pct * kc_max;
-                int64_t kc = (pc + kc_max <= D) ? kc_max : (D - pc);
-                pack_a(attn_strip + pc, D, bq_pack_act, kc, bq, pack_attn_a);
+            if (has_y) {
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                    int64_t pc = pct * kc_max;
+                    int64_t kc = (pc + kc_max <= D) ? kc_max : (D - pc);
+                    pack_a(attn_strip + pc, D, bq_pack_act, kc, bq, pack_attn_a);
 
-                for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
-                    int64_t jc = jct * nc_eff;
-                    int64_t nc = (jc + nc_eff <= D) ? nc_eff : (D - jc);
-                    int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-                    int64_t tile_idx = jct * n_pc_tiles + pct;
-                    const float *Wo_pkt = Wo_b_pack + tile_idx * per_tile_floats;
+                    for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                        int64_t jc = jct * nc_eff;
+                        int64_t nc = (jc + nc_eff <= D) ? nc_eff : (D - jc);
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                        int64_t tile_idx = jct * n_pc_tiles + pct;
+                        const float *Wo_pkt = Wo_b_pack + tile_idx * per_tile_floats;
 
-                    for (int64_t ir = 0; ir < bq_pack_act; ir += GEMM_MR) {
-                        int64_t mr = (ir + GEMM_MR <= bq) ? GEMM_MR : (bq > ir ? bq - ir : 0);
-                        if (mr <= 0) break;
-                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
-                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc > jr ? nc - jr : 0);
-                            if (nr <= 0) break;
-                            micro_kernel(kc, pack_attn_a + ir * kc, Wo_pkt + jr * kc,
-                                         y_strip + ir * D + jc + jr, D, mr, nr);
+                        for (int64_t ir = 0; ir < bq_pack_act; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= bq) ? GEMM_MR : (bq > ir ? bq - ir : 0);
+                            if (mr <= 0) break;
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc > jr ? nc - jr : 0);
+                                if (nr <= 0) break;
+                                micro_kernel(kc, pack_attn_a + ir * kc, Wo_pkt + jr * kc,
+                                             y_strip + ir * D + jc + jr, D, mr, nr);
+                            }
                         }
                     }
                 }

@@ -546,6 +546,39 @@ int ax_compute_has_mha_output_proj_fused(void) {
     return (active_ops && active_ops->mha_output_proj_fused) ? 1 : 0;
 }
 
+/* F.3.f: backward-only fused output projection (dWo + dbo + dattn over
+   shared dout strip pass). thin wrapper that calls
+   mha_output_proj_fused with y=NULL/bo=NULL to skip op 1. backends
+   that implement mha_output_proj_fused get F.3.f for free. */
+ax_status_t ax_compute_output_proj_bwd_fused(const ax_tensor_t *attn_flat,
+                                               const ax_tensor_t *Wo,
+                                               const ax_tensor_t *dout,
+                                               ax_tensor_t *dattn,
+                                               ax_tensor_t *dWo_acc,
+                                               ax_tensor_t *dbo_acc)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->mha_output_proj_fused) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "output_proj_bwd_fused not implemented in %s",
+                   active_ops ? active_ops->name : "none");
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    /* y=NULL, bo=NULL → backend skips op 1 (forward y) */
+    ax_status_t st = active_ops->mha_output_proj_fused(
+        attn_flat, Wo, NULL, dout, NULL, dattn, dWo_acc, dbo_acc);
+    if (st == AX_OK) {
+        if (dattn   && dattn->storage)   ax_storage_touch(dattn->storage);
+        if (dWo_acc && dWo_acc->storage) ax_storage_touch(dWo_acc->storage);
+        if (dbo_acc && dbo_acc->storage) ax_storage_touch(dbo_acc->storage);
+    }
+    return st;
+}
+
+int ax_compute_has_output_proj_bwd_fused(void) {
+    ensure_compute_init();
+    return (active_ops && active_ops->mha_output_proj_fused) ? 1 : 0;
+}
+
 /* fused-scaling gemm: out = alpha * (a @ b) + beta * out. */
 ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
                                 float alpha, float beta, ax_tensor_t *out)

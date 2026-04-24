@@ -194,6 +194,25 @@ ax_status_t ax_compute_mha_output_proj_fused(const ax_tensor_t *attn_flat,
                                                ax_tensor_t *dbo_acc);
 int ax_compute_has_mha_output_proj_fused(void);
 
+/* F.3.f: backward-only strip-fused MHA output projection. shares the
+   underlying mha_output_proj_fused kernel; this entry skips op 1 (fwd y)
+   and only does the three backward ops over the shared dout strip pass:
+     dattn       = dout @ Wo^T                      (overwritten)
+     dWo_acc    += attn_flat^T @ dout               (accumulated)
+     dbo_acc    += col_sum(dout)                     (accumulated; NULL ok)
+   shapes: attn_flat/dout/dattn=[B*S, D], Wo=[D, D], dWo_acc=[D, D],
+           dbo_acc=[D] or NULL.
+   semantics-equivalent to ax_compute_mha_output_proj_fused with
+   y=NULL/bo=NULL. returns AX_ERR_NOT_IMPLEMENTED when the backend
+   lacks the underlying primitive. */
+ax_status_t ax_compute_output_proj_bwd_fused(const ax_tensor_t *attn_flat,
+                                               const ax_tensor_t *Wo,
+                                               const ax_tensor_t *dout,
+                                               ax_tensor_t *dattn,
+                                               ax_tensor_t *dWo_acc,
+                                               ax_tensor_t *dbo_acc);
+int ax_compute_has_output_proj_bwd_fused(void);
+
 /* fused matmul+relu: out = relu(a @ b + bias). bias may be NULL.
    returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
 ax_status_t ax_compute_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,
