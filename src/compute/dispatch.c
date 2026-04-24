@@ -487,6 +487,31 @@ int ax_compute_has_qkv_head_gemm(void) {
     return (active_ops && active_ops->qkv_head_gemm) ? 1 : 0;
 }
 
+/* F.3.d fused d_attn backward gemm_nt + head_interleave.
+   computes dO_head = head_interleave(dout @ Wo^T) in one pass.
+   backends that lack the slot return AX_ERR_NOT_IMPLEMENTED so callers
+   can fall back to gemm_nt + ax_attn_head_interleave. */
+ax_status_t ax_compute_dattn_head_gemm_nt(const ax_tensor_t *dout,
+                                            const ax_tensor_t *Wo,
+                                            int64_t B, int64_t S, int64_t H, int64_t dk,
+                                            ax_tensor_t *dO_head)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->dattn_head_gemm_nt) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "dattn_head_gemm_nt not implemented in %s",
+                   active_ops ? active_ops->name : "none");
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    ax_status_t st = active_ops->dattn_head_gemm_nt(dout, Wo, B, S, H, dk, dO_head);
+    if (st == AX_OK && dO_head && dO_head->storage) ax_storage_touch(dO_head->storage);
+    return st;
+}
+
+int ax_compute_has_dattn_head_gemm_nt(void) {
+    ensure_compute_init();
+    return (active_ops && active_ops->dattn_head_gemm_nt) ? 1 : 0;
+}
+
 /* fused-scaling gemm: out = alpha * (a @ b) + beta * out. */
 ax_status_t ax_compute_gemm_ex(const ax_tensor_t *a, const ax_tensor_t *b,
                                 float alpha, float beta, ax_tensor_t *out)

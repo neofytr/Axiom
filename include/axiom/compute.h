@@ -157,6 +157,22 @@ ax_status_t ax_compute_qkv_head_gemm(const ax_tensor_t *X,
                                       ax_tensor_t *Vh);
 int ax_compute_has_qkv_head_gemm(void);
 
+/* F.3.d fused d_attn backward gemm_nt + head_interleave.
+   computes:
+     dattn = dout @ Wo^T
+     dO_head = head_interleave(dattn)
+   in one pass, eliminating the [B*S, D] dattn intermediate (~6 MB on
+   B1_S2048_D768).
+   shapes: dout=[B*S, D], Wo=[D, D], dO_head=[B*H, S, dk]   where D = H*dk.
+   dO_head is OVERWRITTEN.
+   returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot —
+   callers fall back to gemm_nt + ax_attn_head_interleave. */
+ax_status_t ax_compute_dattn_head_gemm_nt(const ax_tensor_t *dout,
+                                            const ax_tensor_t *Wo,
+                                            int64_t B, int64_t S, int64_t H, int64_t dk,
+                                            ax_tensor_t *dO_head);
+int ax_compute_has_dattn_head_gemm_nt(void);
+
 /* fused matmul+relu: out = relu(a @ b + bias). bias may be NULL.
    returns AX_ERR_NOT_IMPLEMENTED if the backend lacks the slot. */
 ax_status_t ax_compute_gemm_relu(const ax_tensor_t *a, const ax_tensor_t *b,

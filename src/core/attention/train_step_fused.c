@@ -328,9 +328,22 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
             dout stays warm from dattn_nt's read into dWo_tn's.
          3. dbo_col_sum reads dout once more; warm from dWo_tn. */
 
-    ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
-    if (!d_attn_flat) return AX_ERR_ALLOC;
-    if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn_flat) != AX_OK) return AX_ERR_BACKEND;
+    /* dattn + head_interleave: F.3.d fused path streams dout @ Wo^T
+       directly into dO_head, no d_attn_flat intermediate. */
+    ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
+    if (!dO_head) return AX_ERR_ALLOC;
+
+    if (ax_compute_has_dattn_head_gemm_nt()) {
+        if (ax_compute_dattn_head_gemm_nt(dout_flat, m->Wo, B, S, H, dk, dO_head) != AX_OK)
+            return AX_ERR_BACKEND;
+    } else {
+        ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
+        if (!d_attn_flat) return AX_ERR_ALLOC;
+        if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn_flat) != AX_OK) return AX_ERR_BACKEND;
+        ax_attn_head_interleave(
+            (const float *)d_attn_flat->storage->data,
+            (float *)dO_head->storage->data, B, S, H, dk);
+    }
 
     if (m->Wo->requires_grad) {
         float *dWo = ensure_grad_ptr(m->Wo);
@@ -350,13 +363,6 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
             ax_storage_touch(m->bo->grad->storage);
         }
     }
-
-    /* step 2 — re-interleave heads + SDPA backward */
-    ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
-    if (!dO_head) return AX_ERR_ALLOC;
-    ax_attn_head_interleave(
-        (const float *)d_attn_flat->storage->data,
-        (float *)dO_head->storage->data, B, S, H, dk);
 
     ax_tensor_t *dQh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *dKh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);

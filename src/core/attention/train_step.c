@@ -401,21 +401,31 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
 
     if (prof_enabled) pf_wog += PF_TICK() - pf_t0;
 
-    /* dattn = dout_flat @ Wo^T  →  [rows, D] */
-    ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
-    if (!d_attn_flat) return AX_ERR_ALLOC;
-    pf_t0 = prof_enabled ? PF_TICK() : 0;
-    if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn_flat) != AX_OK) return AX_ERR_BACKEND;
-    if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
-
-    /* step 2 — re-interleave heads + SDPA backward */
+    /* dattn + head_interleave: F.3.d fused path streams dout @ Wo^T
+       directly into head-interleaved dO_head, eliminating the [rows, D]
+       d_attn_flat intermediate. fall back to gemm_nt + head_interleave
+       when the backend lacks the slot. */
     ax_tensor_t *dO_head = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     if (!dO_head) return AX_ERR_ALLOC;
+
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    ax_attn_head_interleave(
-        (const float *)d_attn_flat->storage->data,
-        (float *)dO_head->storage->data, B, S, H, dk);
-    if (prof_enabled) pf_hint += PF_TICK() - pf_t0;
+    if (ax_compute_has_dattn_head_gemm_nt()) {
+        if (ax_compute_dattn_head_gemm_nt(dout_flat, m->Wo, B, S, H, dk, dO_head) != AX_OK)
+            return AX_ERR_BACKEND;
+        if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
+        /* head_interleave is folded into the fused gemm_nt; pf_hint stays zero */
+    } else {
+        ax_tensor_t *d_attn_flat = ax_tensor_arena_create(arena, flat_sh, 2, AX_FLOAT32);
+        if (!d_attn_flat) return AX_ERR_ALLOC;
+        if (ax_compute_gemm_nt(dout_flat, m->Wo, d_attn_flat) != AX_OK) return AX_ERR_BACKEND;
+        if (prof_enabled) pf_dattn += PF_TICK() - pf_t0;
+
+        pf_t0 = prof_enabled ? PF_TICK() : 0;
+        ax_attn_head_interleave(
+            (const float *)d_attn_flat->storage->data,
+            (float *)dO_head->storage->data, B, S, H, dk);
+        if (prof_enabled) pf_hint += PF_TICK() - pf_t0;
+    }
 
     ax_tensor_t *dQh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);
     ax_tensor_t *dKh = ax_tensor_arena_create(arena, head_sh, 3, AX_FLOAT32);

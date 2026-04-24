@@ -806,6 +806,65 @@ static void test_qkv_head_gemm_parity(void)
     }
 }
 
+/* ================================================================
+   test: F.3.d opt_dattn_head_gemm_nt produces bit-equivalent dO_head
+   to the unfused gemm_nt + ax_attn_head_interleave sequence.
+   ================================================================ */
+static void test_dattn_head_gemm_nt_parity(void)
+{
+    struct shape_case { int64_t B, S, D, H; };
+    struct shape_case cases[] = {
+        { 2, 8, 16, 4 },
+        { 1, 64, 64, 8 },
+        { 4, 32, 64, 4 },
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases)/sizeof(cases[0]); ci++) {
+        struct shape_case c = cases[ci];
+        int64_t B = c.B, S = c.S, D = c.D, H = c.H;
+        int64_t dk = D / H;
+        int64_t rows = B * S;
+
+        ax_set_seed(8888 + (int)ci);
+        int64_t dout_sh[]    = {rows, D};
+        int64_t Wo_sh[]      = {D, D};
+        int64_t dattn_sh[]   = {rows, D};
+        int64_t dO_head_sh[] = {B * H, S, dk};
+
+        ax_tensor_t *dout = ax_tensor_rand(dout_sh, 2, -0.1f, 0.1f);
+        ax_tensor_t *Wo   = ax_tensor_rand(Wo_sh, 2, -0.1f, 0.1f);
+
+        /* reference: gemm_nt → dattn → head_interleave → dO_head */
+        ax_tensor_t *dattn_ref = ax_tensor_create(dattn_sh, 2, AX_FLOAT32);
+        ax_tensor_t *dO_ref    = ax_tensor_create(dO_head_sh, 3, AX_FLOAT32);
+        ax_status_t s1 = ax_compute_gemm_nt(dout, Wo, dattn_ref);
+        AX_TEST_ASSERT_EQ((int)s1, (int)AX_OK, "ref gemm_nt ok");
+        extern void ax_attn_head_interleave(const float *, float *,
+                                              int64_t, int64_t, int64_t, int64_t);
+        ax_attn_head_interleave((const float *)dattn_ref->storage->data,
+                                  (float *)dO_ref->storage->data,
+                                  B, S, H, dk);
+
+        /* fused */
+        ax_tensor_t *dO_fus = ax_tensor_create(dO_head_sh, 3, AX_FLOAT32);
+        ax_status_t s2 = ax_compute_dattn_head_gemm_nt(dout, Wo, B, S, H, dk, dO_fus);
+        AX_TEST_ASSERT_EQ((int)s2, (int)AX_OK, "fused dattn_head_gemm_nt ok");
+
+        int64_t nel = B * H * S * dk;
+        const float *r = (const float *)dO_ref->storage->data;
+        const float *f = (const float *)dO_fus->storage->data;
+        float maxd = 0.0f;
+        for (int64_t i = 0; i < nel; i++) {
+            float d = fabsf(r[i] - f[i]);
+            if (d > maxd) maxd = d;
+        }
+        AX_TEST_ASSERT(maxd < 1e-5f, "dO_head matches fused vs unfused");
+
+        ax_tensor_destroy(dout); ax_tensor_destroy(Wo);
+        ax_tensor_destroy(dattn_ref); ax_tensor_destroy(dO_ref); ax_tensor_destroy(dO_fus);
+    }
+}
+
 int main(void)
 {
     ax_init();
@@ -824,6 +883,7 @@ int main(void)
     AX_RUN_TEST(test_mha_train_step_parity);
     AX_RUN_TEST(test_mha_train_step_fused_parity);
     AX_RUN_TEST(test_qkv_head_gemm_parity);
+    AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
 
     ax_shutdown();
     AX_TEST_SUMMARY();

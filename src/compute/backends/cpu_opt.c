@@ -4621,6 +4621,285 @@ fallback_materialise:
     }
 }
 
+/* forward declaration for the head_interleave helper used by F.3.d
+   fallback. defined in src/core/attention/layout.c. */
+extern void ax_attn_head_interleave(const float *src, float *dst,
+                                     int64_t B, int64_t S, int64_t H, int64_t dk);
+
+/* ================================================================
+   F.3.d: opt_dattn_head_gemm_nt — fused d_attn backward gemm_nt + head_interleave
+
+   computes:    dattn = dout @ Wo^T
+                dO_head = head_interleave(dattn)
+   in one pass, eliminating the [rows, D] dattn intermediate (~6 MB on
+   B1_S2048_D768).
+
+   shapes:
+     dout   [B*S, D]
+     Wo     [D, D]
+     dO_head   [B*H, S, dk]   (D = H*dk)
+
+   semantics: writes to dO_head, OVERWRITING. callers must not pre-populate.
+
+   structure mirrors opt_qkv_head_gemm (F.3.a) but for the NT backward
+   direction — pack_b_t (not pack_b), single output destination (not 3-way
+   split).
+
+   constraints (else falls back to gemm_nt + ax_attn_head_interleave):
+     - dk >= GEMM_NR && dk % GEMM_NR == 0
+   on shapes shipped (dk = 64, NR = 16), holds. */
+static ax_status_t opt_dattn_head_gemm_nt(
+    const ax_tensor_t *dout, const ax_tensor_t *Wo,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    ax_tensor_t *dO_head)
+{
+    if (!dout || !Wo || !dO_head) {
+        ax_err_set(AX_ERR_NULL_ARG, "dattn_head_gemm_nt: NULL");
+        return AX_ERR_NULL_ARG;
+    }
+    if (dout->dtype != AX_FLOAT32 || Wo->dtype != AX_FLOAT32 || dO_head->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (dout->ndim != 2 || Wo->ndim != 2 || dO_head->ndim != 3) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t rows = dout->shape[0];
+    int64_t D    = dout->shape[1];
+    if (rows != B * S || D != H * dk) return AX_ERR_SHAPE_MISMATCH;
+    if (Wo->shape[0] != D || Wo->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dO_head->shape[0] != B*H || dO_head->shape[1] != S || dO_head->shape[2] != dk)
+        return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(dout) < 0 || validate_contig_f32(Wo) < 0 ||
+        validate_contig_f32(dO_head) < 0)
+        return AX_ERR_BACKEND;
+
+    const float *ad = raw_f32(dout);
+    const float *bd = raw_f32(Wo);
+    float *od = raw_f32(dO_head);
+
+    int64_t m = rows, n = D, k = D;
+    int64_t head_sz = S * dk;
+
+    /* zero dO_head — gemm accumulates into it */
+    memset(od, 0, (size_t)(B * H * head_sz) * sizeof(float));
+
+    /* small-shape fast path */
+    if (m * n * k < 100000) {
+        for (int64_t i = 0; i < m; i++) {
+            int64_t b = i / S, s = i % S;
+            for (int64_t j = 0; j < n; j++) {
+                int64_t h = j / dk;
+                int64_t kk = j - h * dk;
+                float acc = 0.0f;
+                for (int64_t p = 0; p < k; p++) acc += ad[i * k + p] * bd[j * k + p];
+                od[(b * H + h) * head_sz + s * dk + kk] = acc;
+            }
+        }
+        return AX_OK;
+    }
+
+    if (dk < GEMM_NR || (dk % GEMM_NR) != 0) goto fallback_materialise;
+
+    pack_b_cache_invalidate();
+    if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
+
+    int max_threads = ax_gemm_threads_for_shape(m, n, k);
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
+    int64_t nc_eff = ax_adaptive_nc(n, max_threads);
+    int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
+    int64_t n_ic_tiles = (m + GEMM_MC - 1) / GEMM_MC;
+    int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
+    int64_t n_jc_full = (n + nc_full - 1) / nc_full;
+
+    bool use_hybrid = (max_threads > 1)
+                      && (n_jc_full * 4 <= max_threads)
+                      && (n_jc_full * n_ic_tiles >= max_threads);
+    bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
+    bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
+
+    int gemm_threads = 1;
+    if (use_hybrid) {
+        gemm_threads = max_threads;
+        nc_eff = nc_full;
+        n_jc_tiles = n_jc_full;
+    } else if (use_jc_par) {
+        gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
+    } else if (use_ic_par) {
+        gemm_threads = (int)(n_ic_tiles < (int64_t)max_threads ? n_ic_tiles : (int64_t)max_threads);
+    }
+    (void)gemm_threads;
+
+    /* tile writeback for dattn → dO_head: dst is at
+       (b*H + h)*S*dk + s*dk + k. constants per tile if MR rows in one
+       batch and NR cols within one head (NR <= dk, dk % NR == 0). */
+    #define DATTN_TILE_WRITEBACK(pack_a_buf_, pack_b_buf_, ir_, jr_,        \
+                                  ic_, jc_, mr_, nr_, kc_)                   \
+        do {                                                                 \
+            int64_t _row_g = (ic_) + (ir_);                                  \
+            int64_t _b = _row_g / S;                                         \
+            int64_t _s = _row_g % S;                                         \
+            int64_t _j_in_n = (jc_) + (jr_);                                 \
+            int64_t _h = _j_in_n / dk;                                       \
+            int64_t _k_off = _j_in_n - _h * dk;                              \
+            if ((_s) + (mr_) <= S) {                                         \
+                float *_base = od + (_b * H + _h) * head_sz                  \
+                             + _s * dk + _k_off;                             \
+                micro_kernel((kc_), (pack_a_buf_) + (ir_) * (kc_),           \
+                             (pack_b_buf_) + (jr_) * (kc_),                  \
+                             _base, dk, (mr_), (nr_));                       \
+            } else {                                                         \
+                float _buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));  \
+                memset(_buf, 0, sizeof(_buf));                               \
+                micro_kernel((kc_), (pack_a_buf_) + (ir_) * (kc_),           \
+                             (pack_b_buf_) + (jr_) * (kc_),                  \
+                             _buf, GEMM_NR, (mr_), (nr_));                   \
+                for (int64_t _rr = 0; _rr < (mr_); _rr++) {                  \
+                    int64_t _rg = (ic_) + (ir_) + _rr;                       \
+                    int64_t _bb = _rg / S, _ss = _rg % S;                    \
+                    float *_dst = od + (_bb * H + _h) * head_sz              \
+                                + _ss * dk + _k_off;                         \
+                    for (int64_t _cc = 0; _cc < (nr_); _cc++) {              \
+                        _dst[_cc] += _buf[_rr * GEMM_NR + _cc];              \
+                    }                                                        \
+                }                                                            \
+            }                                                                \
+        } while (0)
+
+    if (use_hybrid) {
+        int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
+#ifdef _OPENMP
+        #pragma omp parallel num_threads(gemm_threads)
+#endif
+        {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            int64_t last_jct = -1;
+            int64_t last_pct = -1;
+
+#ifdef _OPENMP
+            #pragma omp for collapse(3) schedule(static)
+#endif
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                        if (!pack_a_buf || !pack_b_buf) continue;
+                        int64_t jc = jct * nc_eff;
+                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                        int64_t pc = pct * kc_max;
+                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                        int64_t ic = ict * GEMM_MC;
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+
+                        if (jct != last_jct || pct != last_pct) {
+                            pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, pack_b_buf);
+                            last_jct = jct; last_pct = pct;
+                        }
+                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                                DATTN_TILE_WRITEBACK(pack_a_buf, pack_b_buf,
+                                                      ir, jr, ic, jc, mr, nr, kc);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else if (use_jc_par) {
+#ifdef _OPENMP
+        #pragma omp parallel for num_threads(gemm_threads) schedule(static)
+#endif
+        for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+            ensure_tl_pack_bufs();
+            float *pack_a_buf = tl_pack_a_buf;
+            float *pack_b_buf = tl_pack_b_buf;
+            if (!pack_a_buf || !pack_b_buf) continue;
+            int64_t jc = jct * nc_eff;
+            int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, pack_b_buf);
+                for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            DATTN_TILE_WRITEBACK(pack_a_buf, pack_b_buf,
+                                                  ir, jr, ic, jc, mr, nr, kc);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        /* IC-parallel or serial fallback */
+        float *main_pack_b = tl_pack_b_buf;
+        for (int64_t jc = 0; jc < n; jc += nc_eff) {
+            int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+            int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+            for (int64_t pc = 0; pc < k; pc += kc_max) {
+                int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, main_pack_b);
+                const float *pack_b_buf = main_pack_b;
+#ifdef _OPENMP
+                #pragma omp parallel for num_threads(gemm_threads) schedule(static) if(use_ic_par)
+#endif
+                for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                    ensure_tl_pack_bufs();
+                    float *pack_a_buf = tl_pack_a_buf;
+                    if (!pack_a_buf) continue;
+                    int64_t ic = ict * GEMM_MC;
+                    int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                    int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                    pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                    for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                        int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                        for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            DATTN_TILE_WRITEBACK(pack_a_buf, pack_b_buf,
+                                                  ir, jr, ic, jc, mr, nr, kc);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pack_b_cache_invalidate();
+    #undef DATTN_TILE_WRITEBACK
+    return AX_OK;
+
+fallback_materialise:
+    {
+        size_t dattn_bytes = (size_t)rows * (size_t)D * sizeof(float);
+        float *dattn_temp = (float *)ax_aligned_alloc(dattn_bytes, 64);
+        if (!dattn_temp) return AX_ERR_ALLOC;
+
+        ax_storage_t st_dattn = {0};
+        atomic_init(&st_dattn.refcount, 0);
+        st_dattn.data = dattn_temp; st_dattn.size_bytes = dattn_bytes;
+        st_dattn.device = AX_DEVICE_CPU; st_dattn.is_arena_temp = true;
+        st_dattn.generation = 1;
+        ax_tensor_t dattn_t = {0};
+        dattn_t.storage = &st_dattn; dattn_t.ndim = 2; dattn_t.dtype = AX_FLOAT32;
+        dattn_t.shape[0] = rows; dattn_t.shape[1] = D;
+        dattn_t.strides[0] = D; dattn_t.strides[1] = 1;
+
+        ax_status_t st = opt_gemm_nt(dout, Wo, &dattn_t);
+        if (st != AX_OK) { ax_aligned_free(dattn_temp); return st; }
+
+        ax_attn_head_interleave(dattn_temp, od, B, S, H, dk);
+        ax_aligned_free(dattn_temp);
+        return AX_OK;
+    }
+}
+
 /* fused bias add: out[..., axis, ...] = in[..., axis, ...] + bias.
    bias is rank-1, numel == in->shape[axis]. single-pass fused write
    to out. broadcast is along `axis` — the stride of the bias lookup
@@ -5016,7 +5295,8 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
     .dwqkv_split_acc = opt_dwqkv_split_acc,
-    .qkv_head_gemm   = opt_qkv_head_gemm,
+    .qkv_head_gemm        = opt_qkv_head_gemm,
+    .dattn_head_gemm_nt   = opt_dattn_head_gemm_nt,
     .add_relu   = opt_add_relu,
     .axpy       = opt_axpy,
     .softmax_rowwise = opt_softmax_rowwise,

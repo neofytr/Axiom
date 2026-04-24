@@ -99,6 +99,22 @@ struct ax_backend_ops {
                                   ax_tensor_t *Kh,
                                   ax_tensor_t *Vh);
 
+    /* optional: F.3.d fused d_attn backward gemm_NT + head_interleave.
+       computes:
+         dattn = dout @ Wo^T
+         dO_head = head_interleave(dattn)
+       in one pass, eliminating the [B*S, D] dattn intermediate (~6 MB on
+       B1_S2048_D768). shapes:
+         dout    [B*S, D]
+         Wo      [D, D]
+         dO_head [B*H, S, dk]   (D = H*dk)
+       writes OVERWRITE dO_head. NULL when unimplemented — attention.c
+       falls back to gemm_nt + ax_attn_head_interleave. */
+    ax_status_t (*dattn_head_gemm_nt)(const ax_tensor_t *dout,
+                                       const ax_tensor_t *Wo,
+                                       int64_t B, int64_t S, int64_t H, int64_t dk,
+                                       ax_tensor_t *dO_head);
+
     /* optional: fused matmul + relu. out = relu(a @ b + bias).
        bias may be NULL for matmul+relu without bias.
        applies max(0, x) during the gemm writeback step, saving a full
