@@ -688,6 +688,20 @@ static void test_mha_train_step_v4_parity(void)
     run_train_step_parity(ax_mha_train_step_v4, "train_step_v4");
 }
 
+/* F.4.4 Phase B: exercise the qi-block loop with multiple iterations by
+   forcing qi_block smaller than S (default is 126; test uses S=8). for
+   qi_block=4 we get 2 iterations; for qi_block=2 we get 4. the driver
+   must produce bit-equivalent grads regardless of qi_block — each
+   iteration owns a disjoint row range of dQh and accumulates into dKh/dVh. */
+static void test_mha_train_step_v4_qi_block_parity(void)
+{
+    setenv("AX_V4_QI_BLOCK", "4", 1);
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_blk4");
+    setenv("AX_V4_QI_BLOCK", "2", 1);
+    run_train_step_parity(ax_mha_train_step_v4, "train_step_v4_blk2");
+    unsetenv("AX_V4_QI_BLOCK");
+}
+
 /* ================================================================
    test: F.3.a opt_qkv_head_gemm produces bit-for-bit identical Qh/Kh/Vh
    to the unfused gemm + ax_attn_head_interleave_qkv_split_bias sequence.
@@ -1539,6 +1553,7 @@ int main(void)
     AX_RUN_TEST(test_mha_train_step_parity);
     AX_RUN_TEST(test_mha_train_step_fused_parity);
     AX_RUN_TEST(test_mha_train_step_v4_parity);
+    AX_RUN_TEST(test_mha_train_step_v4_qi_block_parity);
     AX_RUN_TEST(test_qkv_head_gemm_parity);
     AX_RUN_TEST(test_dattn_head_gemm_nt_parity);
     AX_RUN_TEST(test_sdpa_fwd_to_flat_parity);
