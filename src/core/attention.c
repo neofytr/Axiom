@@ -188,7 +188,15 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     /* ---- head-interleave directly from the fused QKV buffer into
        Qh/Kh/Vh, with optional bias fused in. eliminates the separate
        bias_add pass over the [rows, 3D] qkv buffer (saves ~12 MB of
-       L3↔L1 traffic at B=1 S=512 D=1024). ---- */
+       L3↔L1 traffic at B=1 S=512 D=1024). ----
+
+       note: F.3.a (ax_compute_qkv_head_gemm) was measured on the
+       autograd path and regressed B8_S128 by +20 % while being
+       near-neutral on other shapes. the fused primitive is a win for
+       train_step_v4 (which uses arena allocations differently), but
+       the autograd forward's tensor allocation / refcount pattern
+       seems to erode the benefit at small shapes. kept on the unfused
+       path here; train_step_v4 continues to use F.3.a directly. */
     int64_t head_sh[] = {B * H, S, dk};
     ax_tensor_t *Qh = NULL, *Kh = NULL, *Vh = NULL;
     ALLOC_SHAPE(Qh, head_sh, 3);
