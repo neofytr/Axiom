@@ -199,6 +199,7 @@ set(AXIOM_SOURCES
     src/core/quantize.c
     src/compute/dispatch.c
     src/compute/backends/cpu_naive.c
+    src/compute/backends/attn_tunables.c
 )
 
 # JIT encoders. x86_64 path emits VEX/EVEX, arm64 path emits A64.

@@ -5796,6 +5796,36 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
 static int64_t ATTN_BQ = ATTN_BQ_DEFAULT;
 static int64_t ATTN_BK = ATTN_BQ_DEFAULT;
 
+/* per-ISA getters for the ATTN tile defaults. each ISA's compilation of
+   this TU exposes its own MR-derived default through the AX_SYM-suffixed
+   symbol; fused_attention.c picks the right one at runtime via
+   __builtin_cpu_supports the same way it dispatches sdpa_fwd / sdpa_bwd.
+
+   the attn_tunables module reads through a single resolved entry point
+   so its calibration logic stays ISA-agnostic. */
+int64_t AX_SYM(ax_cpu_opt_attn_bq_default)(void) { return ATTN_BQ_DEFAULT; }
+int64_t AX_SYM(ax_cpu_opt_attn_bk_default)(void) { return ATTN_BQ_DEFAULT; }
+
+/* runtime tunable setters — the calibrator picks values via attn_tunables.c
+   and pokes them in here once measurement converges. callers (attn_fwd_head,
+   attn_bwd_head's kj loop) read ATTN_BQ / ATTN_BK directly so changes take
+   effect on the next call. setters validate alignment + bounds. */
+void AX_SYM(ax_cpu_opt_set_attn_bq)(int64_t v) {
+    if (v <= 0) return;
+    /* must be MR-aligned and not exceed the static buffer max. */
+    if (v % GEMM_MR != 0) v = (v / GEMM_MR) * GEMM_MR;
+    if (v < GEMM_MR) v = GEMM_MR;
+    if (v > ATTN_BQ_MAX) v = ATTN_BQ_MAX;
+    ATTN_BQ = v;
+}
+void AX_SYM(ax_cpu_opt_set_attn_bk)(int64_t v) {
+    if (v <= 0) return;
+    if (v % GEMM_NR != 0) v = (v / GEMM_NR) * GEMM_NR;
+    if (v < GEMM_NR) v = GEMM_NR;
+    if (v > ATTN_BK_MAX) v = ATTN_BK_MAX;
+    ATTN_BK = v;
+}
+
 /* in-place multiply a packed panel by a scalar (SIMD-vectorized).
    used to bake 1/√dk into Kt_packed so the score GEMM output is
    pre-scaled without a separate pass over the score tile. */

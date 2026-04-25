@@ -8,6 +8,7 @@
 
 #include "axiom/compute.h"
 #include "axiom/internal/compute_internal.h"
+#include "axiom/internal/attn_tunables.h"
 #include "axiom/device.h"
 #include "axiom/error.h"
 #include <stddef.h>
@@ -214,6 +215,13 @@ ax_status_t ax_compute_init(void) {
        candidates on a representative 1024^3 gemm and picks the fastest.
        ~500ms startup cost, opt-in via AX_GEMM_CALIBRATE=1. */
     ax_calibrate_gemm_tiles();
+
+    /* attention-tunables calibration. measures the empirical crossover
+       for each fused-vs-unfused gate (F.3.a, F.3.c, save_p, fused_bh,
+       sdpa_fused, gemm_tn pre-transpose, ATTN_BQ/BK) on this host.
+       results cached so cost is paid once per machine + version.
+       no-op under AX_NO_AUTOTUNE=1 / AX_NO_ATTN_CALIB=1. */
+    ax_attn_tunables_calibrate();
 
     return AX_OK;
 }

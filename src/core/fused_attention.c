@@ -209,6 +209,21 @@ extern void ax_cpu_kv_cache_attend_scalar(const float *, const float *,
                                             const float *, float *,
                                             int64_t, int64_t, int64_t, int64_t, float);
 
+/* attn tile getters/setters per ISA — used by attn_tunables.c to read
+   the cpu_opt-side ATTN_BQ_DEFAULT and to install calibrated values. */
+extern int64_t ax_cpu_opt_attn_bq_default_avx512(void);
+extern int64_t ax_cpu_opt_attn_bq_default_avx2  (void);
+extern int64_t ax_cpu_opt_attn_bq_default_scalar(void);
+extern int64_t ax_cpu_opt_attn_bk_default_avx512(void);
+extern int64_t ax_cpu_opt_attn_bk_default_avx2  (void);
+extern int64_t ax_cpu_opt_attn_bk_default_scalar(void);
+extern void    ax_cpu_opt_set_attn_bq_avx512(int64_t);
+extern void    ax_cpu_opt_set_attn_bq_avx2  (int64_t);
+extern void    ax_cpu_opt_set_attn_bq_scalar(int64_t);
+extern void    ax_cpu_opt_set_attn_bk_avx512(int64_t);
+extern void    ax_cpu_opt_set_attn_bk_avx2  (int64_t);
+extern void    ax_cpu_opt_set_attn_bk_scalar(int64_t);
+
 #else /* single-ISA build */
 
 extern void ax_cpu_sdpa_fwd(const float *, const float *, const float *,
@@ -267,6 +282,11 @@ extern void ax_cpu_kv_cache_attend(const float *, const float *,
                                      const float *, float *,
                                      int64_t, int64_t, int64_t, int64_t, float);
 
+extern int64_t ax_cpu_opt_attn_bq_default(void);
+extern int64_t ax_cpu_opt_attn_bk_default(void);
+extern void    ax_cpu_opt_set_attn_bq(int64_t);
+extern void    ax_cpu_opt_set_attn_bk(int64_t);
+
 #endif
 
 /* ================================================================
@@ -322,6 +342,9 @@ typedef void (*kv_attend_fn_t)(const float *, const float *,
                                 const float *, float *,
                                 int64_t, int64_t, int64_t, int64_t, float);
 
+typedef int64_t (*attn_tile_default_fn_t)(void);
+typedef void    (*attn_tile_setter_fn_t)(int64_t);
+
 static sdpa_fwd_fn_t                         g_sdpa_fwd                         = NULL;
 static sdpa_fwd_to_flat_fn_t                 g_sdpa_fwd_to_flat                 = NULL;
 static sdpa_fwd_to_flat_qi_block_fn_t        g_sdpa_fwd_to_flat_qi_block        = NULL;
@@ -333,6 +356,10 @@ static sdpa_bwd_from_flat_qi_block_inner_fn_t g_sdpa_bwd_from_flat_qi_block_inne
 static sdpa_fwd_bwd_qi_block_inner_fn_t      g_sdpa_fwd_bwd_qi_block_inner      = NULL;
 static rope_fn_t                             g_rope                             = NULL;
 static kv_attend_fn_t                        g_kv_attend                        = NULL;
+static attn_tile_default_fn_t                g_attn_bq_default                  = NULL;
+static attn_tile_default_fn_t                g_attn_bk_default                  = NULL;
+static attn_tile_setter_fn_t                 g_attn_set_bq                      = NULL;
+static attn_tile_setter_fn_t                 g_attn_set_bk                      = NULL;
 
 static void resolve_once(void)
 {
@@ -351,6 +378,10 @@ static void resolve_once(void)
         g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner_avx512;
         g_rope                              = ax_cpu_rope_apply_avx512;
         g_kv_attend                         = ax_cpu_kv_cache_attend_avx512;
+        g_attn_bq_default                   = ax_cpu_opt_attn_bq_default_avx512;
+        g_attn_bk_default                   = ax_cpu_opt_attn_bk_default_avx512;
+        g_attn_set_bq                       = ax_cpu_opt_set_attn_bq_avx512;
+        g_attn_set_bk                       = ax_cpu_opt_set_attn_bk_avx512;
     } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
         g_sdpa_fwd                          = ax_cpu_sdpa_fwd_avx2;
         g_sdpa_fwd_to_flat                  = ax_cpu_sdpa_fwd_to_flat_avx2;
@@ -363,6 +394,10 @@ static void resolve_once(void)
         g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner_avx2;
         g_rope                              = ax_cpu_rope_apply_avx2;
         g_kv_attend                         = ax_cpu_kv_cache_attend_avx2;
+        g_attn_bq_default                   = ax_cpu_opt_attn_bq_default_avx2;
+        g_attn_bk_default                   = ax_cpu_opt_attn_bk_default_avx2;
+        g_attn_set_bq                       = ax_cpu_opt_set_attn_bq_avx2;
+        g_attn_set_bk                       = ax_cpu_opt_set_attn_bk_avx2;
     } else {
         g_sdpa_fwd                          = ax_cpu_sdpa_fwd_scalar;
         g_sdpa_fwd_to_flat                  = ax_cpu_sdpa_fwd_to_flat_scalar;
@@ -375,6 +410,10 @@ static void resolve_once(void)
         g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner_scalar;
         g_rope                              = ax_cpu_rope_apply_scalar;
         g_kv_attend                         = ax_cpu_kv_cache_attend_scalar;
+        g_attn_bq_default                   = ax_cpu_opt_attn_bq_default_scalar;
+        g_attn_bk_default                   = ax_cpu_opt_attn_bk_default_scalar;
+        g_attn_set_bq                       = ax_cpu_opt_set_attn_bq_scalar;
+        g_attn_set_bk                       = ax_cpu_opt_set_attn_bk_scalar;
     }
 #else
     g_sdpa_fwd                          = ax_cpu_sdpa_fwd;
@@ -388,7 +427,34 @@ static void resolve_once(void)
     g_sdpa_fwd_bwd_qi_block_inner       = ax_cpu_sdpa_fwd_bwd_qi_block_inner;
     g_rope                              = ax_cpu_rope_apply;
     g_kv_attend                         = ax_cpu_kv_cache_attend;
+    g_attn_bq_default                   = ax_cpu_opt_attn_bq_default;
+    g_attn_bk_default                   = ax_cpu_opt_attn_bk_default;
+    g_attn_set_bq                       = ax_cpu_opt_set_attn_bq;
+    g_attn_set_bk                       = ax_cpu_opt_set_attn_bk;
 #endif
+}
+
+/* ================================================================
+   ISA-resolved getters/setters for attn tile sizes — used by
+   attn_tunables.c (the runtime calibration module) so it doesn't have
+   to know which ISA variant of cpu_opt is running.
+   ================================================================ */
+
+int64_t ax_attn_bq_default_resolved(void) {
+    resolve_once();
+    return g_attn_bq_default ? g_attn_bq_default() : 126;
+}
+int64_t ax_attn_bk_default_resolved(void) {
+    resolve_once();
+    return g_attn_bk_default ? g_attn_bk_default() : 126;
+}
+void ax_attn_set_bq_resolved(int64_t v) {
+    resolve_once();
+    if (g_attn_set_bq) g_attn_set_bq(v);
+}
+void ax_attn_set_bk_resolved(int64_t v) {
+    resolve_once();
+    if (g_attn_set_bk) g_attn_set_bk(v);
 }
 
 /* ================================================================
