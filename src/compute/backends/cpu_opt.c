@@ -51,6 +51,7 @@
 #endif
 
 #include "axiom/internal/backend_ops.h"
+#include "axiom/internal/attn_tunables.h"
 #include "axiom/tensor.h"
 #include "axiom/error.h"
 #include "axiom/memory.h"
@@ -3951,7 +3952,7 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     int64_t at_bytes = (int64_t)m * (int64_t)k * (int64_t)sizeof(float);
     int64_t flops = 2 * m * n * k;
     bool can_pretrans = (at_bytes <= ax_tn_pretranspose_budget_bytes)
-                        && (flops >= 2000000000LL)
+                        && (flops >= ax_attn_tunable_gemm_tn_pretranspose_flops())
                         && (m >= 8 && k >= 8)
                         && (n >= 2 * m);
     if (can_pretrans) {
@@ -6946,17 +6947,11 @@ static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
     } else if (env_mode == 0) {
         use_fused = 0;
     } else {
-#ifdef _OPENMP
-        int nt = omp_get_max_threads();
-        /* avoid fused only when each thread owns exactly one head and no
-           inner parallelism kicks in — that's exactly BH == NT because
-           ax_attn_bwd_inner_threads returns ceil(NT/BH) which is 1 iff
-           BH >= NT. BH > NT is fine (outer loop amortizes); BH < NT
-           spawns inner threads that amortize. */
-        use_fused = (BH != (int64_t)nt);
-#else
-        use_fused = 1;
-#endif
+        /* shape-dispatched: ask the runtime tunable, which encodes the
+           BH-vs-NT regime decisions calibrated for this host. defaults
+           preserve the old "BH != NT" rule (true for <NT and >NT,
+           false for ==NT) but the calibrator may override per-CPU. */
+        use_fused = ax_attn_tunable_use_sdpa_fused(BH) ? 1 : 0;
     }
 
     /* debug trace: AX_SDPA_DISPATCH_LOG=1 prints the dispatch decision */

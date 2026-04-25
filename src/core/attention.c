@@ -36,6 +36,7 @@
 #include "axiom/compute.h"
 #include "axiom/internal/compute_internal.h"
 #include "axiom/internal/cuda_extension.h"
+#include "axiom/internal/attn_tunables.h"
 #include "axiom/init.h"
 #include "axiom/error.h"
 #include "attention/internal.h"
@@ -210,7 +211,7 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     bool on_cuda = (x_flat->storage->device != AX_DEVICE_CPU);
     int64_t qkv_bytes = rows * 3 * D * (int64_t)sizeof(float);
     bool use_f3a = (!on_cuda) && ax_compute_has_qkv_head_gemm()
-                   && (qkv_bytes > 8 * 1024 * 1024);
+                   && (qkv_bytes > ax_attn_tunable_f3a_qkv_bytes_threshold());
     {
         const char *no_f3a = getenv("AX_NO_F3A");
         if (no_f3a && no_f3a[0] == '1') use_f3a = false;
@@ -308,7 +309,7 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_tensor_t *P_save_t = NULL;
     int64_t bh = B * H;
     int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
-    bool save_enabled = (record && p_save_bytes <= (int64_t)8 * 1024 * 1024);
+    bool save_enabled = (record && p_save_bytes <= ax_attn_tunable_save_p_max_bytes());
     const char *env = getenv("AX_MHA_SAVE_P");
     if (env) save_enabled = (env[0] == '1');
     if (save_enabled) {
@@ -757,7 +758,7 @@ static void mha_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
            grads (the kernel doesn't support partial — fall back if
            only some need grads), and requires the backend to expose
            the entry. */
-        if (all_wqkv_grad && D >= 1024 && ax_compute_has_dwqkv_split_acc()) {
+        if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold() && ax_compute_has_dwqkv_split_acc()) {
             float *dq_init = param_grad_ptr(m->Wq);
             float *dk_init = param_grad_ptr(m->Wk);
             float *dv_init = param_grad_ptr(m->Wv);

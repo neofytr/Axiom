@@ -41,6 +41,7 @@
 #include "axiom/memory.h"
 #include "axiom/tensor.h"
 #include "axiom/internal/cuda_extension.h"
+#include "axiom/internal/attn_tunables.h"
 #include "internal.h"
 
 #include <math.h>
@@ -252,8 +253,8 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
 
     ax_tensor_t *P_save_t = NULL;
     int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
-    bool save_p = (p_save_bytes <= (int64_t)8 * 1024 * 1024);
-    if (save_p && S <= 128 && dk <= 64) save_p = false;
+    bool save_p = (p_save_bytes <= ax_attn_tunable_save_p_max_bytes());
+    if (save_p && S <= ax_attn_tunable_save_p_small_exclusion_s() && (S * dk) <= ax_attn_tunable_save_p_small_exclusion_sk()) save_p = false;
     const char *env = getenv("AX_MHA_SAVE_P");
     if (env) save_p = (env[0] == '1');
     if (save_p) {
@@ -469,7 +470,7 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
     bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad &&
                          m->Wv->requires_grad;
     if (any_wqkv_grad) {
-        if (all_wqkv_grad && D >= 1024 && ax_compute_has_dwqkv_split_acc()) {
+        if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold() && ax_compute_has_dwqkv_split_acc()) {
             (void)ensure_grad_ptr(m->Wq);
             (void)ensure_grad_ptr(m->Wk);
             (void)ensure_grad_ptr(m->Wv);
