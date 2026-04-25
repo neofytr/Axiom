@@ -1084,6 +1084,29 @@ void ax_attn_tunables_init_early(void) {
             g_attn.gemm_tile_switch_margin = v;
         }
     }
+
+    /* A2: SDPA tile size overrides — AX_ATTN_BQ / AX_ATTN_BK. resolved
+       early so the cpu_opt static ATTN_BQ/ATTN_BK are set before the
+       first SDPA call. cpu_opt's setters validate alignment; we just
+       parse and forward. proper measurement-based calibration of these
+       remains future work (would need SDPA-specific A/B harness; the
+       defaults are MR/NR-aligned values that fit L2 across vendors). */
+    const char *bq_env = getenv("AX_ATTN_BQ");
+    if (bq_env && bq_env[0] != '\0') {
+        char *endp = NULL;
+        long v = strtol(bq_env, &endp, 10);
+        if (endp != bq_env && v > 0 && v <= 4096) {
+            g_attn.attn_bq = v;
+        }
+    }
+    const char *bk_env = getenv("AX_ATTN_BK");
+    if (bk_env && bk_env[0] != '\0') {
+        char *endp = NULL;
+        long v = strtol(bk_env, &endp, 10);
+        if (endp != bk_env && v > 0 && v <= 4096) {
+            g_attn.attn_bk = v;
+        }
+    }
 }
 
 void ax_attn_tunables_calibrate(void) {

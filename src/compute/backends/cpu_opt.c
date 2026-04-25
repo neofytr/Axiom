@@ -1077,7 +1077,14 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
         /* mha-train qkv-forward shapes (NN) — rows=B*S, n=3*D, k=D. */
         sh[3].M = 1024; sh[3].N = 1536; sh[3].K = 512;   /* B8_S128_D512 */
         sh[4].M = 2048; sh[4].N = 2304; sh[4].K = 768;   /* B4_S512_D768 / B1_S2048_D768 */
-        n_sh = 5;
+        /* A1: additional mha-Wo-projection shape (B8_S128 D=512), the
+           per-stage gemm that's smallest and where overhead matters most;
+           and one transformer-typical larger-D shape. helps the geomean
+           score not over-weight the large-square probes vs the small-
+           shape regime where we currently lag TF most. */
+        sh[5].M = 1024; sh[5].N = 512;  sh[5].K = 512;   /* B8_S128_D512 Wo */
+        sh[6].M = 4096; sh[6].N = 3072; sh[6].K = 1024;  /* B8_S512_D1024 qkv */
+        n_sh = 7;
     }
     uint32_t s = 2463534242u;
     for (int sh_i = 0; sh_i < n_sh; sh_i++) {
