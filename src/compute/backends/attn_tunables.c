@@ -14,6 +14,7 @@
 #include "axiom/compute.h"
 #include "axiom/memory.h"
 #include "axiom/attention.h"
+#include "axiom/layer.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -53,11 +54,14 @@ static struct {
     int64_t fused_bh_per_head_bytes;      /* default: 32 KB */
 
     /* AX_SDPA_FUSED auto: when true, use FA-2-style fused kj-block.
-       calibrator decides per-BH-vs-NT regime; defaults to "always
-       use materialized" (safest pre-calibration default). */
-    bool sdpa_fused_use_when_bh_lt_nt;    /* default: true (BH<NT path) */
-    bool sdpa_fused_use_when_bh_eq_nt;    /* default: false (regression case) */
-    bool sdpa_fused_use_when_bh_gt_nt;    /* default: true */
+       calibrator decides per-BH-vs-NT regime; conservative pre-cal
+       default is "always materialized" (false everywhere) so that
+       AX_NO_AUTOTUNE=1 + unset env var matches the pre-tunable
+       "force off when unset" behaviour. the calibrator flips
+       individual regimes to true only when measurement is confident. */
+    bool sdpa_fused_use_when_bh_lt_nt;    /* default: false */
+    bool sdpa_fused_use_when_bh_eq_nt;    /* default: false */
+    bool sdpa_fused_use_when_bh_gt_nt;    /* default: false */
 
     /* gemm_tn pre-transpose flop threshold */
     int64_t gemm_tn_pretranspose_flops;   /* default: 2 GFLOPS */
@@ -73,9 +77,9 @@ static struct {
     .save_p_small_exclusion_sk = 8192,
     .save_p_small_exclusion_s = 128,
     .fused_bh_per_head_bytes = 32 * 1024,
-    .sdpa_fused_use_when_bh_lt_nt = true,
+    .sdpa_fused_use_when_bh_lt_nt = false,
     .sdpa_fused_use_when_bh_eq_nt = false,
-    .sdpa_fused_use_when_bh_gt_nt = true,
+    .sdpa_fused_use_when_bh_gt_nt = false,
     .gemm_tn_pretranspose_flops = 2000000000LL,
     /* attn_bq/bk seeded from the existing ATTN_BQ_DEFAULT macro at
        calibrate-time. without that we'd duplicate the macro definition
@@ -527,41 +531,445 @@ static int64_t calibrate_gemm_tn_pretranspose_flops(void) {
 }
 
 /* ============================================================
-   placeholder calibrators for the remaining gates. each will be
-   filled in as its measurement infrastructure stabilises. for now
-   they return the pre-calibration default so behaviour matches what
-   shipped before the autotuner. each TODO marks the next work item.
+   mha-train micro-harness — owns one MHA layer + Q/K/V buffers
+   for the duration of a calibration sweep, runs ax_mha_train_step
+   (autograd path) or ax_mha_train_step_v4 (fused-bh path) per call.
+
+   the harness is the shared substrate for save_p / fused_bh /
+   sdpa_fused calibration: each calibrator flips one of g_attn's
+   gate fields between a pair of values, runs the harness through
+   the trimmed-mean timer, and picks the winner.
+
+   we use the autograd train_step (not train_step_fused) for the
+   save_p calibration so the gate inside train_step.c is the one
+   exercised. fused_bh calibration uses train_step_v4 because
+   that's the path with the per_head_bytes gate. sdpa_fused
+   calibration uses train_step too — its bwd routes through the
+   sdpa_bwd dispatch where AX_SDPA_FUSED resolves.
    ============================================================ */
 
+typedef struct meas_mha {
+    ax_layer_t  *mha;
+    ax_tensor_t *x;
+    ax_tensor_t *dout;
+    ax_tensor_t *y_out;
+    /* shape kept for sanity/printing */
+    int64_t B, S, D;
+    int     H;
+} meas_mha_t;
+
+static ax_status_t meas_mha_create(meas_mha_t *m, int64_t B, int64_t S,
+                                    int64_t D, int H, bool causal) {
+    memset(m, 0, sizeof(*m));
+    m->B = B; m->S = S; m->D = D; m->H = H;
+    m->mha = ax_mha_create(D, H, /*use_bias*/false, causal);
+    if (!m->mha) return AX_ERR_ALLOC;
+    ax_layer_train(m->mha);
+    int64_t shape[3] = { B, S, D };
+    m->x     = ax_tensor_rand(shape, 3, -0.5f, 0.5f);
+    m->dout  = ax_tensor_rand(shape, 3, -0.5f, 0.5f);
+    m->y_out = ax_tensor_create(shape, 3, AX_FLOAT32);
+    if (!m->x || !m->dout || !m->y_out) {
+        if (m->x)     ax_tensor_destroy(m->x);
+        if (m->dout)  ax_tensor_destroy(m->dout);
+        if (m->y_out) ax_tensor_destroy(m->y_out);
+        ax_layer_destroy(m->mha);
+        memset(m, 0, sizeof(*m));
+        return AX_ERR_ALLOC;
+    }
+    return AX_OK;
+}
+
+static void meas_mha_destroy(meas_mha_t *m) {
+    if (m->y_out) ax_tensor_destroy(m->y_out);
+    if (m->dout)  ax_tensor_destroy(m->dout);
+    if (m->x)     ax_tensor_destroy(m->x);
+    if (m->mha)   ax_layer_destroy(m->mha);
+    memset(m, 0, sizeof(*m));
+}
+
+static ax_status_t meas_mha_run_step(void *p) {
+    meas_mha_t *c = (meas_mha_t *)p;
+    return ax_mha_train_step(c->mha, c->x, c->dout, c->y_out);
+}
+
+static ax_status_t meas_mha_run_step_v4(void *p) {
+    meas_mha_t *c = (meas_mha_t *)p;
+    return ax_mha_train_step_v4(c->mha, c->x, c->dout, c->y_out);
+}
+
+/* ============================================================
+   save_p calibration
+
+   the gate sits in train_step.c at the SDPA fwd point:
+     save_p = (p_save_bytes <= ax_attn_tunable_save_p_max_bytes())
+
+   for each candidate (B, S, H, dk), we time a full mha_train_step
+   twice — once with save_p forced ON (bytes-cap = INT64_MAX,
+   small-S/dk exclusions = 0/0), once forced OFF (bytes-cap = 0).
+   the threshold is the largest p_save_bytes where ON wins; above
+   that, OFF (recompute) is faster.
+
+   small-S/dk exclusion thresholds are calibrated separately
+   (calibrate_save_p_small_exclusion_*) by sweeping S in {64, 96,
+   128, 192, 256} at fixed dk=64 and finding the largest S where
+   recompute beats save even though save's memory budget is below
+   the bytes cap. that gives the s_threshold; the sk_threshold is
+   the corresponding S*dk product.
+   ============================================================ */
+
+typedef struct {
+    /* shape spans cache regimes:
+        (4, 128, 8, 64) → p = 4*8*128*128*4 = 2 MB    (small)
+        (8, 128, 8, 64) → p = 4 MB
+        (4, 256, 8, 64) → p = 4 MB
+        (8, 256, 8, 64) → p = 16 MB                    (above default 8 MB)
+        (4, 512, 8, 64) → p = 16 MB                    (above default)
+        (2,1024,12,64) → p = 96 MB                    (well above) */
+    int64_t B, S;
+    int64_t D;
+    int     H;
+} sp_shape_t;
+
 static int64_t calibrate_save_p_max_bytes(void) {
-    /* TODO: needs full mha train_step harness with save_p toggle.
-       for now return the empirical 8 MB default. */
-    return (int64_t)8 * 1024 * 1024;
+    /* representative shapes covering the regime where save_p is
+       contested. the gate matters most when p_save_bytes is in
+       [1 MB, 100 MB] — below that the small-S exclusion handles
+       it; above, recompute always wins. */
+    static const sp_shape_t cand[] = {
+        { 4, 128, 512,  8 },   /*  p=2 MB, s_p<=8 MB → save ON */
+        { 8, 128, 512,  8 },   /*  p=4 MB */
+        { 4, 256, 512,  8 },   /*  p=4 MB */
+        { 8, 256, 512,  8 },   /*  p=16 MB */
+        { 4, 512, 512,  8 },   /*  p=16 MB */
+        { 2,1024, 768, 12 },   /*  p=96 MB */
+    };
+    static const int n_cand = (int)(sizeof(cand) / sizeof(cand[0]));
+    /* heavier sample budget than per-gate calibrators that hit small
+       gemms: each iter is a full mha_train_step (5-50 ms), so noise
+       at 3 % margin is borderline. warm=2 lets the layer's TLS scratch
+       and arena settle; timed=8 → trim 2 high samples → 6 averaged. */
+    const int warm = 2, timed = 8;
+    const double margin = 0.95;  /* 5 % win margin for the wider noise band */
+
+    /* save existing g_attn fields we'll mutate so we can restore
+       them between/after measurements. */
+    int64_t saved_max  = g_attn.save_p_max_bytes;
+    int64_t saved_excl_s  = g_attn.save_p_small_exclusion_s;
+    int64_t saved_excl_sk = g_attn.save_p_small_exclusion_sk;
+
+    /* the running answer: largest p_save_bytes where save_p ON wins.
+       we initialise to the pre-calibration default (8 MB) so if no
+       shape provides a confident measurement, we keep that default. */
+    int64_t best = saved_max;
+    bool    any_measured = false;
+
+    for (int i = 0; i < n_cand; i++) {
+        const sp_shape_t *s = &cand[i];
+        int64_t bh = s->B * s->H;
+        int64_t dk = s->D / s->H;
+        int64_t p_bytes = bh * s->S * s->S * (int64_t)sizeof(float);
+
+        meas_mha_t mh;
+        if (meas_mha_create(&mh, s->B, s->S, s->D, s->H, /*causal*/false) != AX_OK)
+            continue;
+
+        /* force save_p ON: huge cap, no small-S/dk exclusion. */
+        g_attn.save_p_max_bytes        = INT64_MAX;
+        g_attn.save_p_small_exclusion_s  = 0;
+        g_attn.save_p_small_exclusion_sk = 0;
+        double t_on = meas_trimmed_mean_ms(meas_mha_run_step, &mh, warm, timed);
+
+        /* force save_p OFF: cap = 0 → save_p = (p_bytes <= 0) = false. */
+        g_attn.save_p_max_bytes = 0;
+        double t_off = meas_trimmed_mean_ms(meas_mha_run_step, &mh, warm, timed);
+
+        meas_mha_destroy(&mh);
+
+        if (t_on >= 1.0e29 || t_off >= 1.0e29) continue;
+        any_measured = true;
+
+        /* save wins: t_on < margin * t_off. if save wins on this shape,
+           we know p_bytes is below the crossover, so the threshold
+           should be at least p_bytes. pick the largest such p_bytes.
+           if save loses (t_on >= t_off), p_bytes is at/above the
+           crossover; we don't lower `best` from a single noisy
+           sample — a smaller shape may have already delivered a
+           higher confirmed bound. */
+        if (t_on < t_off * margin && p_bytes > best) {
+            best = p_bytes;
+        }
+        (void)dk; (void)bh;
+    }
+
+    g_attn.save_p_max_bytes        = saved_max;
+    g_attn.save_p_small_exclusion_s  = saved_excl_s;
+    g_attn.save_p_small_exclusion_sk = saved_excl_sk;
+
+    if (!any_measured) return 0;  /* sentinel: keep default */
+    return best;
+}
+
+/* small-S exclusion: at small S, save_p ON saves a small bytes count
+   but the per-head materialisation overhead (zero pollution + extra
+   memory pass) often outweighs the bwd recompute saving. measure at
+   a small dk fixed, sweep S, find largest S where save loses. */
+static int64_t calibrate_save_p_small_exclusion_s(void) {
+    /* fixed B*H*dk so total compute is comparable across S. */
+    static const int64_t cand_S[] = { 64, 96, 128, 192 };
+    static const int     n_cand = (int)(sizeof(cand_S) / sizeof(cand_S[0]));
+    const int warm = 2, timed = 8;
+    const double margin = 0.95;  /* 5 % margin */
+    const int64_t B = 8;
+    const int64_t D = 512;
+    const int     H = 8;
+
+    int64_t saved_max  = g_attn.save_p_max_bytes;
+    int64_t saved_excl_s  = g_attn.save_p_small_exclusion_s;
+    int64_t saved_excl_sk = g_attn.save_p_small_exclusion_sk;
+
+    int64_t threshold_s = 0;     /* largest S where recompute beats save */
+    bool    any_measured = false;
+
+    for (int i = 0; i < n_cand; i++) {
+        int64_t S = cand_S[i];
+        meas_mha_t mh;
+        if (meas_mha_create(&mh, B, S, D, H, /*causal*/false) != AX_OK)
+            continue;
+
+        g_attn.save_p_max_bytes        = INT64_MAX;
+        g_attn.save_p_small_exclusion_s  = 0;
+        g_attn.save_p_small_exclusion_sk = 0;
+        double t_on = meas_trimmed_mean_ms(meas_mha_run_step, &mh, warm, timed);
+
+        g_attn.save_p_max_bytes = 0;
+        double t_off = meas_trimmed_mean_ms(meas_mha_run_step, &mh, warm, timed);
+
+        meas_mha_destroy(&mh);
+
+        if (t_on >= 1.0e29 || t_off >= 1.0e29) continue;
+        any_measured = true;
+
+        /* recompute wins (save loses) at this S → exclude S from save. */
+        if (t_off < t_on * margin && S > threshold_s) {
+            threshold_s = S;
+        }
+    }
+
+    g_attn.save_p_max_bytes        = saved_max;
+    g_attn.save_p_small_exclusion_s  = saved_excl_s;
+    g_attn.save_p_small_exclusion_sk = saved_excl_sk;
+
+    if (!any_measured) return -1;  /* sentinel: keep default */
+    return threshold_s;
 }
 
 static int64_t calibrate_save_p_small_exclusion_sk(void) {
-    /* TODO: needs save_p A/B on small-S/dk shapes. */
+    /* the original gate uses S*dk as a separate criterion (S<=128 AND
+       S*dk<=8192, both must hold for exclusion to fire). dk is fixed
+       at 64 in the calibrate_save_p_small_exclusion_s sweep, so the
+       sk threshold should track 128*64 = 8192 as the canonical
+       crossover. measuring sk independently would require a separate
+       sweep over dk while holding S small; that's marginal value
+       since dk is typically 64 in the workloads we care about.
+       return the canonical 8192. */
     return 8192;
 }
 
-static int64_t calibrate_save_p_small_exclusion_s(void) {
-    return 128;
-}
+/* ============================================================
+   fused_bh calibration
+
+   the gate sits in train_step_v4.c (auto_enable_fused_bh):
+     fits_l1 = per_head_bytes <= ax_attn_tunable_fused_bh_per_head_bytes()
+     enabled = fits_l1 && BH >= NT
+
+   for each candidate per_head_bytes, we time train_step_v4 twice:
+     ON:  per_head_bytes_threshold = INT64_MAX → fits_l1 = true
+     OFF: per_head_bytes_threshold = 0          → fits_l1 = false
+   (BH >= NT must hold for the gate to fire; we pick shapes that
+    satisfy it.)
+
+   per_head_bytes = S * dk * 4. shapes vary S + dk to span the L1
+   regime (~16 KB) up to L2 spill (~256 KB).
+   ============================================================ */
+
+typedef struct {
+    int64_t B, S;
+    int64_t D;
+    int     H;
+} fbh_shape_t;
 
 static int64_t calibrate_fused_bh_per_head_bytes(void) {
-    /* TODO: needs combined kernel A/B sweep over per-head bytes.
-       the threshold should equal half the host's L1d (after
-       subtracting tile scratch). until measured, use 32 KB which
-       is half-L1d on most x86 (32-48 KB) and conservative enough
-       on Apple M (128 KB L1d) to not regress. */
-    return 32 * 1024;
+    /* shapes ordered by per_head_bytes ascending. BH ≥ NT for all. */
+    static const fbh_shape_t cand[] = {
+        /* per_head_bytes = S * dk * 4, dk = D/H */
+        { 4,   64, 512,  8 },   /*  S=64, dk=64 → 16 KB */
+        { 4,  128, 512,  8 },   /*  32 KB */
+        { 4,  192, 512,  8 },   /*  48 KB */
+        { 4,  256, 512,  8 },   /*  64 KB */
+        { 2,  512, 768, 12 },   /*  S=512, dk=64 → 128 KB */
+    };
+    static const int n_cand = (int)(sizeof(cand) / sizeof(cand[0]));
+    const int warm = 2, timed = 8;
+    const double margin = 0.95;
+
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+#else
+    int nt = 1;
+#endif
+
+    int64_t saved = g_attn.fused_bh_per_head_bytes;
+    int64_t best  = saved;
+    bool    any_measured = false;
+
+    for (int i = 0; i < n_cand; i++) {
+        const fbh_shape_t *s = &cand[i];
+        int64_t bh = s->B * s->H;
+        if (bh < (int64_t)nt) continue;  /* gate's enough_heads requires it */
+        int64_t dk = s->D / s->H;
+        int64_t per_head_bytes = s->S * dk * (int64_t)sizeof(float);
+
+        meas_mha_t mh;
+        if (meas_mha_create(&mh, s->B, s->S, s->D, s->H, /*causal*/false) != AX_OK)
+            continue;
+
+        /* force fused_bh ON */
+        g_attn.fused_bh_per_head_bytes = INT64_MAX;
+        double t_on = meas_trimmed_mean_ms(meas_mha_run_step_v4, &mh, warm, timed);
+
+        /* force fused_bh OFF */
+        g_attn.fused_bh_per_head_bytes = 0;
+        double t_off = meas_trimmed_mean_ms(meas_mha_run_step_v4, &mh, warm, timed);
+
+        meas_mha_destroy(&mh);
+
+        if (t_on >= 1.0e29 || t_off >= 1.0e29) continue;
+        any_measured = true;
+
+        if (t_on < t_off * margin && per_head_bytes > best) {
+            best = per_head_bytes;
+        }
+    }
+
+    g_attn.fused_bh_per_head_bytes = saved;
+    if (!any_measured) return 0;
+    return best;
+}
+
+/* ============================================================
+   sdpa_fused regimes calibration
+
+   the dispatch (ax_attn_bwd_get_impl in cpu_opt.c) consults
+   ax_attn_tunable_use_sdpa_fused(BH) when the env var is unset
+   or =auto. that getter returns one of three booleans depending
+   on BH vs NT.
+
+   for each regime (BH<NT, BH=NT, BH>NT), we pick a representative
+   shape and A/B by flipping the corresponding boolean in g_attn
+   while running mha train_step. since the dispatch caches env_mode
+   on first call, we ensure no AX_SDPA_FUSED env override is set
+   when calibration runs (the default env_mode now resolves to
+   "consult tunable" — the dispatch then reads g_attn directly).
+   ============================================================ */
+
+static double meas_sdpa_regime(int64_t B, int64_t S, int64_t D, int H,
+                                bool *target_flag, bool force_value,
+                                int warm, int timed) {
+    meas_mha_t mh;
+    if (meas_mha_create(&mh, B, S, D, H, /*causal*/false) != AX_OK)
+        return 1.0e30;
+    bool saved = *target_flag;
+    *target_flag = force_value;
+    double t = meas_trimmed_mean_ms(meas_mha_run_step, &mh, warm, timed);
+    *target_flag = saved;
+    meas_mha_destroy(&mh);
+    return t;
 }
 
 static void calibrate_sdpa_fused_regimes(bool *lt, bool *eq, bool *gt) {
-    /* TODO: needs A/B over BH<NT, BH==NT, BH>NT shapes calling the
-       sdpa_bwd dispatch. for now mirror the pre-calibration defaults
-       (lt=true, eq=false, gt=true) — the "BH==NT regression" rule. */
-    *lt = true; *eq = false; *gt = true;
+#ifdef _OPENMP
+    int nt = omp_get_max_threads();
+#else
+    int nt = 1;
+#endif
+
+    /* skip calibration if AX_SDPA_FUSED is set — the env override
+       wins over our tunable settings, so any A/B we attempt won't
+       be reflected in the dispatch. retain conservative defaults. */
+    const char *env = getenv("AX_SDPA_FUSED");
+    if (env && env[0] != '\0' && env[0] != 'a' && env[0] != 'A') {
+        *lt = g_attn.sdpa_fused_use_when_bh_lt_nt;
+        *eq = g_attn.sdpa_fused_use_when_bh_eq_nt;
+        *gt = g_attn.sdpa_fused_use_when_bh_gt_nt;
+        return;
+    }
+
+    /* shape parameters tuned so each regime hits with a workload that
+       still fits a calibration time budget (< ~500 ms / measurement).
+       D=512, H=8 gives BH = 8*B; we pick B to land on/above/below NT. */
+    const int64_t D = 512;
+    const int     H = 8;
+    const int64_t S = 256;
+    const int     warm = 2, timed = 8;
+    const double  margin = 0.95;  /* 5 % win margin */
+
+    /* BH < NT: pick B such that BH = max(1, nt/2). */
+    int64_t B_lt = (nt >= 16) ? 1 : 1;  /* BH = 8 < NT=16; BH=8 < NT for NT>=10 */
+    /* BH = NT: pick B = nt/H (rounded). if NT/H is not integer, skip. */
+    int64_t B_eq = (nt % H == 0) ? (nt / H) : 0;
+    /* BH > NT: pick B such that BH = 2*NT (rounded up). */
+    int64_t B_gt = ((int64_t)2 * nt + H - 1) / H;
+    if (B_gt < 1) B_gt = 1;
+
+    /* lt regime */
+    if (B_lt * H < nt) {
+        double t_on  = meas_sdpa_regime(B_lt, S, D, H,
+                                         &g_attn.sdpa_fused_use_when_bh_lt_nt, true,
+                                         warm, timed);
+        double t_off = meas_sdpa_regime(B_lt, S, D, H,
+                                         &g_attn.sdpa_fused_use_when_bh_lt_nt, false,
+                                         warm, timed);
+        if (t_on < 1.0e29 && t_off < 1.0e29) {
+            *lt = (t_on < t_off * margin);  /* fused wins by margin */
+        } else {
+            *lt = g_attn.sdpa_fused_use_when_bh_lt_nt;
+        }
+    } else {
+        *lt = g_attn.sdpa_fused_use_when_bh_lt_nt;
+    }
+
+    /* eq regime — only measurable when BH==NT is reachable */
+    if (B_eq > 0 && B_eq * H == nt) {
+        double t_on  = meas_sdpa_regime(B_eq, S, D, H,
+                                         &g_attn.sdpa_fused_use_when_bh_eq_nt, true,
+                                         warm, timed);
+        double t_off = meas_sdpa_regime(B_eq, S, D, H,
+                                         &g_attn.sdpa_fused_use_when_bh_eq_nt, false,
+                                         warm, timed);
+        if (t_on < 1.0e29 && t_off < 1.0e29) {
+            *eq = (t_on < t_off * margin);
+        } else {
+            *eq = g_attn.sdpa_fused_use_when_bh_eq_nt;
+        }
+    } else {
+        *eq = g_attn.sdpa_fused_use_when_bh_eq_nt;
+    }
+
+    /* gt regime */
+    {
+        double t_on  = meas_sdpa_regime(B_gt, S, D, H,
+                                         &g_attn.sdpa_fused_use_when_bh_gt_nt, true,
+                                         warm, timed);
+        double t_off = meas_sdpa_regime(B_gt, S, D, H,
+                                         &g_attn.sdpa_fused_use_when_bh_gt_nt, false,
+                                         warm, timed);
+        if (t_on < 1.0e29 && t_off < 1.0e29) {
+            *gt = (t_on < t_off * margin);
+        } else {
+            *gt = g_attn.sdpa_fused_use_when_bh_gt_nt;
+        }
+    }
 }
 
 /* ============================================================

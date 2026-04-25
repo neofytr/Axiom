@@ -7063,25 +7063,20 @@ typedef void (*ax_attn_bwd_kj_fn_t)(
 /* pick the kj-block impl. dispatch:
      AX_SDPA_FUSED=1     → force fused
      AX_SDPA_FUSED=0     → force materialized
-     AX_SDPA_FUSED=auto  → shape-dispatched: fused when BH != NT, materialized
-                           when BH == NT (the known regression case per
-                           plan.md where each thread owns exactly one head)
-     unset               → materialized (same as =0; conservative default)
+     AX_SDPA_FUSED=auto  → shape-dispatched via the calibrated tunable
+                           (encodes the per-regime BH<NT / =NT / >NT
+                           winners measured on this host)
+     unset               → same as =auto (consult the tunable). pre-tunable
+                           builds defaulted to "force off" because the
+                           BH==NT regression hadn't been encoded anywhere;
+                           the tunable now carries that decision per regime
+                           so consult-by-default is safe and gives users
+                           the calibrator's wins without an explicit opt-in.
 
-   the default was briefly flipped to shape-auto in a2891a3 based on
-   plan.md's bench table that showed fused -10% on B8_S128. subsequent
-   bench on 2026-04-24 at ~2 AM local, with lower bg load, measured
-   fused ~flat or marginally slower than materialized on B8_S128 at
-   the current post-F.3.c code state — plan.md's numbers appear to
-   have drifted relative to the current kernel. reverted to
-   materialized default; users can opt into shape-dispatch with
-   AX_SDPA_FUSED=auto or force-enable with AX_SDPA_FUSED=1 after
-   measuring locally.
-
-   BH=16=NT regression case still handled by =auto dispatch. */
+   to bring back the old conservative default, set AX_SDPA_FUSED=0. */
 static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
-    /* cache env parse once. -2 = uninitialised, 0 = force off (default),
-       1 = force on, 2 = shape-dispatched auto. */
+    /* cache env parse once. -2 = uninitialised, 0 = force off,
+       1 = force on, 2 = shape-dispatched auto (default when env unset). */
     static int env_mode = -2;
     if (env_mode == -2) {
         const char *env = getenv("AX_SDPA_FUSED");
@@ -7090,7 +7085,7 @@ static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
             else if (env[0] == 'a' || env[0] == 'A') env_mode = 2;
             else env_mode = 0;
         } else {
-            env_mode = 0;
+            env_mode = 2;  /* default: consult tunable */
         }
     }
 
