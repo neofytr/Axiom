@@ -892,10 +892,21 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
        conservative: only swaps to a non-default tile config when the
        measured win is ≥5% over the static defaults. avoids picking a
        worse-on-noisy-runs config. */
+    /* env semantics:
+         AX_GEMM_CALIBRATE=0     → skip calibration entirely (use static heuristic)
+         AX_GEMM_CALIBRATE=fast  → 3-shape quick sweep (~250 ms, pre-2026-04-25 default)
+         AX_GEMM_CALIBRATE unset → 5-shape extended sweep including mha-rep shapes
+                                    (~500-700 ms, default since the audit found
+                                    mha probes finding non-default tiles on some
+                                    hosts; one-time at startup)
+         AX_GEMM_CALIBRATE=1     → extended (kept for back-compat with old scripts)
+       AX_GEMM_MC/NC/KC env vars override calibration entirely. */
     const char *calibrate_env = getenv("AX_GEMM_CALIBRATE");
     if (calibrate_env && calibrate_env[0] == '0') return;          /* user opt-out */
     if (getenv("AX_GEMM_MC") || getenv("AX_GEMM_NC") || getenv("AX_GEMM_KC")) return;
-    bool extended = (calibrate_env && calibrate_env[0] == '1');
+    /* extended is the default. only "fast" (3-shape) needs explicit opt-in
+       for tests / quick-iteration where startup time matters. */
+    bool extended = !(calibrate_env && (calibrate_env[0] == 'f' || calibrate_env[0] == 'F'));
 
     int64_t mc_orig = GEMM_MC, nc_orig = GEMM_NC, kc_orig = GEMM_KC;
     /* candidate set: baseline + a few neighbors. extended sweep adds more. */
