@@ -580,10 +580,38 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
         (float *)dQKV->storage->data,
         B, S, H, dk, D);
 
-    /* (9) dWqkv = x^T @ dQKV, split → dWq / dWk / dWv (accumulate into grads) */
+    /* (9) dWqkv = x^T @ dQKV, split → dWq / dWk / dWv (accumulate into grads).
+       F.3.c (opt_dwqkv_split_acc) writes the gemm output directly into
+       the three separate grad tensors, eliminating the [D, 3D] intermediate
+       (~6 MB on D=1024). gated D >= 1024 because measured regression on
+       smaller D (the [D, 3D] intermediate fits L3 cheaply on D<=768 and
+       per-jc dest dispatch adds overhead). when active, requires all three
+       Wq/Wk/Wv grads (the kernel doesn't support partial). this mirrors
+       attention.c's autograd path which has had F.3.c since commit 408600e —
+       train_step_v4 was missing it until this commit. */
     bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad ||
                          m->Wv->requires_grad;
+    bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad &&
+                         m->Wv->requires_grad;
     if (any_wqkv_grad) {
+        if (all_wqkv_grad && D >= 1024 && ax_compute_has_dwqkv_split_acc()) {
+            float *dq_init = ensure_grad_ptr(m->Wq);
+            float *dk_init = ensure_grad_ptr(m->Wk);
+            float *dv_init = ensure_grad_ptr(m->Wv);
+            (void)dq_init; (void)dk_init; (void)dv_init;
+            if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
+                if (ax_compute_dwqkv_split_acc(&x_flat_v, dQKV,
+                                                m->Wq->grad, m->Wk->grad,
+                                                m->Wv->grad) != AX_OK)
+                    return AX_ERR_BACKEND;
+                ax_storage_touch(m->Wq->grad->storage);
+                ax_storage_touch(m->Wk->grad->storage);
+                ax_storage_touch(m->Wv->grad->storage);
+                goto dwqkv_done_v4;
+            }
+        }
+
+        /* fallback: materialize then split */
         int64_t dW_sh[] = {D, 3 * D};
         ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
         if (!dWqkv) return AX_ERR_ALLOC;
@@ -606,6 +634,7 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
         if (dp_q) ax_storage_touch(m->Wq->grad->storage);
         if (dp_k) ax_storage_touch(m->Wk->grad->storage);
         if (dp_v) ax_storage_touch(m->Wv->grad->storage);
+        dwqkv_done_v4: ;
     }
 
     /* (10) dbqkv = colsum(dQKV), split → dbq / dbk / dbv */

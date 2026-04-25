@@ -501,12 +501,39 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
     if (prof_enabled) pf_dqkv_merge += PF_TICK() - pf_t0;
 
     /* step 4 — fused weight grad: dWqkv = x_flat^T @ dQKV → [D, 3D]
-       then split columns into dWq / dWk / dWv. same pattern as
-       mha_backward — trying to skip the intermediate via 3 strided
-       calls regressed perf on this CPU (see commit 4b8c21f). */
+       then split columns into dWq / dWk / dWv.
+       F.3.c (opt_dwqkv_split_acc) writes the gemm output DIRECTLY into
+       the three separate grad tensors — eliminates the [D, 3D]
+       intermediate (~6 MB on D=1024) and the 3 ACC_PARAM split passes.
+       gated D >= 1024 because measured regression on smaller D where
+       the intermediate fits L3 cheaply. requires all three Wq/Wk/Wv
+       grads (kernel doesn't support partial). this matches attention.c
+       autograd's wiring (commit 408600e); train_step lacked it until
+       this commit. */
     bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad ||
                          m->Wv->requires_grad;
+    bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad &&
+                         m->Wv->requires_grad;
     if (any_wqkv_grad) {
+        if (all_wqkv_grad && D >= 1024 && ax_compute_has_dwqkv_split_acc()) {
+            (void)ensure_grad_ptr(m->Wq);
+            (void)ensure_grad_ptr(m->Wk);
+            (void)ensure_grad_ptr(m->Wv);
+            if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
+                pf_t0 = prof_enabled ? PF_TICK() : 0;
+                if (ax_compute_dwqkv_split_acc(&x_flat_v, dQKV,
+                                                m->Wq->grad, m->Wk->grad,
+                                                m->Wv->grad) != AX_OK)
+                    return AX_ERR_BACKEND;
+                if (prof_enabled) pf_dwqkv += PF_TICK() - pf_t0;
+                ax_storage_touch(m->Wq->grad->storage);
+                ax_storage_touch(m->Wk->grad->storage);
+                ax_storage_touch(m->Wv->grad->storage);
+                goto dwqkv_done_ts;
+            }
+        }
+
+        /* fallback: materialize then split */
         int64_t dW_sh[] = {D, 3 * D};
         ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
         if (!dWqkv) return AX_ERR_ALLOC;
@@ -530,6 +557,7 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         ACC_PARAM(m->Wk, D);
         ACC_PARAM(m->Wv, 2 * D);
         #undef ACC_PARAM
+        dwqkv_done_ts: ;
     }
 
     /* step 5 — bias grads: dbqkv = col-sum(dQKV) → split into bq/bk/bv */

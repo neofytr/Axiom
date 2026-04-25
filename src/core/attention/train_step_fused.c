@@ -460,15 +460,35 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
         (float *)dQKV->storage->data,
         B, S, H, dk, D);
 
-    /* step 4 — fused weight grad: dWqkv = x_flat^T @ dQKV. the 3 ACC_PARAM
-       split-into-Wq/Wk/Wv passes are merged into one parallel region so
-       we pay the omp spawn/join cost once instead of three times — saves
-       ~20-30 us per train_step call at NT=16. the dw[i*3D:(i+1)*3D] row
-       stays in L1 across the three acc_f32 calls inside one iteration,
-       eliminating the row's second and third load on most hardware. */
+    /* step 4 — fused weight grad: dWqkv = x_flat^T @ dQKV.
+       F.3.c (opt_dwqkv_split_acc) writes the gemm output directly into
+       the three separate grad tensors when D >= 1024 — eliminates the
+       [D, 3D] intermediate (~6 MB on D=1024). matches autograd's wiring;
+       train_step_fused was missing it before. fallback path (D<1024 or
+       partial grads) merges the 3 split passes into one parallel region
+       so we pay omp spawn/join once instead of three times. */
     bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad ||
                          m->Wv->requires_grad;
+    bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad &&
+                         m->Wv->requires_grad;
     if (any_wqkv_grad) {
+        if (all_wqkv_grad && D >= 1024 && ax_compute_has_dwqkv_split_acc()) {
+            (void)ensure_grad_ptr(m->Wq);
+            (void)ensure_grad_ptr(m->Wk);
+            (void)ensure_grad_ptr(m->Wv);
+            if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
+                if (ax_compute_dwqkv_split_acc(&x_flat_v, dQKV,
+                                                m->Wq->grad, m->Wk->grad,
+                                                m->Wv->grad) != AX_OK)
+                    return AX_ERR_BACKEND;
+                ax_storage_touch(m->Wq->grad->storage);
+                ax_storage_touch(m->Wk->grad->storage);
+                ax_storage_touch(m->Wv->grad->storage);
+                goto dwqkv_done_tsf;
+            }
+        }
+
+        /* fallback: materialize then split */
         int64_t dW_sh[] = {D, 3 * D};
         ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
         if (!dWqkv) return AX_ERR_ALLOC;
@@ -491,6 +511,7 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
         if (dp_q) ax_storage_touch(m->Wq->grad->storage);
         if (dp_k) ax_storage_touch(m->Wk->grad->storage);
         if (dp_v) ax_storage_touch(m->Wv->grad->storage);
+        dwqkv_done_tsf: ;
     }
 
     /* step 5 — bias grads */
