@@ -130,17 +130,21 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
     # link-time optimization. enables cross-TU inlining of dispatch
     # wrappers (ax_compute_gemm -> opt_gemm) and constant folding of
     # tile-size globals into the JIT-emitted micro-kernel call sites.
-    # measured ~3-8% on mha_train benches; cost is +30-90 s build time
-    # for a clean release. opt out with -DAX_NO_LTO=ON for fast iteration.
-    option(AX_NO_LTO "disable LTO in release builds (faster compile, slower runtime)" OFF)
-    if(NOT AX_NO_LTO)
+    # measured ~3-8 % on mha_train benches when combined with AX_NATIVE.
+    # cost: +30-90 s clean build time, +5-20 s incremental rebuilds.
+    #
+    # default OFF for fast iteration. opt in via -DAX_LTO=ON for
+    # production / distribution builds where the runtime gain matters
+    # more than build cycle time.
+    option(AX_LTO "enable LTO for release builds (slower compile, faster runtime)" OFF)
+    if(AX_LTO)
         include(CheckIPOSupported)
         check_ipo_supported(RESULT _lto_ok OUTPUT _lto_err)
         if(_lto_ok)
             set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
-            message(STATUS "LTO enabled for release build")
+            message(STATUS "LTO enabled for release build (AX_LTO=ON)")
         else()
-            message(STATUS "LTO not supported by toolchain: ${_lto_err}")
+            message(STATUS "LTO requested but not supported by toolchain: ${_lto_err}")
         endif()
     endif()
 
