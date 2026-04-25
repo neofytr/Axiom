@@ -10,6 +10,7 @@
    values — the behaviour everyone shipped before this work landed. */
 
 #include "axiom/internal/attn_tunables.h"
+#include "axiom/internal/calib_cache.h"
 #include "axiom/tensor.h"
 #include "axiom/compute.h"
 #include "axiom/memory.h"
@@ -1048,6 +1049,8 @@ extern int64_t ax_attn_bk_default_resolved(void);
 extern void    ax_attn_set_bq_resolved(int64_t v);
 extern void    ax_attn_set_bk_resolved(int64_t v);
 extern void    ax_attn_pack_stats_dump(void);  /* T2.1 */
+extern void    ax_gemm_tiles_get_resolved(int64_t *, int64_t *, int64_t *);  /* A4 */
+extern void    ax_gemm_tiles_set_resolved(int64_t, int64_t, int64_t);          /* A4 */
 
 /* atexit hook: when AX_PROFILE_PACK=1, emit pack-cycle totals before
    process teardown so users see where pack overhead actually fell. */
@@ -1143,4 +1146,85 @@ void ax_attn_tunables_calibrate(void) {
 
     g_attn.calibrated = true;
 #endif
+}
+
+/* ============================================================
+   A4: calibration cache integration
+   ============================================================ */
+
+/* indicates that ax_calib_cache_try_apply() loaded a payload — we
+   use this to skip both the gemm-tile sweep and the attn calibrator,
+   and to bypass the post-calibration cache save. */
+static bool g_calib_loaded_from_cache = false;
+
+bool ax_calib_cache_try_apply(void) {
+    if (g_attn.calibrated) return false;  /* already done some other way */
+
+    /* run early init first so env-var overrides (notably the
+       gemm_tile_switch_margin) hit before we even consider a cache
+       hit — env beats cache, by design. */
+    ax_attn_tunables_init_early();
+
+    ax_calib_payload_t pl;
+    if (!ax_calib_cache_load(&pl)) return false;
+
+    /* apply cached values to the live tunable state. */
+    g_attn.f3a_qkv_bytes_threshold       = pl.f3a_qkv_bytes_threshold;
+    g_attn.f3c_d_threshold               = pl.f3c_d_threshold;
+    g_attn.save_p_max_bytes              = pl.save_p_max_bytes;
+    g_attn.save_p_small_exclusion_sk     = pl.save_p_small_exclusion_sk;
+    g_attn.save_p_small_exclusion_s      = pl.save_p_small_exclusion_s;
+    g_attn.fused_bh_per_head_bytes       = pl.fused_bh_per_head_bytes;
+    g_attn.gemm_tn_pretranspose_flops    = pl.gemm_tn_pretranspose_flops;
+    g_attn.attn_bq                       = pl.attn_bq;
+    g_attn.attn_bk                       = pl.attn_bk;
+    g_attn.sdpa_fused_use_when_bh_lt_nt  = (bool)pl.sdpa_fused_use_when_bh_lt_nt;
+    g_attn.sdpa_fused_use_when_bh_eq_nt  = (bool)pl.sdpa_fused_use_when_bh_eq_nt;
+    g_attn.sdpa_fused_use_when_bh_gt_nt  = (bool)pl.sdpa_fused_use_when_bh_gt_nt;
+    /* preserve whatever init_early set the margin to (env-var override
+       wins over cached value). only fall through to cache if init_early
+       didn't change it. */
+    if (g_attn.gemm_tile_switch_margin == 0.94)  /* default unchanged */
+        g_attn.gemm_tile_switch_margin = pl.gemm_tile_switch_margin;
+
+    /* push attn tile sizes into cpu_opt's static so attn fwd/bwd take
+       effect immediately. gemm tiles ditto via the resolved setter. */
+    ax_attn_set_bq_resolved(g_attn.attn_bq);
+    ax_attn_set_bk_resolved(g_attn.attn_bk);
+    ax_gemm_tiles_set_resolved(pl.gemm_mc, pl.gemm_nc, pl.gemm_kc);
+
+    g_attn.calibrated = true;
+    g_calib_loaded_from_cache = true;
+    return true;
+}
+
+bool ax_calib_loaded_from_cache(void) {
+    return g_calib_loaded_from_cache;
+}
+
+void ax_calib_cache_save_current(void) {
+    if (!g_attn.calibrated) return;
+    if (g_calib_loaded_from_cache) return;  /* nothing new to persist */
+
+    ax_calib_payload_t pl;
+    pl.f3a_qkv_bytes_threshold       = g_attn.f3a_qkv_bytes_threshold;
+    pl.f3c_d_threshold               = g_attn.f3c_d_threshold;
+    pl.save_p_max_bytes              = g_attn.save_p_max_bytes;
+    pl.save_p_small_exclusion_sk     = g_attn.save_p_small_exclusion_sk;
+    pl.save_p_small_exclusion_s      = g_attn.save_p_small_exclusion_s;
+    pl.fused_bh_per_head_bytes       = g_attn.fused_bh_per_head_bytes;
+    pl.gemm_tn_pretranspose_flops    = g_attn.gemm_tn_pretranspose_flops;
+    pl.attn_bq                       = g_attn.attn_bq;
+    pl.attn_bk                       = g_attn.attn_bk;
+    pl.sdpa_fused_use_when_bh_lt_nt  = (int8_t)g_attn.sdpa_fused_use_when_bh_lt_nt;
+    pl.sdpa_fused_use_when_bh_eq_nt  = (int8_t)g_attn.sdpa_fused_use_when_bh_eq_nt;
+    pl.sdpa_fused_use_when_bh_gt_nt  = (int8_t)g_attn.sdpa_fused_use_when_bh_gt_nt;
+    pl._pad0                         = 0;
+    pl.gemm_tile_switch_margin       = g_attn.gemm_tile_switch_margin;
+
+    int64_t mc = 0, nc = 0, kc = 0;
+    ax_gemm_tiles_get_resolved(&mc, &nc, &kc);
+    pl.gemm_mc = mc; pl.gemm_nc = nc; pl.gemm_kc = kc;
+
+    (void)ax_calib_cache_save(&pl);
 }

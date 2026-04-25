@@ -5982,6 +5982,40 @@ void AX_SYM(ax_cpu_opt_set_attn_bk)(int64_t v) {
     ATTN_BK = v;
 }
 
+/* GEMM tile getters / setters — used by the calibration cache to
+   capture and restore the tile sweep result. setters validate alignment
+   + the static MC/NC/KC clamping that ax_cpu_opt_calibrate_tiles applies
+   so a corrupted cache file can't induce out-of-bounds behaviour. */
+void AX_SYM(ax_cpu_opt_get_gemm_tiles)(int64_t *mc, int64_t *nc, int64_t *kc) {
+    if (mc) *mc = GEMM_MC;
+    if (nc) *nc = GEMM_NC;
+    if (kc) *kc = GEMM_KC;
+}
+
+void AX_SYM(ax_cpu_opt_set_gemm_tiles)(int64_t mc, int64_t nc, int64_t kc) {
+    /* defensive clamping: cache load is the only caller that sets
+       arbitrary values here; ensure we stay within the JIT kernel's
+       packed-panel budget so a stale cache doesn't crash. */
+    if (mc <= 0) mc = AX_GEMM_DEFAULT_MC;
+    if (nc <= 0) nc = AX_GEMM_DEFAULT_NC;
+    if (kc <= 0) kc = AX_GEMM_DEFAULT_KC;
+    if (mc % GEMM_MR != 0) mc = (mc / GEMM_MR) * GEMM_MR;
+    if (mc < GEMM_MR) mc = GEMM_MR;
+    if (nc % GEMM_NR != 0) nc = (nc / GEMM_NR) * GEMM_NR;
+    if (nc < GEMM_NR) nc = GEMM_NR;
+    if (kc < 1) kc = 1;
+    /* MC/NC ceilings: pack buffers are TLS-grown on demand so any
+       reasonable size is fine. clamp at 4 KB worth of MR/NR multiples
+       to catch obviously corrupt cache values without forcing an
+       artificial limit. */
+    if (mc > 4096) mc = 4096;
+    if (nc > 4096) nc = 4096;
+    if (kc > AX_GEMM_MAX_KC) kc = AX_GEMM_MAX_KC;
+    GEMM_MC = mc;
+    GEMM_NC = nc;
+    GEMM_KC = kc;
+}
+
 /* in-place multiply a packed panel by a scalar (SIMD-vectorized).
    used to bake 1/√dk into Kt_packed so the score GEMM output is
    pre-scaled without a separate pass over the score tile. */

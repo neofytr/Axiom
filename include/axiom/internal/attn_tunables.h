@@ -51,6 +51,22 @@ void ax_attn_tunables_init_early(void);
    match the pre-calibration hardcoded values). idempotent. */
 void ax_attn_tunables_calibrate(void);
 
+/* A4: try to load a cached payload matching this host. on hit, applies
+   the values to live state (g_attn + cpu_opt's static GEMM tile config)
+   and marks calibration as done so subsequent calibrators short-circuit.
+   returns true on hit, false on miss / env-disabled / error. */
+bool ax_calib_cache_try_apply(void);
+
+/* A4: returns true if the most recent calibrate cycle came from disk.
+   used by the post-calibration save hook to avoid re-writing what we
+   just read. */
+bool ax_calib_loaded_from_cache(void);
+
+/* A4: persist the current live tunable + tile state to the calibration
+   cache. fire after both gemm-tile and attn-tunable calibrators have run.
+   no-op when the values were loaded from cache (nothing new to save). */
+void ax_calib_cache_save_current(void);
+
 /* getters. all return values appropriate for the current host. callers
    should branch on these instead of hardcoded constants. */
 

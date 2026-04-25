@@ -216,11 +216,20 @@ ax_status_t ax_compute_init(void) {
        below) and wires up atexit hooks. fast — no measurements. */
     ax_attn_tunables_init_early();
 
+    /* A4: attempt to load cached calibration from disk. on hit, every
+       downstream calibrator short-circuits (g_attn.calibrated = true)
+       and the gemm tile sweep is skipped via the cache-loaded flag.
+       saves ~10-15 s per process startup once the cache is warm. */
+    bool calib_cached = ax_calib_cache_try_apply();
+
     /* optional gemm tile calibration: sweeps a grid of (mc, nc, kc)
        candidates on a representative 1024^3 gemm and picks the fastest.
        ~500ms startup cost, opt-in via AX_GEMM_CALIBRATE=1. consults
-       the gemm_tile_switch_margin tunable for its accept-cutoff. */
-    ax_calibrate_gemm_tiles();
+       the gemm_tile_switch_margin tunable for its accept-cutoff. skipped
+       when calibration was loaded from cache. */
+    if (!calib_cached) {
+        ax_calibrate_gemm_tiles();
+    }
 
     /* attention-tunables calibration. measures the empirical crossover
        for each fused-vs-unfused gate (F.3.a, F.3.c, save_p, fused_bh,
@@ -228,6 +237,12 @@ ax_status_t ax_compute_init(void) {
        results cached so cost is paid once per machine + version.
        no-op under AX_NO_AUTOTUNE=1 / AX_NO_ATTN_CALIB=1. */
     ax_attn_tunables_calibrate();
+
+    /* A4: persist the calibrated values so the next process startup
+       can short-circuit. no-op when calibration came from cache. */
+    if (!calib_cached) {
+        ax_calib_cache_save_current();
+    }
 
     return AX_OK;
 }
