@@ -526,25 +526,23 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
     (void)d_attn;  /* only used in the non-F.3.d fallback above */
 
     /* (5) fwd y = attn_flat @ Wo + bo (full-rows — all attn_flat rows are
-       filled by now). */
-    if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
+       filled by now). T1.5 bias-fuse via skip_init: pre-fill output with
+       broadcast bias, then accumulate gemm into it. */
     if (m->use_bias) {
         const float *bd = (const float *)m->bo->storage->data;
         float *od = (float *)y_flat_v.storage->data;
-        int64_t de = D - (D % AX_VF32_WIDTH);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
         for (int64_t r = 0; r < rows; r++) {
-            float *row = od + r * D;
-            int64_t c = 0;
-            for (; c < de; c += AX_VF32_WIDTH) {
-                ax_vf32 v = ax_vf32_loadu(row + c);
-                ax_vf32 b = ax_vf32_loadu(bd + c);
-                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
-            }
-            for (; c < D; c++) row[c] += bd[c];
+            memcpy(od + r * D, bd, (size_t)D * sizeof(float));
         }
+        ax_gemm_set_skip_init(true);
+        ax_status_t s = ax_compute_gemm(attn_flat, m->Wo, &y_flat_v);
+        ax_gemm_set_skip_init(false);
+        if (s != AX_OK) return AX_ERR_BACKEND;
+    } else {
+        if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
     }
     ax_storage_touch(y_out->storage);
 

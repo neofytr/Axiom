@@ -351,26 +351,29 @@ ax_status_t ax_mha_train_step(ax_layer_t *layer,
         if (prof_enabled) pf_deint += PF_TICK() - pf_t0;
     }
 
-    /* output projection: y_flat = attn_flat @ Wo, then (+bo) */
+    /* output projection: y_flat = attn_flat @ Wo + bo.
+       T1.5 bias-fuse: when use_bias, pre-fill y rows with bo broadcast,
+       then run gemm with skip_init=true so it accumulates A@B into the
+       bias-pre-filled buffer. produces same y as gemm-then-bias-add but
+       merges the two memory passes — the gemm's last-K-iter writeback
+       is the only write that touches y, instead of writeback + a
+       separate bias-add full-rows pass. */
     pf_t0 = prof_enabled ? PF_TICK() : 0;
-    if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
     if (m->use_bias) {
         const float *bd = (const float *)m->bo->storage->data;
         float *od = (float *)y_flat_v.storage->data;
-        int64_t de = D - (D % AX_VF32_WIDTH);
 #ifdef _OPENMP
         #pragma omp parallel for schedule(static)
 #endif
         for (int64_t r = 0; r < rows; r++) {
-            float *row = od + r * D;
-            int64_t c = 0;
-            for (; c < de; c += AX_VF32_WIDTH) {
-                ax_vf32 v = ax_vf32_loadu(row + c);
-                ax_vf32 b = ax_vf32_loadu(bd + c);
-                ax_vf32_storeu(row + c, ax_vf32_add(v, b));
-            }
-            for (; c < D; c++) row[c] += bd[c];
+            memcpy(od + r * D, bd, (size_t)D * sizeof(float));
         }
+        ax_gemm_set_skip_init(true);
+        ax_status_t s = ax_compute_gemm(attn_flat, m->Wo, &y_flat_v);
+        ax_gemm_set_skip_init(false);
+        if (s != AX_OK) return AX_ERR_BACKEND;
+    } else {
+        if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
     }
     ax_storage_touch(y_out->storage);
     if (prof_enabled) pf_wo += PF_TICK() - pf_t0;

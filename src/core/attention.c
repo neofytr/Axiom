@@ -384,32 +384,36 @@ static ax_tensor_t *mha_forward(ax_layer_t *self, ax_tensor_t *input)
     ax_tensor_t *out_flat_view = ax_tensor_reshape(out, out_flat_sh, 2);
     if (!out_flat_view) { ax_tensor_destroy(out); goto fail; }
 
-    if (ax_compute_gemm(attn_flat, m->Wo, out_flat_view) != AX_OK) {
-        ax_tensor_destroy(out_flat_view);
-        ax_tensor_destroy(out);
-        goto fail;
-    }
-    if (m->use_bias) {
-        if (on_cuda) {
+    /* T1.5 bias-fuse via skip_init: when use_bias on CPU, pre-fill output
+       with bo broadcast then run gemm with skip_init so it accumulates
+       into the bias buffer. saves the separate bias-add full-rows pass.
+       CUDA still uses the dispatched bias_add for layout consistency. */
+    if (m->use_bias && !on_cuda) {
+        const float *bd = (const float *)m->bo->storage->data;
+        float *od = (float *)out_flat_view->storage->data;
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int64_t r = 0; r < rows; r++) {
+            memcpy(od + r * D, bd, (size_t)D * sizeof(float));
+        }
+        ax_gemm_set_skip_init(true);
+        ax_status_t s = ax_compute_gemm(attn_flat, m->Wo, out_flat_view);
+        ax_gemm_set_skip_init(false);
+        if (s != AX_OK) {
+            ax_tensor_destroy(out_flat_view);
+            ax_tensor_destroy(out);
+            goto fail;
+        }
+    } else {
+        if (ax_compute_gemm(attn_flat, m->Wo, out_flat_view) != AX_OK) {
+            ax_tensor_destroy(out_flat_view);
+            ax_tensor_destroy(out);
+            goto fail;
+        }
+        if (m->use_bias && on_cuda) {
             /* dispatched bias_add (CUDA-aware) */
             ax_compute_bias_add(out_flat_view, m->bo, 1, out_flat_view);
-        } else {
-            float *od = (float *)out_flat_view->storage->data;
-            const float *bd = (const float *)m->bo->storage->data;
-            int64_t de = D - (D % AX_VF32_WIDTH);
-#ifdef _OPENMP
-            #pragma omp parallel for schedule(static) if (rows * D >= ax_par_threshold_elems)
-#endif
-            for (int64_t r = 0; r < rows; r++) {
-                float *row = od + r * D;
-                int64_t c = 0;
-                for (; c < de; c += AX_VF32_WIDTH) {
-                    ax_vf32 v = ax_vf32_loadu(row + c);
-                    ax_vf32 b = ax_vf32_loadu(bd + c);
-                    ax_vf32_storeu(row + c, ax_vf32_add(v, b));
-                }
-                for (; c < D; c++) row[c] += bd[c];
-            }
         }
     }
     ax_storage_touch(out->storage);
