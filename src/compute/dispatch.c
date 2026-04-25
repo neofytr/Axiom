@@ -211,9 +211,15 @@ ax_status_t ax_compute_init(void) {
     ax_cpu_opt_prewarm();
 #endif
 
+    /* tunables early-init: resolves env-var overrides (notably
+       AX_GEMM_TILE_SWITCH_MARGIN, read by the gemm tile calibration
+       below) and wires up atexit hooks. fast — no measurements. */
+    ax_attn_tunables_init_early();
+
     /* optional gemm tile calibration: sweeps a grid of (mc, nc, kc)
        candidates on a representative 1024^3 gemm and picks the fastest.
-       ~500ms startup cost, opt-in via AX_GEMM_CALIBRATE=1. */
+       ~500ms startup cost, opt-in via AX_GEMM_CALIBRATE=1. consults
+       the gemm_tile_switch_margin tunable for its accept-cutoff. */
     ax_calibrate_gemm_tiles();
 
     /* attention-tunables calibration. measures the empirical crossover

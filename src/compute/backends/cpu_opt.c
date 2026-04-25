@@ -1166,16 +1166,18 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     }
 
     /* conservative selection: only switch if the proposed config beats
-       baseline by ≥6% on the geometric mean across 3 probe shapes
-       (512² + 1024² + skinny). 6% sits between the prior 5% (too loose,
-       triggered NC=128 swap that cost large-shape) and 8% (too tight,
-       missed MC=24 swap that helped narrow-N by 13%). this is empirical
-       — the right value depends on the noise floor of the host. */
+       baseline by the configured margin on the geometric mean across the
+       probe shapes. default 6 % (margin = 0.94) sits between 5 % (too
+       loose, triggered NC=128 swap that cost large-shape) and 8 % (too
+       tight, missed MC=24 swap that helped narrow-N by 13 %). users on
+       noisier hosts can loosen via AX_GEMM_TILE_SWITCH_MARGIN env var,
+       resolved by ax_attn_tunables_init_early() before this function. */
+    const double switch_margin = ax_attn_tunable_gemm_tile_switch_margin();
     for (int i = 1; i < nc_configs; i++) {
         double prod = 1.0;
         for (int sh_i = 0; sh_i < n_sh; sh_i++) prod *= per_shape_per_config[i][sh_i];
         double cand_score = pow(prod, 1.0 / (double)n_sh);
-        if (cand_score < base_score * 0.94) {
+        if (cand_score < base_score * switch_margin) {
             best_i = i;
             base_score = cand_score;
         }

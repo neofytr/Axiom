@@ -34,6 +34,15 @@
 extern "C" {
 #endif
 
+/* early init: resolves env-var overrides for tunables that downstream
+   calibrators consult (notably AX_GEMM_TILE_SWITCH_MARGIN, read by
+   ax_calibrate_gemm_tiles). called from ax_compute_init BEFORE the
+   gemm-tile sweep so the override has effect. registers atexit hooks
+   used by the pack-profile and similar instrumentation. NO heavy
+   measurements — that's ax_attn_tunables_calibrate. idempotent;
+   safe to call before the active backend is initialised. */
+void ax_attn_tunables_init_early(void);
+
 /* run all attention-tunable measurements. called once from ax_compute_init
    after gemm tile calibration. budget ~2-10 s on a quiet machine; cached
    by calib_cache so subsequent runs are instantaneous.
@@ -86,6 +95,20 @@ int64_t ax_attn_tunable_gemm_tn_pretranspose_flops(void);
    default. returned values are MR-multiples. */
 int64_t ax_attn_tunable_attn_bq(void);
 int64_t ax_attn_tunable_attn_bk(void);
+
+/* GEMM tile calibration: candidate-vs-baseline switch margin. the tile
+   sweep prefers a non-baseline (mc, nc, kc) combo only when its score
+   is < base_score * margin (default 0.94 → "must beat baseline by 6 %").
+   tuned to sit between 5 % (too loose) and 8 % (too tight) on x86 +
+   ARM hosts. exposed as a tunable so users on noisier hosts can
+   loosen / tighten as needed without recompiling.
+
+   getter returns a fraction in [0.5, 1.0); 1.0 - margin is the
+   minimum-required improvement. callers should multiply baseline by
+   the returned value to get the cutoff. NOT consumed by the attention
+   path — lives here because attn_tunables.c is the consolidated
+   runtime-tunables home. */
+double  ax_attn_tunable_gemm_tile_switch_margin(void);
 
 /* override / debug: AX_ATTN_TUNABLES_LOG=1 prints chosen values to
    stderr at calibration time. AX_NO_ATTN_CALIB=1 forces fallback to

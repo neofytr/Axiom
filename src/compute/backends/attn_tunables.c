@@ -69,6 +69,11 @@ static struct {
     /* attention tile sizes (MR-multiples) */
     int64_t attn_bq;                      /* default: ATTN_BQ_DEFAULT */
     int64_t attn_bk;                      /* default: ATTN_BQ_DEFAULT */
+
+    /* GEMM tile calibration switch margin. cand wins iff
+       cand_score < base_score * gemm_tile_switch_margin. values
+       in [0.5, 1.0); 0.94 = "must beat baseline by ≥6 %". */
+    double gemm_tile_switch_margin;       /* default: 0.94 */
 } g_attn = {
     .calibrated = false,
     .f3a_qkv_bytes_threshold = (int64_t)8 * 1024 * 1024,
@@ -86,6 +91,7 @@ static struct {
        here; see ax_attn_tunables_calibrate(). */
     .attn_bq = 0,
     .attn_bk = 0,
+    .gemm_tile_switch_margin = 0.94,
 };
 
 /* ============================================================
@@ -138,6 +144,10 @@ int64_t ax_attn_tunable_attn_bq(void) {
 
 int64_t ax_attn_tunable_attn_bk(void) {
     return g_attn.attn_bk;
+}
+
+double ax_attn_tunable_gemm_tile_switch_margin(void) {
+    return g_attn.gemm_tile_switch_margin;
 }
 
 /* ============================================================
@@ -1046,16 +1056,40 @@ static void pack_stats_atexit_hook(void) {
     if (e && e[0] == '1') ax_attn_pack_stats_dump();
 }
 
+/* early init: resolves env-var overrides for tunables that downstream
+   calibrators (notably ax_calibrate_gemm_tiles) consult. registers
+   atexit hooks. NO measurements — that's ax_attn_tunables_calibrate.
+   safe to call before the active backend is initialised; idempotent. */
+void ax_attn_tunables_init_early(void) {
+    static bool inited = false;
+    if (inited) return;
+    inited = true;
+
+    /* register pack-stats atexit hook once. cheap (one libc call). */
+    atexit(pack_stats_atexit_hook);
+
+    /* AX_GEMM_TILE_SWITCH_MARGIN: numeric override, e.g. 0.92 ("must
+       beat baseline by 8 %") or 0.96 ("only switch on a >= 4 % win").
+       reject out-of-range values (sticking with default 0.94 if user
+       passes garbage). exposed as env-var so users on noisier hosts
+       can loosen the margin without rebuilding. */
+    const char *env = getenv("AX_GEMM_TILE_SWITCH_MARGIN");
+    if (env && env[0] != '\0') {
+        char *endp = NULL;
+        double v = strtod(env, &endp);
+        if (endp != env && v >= 0.5 && v < 1.0) {
+            g_attn.gemm_tile_switch_margin = v;
+        }
+    }
+}
+
 void ax_attn_tunables_calibrate(void) {
     if (g_attn.calibrated) return;
 
-    /* register pack-stats atexit hook once. atexit is process-global so
-       only the first calibrate call wires it. cheap (one libc call). */
-    static bool atexit_registered = false;
-    if (!atexit_registered) {
-        atexit(pack_stats_atexit_hook);
-        atexit_registered = true;
-    }
+    /* run the early-init phase if it hasn't been run yet (some entry
+       points may call calibrate without going through the normal
+       compute-init path). cheap and idempotent. */
+    ax_attn_tunables_init_early();
 
     /* seed runtime defaults from the resolved cpu_opt ATTN_BQ_DEFAULT.
        even if calibration is skipped, the getter returns the same value
