@@ -629,9 +629,25 @@ extern int64_t ax_attn_bq_default_resolved(void);
 extern int64_t ax_attn_bk_default_resolved(void);
 extern void    ax_attn_set_bq_resolved(int64_t v);
 extern void    ax_attn_set_bk_resolved(int64_t v);
+extern void    ax_attn_pack_stats_dump(void);  /* T2.1 */
+
+/* atexit hook: when AX_PROFILE_PACK=1, emit pack-cycle totals before
+   process teardown so users see where pack overhead actually fell. */
+static void pack_stats_atexit_hook(void) {
+    const char *e = getenv("AX_PROFILE_PACK");
+    if (e && e[0] == '1') ax_attn_pack_stats_dump();
+}
 
 void ax_attn_tunables_calibrate(void) {
     if (g_attn.calibrated) return;
+
+    /* register pack-stats atexit hook once. atexit is process-global so
+       only the first calibrate call wires it. cheap (one libc call). */
+    static bool atexit_registered = false;
+    if (!atexit_registered) {
+        atexit(pack_stats_atexit_hook);
+        atexit_registered = true;
+    }
 
     /* seed runtime defaults from the resolved cpu_opt ATTN_BQ_DEFAULT.
        even if calibration is skipped, the getter returns the same value

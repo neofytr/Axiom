@@ -200,6 +200,36 @@ AX_TLS float *tl_bwd_dq_pool    = NULL; AX_TLS int64_t tl_bwd_dq_pool_bytes = 0;
    pack_a_t. amortizes the alloc cost across calls of the same shape. */
 AX_TLS float *tl_tn_pretranspose = NULL; AX_TLS int64_t tl_tn_pretranspose_bytes = 0;
 
+/* pack profiling counters — TLS so each thread accumulates independently;
+   summed at dump time. tracks calls + cycles for each of the four pack
+   variants. activated by AX_PROFILE_PACK=1 env var (resolved once on
+   first pack call so the dispatch is a single compare-zero on the hot
+   path when profiling is off). */
+AX_TLS uint64_t tl_pack_a_cycles    = 0; AX_TLS uint64_t tl_pack_a_calls    = 0;
+AX_TLS uint64_t tl_pack_a_t_cycles  = 0; AX_TLS uint64_t tl_pack_a_t_calls  = 0;
+AX_TLS uint64_t tl_pack_b_cycles    = 0; AX_TLS uint64_t tl_pack_b_calls    = 0;
+AX_TLS uint64_t tl_pack_b_t_cycles  = 0; AX_TLS uint64_t tl_pack_b_t_calls  = 0;
+
+static int g_pack_prof_resolved = 0;
+static int g_pack_prof_on       = 0;
+
+static inline int pack_prof_on(void) {
+    if (!g_pack_prof_resolved) {
+        const char *e = getenv("AX_PROFILE_PACK");
+        g_pack_prof_on = (e && e[0] == '1') ? 1 : 0;
+        g_pack_prof_resolved = 1;
+    }
+    return g_pack_prof_on;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+    #define PACK_TICK() ((uint64_t)__builtin_ia32_rdtsc())
+#elif defined(__aarch64__)
+    #define PACK_TICK() ({ uint64_t _v; __asm__ volatile("mrs %0, cntvct_el0" : "=r"(_v)); _v; })
+#else
+    #define PACK_TICK() ((uint64_t)0)
+#endif
+
 static inline float *ax_tls_grow(float **p, int64_t *cap_bytes, int64_t want_bytes) {
     if (*p && *cap_bytes >= want_bytes) return *p;
     if (*p) { ax_aligned_free(*p); *p = NULL; *cap_bytes = 0; }
@@ -857,6 +887,77 @@ void AX_SYM(ax_cpu_opt_tune_init)(void) {
     ax_cpu_opt_init_impl();
 }
 
+/* aggregate pack-profile counters across all live OMP threads and emit
+   per-variant cycles + call counts. activated by AX_PROFILE_PACK=1
+   alongside AX_PROFILE_PACK_DUMP=1 (or called manually via the public
+   ax_pack_stats_dump entry point). counters are TLS so each thread
+   accumulates independently; we sum via an omp critical section.
+   the function is suffixed under AX_CPU_ISA_DISPATCH so both isa
+   builds coexist; fused_attention.c routes to the active variant. */
+void AX_SYM(ax_cpu_opt_pack_stats_dump)(void) {
+#ifndef AX_NO_STDIO
+    if (!pack_prof_on()) return;
+
+    uint64_t total_a_cy = 0, total_a_calls = 0;
+    uint64_t total_at_cy = 0, total_at_calls = 0;
+    uint64_t total_b_cy = 0, total_b_calls = 0;
+    uint64_t total_bt_cy = 0, total_bt_calls = 0;
+#ifdef _OPENMP
+    /* collect per-thread counters into a heap array first, so we don't
+       need omp critical inside the parallel region (which serialises
+       anyway). spawn one thread per omp slot and write that thread's
+       TLS values into its slot. */
+    int nt = omp_get_max_threads();
+    uint64_t *acy = (uint64_t *)calloc((size_t)nt * 8, sizeof(uint64_t));
+    if (!acy) return;
+    #pragma omp parallel num_threads(nt)
+    {
+        int tid = omp_get_thread_num();
+        acy[tid * 8 + 0] = tl_pack_a_cycles;
+        acy[tid * 8 + 1] = tl_pack_a_calls;
+        acy[tid * 8 + 2] = tl_pack_a_t_cycles;
+        acy[tid * 8 + 3] = tl_pack_a_t_calls;
+        acy[tid * 8 + 4] = tl_pack_b_cycles;
+        acy[tid * 8 + 5] = tl_pack_b_calls;
+        acy[tid * 8 + 6] = tl_pack_b_t_cycles;
+        acy[tid * 8 + 7] = tl_pack_b_t_calls;
+    }
+    for (int t = 0; t < nt; t++) {
+        total_a_cy   += acy[t * 8 + 0]; total_a_calls   += acy[t * 8 + 1];
+        total_at_cy  += acy[t * 8 + 2]; total_at_calls  += acy[t * 8 + 3];
+        total_b_cy   += acy[t * 8 + 4]; total_b_calls   += acy[t * 8 + 5];
+        total_bt_cy  += acy[t * 8 + 6]; total_bt_calls  += acy[t * 8 + 7];
+    }
+    free(acy);
+#else
+    total_a_cy   = tl_pack_a_cycles;   total_a_calls   = tl_pack_a_calls;
+    total_at_cy  = tl_pack_a_t_cycles; total_at_calls  = tl_pack_a_t_calls;
+    total_b_cy   = tl_pack_b_cycles;   total_b_calls   = tl_pack_b_calls;
+    total_bt_cy  = tl_pack_b_t_cycles; total_bt_calls  = tl_pack_b_t_calls;
+#endif
+
+    uint64_t total_cy    = total_a_cy + total_at_cy + total_b_cy + total_bt_cy;
+    uint64_t total_calls = total_a_calls + total_at_calls + total_b_calls + total_bt_calls;
+
+    fprintf(stderr,
+        "axiom: pack stats (cycles aggregated across threads):\n"
+        "  pack_a    %12llu cy / %10llu calls (%.1f%%)\n"
+        "  pack_a_t  %12llu cy / %10llu calls (%.1f%%)\n"
+        "  pack_b    %12llu cy / %10llu calls (%.1f%%)\n"
+        "  pack_b_t  %12llu cy / %10llu calls (%.1f%%)\n"
+        "  total     %12llu cy / %10llu calls\n",
+        (unsigned long long)total_a_cy,  (unsigned long long)total_a_calls,
+        total_cy ? 100.0 * (double)total_a_cy  / (double)total_cy : 0.0,
+        (unsigned long long)total_at_cy, (unsigned long long)total_at_calls,
+        total_cy ? 100.0 * (double)total_at_cy / (double)total_cy : 0.0,
+        (unsigned long long)total_b_cy,  (unsigned long long)total_b_calls,
+        total_cy ? 100.0 * (double)total_b_cy  / (double)total_cy : 0.0,
+        (unsigned long long)total_bt_cy, (unsigned long long)total_bt_calls,
+        total_cy ? 100.0 * (double)total_bt_cy / (double)total_cy : 0.0,
+        (unsigned long long)total_cy, (unsigned long long)total_calls);
+#endif
+}
+
 /* always-on: pre-allocate per-thread pack buffers on every omp worker.
    lazy allocation per-thread inside ensure_tl_pack_bufs() otherwise
    happens on the first gemm call that crosses the tile threshold,
@@ -1511,8 +1612,8 @@ static inline void pack_b_cached(const float *tile_bptr, uint64_t b_gen,
 }
 
 /* pack a MC x KC panel of A (row-major) into contiguous MR-row strips */
-static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
-                    int64_t m_remain, float *packed)
+static void pack_a_impl(const float *a, int64_t lda, int64_t mc, int64_t kc,
+                         int64_t m_remain, float *packed)
 {
     for (int64_t i = 0; i < mc; i += GEMM_MR) {
         int64_t mr = (i + GEMM_MR <= m_remain) ? GEMM_MR : (m_remain > i ? m_remain - i : 0);
@@ -1528,11 +1629,24 @@ static void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
     }
 }
 
+static inline void pack_a(const float *a, int64_t lda, int64_t mc, int64_t kc,
+                           int64_t m_remain, float *packed)
+{
+    if (pack_prof_on()) {
+        uint64_t t0 = PACK_TICK();
+        pack_a_impl(a, lda, mc, kc, m_remain, packed);
+        tl_pack_a_cycles += PACK_TICK() - t0;
+        tl_pack_a_calls++;
+    } else {
+        pack_a_impl(a, lda, mc, kc, m_remain, packed);
+    }
+}
+
 /* pack an MC x KC panel of A^T, where the physical source a_src is
    stored [K, M] row-major with lda == M. A^T[i,p] = a_src[p*lda + i].
    produces the same layout as pack_a so the shared micro_kernel works. */
-static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc,
-                      int64_t m_remain, float *packed)
+static void pack_a_t_impl(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc,
+                           int64_t m_remain, float *packed)
 {
     /* Phase 2.4: pack_a_t reads MR contiguous floats per (i, p) inner iter
        (the row of A^T at column p starting at row i). the original scalar
@@ -1561,11 +1675,24 @@ static void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc
     }
 }
 
+static inline void pack_a_t(const float *a_src, int64_t lda_src, int64_t mc, int64_t kc,
+                             int64_t m_remain, float *packed)
+{
+    if (pack_prof_on()) {
+        uint64_t t0 = PACK_TICK();
+        pack_a_t_impl(a_src, lda_src, mc, kc, m_remain, packed);
+        tl_pack_a_t_cycles += PACK_TICK() - t0;
+        tl_pack_a_t_calls++;
+    } else {
+        pack_a_t_impl(a_src, lda_src, mc, kc, m_remain, packed);
+    }
+}
+
 /* pack a KC x NC panel of B^T, where the physical source b_src is
    stored [N, K] row-major with ldb == K. B^T[p,j] = b_src[j*ldb + p].
    produces the same layout as pack_b. */
-static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc,
-                      int64_t n_remain, float *packed)
+static void pack_b_t_impl(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc,
+                           int64_t n_remain, float *packed)
 {
     /* b_src is [N, K] (row-major). pack as if transposed:
        packed[p * NR + jj] = b_src[(j + jj) * ldb + p].
@@ -1684,6 +1811,19 @@ static void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc
 #endif
 }
 
+static inline void pack_b_t(const float *b_src, int64_t ldb_src, int64_t kc, int64_t nc,
+                             int64_t n_remain, float *packed)
+{
+    if (pack_prof_on()) {
+        uint64_t t0 = PACK_TICK();
+        pack_b_t_impl(b_src, ldb_src, kc, nc, n_remain, packed);
+        tl_pack_b_t_cycles += PACK_TICK() - t0;
+        tl_pack_b_t_calls++;
+    } else {
+        pack_b_t_impl(b_src, ldb_src, kc, nc, n_remain, packed);
+    }
+}
+
 /* full-matrix transpose A[K, M] (row-major) → AT[M, K] (row-major).
    used by opt_gemm_tn pre-transpose path so the GEMM hot loop runs through
    pack_a (sequential reads) instead of pack_a_t (strided reads).
@@ -1762,8 +1902,8 @@ static void transpose_kxm_to_mxk(const float *src, int64_t K, int64_t M, float *
    T3.1: branch out the common nr == GEMM_NR case to a memcpy of GEMM_NR
    floats per row — compiler emits a constant-size SIMD copy and avoids
    per-element `if (jj < nr)` checks. mirrors the pack_a_t fast path. */
-static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
-                    int64_t n_remain, float *packed)
+static void pack_b_impl(const float *b, int64_t ldb, int64_t kc, int64_t nc,
+                         int64_t n_remain, float *packed)
 {
     for (int64_t j = 0; j < nc; j += GEMM_NR) {
         int64_t nr = (j + GEMM_NR <= n_remain) ? GEMM_NR : (n_remain > j ? n_remain - j : 0);
@@ -1781,6 +1921,19 @@ static void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
                 packed += GEMM_NR;
             }
         }
+    }
+}
+
+static inline void pack_b(const float *b, int64_t ldb, int64_t kc, int64_t nc,
+                           int64_t n_remain, float *packed)
+{
+    if (pack_prof_on()) {
+        uint64_t t0 = PACK_TICK();
+        pack_b_impl(b, ldb, kc, nc, n_remain, packed);
+        tl_pack_b_cycles += PACK_TICK() - t0;
+        tl_pack_b_calls++;
+    } else {
+        pack_b_impl(b, ldb, kc, nc, n_remain, packed);
     }
 }
 
