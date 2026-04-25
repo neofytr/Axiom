@@ -532,6 +532,57 @@ static int64_t GEMM_MC = AX_GEMM_DEFAULT_MC;
 static int64_t GEMM_NC = AX_GEMM_DEFAULT_NC;
 static int64_t GEMM_KC = AX_GEMM_DEFAULT_KC;
 
+/* A3: per-shape-regime tile sets. one (mc, nc, kc) per regime, picked
+   at gemm entry by total-flops classification. inner kernels still read
+   GEMM_MC/NC/KC; we mutate those globals to the regime's values at the
+   start of each call. safe under axiom's gemm-call-from-single-thread
+   model — gemm itself spawns the omp team internally; callers don't
+   issue concurrent gemms. when calibration is skipped or per-regime
+   measurement is inconclusive, all three regimes hold the legacy
+   single-tile values, behaving identically to the pre-A3 build. */
+typedef struct { int64_t mc, nc, kc; } gemm_tile_set_t;
+
+static gemm_tile_set_t g_tiles_small = {
+    AX_GEMM_DEFAULT_MC, AX_GEMM_DEFAULT_NC, AX_GEMM_DEFAULT_KC
+};
+static gemm_tile_set_t g_tiles_med   = {
+    AX_GEMM_DEFAULT_MC, AX_GEMM_DEFAULT_NC, AX_GEMM_DEFAULT_KC
+};
+static gemm_tile_set_t g_tiles_large = {
+    AX_GEMM_DEFAULT_MC, AX_GEMM_DEFAULT_NC, AX_GEMM_DEFAULT_KC
+};
+
+/* gflops cutoffs for the 3 regimes. tuned empirically: < 2 GF puts
+   typical small mha gemms (Wo on B8_S128 = 0.54 GF, qkv on B8_S128 =
+   1.6 GF) in "small"; 2-15 GF spans medium transformer shapes (B4_S512
+   qkv ~7 GF); above is large. */
+#define GEMM_REGIME_SMALL_FLOPS  2000000000LL    /*  2 GF */
+#define GEMM_REGIME_MED_FLOPS    15000000000LL   /* 15 GF */
+
+/* per-regime dispatch is gated: apply_tiles_for_shape() is a no-op
+   until the gemm-tile calibration finishes (or the cache load applies
+   the cached values). this lets early-init code paths — thread-count
+   autotune, threshold calibration, hybrid-crossover probe — run their
+   internal gemms without having apply_tiles_for_shape() clobber the
+   default (auto-tuned-to-L1d) GEMM_MC. set to 1 by the calibrator at
+   the end of its run, or by the cache loader after a successful read. */
+static int g_per_regime_active = 0;
+
+/* set GEMM_MC/NC/KC to the regime appropriate for this shape. called
+   once per opt_gemm{,_tn,_nt} entry. no-op until per-regime tiles are
+   active so pre-calibration probes use the L1d-fitted default. */
+static inline void apply_tiles_for_shape(int64_t M, int64_t N, int64_t K) {
+    if (!g_per_regime_active) return;
+    int64_t flops = 2 * M * N * K;
+    const gemm_tile_set_t *t;
+    if (flops < GEMM_REGIME_SMALL_FLOPS)     t = &g_tiles_small;
+    else if (flops < GEMM_REGIME_MED_FLOPS)  t = &g_tiles_med;
+    else                                      t = &g_tiles_large;
+    GEMM_MC = t->mc;
+    GEMM_NC = t->nc;
+    GEMM_KC = t->kc;
+}
+
 /* per-fast-thread crossover FLOPs. set by ax_calibrate_hybrid_crossover
    when running on a hybrid CPU; defaults to 25M on miss. */
 static int64_t ax_hybrid_crossover_per_fast_thread = 25000000LL;
@@ -1011,6 +1062,7 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     bool extended = !(calibrate_env && (calibrate_env[0] == 'f' || calibrate_env[0] == 'F'));
 
     int64_t mc_orig = GEMM_MC, nc_orig = GEMM_NC, kc_orig = GEMM_KC;
+
     /* candidate set: baseline + a few neighbors. extended sweep adds more. */
     typedef struct { int64_t mc, nc, kc; } tile_cfg_t;
     tile_cfg_t base_configs[] = {
@@ -1193,6 +1245,62 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     GEMM_MC = configs[best_i].mc;
     GEMM_NC = configs[best_i].nc;
     GEMM_KC = configs[best_i].kc;
+
+    /* A3: per-regime tile selection. classify each probe shape by flops
+       into small/med/large buckets matching the runtime apply_tiles_for_
+       shape() classifier. for each bucket, compute geomean of each
+       config across the bucket's shapes and pick the best. when a
+       bucket has zero or one probe, fall back to the global best so
+       small-bucket noise from a single shape doesn't corrupt the
+       calibration. */
+    int regime_idx[8];
+    int n_per_regime[3] = {0, 0, 0};
+    for (int sh_i = 0; sh_i < n_sh; sh_i++) {
+        int64_t flops = 2 * (int64_t)sh[sh_i].M * (int64_t)sh[sh_i].N * (int64_t)sh[sh_i].K;
+        if (flops < GEMM_REGIME_SMALL_FLOPS)      regime_idx[sh_i] = 0;
+        else if (flops < GEMM_REGIME_MED_FLOPS)   regime_idx[sh_i] = 1;
+        else                                       regime_idx[sh_i] = 2;
+        n_per_regime[regime_idx[sh_i]]++;
+    }
+
+    int regime_best[3] = { best_i, best_i, best_i };
+    for (int reg = 0; reg < 3; reg++) {
+        if (n_per_regime[reg] < 2) continue;  /* not enough probes */
+        double base_reg = 1.0;
+        int n_in_reg = 0;
+        for (int sh_i = 0; sh_i < n_sh; sh_i++) {
+            if (regime_idx[sh_i] != reg) continue;
+            base_reg *= per_shape_per_config[0][sh_i];
+            n_in_reg++;
+        }
+        if (n_in_reg < 2) continue;
+        base_reg = pow(base_reg, 1.0 / (double)n_in_reg);
+        int reg_best = 0;
+        double reg_best_score = base_reg;
+        for (int i = 1; i < nc_configs; i++) {
+            double prod = 1.0;
+            for (int sh_i = 0; sh_i < n_sh; sh_i++) {
+                if (regime_idx[sh_i] != reg) continue;
+                prod *= per_shape_per_config[i][sh_i];
+            }
+            double cand = pow(prod, 1.0 / (double)n_in_reg);
+            if (cand < reg_best_score * switch_margin) {
+                reg_best = i;
+                reg_best_score = cand;
+            }
+        }
+        regime_best[reg] = reg_best;
+    }
+    g_tiles_small.mc = configs[regime_best[0]].mc;
+    g_tiles_small.nc = configs[regime_best[0]].nc;
+    g_tiles_small.kc = configs[regime_best[0]].kc;
+    g_tiles_med.mc   = configs[regime_best[1]].mc;
+    g_tiles_med.nc   = configs[regime_best[1]].nc;
+    g_tiles_med.kc   = configs[regime_best[1]].kc;
+    g_tiles_large.mc = configs[regime_best[2]].mc;
+    g_tiles_large.nc = configs[regime_best[2]].nc;
+    g_tiles_large.kc = configs[regime_best[2]].kc;
+
     double total_ms = ax_tile_cal_now_ms() - t_start;
 
 #ifndef AX_NO_STDIO
@@ -1223,11 +1331,20 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
         "axiom: gemm calibrate MC=%ld NC=%ld KC=%ld (%s; sq %.1f gflops, sk %.1f gflops, sweep %.0fms%s)\n",
         (long)GEMM_MC, (long)GEMM_NC, (long)GEMM_KC, which, sq_gflops, sk_gflops, total_ms,
         extended ? ", extended" : "");
+    fprintf(stderr,
+        "axiom: gemm regimes — small(<2GF): MC=%ld NC=%ld KC=%ld; "
+        "med(<15GF): MC=%ld NC=%ld KC=%ld; large: MC=%ld NC=%ld KC=%ld\n",
+        (long)g_tiles_small.mc, (long)g_tiles_small.nc, (long)g_tiles_small.kc,
+        (long)g_tiles_med.mc,   (long)g_tiles_med.nc,   (long)g_tiles_med.kc,
+        (long)g_tiles_large.mc, (long)g_tiles_large.nc, (long)g_tiles_large.kc);
 #endif
 
     for (int sh_i = 0; sh_i < n_sh; sh_i++) {
         ax_aligned_free(sh[sh_i].A); ax_aligned_free(sh[sh_i].B); ax_aligned_free(sh[sh_i].C);
     }
+
+    /* A3: per-regime tiles are now populated; arm runtime dispatch. */
+    g_per_regime_active = 1;
 #endif
 }
 
@@ -2590,6 +2707,10 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         return ax_cpu_naive_ops.gemm(a, b, out);
     }
 
+    /* A3: pick per-shape tiles. updates GEMM_MC/NC/KC for the duration
+       of this call; subsequent calls re-classify on their own shape. */
+    apply_tiles_for_shape(m, n, k);
+
     /* pack_b cache invalidation: if A's data pointer equals the cached B pointer
        range, a prior call's pack_b data no longer describes the current B and must
        be re-packed. we only hold a base tile pointer, so also invalidate when the
@@ -3597,6 +3718,9 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     if (validate_contig_f32(a) < 0 || validate_contig_f32(b) < 0 || validate_contig_f32(out) < 0)
         return AX_ERR_BACKEND;
 
+    /* A3: per-shape tile dispatch. */
+    apply_tiles_for_shape(m, n, k);
+
     const float *ad = raw_f32(a);
     const float *bd = raw_f32(b);  /* [n, k] — walked as if transposed */
     float *od = raw_f32(out);
@@ -4099,6 +4223,9 @@ static ax_status_t opt_gemm_tn(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     if (b->shape[0] != k || out->shape[0] != m || out->shape[1] != n) return AX_ERR_SHAPE_MISMATCH;
     if (validate_contig_f32(a) < 0 || validate_contig_f32(b) < 0 || validate_contig_f32(out) < 0)
         return AX_ERR_BACKEND;
+
+    /* A3: per-shape tile dispatch. */
+    apply_tiles_for_shape(m, n, k);
 
     const float *ad = raw_f32(a);
     const float *bd = raw_f32(b);
@@ -6021,6 +6148,44 @@ void AX_SYM(ax_cpu_opt_set_gemm_tiles)(int64_t mc, int64_t nc, int64_t kc) {
     GEMM_MC = mc;
     GEMM_NC = nc;
     GEMM_KC = kc;
+}
+
+/* A3: per-regime tile getters/setters for the calibration cache.
+   "regime" is 0=small, 1=med, 2=large to match apply_tiles_for_shape's
+   classification. setters apply the same defensive clamping as
+   set_gemm_tiles to keep a stale cache from inducing OOB. */
+void AX_SYM(ax_cpu_opt_get_gemm_tiles_regime)(int regime,
+                                                int64_t *mc, int64_t *nc, int64_t *kc) {
+    const gemm_tile_set_t *t;
+    if      (regime == 0) t = &g_tiles_small;
+    else if (regime == 1) t = &g_tiles_med;
+    else                  t = &g_tiles_large;
+    if (mc) *mc = t->mc;
+    if (nc) *nc = t->nc;
+    if (kc) *kc = t->kc;
+}
+
+void AX_SYM(ax_cpu_opt_set_gemm_tiles_regime)(int regime,
+                                                int64_t mc, int64_t nc, int64_t kc) {
+    if (mc <= 0) mc = AX_GEMM_DEFAULT_MC;
+    if (nc <= 0) nc = AX_GEMM_DEFAULT_NC;
+    if (kc <= 0) kc = AX_GEMM_DEFAULT_KC;
+    if (mc % GEMM_MR != 0) mc = (mc / GEMM_MR) * GEMM_MR;
+    if (mc < GEMM_MR) mc = GEMM_MR;
+    if (nc % GEMM_NR != 0) nc = (nc / GEMM_NR) * GEMM_NR;
+    if (nc < GEMM_NR) nc = GEMM_NR;
+    if (kc < 1) kc = 1;
+    if (mc > 4096) mc = 4096;
+    if (nc > 4096) nc = 4096;
+    if (kc > AX_GEMM_MAX_KC) kc = AX_GEMM_MAX_KC;
+    gemm_tile_set_t *t;
+    if      (regime == 0) t = &g_tiles_small;
+    else if (regime == 1) t = &g_tiles_med;
+    else                  t = &g_tiles_large;
+    t->mc = mc; t->nc = nc; t->kc = kc;
+    /* once any regime is set externally (cache load or env override),
+       arm runtime per-regime dispatch. */
+    g_per_regime_active = 1;
 }
 
 /* in-place multiply a packed panel by a scalar (SIMD-vectorized).

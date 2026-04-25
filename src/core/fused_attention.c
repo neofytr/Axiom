@@ -240,6 +240,14 @@ extern void ax_cpu_opt_set_gemm_tiles_avx512(int64_t, int64_t, int64_t);
 extern void ax_cpu_opt_set_gemm_tiles_avx2  (int64_t, int64_t, int64_t);
 extern void ax_cpu_opt_set_gemm_tiles_scalar(int64_t, int64_t, int64_t);
 
+/* A3: per-regime tile getters/setters. */
+extern void ax_cpu_opt_get_gemm_tiles_regime_avx512(int, int64_t *, int64_t *, int64_t *);
+extern void ax_cpu_opt_get_gemm_tiles_regime_avx2  (int, int64_t *, int64_t *, int64_t *);
+extern void ax_cpu_opt_get_gemm_tiles_regime_scalar(int, int64_t *, int64_t *, int64_t *);
+extern void ax_cpu_opt_set_gemm_tiles_regime_avx512(int, int64_t, int64_t, int64_t);
+extern void ax_cpu_opt_set_gemm_tiles_regime_avx2  (int, int64_t, int64_t, int64_t);
+extern void ax_cpu_opt_set_gemm_tiles_regime_scalar(int, int64_t, int64_t, int64_t);
+
 #else /* single-ISA build */
 
 extern void ax_cpu_sdpa_fwd(const float *, const float *, const float *,
@@ -305,6 +313,8 @@ extern void    ax_cpu_opt_set_attn_bk(int64_t);
 extern void    ax_cpu_opt_pack_stats_dump(void);
 extern void    ax_cpu_opt_get_gemm_tiles(int64_t *, int64_t *, int64_t *);
 extern void    ax_cpu_opt_set_gemm_tiles(int64_t, int64_t, int64_t);
+extern void    ax_cpu_opt_get_gemm_tiles_regime(int, int64_t *, int64_t *, int64_t *);
+extern void    ax_cpu_opt_set_gemm_tiles_regime(int, int64_t, int64_t, int64_t);
 
 #endif
 
@@ -366,6 +376,8 @@ typedef void    (*attn_tile_setter_fn_t)(int64_t);
 typedef void    (*pack_stats_dump_fn_t)(void);
 typedef void    (*gemm_tiles_get_fn_t)(int64_t *, int64_t *, int64_t *);
 typedef void    (*gemm_tiles_set_fn_t)(int64_t, int64_t, int64_t);
+typedef void    (*gemm_tiles_get_regime_fn_t)(int, int64_t *, int64_t *, int64_t *);
+typedef void    (*gemm_tiles_set_regime_fn_t)(int, int64_t, int64_t, int64_t);
 
 static sdpa_fwd_fn_t                         g_sdpa_fwd                         = NULL;
 static sdpa_fwd_to_flat_fn_t                 g_sdpa_fwd_to_flat                 = NULL;
@@ -385,6 +397,8 @@ static attn_tile_setter_fn_t                 g_attn_set_bk                      
 static pack_stats_dump_fn_t                  g_pack_stats_dump                  = NULL;
 static gemm_tiles_get_fn_t                   g_gemm_tiles_get                   = NULL;
 static gemm_tiles_set_fn_t                   g_gemm_tiles_set                   = NULL;
+static gemm_tiles_get_regime_fn_t            g_gemm_tiles_get_regime            = NULL;
+static gemm_tiles_set_regime_fn_t            g_gemm_tiles_set_regime            = NULL;
 
 static void resolve_once(void)
 {
@@ -410,6 +424,8 @@ static void resolve_once(void)
         g_pack_stats_dump                   = ax_cpu_opt_pack_stats_dump_avx512;
         g_gemm_tiles_get                    = ax_cpu_opt_get_gemm_tiles_avx512;
         g_gemm_tiles_set                    = ax_cpu_opt_set_gemm_tiles_avx512;
+        g_gemm_tiles_get_regime             = ax_cpu_opt_get_gemm_tiles_regime_avx512;
+        g_gemm_tiles_set_regime             = ax_cpu_opt_set_gemm_tiles_regime_avx512;
     } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
         g_sdpa_fwd                          = ax_cpu_sdpa_fwd_avx2;
         g_sdpa_fwd_to_flat                  = ax_cpu_sdpa_fwd_to_flat_avx2;
@@ -429,6 +445,8 @@ static void resolve_once(void)
         g_pack_stats_dump                   = ax_cpu_opt_pack_stats_dump_avx2;
         g_gemm_tiles_get                    = ax_cpu_opt_get_gemm_tiles_avx2;
         g_gemm_tiles_set                    = ax_cpu_opt_set_gemm_tiles_avx2;
+        g_gemm_tiles_get_regime             = ax_cpu_opt_get_gemm_tiles_regime_avx2;
+        g_gemm_tiles_set_regime             = ax_cpu_opt_set_gemm_tiles_regime_avx2;
     } else {
         g_sdpa_fwd                          = ax_cpu_sdpa_fwd_scalar;
         g_sdpa_fwd_to_flat                  = ax_cpu_sdpa_fwd_to_flat_scalar;
@@ -448,6 +466,8 @@ static void resolve_once(void)
         g_pack_stats_dump                   = ax_cpu_opt_pack_stats_dump_scalar;
         g_gemm_tiles_get                    = ax_cpu_opt_get_gemm_tiles_scalar;
         g_gemm_tiles_set                    = ax_cpu_opt_set_gemm_tiles_scalar;
+        g_gemm_tiles_get_regime             = ax_cpu_opt_get_gemm_tiles_regime_scalar;
+        g_gemm_tiles_set_regime             = ax_cpu_opt_set_gemm_tiles_regime_scalar;
     }
 #else
     g_sdpa_fwd                          = ax_cpu_sdpa_fwd;
@@ -468,6 +488,8 @@ static void resolve_once(void)
     g_pack_stats_dump                   = ax_cpu_opt_pack_stats_dump;
     g_gemm_tiles_get                    = ax_cpu_opt_get_gemm_tiles;
     g_gemm_tiles_set                    = ax_cpu_opt_set_gemm_tiles;
+    g_gemm_tiles_get_regime             = ax_cpu_opt_get_gemm_tiles_regime;
+    g_gemm_tiles_set_regime             = ax_cpu_opt_set_gemm_tiles_regime;
 #endif
 }
 
@@ -513,6 +535,21 @@ void ax_gemm_tiles_get_resolved(int64_t *mc, int64_t *nc, int64_t *kc) {
 void ax_gemm_tiles_set_resolved(int64_t mc, int64_t nc, int64_t kc) {
     resolve_once();
     if (g_gemm_tiles_set) g_gemm_tiles_set(mc, nc, kc);
+}
+
+/* A3: per-regime tile getters/setters routed through the active ISA. */
+void ax_gemm_tiles_get_regime_resolved(int regime, int64_t *mc, int64_t *nc, int64_t *kc) {
+    resolve_once();
+    if (g_gemm_tiles_get_regime) {
+        g_gemm_tiles_get_regime(regime, mc, nc, kc);
+    } else {
+        if (mc) *mc = 0; if (nc) *nc = 0; if (kc) *kc = 0;
+    }
+}
+
+void ax_gemm_tiles_set_regime_resolved(int regime, int64_t mc, int64_t nc, int64_t kc) {
+    resolve_once();
+    if (g_gemm_tiles_set_regime) g_gemm_tiles_set_regime(regime, mc, nc, kc);
 }
 
 /* ================================================================

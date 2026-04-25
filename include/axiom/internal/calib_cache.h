@@ -57,8 +57,15 @@ typedef struct ax_calib_payload {
     int8_t  sdpa_fused_use_when_bh_gt_nt;
     int8_t  _pad0;
     double  gemm_tile_switch_margin;
-    /* gemm tile config */
+    /* gemm tile config — legacy "global" tile set, kept for compat
+       and used as the default for any regime that didn't get its own
+       calibration. */
     int64_t gemm_mc, gemm_nc, gemm_kc;
+    /* A3: per-regime tile sets. picked at gemm-call time based on flops.
+       small < 2 GF, med 2-15 GF, large >= 15 GF. */
+    int64_t gemm_mc_small, gemm_nc_small, gemm_kc_small;
+    int64_t gemm_mc_med,   gemm_nc_med,   gemm_kc_med;
+    int64_t gemm_mc_large, gemm_nc_large, gemm_kc_large;
 } ax_calib_payload_t;
 
 /* attempt to load a cached payload matching the current host. returns

@@ -1051,6 +1051,8 @@ extern void    ax_attn_set_bk_resolved(int64_t v);
 extern void    ax_attn_pack_stats_dump(void);  /* T2.1 */
 extern void    ax_gemm_tiles_get_resolved(int64_t *, int64_t *, int64_t *);  /* A4 */
 extern void    ax_gemm_tiles_set_resolved(int64_t, int64_t, int64_t);          /* A4 */
+extern void    ax_gemm_tiles_get_regime_resolved(int, int64_t *, int64_t *, int64_t *);  /* A3 */
+extern void    ax_gemm_tiles_set_regime_resolved(int, int64_t, int64_t, int64_t);          /* A3 */
 
 /* atexit hook: when AX_PROFILE_PACK=1, emit pack-cycle totals before
    process teardown so users see where pack overhead actually fell. */
@@ -1211,10 +1213,16 @@ bool ax_calib_cache_try_apply(void) {
         g_attn.gemm_tile_switch_margin = pl.gemm_tile_switch_margin;
 
     /* push attn tile sizes into cpu_opt's static so attn fwd/bwd take
-       effect immediately. gemm tiles ditto via the resolved setter. */
+       effect immediately. gemm tiles ditto via the resolved setter,
+       both the legacy "global" tile (for callers not using per-regime
+       dispatch) and the three per-regime sets used by apply_tiles_for_
+       shape() in cpu_opt.c. */
     ax_attn_set_bq_resolved(g_attn.attn_bq);
     ax_attn_set_bk_resolved(g_attn.attn_bk);
     ax_gemm_tiles_set_resolved(pl.gemm_mc, pl.gemm_nc, pl.gemm_kc);
+    ax_gemm_tiles_set_regime_resolved(0, pl.gemm_mc_small, pl.gemm_nc_small, pl.gemm_kc_small);
+    ax_gemm_tiles_set_regime_resolved(1, pl.gemm_mc_med,   pl.gemm_nc_med,   pl.gemm_kc_med);
+    ax_gemm_tiles_set_regime_resolved(2, pl.gemm_mc_large, pl.gemm_nc_large, pl.gemm_kc_large);
 
     g_attn.calibrated = true;
     g_calib_loaded_from_cache = true;
@@ -1248,6 +1256,15 @@ void ax_calib_cache_save_current(void) {
     int64_t mc = 0, nc = 0, kc = 0;
     ax_gemm_tiles_get_resolved(&mc, &nc, &kc);
     pl.gemm_mc = mc; pl.gemm_nc = nc; pl.gemm_kc = kc;
+
+    /* A3: per-regime tile sets. these are populated by the gemm-tile
+       calibrator (cpu_opt.c) which now picks per-regime winners. */
+    ax_gemm_tiles_get_regime_resolved(0, &mc, &nc, &kc);
+    pl.gemm_mc_small = mc; pl.gemm_nc_small = nc; pl.gemm_kc_small = kc;
+    ax_gemm_tiles_get_regime_resolved(1, &mc, &nc, &kc);
+    pl.gemm_mc_med   = mc; pl.gemm_nc_med   = nc; pl.gemm_kc_med   = kc;
+    ax_gemm_tiles_get_regime_resolved(2, &mc, &nc, &kc);
+    pl.gemm_mc_large = mc; pl.gemm_nc_large = nc; pl.gemm_kc_large = kc;
 
     (void)ax_calib_cache_save(&pl);
 }

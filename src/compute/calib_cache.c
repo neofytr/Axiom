@@ -33,8 +33,9 @@
 #include <omp.h>
 #endif
 
-/* bump when the payload struct layout changes incompatibly. */
-#define AX_CALIB_SCHEMA_VERSION 1u
+/* bump when the payload struct layout changes incompatibly.
+   v2: A3 added per-regime gemm tiles (gemm_{mc,nc,kc}_{small,med,large}). */
+#define AX_CALIB_SCHEMA_VERSION 2u
 
 #define AX_CALIB_MAGIC "AXIOMCAL"
 #define AX_CALIB_MAGIC_LEN 8
