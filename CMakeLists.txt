@@ -123,9 +123,37 @@ if(AX_INFERENCE_ONLY)
     add_compile_definitions(AX_INFERENCE_ONLY=1)
 endif()
 
-# hardening flags for release
+# hardening + perf flags for release
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O3 -fno-math-errno -funroll-loops -fno-trapping-math -D_FORTIFY_SOURCE=2)
+
+    # link-time optimization. enables cross-TU inlining of dispatch
+    # wrappers (ax_compute_gemm -> opt_gemm) and constant folding of
+    # tile-size globals into the JIT-emitted micro-kernel call sites.
+    # measured ~3-8% on mha_train benches; cost is +30-90 s build time
+    # for a clean release. opt out with -DAX_NO_LTO=ON for fast iteration.
+    option(AX_NO_LTO "disable LTO in release builds (faster compile, slower runtime)" OFF)
+    if(NOT AX_NO_LTO)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT _lto_ok OUTPUT _lto_err)
+        if(_lto_ok)
+            set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+            message(STATUS "LTO enabled for release build")
+        else()
+            message(STATUS "LTO not supported by toolchain: ${_lto_err}")
+        endif()
+    endif()
+
+    # native-targeted build: tunes scheduling for the build host's CPU.
+    # mutually exclusive with portable releases; opt-in via -DAX_NATIVE=ON.
+    # under AX_CPU_ISA_DISPATCH the per-ISA TU's still get their explicit
+    # -mavx2 -mfma / -mavx512f flags, so this only affects scheduling
+    # and instruction selection within the chosen ISA family.
+    option(AX_NATIVE "build for the local CPU (-march=native, -mtune=native)" OFF)
+    if(AX_NATIVE)
+        add_compile_options(-march=native -mtune=native)
+        message(STATUS "native build (-march=native -mtune=native)")
+    endif()
 endif()
 
 # library sources — split into always-on (forward + shared infra) and
