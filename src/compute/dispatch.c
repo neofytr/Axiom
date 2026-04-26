@@ -1213,12 +1213,23 @@ int64_t ax_par_threshold_elems_heavy  = 65536 / 4;
    API: ax_gemm_set_skip_init(true), ..., ax_gemm_set_skip_init(false). */
 #ifdef AX_SINGLE_THREADED
 bool ax_gemm_skip_init = false;
+bool ax_gemm_inner_team = false;
 #else
 _Thread_local bool ax_gemm_skip_init = false;
+/* (#2) per-thread opt-in: when set, the caller has wrapped gemm calls
+   in an outer omp parallel and wants the gemm to workshare with the
+   existing team (instead of nested-spawning its own). when false (the
+   default), gemms behave as before — each call spawns its own team.
+   distinguishes "wrapper parallelism" (V4-style) from "parallel-for-
+   over-work-items" (conv per-sample backward, where each thread calls
+   gemm independently and wants nested spawning). */
+_Thread_local bool ax_gemm_inner_team = false;
 #endif
 
 void ax_gemm_set_skip_init(bool v) { ax_gemm_skip_init = v; }
 bool ax_gemm_get_skip_init(void)   { return ax_gemm_skip_init; }
+void ax_gemm_set_inner_team(bool v) { ax_gemm_inner_team = v; }
+bool ax_gemm_get_inner_team(void)   { return ax_gemm_inner_team; }
 
 #ifdef _OPENMP
 /* measured mean overhead of entering and leaving an omp parallel region

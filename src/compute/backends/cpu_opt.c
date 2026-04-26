@@ -274,10 +274,13 @@ extern const ax_backend_ops_t ax_cpu_naive_ops;
    broadcast, then GEMM accumulates: C = bias + A @ B in one pass). */
 #ifdef AX_SINGLE_THREADED
 extern bool ax_gemm_skip_init;
+extern bool ax_gemm_inner_team;
 #else
 extern _Thread_local bool ax_gemm_skip_init;
+extern _Thread_local bool ax_gemm_inner_team;
 #endif
 #define tl_gemm_skip_init ax_gemm_skip_init
+#define tl_gemm_inner_team ax_gemm_inner_team
 
 /* validation helpers */
 
@@ -3107,6 +3110,39 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         const float *ad = a_raw;
         const float *bd = b_raw;
         float *od = o_raw;
+        /* small-path is a serial scalar+SIMD loop. when called from inside
+           an outer parallel region (inner_mode), only ONE thread should
+           execute it — otherwise N threads each write to the same C buffer
+           = race. wrap in #pragma omp single. the implicit barrier at the
+           end of single ensures all threads exit the function consistently. */
+#ifdef _OPENMP
+        bool small_inner = tl_gemm_inner_team;
+        if (small_inner) {
+            #pragma omp single
+            {
+                if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
+                int64_t vec_end_s = n - (n % AX_VF32_WIDTH);
+                for (int64_t i = 0; i < m; i++) {
+                    float *oi = od + i * n;
+                    const float *ai = ad + i * k;
+                    for (int64_t p = 0; p < k; p++) {
+                        float a_ip = ai[p];
+                        const float *bp_ = bd + p * n;
+                        ax_vf32 va = ax_vf32_set1(a_ip);
+                        int64_t j = 0;
+                        for (; j < vec_end_s; j += AX_VF32_WIDTH) {
+                            ax_vf32 vo = ax_vf32_loadu(oi + j);
+                            ax_vf32 vb = ax_vf32_loadu(bp_ + j);
+                            ax_vf32_storeu(oi + j, ax_vf32_fmadd(va, vb, vo));
+                        }
+                        for (; j < n; j++)
+                            oi[j] += a_ip * bp_[j];
+                    }
+                }
+            }
+            return AX_OK;
+        }
+#endif
         if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
         int64_t vec_end = n - (n % AX_VF32_WIDTH);
         for (int64_t i = 0; i < m; i++) {
@@ -3200,16 +3236,38 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     const float *ad = a_raw;
     const float *bd = b_raw;
     float *od = o_raw;
-    if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 
     /* #2 hoisted-omp: detect whether the caller is already inside an omp
        parallel region. when true, each path below uses #pragma omp for
        (workshare against the existing team) instead of spawning its own
        team. lets train_step_v4 / autograd hoist a single parallel region
        around multiple gemms — saves spawn-joins + keeps threads pinned
-       to the same cores between gemms (TLS pack buffers stay warm). */
+       to the same cores between gemms (TLS pack buffers stay warm).
+       under inner_mode the body runs on every thread of the enclosing
+       team, so any write to shared output (memset C, small-path scalar
+       loop) MUST be guarded with #pragma omp single to avoid a multi-
+       thread race writing the same bytes. */
+
 #ifdef _OPENMP
-    const bool inner_mode = omp_in_parallel();
+    /* memset of C: needed when the caller hasn't asked us to accumulate.
+       under inner_mode, only one thread does the memset; others wait
+       on the implicit barrier. without inner_mode this is just a single-
+       thread memset before the spawn. */
+    if (!tl_gemm_skip_init) {
+        if (tl_gemm_inner_team) {
+            #pragma omp single
+            memset(od, 0, (size_t)(m * n) * sizeof(float));
+            /* implicit barrier ensures the zero is visible before any
+               thread starts accumulating into C. */
+        } else {
+            memset(od, 0, (size_t)(m * n) * sizeof(float));
+        }
+    }
+#else
+    if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
+#endif
+#ifdef _OPENMP
+    const bool inner_mode = tl_gemm_inner_team;
 #else
     const bool inner_mode = false;
 #endif
@@ -4205,8 +4263,34 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
        honor skip_init by accumulating: pre-zero (or skip pre-zero), then
        always += into oi[j]. without this, callers using skip_init=true to
        accumulate across multiple gemm_nt invocations get only the LAST
-       call's output instead of the sum. */
+       call's output instead of the sum.
+       inner_mode (caller wraps multiple gemms in one parallel): wrap in
+       #pragma omp single so only one thread executes the serial body. */
     if (m * n * k < 100000) {
+#ifdef _OPENMP
+        if (tl_gemm_inner_team) {
+            #pragma omp single
+            {
+                if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
+                for (int64_t i = 0; i < m; i++) {
+                    const float *ai = ad + i * k;
+                    float *oi = od + i * n;
+                    for (int64_t j = 0; j < n; j++) {
+                        const float *bj = bd + j * k;
+                        ax_vf32 acc = ax_vf32_zero();
+                        int64_t p = 0;
+                        int64_t vec_end_s = k - (k % AX_VF32_WIDTH);
+                        for (; p < vec_end_s; p += AX_VF32_WIDTH)
+                            acc = ax_vf32_fmadd(ax_vf32_loadu(ai + p), ax_vf32_loadu(bj + p), acc);
+                        float s = ax_vf32_hsum(acc);
+                        for (; p < k; p++) s += ai[p] * bj[p];
+                        oi[j] += s;
+                    }
+                }
+            }
+            return AX_OK;
+        }
+#endif
         if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
         for (int64_t i = 0; i < m; i++) {
             const float *ai = ad + i * k;
@@ -4227,7 +4311,18 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
 
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
+#ifdef _OPENMP
+    if (!tl_gemm_skip_init) {
+        if (tl_gemm_inner_team) {
+            #pragma omp single
+            memset(od, 0, (size_t)(m * n) * sizeof(float));
+        } else {
+            memset(od, 0, (size_t)(m * n) * sizeof(float));
+        }
+    }
+#else
     if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
+#endif
 
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
@@ -4269,7 +4364,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 
     /* #2 hoisted-omp: same inside-aware pattern as opt_gemm. */
 #ifdef _OPENMP
-    const bool inner_mode = omp_in_parallel();
+    const bool inner_mode = tl_gemm_inner_team;
 #else
     const bool inner_mode = false;
 #endif
@@ -4557,6 +4652,32 @@ static ax_status_t opt_gemm_tn_raw(
     pack_b_cache_invalidate();
 
     if (m * n * k < 100000) {
+#ifdef _OPENMP
+        if (tl_gemm_inner_team) {
+            #pragma omp single
+            {
+                if (!accumulate) {
+                    for (int64_t i = 0; i < m; i++)
+                        memset(od + i * ldc, 0, (size_t)n * sizeof(float));
+                }
+                for (int64_t p = 0; p < k; p++) {
+                    const float *bp_ = bd + p * ldb;
+                    const float *ap_ = ad + p * lda;
+                    for (int64_t i = 0; i < m; i++) {
+                        float ai = ap_[i];
+                        float *oi = od + i * ldc;
+                        ax_vf32 va = ax_vf32_set1(ai);
+                        int64_t j = 0;
+                        int64_t vec_end_s = n - (n % AX_VF32_WIDTH);
+                        for (; j < vec_end_s; j += AX_VF32_WIDTH)
+                            ax_vf32_storeu(oi + j, ax_vf32_fmadd(va, ax_vf32_loadu(bp_ + j), ax_vf32_loadu(oi + j)));
+                        for (; j < n; j++) oi[j] += ai * bp_[j];
+                    }
+                }
+            }
+            return AX_OK;
+        }
+#endif
         if (!accumulate) {
             for (int64_t i = 0; i < m; i++)
                 memset(od + i * ldc, 0, (size_t)n * sizeof(float));
@@ -4579,10 +4700,23 @@ static ax_status_t opt_gemm_tn_raw(
     }
 
     if (!ensure_tl_pack_bufs()) return AX_ERR_ALLOC;
+#ifdef _OPENMP
+    if (!accumulate) {
+        if (tl_gemm_inner_team) {
+            #pragma omp single
+            for (int64_t i = 0; i < m; i++)
+                memset(od + i * ldc, 0, (size_t)n * sizeof(float));
+        } else {
+            for (int64_t i = 0; i < m; i++)
+                memset(od + i * ldc, 0, (size_t)n * sizeof(float));
+        }
+    }
+#else
     if (!accumulate) {
         for (int64_t i = 0; i < m; i++)
             memset(od + i * ldc, 0, (size_t)n * sizeof(float));
     }
+#endif
 
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
@@ -4636,7 +4770,7 @@ static ax_status_t opt_gemm_tn_raw(
 
     /* #2 hoisted-omp: same inside-aware pattern as opt_gemm. */
 #ifdef _OPENMP
-    const bool inner_mode = omp_in_parallel();
+    const bool inner_mode = tl_gemm_inner_team;
 #else
     const bool inner_mode = false;
 #endif
