@@ -2843,6 +2843,18 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     float *od = o_raw;
     if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 
+    /* #2 hoisted-omp: detect whether the caller is already inside an omp
+       parallel region. when true, each path below uses #pragma omp for
+       (workshare against the existing team) instead of spawning its own
+       team. lets train_step_v4 / autograd hoist a single parallel region
+       around multiple gemms — saves spawn-joins + keeps threads pinned
+       to the same cores between gemms (TLS pack buffers stay warm). */
+#ifdef _OPENMP
+    const bool inner_mode = omp_in_parallel();
+#else
+    const bool inner_mode = false;
+#endif
+
     if (use_hybrid) {
         /* hybrid jc+pc+ic for opt_gemm. structure: collapse(3) over (jct, pct,
            ict). pc-as-second-outer ensures within a thread's contiguous chunk
@@ -2858,37 +2870,83 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
            iterations across 16 threads ~evenly. kept as static until a
            work-count-adaptive chunk formula is derived. */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
-        #ifdef _OPENMP
-        #pragma omp parallel num_threads(gemm_threads)
-        #endif
-        {
-            ensure_tl_pack_bufs();
-            float *pack_a_buf = tl_pack_a_buf;
-            float *pack_b_buf = tl_pack_b_buf;
-            int64_t last_jct = -1;
-            int64_t last_pct = -1;
 
-            #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(static)
-            #endif
+        /* hybrid body, pulled into a macro so the inside / spawning paths
+           can share it. each invocation is a parallel region (or worksharing
+           inside an existing one) running the same per-(jct, pct, ict) work. */
+#define HYBRID_BODY()                                                            \
+        do {                                                                     \
+            ensure_tl_pack_bufs();                                               \
+            float *pack_a_buf = tl_pack_a_buf;                                   \
+            float *pack_b_buf = tl_pack_b_buf;                                   \
+            int64_t last_jct = -1;                                               \
+            int64_t last_pct = -1;                                               \
+            _Pragma("omp for collapse(3) schedule(static)")                      \
+            for (int64_t jct = 0; jct < n_jc_tiles; jct++) {                     \
+                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {                 \
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {             \
+                        if (!pack_a_buf || !pack_b_buf) continue;                \
+                        int64_t jc = jct * nc_eff;                               \
+                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);     \
+                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR; \
+                        int64_t pc = pct * kc_max;                               \
+                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);     \
+                        int64_t ic = ict * GEMM_MC;                              \
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);   \
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR; \
+                        if (jct != last_jct || pct != last_pct) {                \
+                            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf); \
+                            last_jct = jct;                                      \
+                            last_pct = pct;                                      \
+                        }                                                        \
+                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf); \
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {      \
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir); \
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {  \
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr); \
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc, \
+                                             od + (ic + ir) * n + (jc + jr), n, mr, nr); \
+                            }                                                    \
+                        }                                                        \
+                    }                                                            \
+                }                                                                \
+            }                                                                    \
+        } while (0)
+
+#ifdef _OPENMP
+        if (inner_mode) {
+            HYBRID_BODY();   /* workshare with existing team */
+        } else {
+            #pragma omp parallel num_threads(gemm_threads)
+            {
+                HYBRID_BODY();
+            }
+        }
+#else
+        HYBRID_BODY();
+#endif
+#undef HYBRID_BODY
+    } else if (use_jc_par) {
+        /* JC parallel: each thread owns a column strip of C and its own pack buffers.
+           Thread-local buffers — lazily allocated once per thread, reused every call.
+           Writes to disjoint columns → no synchronization needed. */
+#ifdef _OPENMP
+        if (inner_mode) {
+            #pragma omp for schedule(static)
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
-                for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
-                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
-                        if (!pack_a_buf || !pack_b_buf) continue;
-                        int64_t jc = jct * nc_eff;
-                        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
-                        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-                        int64_t pc = pct * kc_max;
-                        int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
-                        int64_t ic = ict * GEMM_MC;
+                ensure_tl_pack_bufs();
+                float *pack_a_buf = tl_pack_a_buf;
+                float *pack_b_buf = tl_pack_b_buf;
+                if (!pack_a_buf || !pack_b_buf) continue;
+                int64_t jc = jct * nc_eff;
+                int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+                int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+                for (int64_t pc = 0; pc < k; pc += kc_max) {
+                    int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+                    pack_b_cached(bd + pc * n + jc, b->storage->generation, n, kc, nc_pack, nc, jc, pc);
+                    for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                         int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                         int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-
-                        if (jct != last_jct || pct != last_pct) {
-                            pack_b(bd + pc * n + jc, n, kc, nc_pack, nc, pack_b_buf);
-                            last_jct = jct;
-                            last_pct = pct;
-                        }
                         pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
                         for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                             int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
@@ -2901,14 +2959,10 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                     }
                 }
             }
+            goto jc_par_done;
         }
-    } else if (use_jc_par) {
-        /* JC parallel: each thread owns a column strip of C and its own pack buffers.
-           Thread-local buffers — lazily allocated once per thread, reused every call.
-           Writes to disjoint columns → no synchronization needed. */
-        #ifdef _OPENMP
         #pragma omp parallel for num_threads(gemm_threads) schedule(static)
-        #endif
+#endif
         for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
             /* each thread lazily inits its own TLS pack buffers on first use */
             ensure_tl_pack_bufs();
@@ -2940,6 +2994,9 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                 }
             }
         }
+#ifdef _OPENMP
+jc_par_done:;
+#endif
     } else if (use_fine_par) {
         /* Fine-grained parallel: pack A and B serially (small data), then
            parallelize over the (ir, jr) micro-kernel grid using collapse(2).
@@ -2966,6 +3023,20 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                 int64_t jr_tiles = nc_pack / GEMM_NR;
 
                 #ifdef _OPENMP
+                if (inner_mode) {
+                    #pragma omp for schedule(static) collapse(2)
+                    for (int64_t irt = 0; irt < ir_tiles; irt++) {
+                        for (int64_t jrt = 0; jrt < jr_tiles; jrt++) {
+                            int64_t ir = irt * GEMM_MR;
+                            int64_t jr = jrt * GEMM_NR;
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                            micro_kernel(kc, main_pack_a + ir * kc, main_pack_b + jr * kc,
+                                         od + ir * n + (jc + jr), n, mr, nr);
+                        }
+                    }
+                    continue;  /* next pc */
+                }
                 #pragma omp parallel for num_threads(gemm_threads) schedule(static) collapse(2)
                 #endif
                 for (int64_t irt = 0; irt < ir_tiles; irt++) {
@@ -2998,6 +3069,27 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                 const float *pack_b_buf = main_pack_b;  /* shared read-only in parallel region */
 
                 #ifdef _OPENMP
+                if (inner_mode && use_ic_par) {
+                    #pragma omp for schedule(static)
+                    for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
+                        ensure_tl_pack_bufs();
+                        float *pack_a_buf = tl_pack_a_buf;
+                        if (!pack_a_buf) continue;
+                        int64_t ic = ict * GEMM_MC;
+                        int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                        int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                        for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                            int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                            for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                                int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 #pragma omp parallel for num_threads(gemm_threads) schedule(static) if(use_ic_par)
                 #endif
                 for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
