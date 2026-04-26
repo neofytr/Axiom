@@ -75,6 +75,17 @@ static struct {
        cand_score < base_score * gemm_tile_switch_margin. values
        in [0.5, 1.0); 0.94 = "must beat baseline by ≥6 %". */
     double gemm_tile_switch_margin;       /* default: 0.94 */
+
+    /* (a) unpacked-A micro-kernel max K. when kc <= this threshold AND
+       the matrix is contiguous, opt_gemm uses micro_kernel_unpacked_a
+       to skip pack_a entirely (saves the write+read traffic, ~14-21 %
+       of total bench time on small-shape gemms per pack-profile data).
+       above this kc, packed remains the default — strided A reads
+       across MR rows blow L1d when each row is too long. default 512
+       fits MR=14 rows × 512 floats = 28 KB ≤ typical 32 KB L1d on
+       AVX-512, comfortably for AVX2 MR=6 (12 KB). calibrator sweeps
+       per-host. set to 0 to disable the unpacked path entirely. */
+    int64_t gemm_unpacked_a_max_k;        /* default: 512 */
 } g_attn = {
     .calibrated = false,
     .f3a_qkv_bytes_threshold = (int64_t)8 * 1024 * 1024,
@@ -93,6 +104,7 @@ static struct {
     .attn_bq = 0,
     .attn_bk = 0,
     .gemm_tile_switch_margin = 0.94,
+    .gemm_unpacked_a_max_k = 512,
 };
 
 /* ============================================================
@@ -149,6 +161,10 @@ int64_t ax_attn_tunable_attn_bk(void) {
 
 double ax_attn_tunable_gemm_tile_switch_margin(void) {
     return g_attn.gemm_tile_switch_margin;
+}
+
+int64_t ax_attn_tunable_gemm_unpacked_a_max_k(void) {
+    return g_attn.gemm_unpacked_a_max_k;
 }
 
 /* ============================================================
@@ -1107,6 +1123,18 @@ void ax_attn_tunables_init_early(void) {
         long v = strtol(bk_env, &endp, 10);
         if (endp != bk_env && v > 0 && v <= 4096) {
             g_attn.attn_bk = v;
+        }
+    }
+
+    /* (a) AX_GEMM_UNPACKED_A_MAX_K: override the kc threshold above
+       which the unpacked-A micro-kernel is skipped. set to 0 to disable
+       the unpacked path entirely (forces packed for all shapes). */
+    const char *uak_env = getenv("AX_GEMM_UNPACKED_A_MAX_K");
+    if (uak_env && uak_env[0] != '\0') {
+        char *endp = NULL;
+        long v = strtol(uak_env, &endp, 10);
+        if (endp != uak_env && v >= 0 && v <= 8192) {
+            g_attn.gemm_unpacked_a_max_k = v;
         }
     }
 }

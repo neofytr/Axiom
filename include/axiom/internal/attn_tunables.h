@@ -126,6 +126,13 @@ int64_t ax_attn_tunable_attn_bk(void);
    runtime-tunables home. */
 double  ax_attn_tunable_gemm_tile_switch_margin(void);
 
+/* (a) unpacked-A micro-kernel kc threshold. opt_gemm uses
+   micro_kernel_unpacked_a (reads A from row-major memory, skips pack_a)
+   when kc <= this value. above the threshold, the strided MR-row reads
+   from A would blow L1d, so packed remains the default. zero disables
+   the unpacked path entirely. calibrated per host. */
+int64_t ax_attn_tunable_gemm_unpacked_a_max_k(void);
+
 /* override / debug: AX_ATTN_TUNABLES_LOG=1 prints chosen values to
    stderr at calibration time. AX_NO_ATTN_CALIB=1 forces fallback to
    conservative defaults (== old hardcoded values). */

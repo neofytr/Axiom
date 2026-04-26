@@ -2189,6 +2189,112 @@ static void micro_kernel(int64_t kc, const float *restrict ap, const float *rest
     }
 }
 
+/* (a) AVX-512 unpacked-A micro-kernel — same compute as the 14×32 packed
+   variant above, but reads A directly from row-major memory with stride
+   lda. eliminates pack_a write+read traffic (~14-21 % of total bench
+   time per pack-profile data). 14 row pointers + scalar broadcast per
+   k iter; B stays packed for cache reuse. */
+static void micro_kernel_unpacked_a(int64_t kc,
+                                      const float *restrict a_base, int64_t lda,
+                                      const float *restrict bp,
+                                      float *restrict c, int64_t ldc,
+                                      int64_t mr, int64_t nr)
+{
+    __m512 c00=_mm512_setzero_ps(), c01=_mm512_setzero_ps();
+    __m512 c10=_mm512_setzero_ps(), c11=_mm512_setzero_ps();
+    __m512 c20=_mm512_setzero_ps(), c21=_mm512_setzero_ps();
+    __m512 c30=_mm512_setzero_ps(), c31=_mm512_setzero_ps();
+    __m512 c40=_mm512_setzero_ps(), c41=_mm512_setzero_ps();
+    __m512 c50=_mm512_setzero_ps(), c51=_mm512_setzero_ps();
+    __m512 c60=_mm512_setzero_ps(), c61=_mm512_setzero_ps();
+    __m512 c70=_mm512_setzero_ps(), c71=_mm512_setzero_ps();
+    __m512 c80=_mm512_setzero_ps(), c81=_mm512_setzero_ps();
+    __m512 c90=_mm512_setzero_ps(), c91=_mm512_setzero_ps();
+    __m512 cA0=_mm512_setzero_ps(), cA1=_mm512_setzero_ps();
+    __m512 cB0=_mm512_setzero_ps(), cB1=_mm512_setzero_ps();
+    __m512 cC0=_mm512_setzero_ps(), cC1=_mm512_setzero_ps();
+    __m512 cD0=_mm512_setzero_ps(), cD1=_mm512_setzero_ps();
+
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 16) __builtin_prefetch(c + row * ldc + 16, 0, 3);
+        __builtin_prefetch(a_base + row * lda, 0, 3);
+    }
+
+    /* row pointers per MR — eliminates `r * lda` mul in inner loop */
+    const float *a0  = a_base;
+    const float *a1  = (mr >  1) ? a_base +  1*lda : a_base;
+    const float *a2  = (mr >  2) ? a_base +  2*lda : a_base;
+    const float *a3  = (mr >  3) ? a_base +  3*lda : a_base;
+    const float *a4  = (mr >  4) ? a_base +  4*lda : a_base;
+    const float *a5  = (mr >  5) ? a_base +  5*lda : a_base;
+    const float *a6  = (mr >  6) ? a_base +  6*lda : a_base;
+    const float *a7  = (mr >  7) ? a_base +  7*lda : a_base;
+    const float *a8  = (mr >  8) ? a_base +  8*lda : a_base;
+    const float *a9  = (mr >  9) ? a_base +  9*lda : a_base;
+    const float *aA  = (mr > 10) ? a_base + 10*lda : a_base;
+    const float *aB  = (mr > 11) ? a_base + 11*lda : a_base;
+    const float *aC  = (mr > 12) ? a_base + 12*lda : a_base;
+    const float *aD  = (mr > 13) ? a_base + 13*lda : a_base;
+
+    #define AVX512_BODY_UA(p_off) {                                   \
+        __m512 b0 = _mm512_load_ps(bp + (p_off) * GEMM_NR);           \
+        __m512 b1 = _mm512_load_ps(bp + (p_off) * GEMM_NR + 16);      \
+        __m512 a;                                                     \
+        a=_mm512_set1_ps(a0[(p_off)]); c00=_mm512_fmadd_ps(a,b0,c00); c01=_mm512_fmadd_ps(a,b1,c01); \
+        a=_mm512_set1_ps(a1[(p_off)]); c10=_mm512_fmadd_ps(a,b0,c10); c11=_mm512_fmadd_ps(a,b1,c11); \
+        a=_mm512_set1_ps(a2[(p_off)]); c20=_mm512_fmadd_ps(a,b0,c20); c21=_mm512_fmadd_ps(a,b1,c21); \
+        a=_mm512_set1_ps(a3[(p_off)]); c30=_mm512_fmadd_ps(a,b0,c30); c31=_mm512_fmadd_ps(a,b1,c31); \
+        a=_mm512_set1_ps(a4[(p_off)]); c40=_mm512_fmadd_ps(a,b0,c40); c41=_mm512_fmadd_ps(a,b1,c41); \
+        a=_mm512_set1_ps(a5[(p_off)]); c50=_mm512_fmadd_ps(a,b0,c50); c51=_mm512_fmadd_ps(a,b1,c51); \
+        a=_mm512_set1_ps(a6[(p_off)]); c60=_mm512_fmadd_ps(a,b0,c60); c61=_mm512_fmadd_ps(a,b1,c61); \
+        a=_mm512_set1_ps(a7[(p_off)]); c70=_mm512_fmadd_ps(a,b0,c70); c71=_mm512_fmadd_ps(a,b1,c71); \
+        a=_mm512_set1_ps(a8[(p_off)]); c80=_mm512_fmadd_ps(a,b0,c80); c81=_mm512_fmadd_ps(a,b1,c81); \
+        a=_mm512_set1_ps(a9[(p_off)]); c90=_mm512_fmadd_ps(a,b0,c90); c91=_mm512_fmadd_ps(a,b1,c91); \
+        a=_mm512_set1_ps(aA[(p_off)]); cA0=_mm512_fmadd_ps(a,b0,cA0); cA1=_mm512_fmadd_ps(a,b1,cA1); \
+        a=_mm512_set1_ps(aB[(p_off)]); cB0=_mm512_fmadd_ps(a,b0,cB0); cB1=_mm512_fmadd_ps(a,b1,cB1); \
+        a=_mm512_set1_ps(aC[(p_off)]); cC0=_mm512_fmadd_ps(a,b0,cC0); cC1=_mm512_fmadd_ps(a,b1,cC1); \
+        a=_mm512_set1_ps(aD[(p_off)]); cD0=_mm512_fmadd_ps(a,b0,cD0); cD1=_mm512_fmadd_ps(a,b1,cD1); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR,      0, 3);
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR + 16, 0, 3);
+        AVX512_BODY_UA(p);
+        AVX512_BODY_UA(p + 1);
+    }
+    if (p < kc) {
+        AVX512_BODY_UA(p);
+    }
+    #undef AVX512_BODY_UA
+
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define STORE_ROW(row, lo, hi) \
+            _mm512_storeu_ps(c + (row)*ldc,      _mm512_add_ps(lo, _mm512_loadu_ps(c + (row)*ldc))); \
+            _mm512_storeu_ps(c + (row)*ldc + 16, _mm512_add_ps(hi, _mm512_loadu_ps(c + (row)*ldc + 16)));
+        STORE_ROW( 0,c00,c01); STORE_ROW( 1,c10,c11); STORE_ROW( 2,c20,c21); STORE_ROW( 3,c30,c31);
+        STORE_ROW( 4,c40,c41); STORE_ROW( 5,c50,c51); STORE_ROW( 6,c60,c61); STORE_ROW( 7,c70,c71);
+        STORE_ROW( 8,c80,c81); STORE_ROW( 9,c90,c91); STORE_ROW(10,cA0,cA1); STORE_ROW(11,cB0,cB1);
+        STORE_ROW(12,cC0,cC1); STORE_ROW(13,cD0,cD1);
+        #undef STORE_ROW
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define EXT_ROW(row, lo, hi) \
+            _mm512_store_ps(buf + (row)*GEMM_NR,      lo); \
+            _mm512_store_ps(buf + (row)*GEMM_NR + 16, hi);
+        EXT_ROW( 0,c00,c01); EXT_ROW( 1,c10,c11); EXT_ROW( 2,c20,c21); EXT_ROW( 3,c30,c31);
+        EXT_ROW( 4,c40,c41); EXT_ROW( 5,c50,c51); EXT_ROW( 6,c60,c61); EXT_ROW( 7,c70,c71);
+        EXT_ROW( 8,c80,c81); EXT_ROW( 9,c90,c91); EXT_ROW(10,cA0,cA1); EXT_ROW(11,cB0,cB1);
+        EXT_ROW(12,cC0,cC1); EXT_ROW(13,cD0,cD1);
+        #undef EXT_ROW
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
 #elif defined(AX_SIMD_AVX2)
 
 /* JIT-emitted 6x16 micro-kernel handle. lazily resolved on first call,
@@ -2322,6 +2428,120 @@ static void micro_kernel(int64_t kc, const float * restrict ap, const float * re
     }
 }
 
+/* (a) AVX2 — unpacked-A micro-kernel: same compute as the packed variant
+   above, but reads A directly from raw row-major memory with stride lda.
+   eliminates the pack_a write+read overhead (~14-21 % of total bench
+   time per the pack-profile data on small-shape GEMMs).
+
+   shape contract:
+     a_base = A + ic*lda + pc — row-strip base pointer
+     each row r in [0..mr) accessed as a_base[r*lda + p] for p in [0..kc)
+     bp = packed B (same layout as packed micro_kernel)
+     c, ldc, mr, nr — same as packed variant
+   precondition: caller has verified a_base[0..mr-1][0..kc-1] is
+   reachable (in-bounds) and contiguous within each row.
+
+   wins vs packed: skips MR*KC float reads + MR*KC float writes per
+   pack_a call. for a typical (M=1024, MR=6, kc=256) shape, that's
+   ~6 KB of memory traffic per (ic, pc) tile saved. across the gemm,
+   total saved = (M/MR) * (K/kc) * 6 KB ≈ 1 MB on small shapes —
+   meaningful when this 1 MB would have spilled L2.
+
+   trade-off: A-row strided loads (one per row per k iter) cost a
+   ymm broadcast each. on Skylake+ these are 3 cycles latency, fully
+   pipelined. predictable stride lets the hardware prefetcher fetch
+   the next k columns ahead. */
+static void micro_kernel_unpacked_a(int64_t kc,
+                                      const float *restrict a_base, int64_t lda,
+                                      const float *restrict bp,
+                                      float *restrict c, int64_t ldc,
+                                      int64_t mr, int64_t nr)
+{
+    __m256 c00 = _mm256_setzero_ps(), c01 = _mm256_setzero_ps();
+    __m256 c10 = _mm256_setzero_ps(), c11 = _mm256_setzero_ps();
+    __m256 c20 = _mm256_setzero_ps(), c21 = _mm256_setzero_ps();
+    __m256 c30 = _mm256_setzero_ps(), c31 = _mm256_setzero_ps();
+    __m256 c40 = _mm256_setzero_ps(), c41 = _mm256_setzero_ps();
+    __m256 c50 = _mm256_setzero_ps(), c51 = _mm256_setzero_ps();
+
+    /* prefetch C destination rows + first few A-row prefetches */
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 8) __builtin_prefetch(c + row * ldc + 8, 0, 3);
+        __builtin_prefetch(a_base + row * lda, 0, 3);
+    }
+
+    /* row pointers — eliminates `r * lda` multiplication in the hot loop.
+       max MR=6, so 6 pointers; compiler keeps them in registers. */
+    const float *a0 = a_base;
+    const float *a1 = (mr > 1) ? a_base + lda     : a_base;
+    const float *a2 = (mr > 2) ? a_base + 2 * lda : a_base;
+    const float *a3 = (mr > 3) ? a_base + 3 * lda : a_base;
+    const float *a4 = (mr > 4) ? a_base + 4 * lda : a_base;
+    const float *a5 = (mr > 5) ? a_base + 5 * lda : a_base;
+
+    #define KERNEL_BODY_UA(p_off)                                  \
+    {                                                              \
+        __m256 b0 = _mm256_load_ps(bp + (p_off) * GEMM_NR);        \
+        __m256 b1 = _mm256_load_ps(bp + (p_off) * GEMM_NR + 8);    \
+        __m256 av0 = _mm256_broadcast_ss(a0 + (p_off));            \
+        c00 = _mm256_fmadd_ps(av0, b0, c00); c01 = _mm256_fmadd_ps(av0, b1, c01); \
+        __m256 av1 = _mm256_broadcast_ss(a1 + (p_off));            \
+        c10 = _mm256_fmadd_ps(av1, b0, c10); c11 = _mm256_fmadd_ps(av1, b1, c11); \
+        __m256 av2 = _mm256_broadcast_ss(a2 + (p_off));            \
+        c20 = _mm256_fmadd_ps(av2, b0, c20); c21 = _mm256_fmadd_ps(av2, b1, c21); \
+        __m256 av3 = _mm256_broadcast_ss(a3 + (p_off));            \
+        c30 = _mm256_fmadd_ps(av3, b0, c30); c31 = _mm256_fmadd_ps(av3, b1, c31); \
+        __m256 av4 = _mm256_broadcast_ss(a4 + (p_off));            \
+        c40 = _mm256_fmadd_ps(av4, b0, c40); c41 = _mm256_fmadd_ps(av4, b1, c41); \
+        __m256 av5 = _mm256_broadcast_ss(a5 + (p_off));            \
+        c50 = _mm256_fmadd_ps(av5, b0, c50); c51 = _mm256_fmadd_ps(av5, b1, c51); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
+        /* prefetch B 16 k-steps ahead, A 8 ahead */
+        __builtin_prefetch(bp + (p + 16) * GEMM_NR,     0, 3);
+        __builtin_prefetch(bp + (p + 16) * GEMM_NR + 8, 0, 3);
+        __builtin_prefetch(a0 + p + 8, 0, 3);
+        __builtin_prefetch(a1 + p + 8, 0, 3);
+        __builtin_prefetch(a2 + p + 8, 0, 3);
+        __builtin_prefetch(a3 + p + 8, 0, 3);
+        __builtin_prefetch(a4 + p + 8, 0, 3);
+        __builtin_prefetch(a5 + p + 8, 0, 3);
+        KERNEL_BODY_UA(p);
+        KERNEL_BODY_UA(p + 1);
+    }
+    if (p < kc) {
+        KERNEL_BODY_UA(p);
+    }
+    #undef KERNEL_BODY_UA
+
+    /* writeback — same as packed variant */
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define STORE_ROW(row, lo, hi) \
+            _mm256_storeu_ps(c + (row)*ldc,     _mm256_add_ps(lo, _mm256_loadu_ps(c + (row)*ldc))); \
+            _mm256_storeu_ps(c + (row)*ldc + 8, _mm256_add_ps(hi, _mm256_loadu_ps(c + (row)*ldc + 8)));
+        STORE_ROW(0, c00, c01); STORE_ROW(1, c10, c11);
+        STORE_ROW(2, c20, c21); STORE_ROW(3, c30, c31);
+        STORE_ROW(4, c40, c41); STORE_ROW(5, c50, c51);
+        #undef STORE_ROW
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define EXTRACT_ROW(row, lo, hi) \
+            _mm256_store_ps(buf + (row)*GEMM_NR,     lo); \
+            _mm256_store_ps(buf + (row)*GEMM_NR + 8, hi);
+        EXTRACT_ROW(0, c00, c01); EXTRACT_ROW(1, c10, c11);
+        EXTRACT_ROW(2, c20, c21); EXTRACT_ROW(3, c30, c31);
+        EXTRACT_ROW(4, c40, c41); EXTRACT_ROW(5, c50, c51);
+        #undef EXTRACT_ROW
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
 #elif defined(AX_SIMD_NEON)
 
 /* JIT-emitted 8x12 NEON micro-kernel handle. */
@@ -2439,6 +2659,100 @@ static void micro_kernel(int64_t kc, const float *restrict ap, const float *rest
     }
 }
 
+/* (a) NEON 8x12 unpacked-A micro-kernel.
+   reads A directly from row-major memory at stride lda; uses
+   vfmaq_n_f32 (FMLA Vd.4S, Vn.4S, Vm.S[0]) for scalar-broadcast
+   FMA so the row values don't need to be assembled into vectors
+   first.  saves the pack_a write+read traffic.
+   bench/test on CI (aarch64 runner); not exercised on x86 hosts.
+   layout assumptions match the packed 8x12 NEON kernel above. */
+static void micro_kernel_unpacked_a(int64_t kc,
+                                      const float *restrict a_base, int64_t lda,
+                                      const float *restrict bp,
+                                      float *restrict c, int64_t ldc,
+                                      int64_t mr, int64_t nr)
+{
+    float32x4_t c00=vdupq_n_f32(0), c01=vdupq_n_f32(0), c02=vdupq_n_f32(0);
+    float32x4_t c10=vdupq_n_f32(0), c11=vdupq_n_f32(0), c12=vdupq_n_f32(0);
+    float32x4_t c20=vdupq_n_f32(0), c21=vdupq_n_f32(0), c22=vdupq_n_f32(0);
+    float32x4_t c30=vdupq_n_f32(0), c31=vdupq_n_f32(0), c32=vdupq_n_f32(0);
+    float32x4_t c40=vdupq_n_f32(0), c41=vdupq_n_f32(0), c42=vdupq_n_f32(0);
+    float32x4_t c50=vdupq_n_f32(0), c51=vdupq_n_f32(0), c52=vdupq_n_f32(0);
+    float32x4_t c60=vdupq_n_f32(0), c61=vdupq_n_f32(0), c62=vdupq_n_f32(0);
+    float32x4_t c70=vdupq_n_f32(0), c71=vdupq_n_f32(0), c72=vdupq_n_f32(0);
+
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 4) __builtin_prefetch(c + row * ldc + 4, 0, 3);
+        if (nr > 8) __builtin_prefetch(c + row * ldc + 8, 0, 3);
+        __builtin_prefetch(a_base + row * lda, 0, 3);
+    }
+
+    /* row pointers eliminate `r * lda` mul per inner step (MR=8 max) */
+    const float *a0 = a_base;
+    const float *a1 = (mr > 1) ? a_base + 1*lda : a_base;
+    const float *a2 = (mr > 2) ? a_base + 2*lda : a_base;
+    const float *a3 = (mr > 3) ? a_base + 3*lda : a_base;
+    const float *a4 = (mr > 4) ? a_base + 4*lda : a_base;
+    const float *a5 = (mr > 5) ? a_base + 5*lda : a_base;
+    const float *a6 = (mr > 6) ? a_base + 6*lda : a_base;
+    const float *a7 = (mr > 7) ? a_base + 7*lda : a_base;
+
+    #define NEON_BODY_UA(p_off) {                                          \
+        float32x4_t b0 = vld1q_f32(bp + (p_off) * GEMM_NR);                \
+        float32x4_t b1 = vld1q_f32(bp + (p_off) * GEMM_NR + 4);            \
+        float32x4_t b2 = vld1q_f32(bp + (p_off) * GEMM_NR + 8);            \
+        c00=vfmaq_n_f32(c00,b0,a0[(p_off)]); c01=vfmaq_n_f32(c01,b1,a0[(p_off)]); c02=vfmaq_n_f32(c02,b2,a0[(p_off)]); \
+        c10=vfmaq_n_f32(c10,b0,a1[(p_off)]); c11=vfmaq_n_f32(c11,b1,a1[(p_off)]); c12=vfmaq_n_f32(c12,b2,a1[(p_off)]); \
+        c20=vfmaq_n_f32(c20,b0,a2[(p_off)]); c21=vfmaq_n_f32(c21,b1,a2[(p_off)]); c22=vfmaq_n_f32(c22,b2,a2[(p_off)]); \
+        c30=vfmaq_n_f32(c30,b0,a3[(p_off)]); c31=vfmaq_n_f32(c31,b1,a3[(p_off)]); c32=vfmaq_n_f32(c32,b2,a3[(p_off)]); \
+        c40=vfmaq_n_f32(c40,b0,a4[(p_off)]); c41=vfmaq_n_f32(c41,b1,a4[(p_off)]); c42=vfmaq_n_f32(c42,b2,a4[(p_off)]); \
+        c50=vfmaq_n_f32(c50,b0,a5[(p_off)]); c51=vfmaq_n_f32(c51,b1,a5[(p_off)]); c52=vfmaq_n_f32(c52,b2,a5[(p_off)]); \
+        c60=vfmaq_n_f32(c60,b0,a6[(p_off)]); c61=vfmaq_n_f32(c61,b1,a6[(p_off)]); c62=vfmaq_n_f32(c62,b2,a6[(p_off)]); \
+        c70=vfmaq_n_f32(c70,b0,a7[(p_off)]); c71=vfmaq_n_f32(c71,b1,a7[(p_off)]); c72=vfmaq_n_f32(c72,b2,a7[(p_off)]); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR,     0, 3);
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR + 4, 0, 3);
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR + 8, 0, 3);
+        NEON_BODY_UA(p);
+        NEON_BODY_UA(p + 1);
+    }
+    if (p < kc) {
+        NEON_BODY_UA(p);
+    }
+    #undef NEON_BODY_UA
+
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define NEON_STORE_ROW(row, v0, v1, v2) \
+            vst1q_f32(c + (row)*ldc,     vaddq_f32(v0, vld1q_f32(c + (row)*ldc))); \
+            vst1q_f32(c + (row)*ldc + 4, vaddq_f32(v1, vld1q_f32(c + (row)*ldc + 4))); \
+            vst1q_f32(c + (row)*ldc + 8, vaddq_f32(v2, vld1q_f32(c + (row)*ldc + 8)));
+        NEON_STORE_ROW(0, c00, c01, c02); NEON_STORE_ROW(1, c10, c11, c12);
+        NEON_STORE_ROW(2, c20, c21, c22); NEON_STORE_ROW(3, c30, c31, c32);
+        NEON_STORE_ROW(4, c40, c41, c42); NEON_STORE_ROW(5, c50, c51, c52);
+        NEON_STORE_ROW(6, c60, c61, c62); NEON_STORE_ROW(7, c70, c71, c72);
+        #undef NEON_STORE_ROW
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define NEON_EXT(row, v0, v1, v2) \
+            vst1q_f32(buf + (row)*GEMM_NR,     v0); \
+            vst1q_f32(buf + (row)*GEMM_NR + 4, v1); \
+            vst1q_f32(buf + (row)*GEMM_NR + 8, v2);
+        NEON_EXT(0, c00, c01, c02); NEON_EXT(1, c10, c11, c12);
+        NEON_EXT(2, c20, c21, c22); NEON_EXT(3, c30, c31, c32);
+        NEON_EXT(4, c40, c41, c42); NEON_EXT(5, c50, c51, c52);
+        NEON_EXT(6, c60, c61, c62); NEON_EXT(7, c70, c71, c72);
+        #undef NEON_EXT
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
 #else
 
 /* generic scalar micro-kernel. slowest but correct on any platform. */
@@ -2461,6 +2775,51 @@ static void micro_kernel(int64_t kc, const float *ap, const float *bp,
         }
         ap += GEMM_MR;
         bp += GEMM_NR;
+    }
+
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        for (int ii = 0; ii < GEMM_MR; ii++)
+            for (int v = 0; v < NVEC; v++) {
+                float *cp = c + ii * ldc + v * AX_VF32_WIDTH;
+                ax_vf32_storeu(cp, ax_vf32_add(ax_vf32_loadu(cp), acc[ii][v]));
+            }
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        for (int ii = 0; ii < GEMM_MR; ii++)
+            for (int v = 0; v < NVEC; v++)
+                ax_vf32_store(buf + ii * GEMM_NR + v * AX_VF32_WIDTH, acc[ii][v]);
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+    #undef NVEC
+}
+
+/* (a) generic scalar unpacked-A micro-kernel. reads A directly from
+   row-major memory. correct on any platform; baseline against which
+   the SIMD variants are validated. */
+static void micro_kernel_unpacked_a(int64_t kc,
+                                      const float *a_base, int64_t lda,
+                                      const float *bp,
+                                      float *c, int64_t ldc,
+                                      int64_t mr, int64_t nr)
+{
+    #define NVEC (GEMM_NR / AX_VF32_WIDTH)
+    ax_vf32 acc[GEMM_MR][NVEC];
+    for (int ii = 0; ii < GEMM_MR; ii++)
+        for (int v = 0; v < NVEC; v++)
+            acc[ii][v] = ax_vf32_zero();
+
+    for (int64_t p = 0; p < kc; p++) {
+        for (int v = 0; v < NVEC; v++) {
+            ax_vf32 bv = ax_vf32_loadu(bp + p * GEMM_NR + v * AX_VF32_WIDTH);
+            for (int ii = 0; ii < GEMM_MR; ii++) {
+                if (ii < mr) {
+                    ax_vf32 av = ax_vf32_set1(a_base[ii * lda + p]);
+                    acc[ii][v] = ax_vf32_fmadd(av, bv, acc[ii][v]);
+                }
+            }
+        }
     }
 
     if (mr == GEMM_MR && nr == GEMM_NR) {
@@ -2929,7 +3288,12 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
     } else if (use_jc_par) {
         /* JC parallel: each thread owns a column strip of C and its own pack buffers.
            Thread-local buffers — lazily allocated once per thread, reused every call.
-           Writes to disjoint columns → no synchronization needed. */
+           Writes to disjoint columns → no synchronization needed.
+           (a) When kc <= unpacked_a_max_k (calibrated), the pack_a step is
+           skipped and micro_kernel_unpacked_a reads A directly with
+           stride lda=k. eliminates pack_a's write+read traffic. */
+        const int64_t unpacked_max_k = ax_attn_tunable_gemm_unpacked_a_max_k();
+        const bool use_unpacked_a = (unpacked_max_k > 0) && (k <= unpacked_max_k);
 #ifdef _OPENMP
         if (inner_mode) {
             #pragma omp for schedule(static)
@@ -2937,7 +3301,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                 ensure_tl_pack_bufs();
                 float *pack_a_buf = tl_pack_a_buf;
                 float *pack_b_buf = tl_pack_b_buf;
-                if (!pack_a_buf || !pack_b_buf) continue;
+                if ((!use_unpacked_a && !pack_a_buf) || !pack_b_buf) continue;
                 int64_t jc = jct * nc_eff;
                 int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
                 int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -2947,13 +3311,21 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                     for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                         int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                         int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                        if (!use_unpacked_a) {
+                            pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                        }
                         for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                             int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                             for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                                 int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
-                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                if (use_unpacked_a) {
+                                    micro_kernel_unpacked_a(kc, ad + (ic + ir) * k + pc, k,
+                                                              pack_b_buf + jr * kc,
+                                                              od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                } else {
+                                    micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                                 od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                }
                             }
                         }
                     }
@@ -2968,7 +3340,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             ensure_tl_pack_bufs();
             float *pack_a_buf = tl_pack_a_buf;
             float *pack_b_buf = tl_pack_b_buf;
-            if (!pack_a_buf || !pack_b_buf) continue;
+            if ((!use_unpacked_a && !pack_a_buf) || !pack_b_buf) continue;
 
             int64_t jc = jct * nc_eff;
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
@@ -2981,14 +3353,22 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                     int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                    pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                    if (!use_unpacked_a) {
+                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                    }
 
                     for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                         int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                         for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                             int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
-                            micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                         od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            if (use_unpacked_a) {
+                                micro_kernel_unpacked_a(kc, ad + (ic + ir) * k + pc, k,
+                                                          pack_b_buf + jr * kc,
+                                                          od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            } else {
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            }
                         }
                     }
                 }
