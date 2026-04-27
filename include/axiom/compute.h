@@ -135,6 +135,18 @@ ax_status_t ax_compute_dwqkv_split_acc(const ax_tensor_t *x_flat,
                                         ax_tensor_t *dWv);
 int ax_compute_has_dwqkv_split_acc(void);
 
+/* head-major variant: reads dQ/dK/dV from [B*H, S, dk] directly,
+   eliminating the [rows, 3D] dQKV merge step. */
+ax_status_t ax_compute_dwqkv_split_acc_hm(const ax_tensor_t *x_flat,
+                                            const ax_tensor_t *dQh,
+                                            const ax_tensor_t *dKh,
+                                            const ax_tensor_t *dVh,
+                                            int64_t B, int64_t S, int64_t H, int64_t dk,
+                                            ax_tensor_t *dWq,
+                                            ax_tensor_t *dWk,
+                                            ax_tensor_t *dWv);
+int ax_compute_has_dwqkv_split_acc_hm(void);
+
 /* F.3.a fused forward QKV projection + head_interleave_split.
    computes:
      qkv = X @ Wqkv (+ bqkv)
@@ -261,6 +273,15 @@ ax_status_t ax_compute_conv_gemm(const ax_tensor_t *weight,
    lets conv.c choose between implicit-gemm and im2col+gemm paths once
    per forward call instead of paying the dispatch cost per sample. */
 int ax_compute_has_conv_gemm(void);
+
+/* implicit im2col conv GEMM_NT for weight gradient, per-sample.
+   computes dW += grad_out @ im2col(input)^T without materializing col.
+   returns AX_ERR_NOT_IMPLEMENTED if not available; callers fall back to
+   im2col + gemm_nt. */
+ax_status_t ax_compute_conv_gemm_nt_dw(const ax_tensor_t *grad_out,
+                                        const ax_conv_params_t *params,
+                                        ax_tensor_t *dw);
+int ax_compute_has_conv_gemm_nt_dw(void);
 
 ax_status_t ax_compute_sum(const ax_tensor_t *in, int axis, ax_tensor_t *out);
 ax_status_t ax_compute_mean(const ax_tensor_t *in, int axis, ax_tensor_t *out);

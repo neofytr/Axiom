@@ -39,7 +39,8 @@ include("${_ax_profile_file}")
 add_compile_options(-Wall -Wextra -Wpedantic -Wno-unused-parameter
                     -Wformat=2 -Wformat-security -Wconversion
                     -Wshadow -Wstrict-prototypes
-                    -fstack-protector-strong)
+                    -fstack-protector-strong
+                    -fno-strict-aliasing)
 
 # sanitizer build: cmake -DCMAKE_BUILD_TYPE=Debug -DAX_SANITIZE=ON ..
 option(AX_SANITIZE "enable address + undefined behavior sanitizers" OFF)
@@ -109,6 +110,13 @@ endif()
 if(AX_NO_STDIO)
     message(STATUS "stderr diagnostics disabled (AX_NO_STDIO)")
     add_compile_definitions(AX_NO_STDIO=1)
+endif()
+
+# allocation counting for embedded profiling
+option(AX_COUNT_ALLOCS "enable allocation counting for embedded profiling" OFF)
+if(AX_COUNT_ALLOCS)
+    message(STATUS "allocation counting enabled")
+    add_compile_definitions(AX_COUNT_ALLOCS=1)
 endif()
 
 # inference-only mode: strip all training code from the library.
@@ -189,6 +197,7 @@ set(AXIOM_SOURCES
     src/core/conv/direct.c
     src/core/conv/im2col.c
     src/core/conv/path_selection.c
+    src/core/conv/autotune.c
     src/core/conv/backward.c
     src/core/conv/forward.c
     src/core/norm.c
@@ -283,6 +292,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i[3-6]86")
         src/core/activations.c
         src/core/attention.c
         src/core/autograd_ops.c
+        src/core/conv/autotune.c
         src/core/conv/backward.c
         src/core/conv/conv_bn_relu.c
         src/core/conv/direct.c
@@ -440,7 +450,11 @@ if(NOT AX_INFERENCE_ONLY)
         tests/test_lr_sched.c
         tests/test_inplace.c
         tests/test_stress.c
+        tests/test_thread_stress.c
         tests/test_fuzz_serialize.c
+        tests/test_numerical_edge.c
+        tests/test_conv_paths.c
+        tests/test_optimization_paths.c
     )
 endif()
 
@@ -527,7 +541,8 @@ if(NOT AX_INFERENCE_ONLY)
     # benchmarks/summarize.py merges RESULT lines from both sides.
     foreach(suite_bench
             bench_gemm_suite bench_ops_suite bench_conv_suite
-            bench_transformer bench_stress bench_parity bench_qgemm)
+            bench_transformer bench_stress bench_parity bench_qgemm bench_hotpaths
+            bench_scalability bench_embedded bench_memory bench_comprehensive)
         if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/${suite_bench}.c")
             add_executable(${suite_bench} benchmarks/${suite_bench}.c)
             target_include_directories(${suite_bench} PRIVATE benchmarks)

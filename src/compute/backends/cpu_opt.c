@@ -141,7 +141,7 @@ static inline int64_t ax_par_threshold(void) { return (int64_t)1 << 62; }
 /* per-thread persistent pack buffers for GEMM — allocated once per thread,
    reused on every call. eliminates ~16 malloc/free per GEMM invocation.
    uses AX_TLS so single-threaded baremetal builds drop the _Thread_local. */
-AX_TLS float *tl_pack_a_buf = NULL;  /* GEMM_MC * GEMM_KC floats */
+AX_TLS float *tl_pack_a_buf = NULL;  /* ceil(MC/MR)*MR * max(KC, MAX_KC) floats */
 AX_TLS float *tl_pack_b_buf = NULL;  /* GEMM_NC * GEMM_KC floats */
 
 /* per-thread scratch for SDPA softmax (row_max, row_sum) and attn packing
@@ -554,13 +554,17 @@ static gemm_tile_set_t g_tiles_med   = {
 static gemm_tile_set_t g_tiles_large = {
     AX_GEMM_DEFAULT_MC, AX_GEMM_DEFAULT_NC, AX_GEMM_DEFAULT_KC
 };
+static gemm_tile_set_t g_tiles_vlarge = {
+    AX_GEMM_DEFAULT_MC, AX_GEMM_DEFAULT_NC, AX_GEMM_DEFAULT_KC
+};
 
-/* gflops cutoffs for the 3 regimes. tuned empirically: < 2 GF puts
+/* gflops cutoffs for the 4 regimes. tuned empirically: < 2 GF puts
    typical small mha gemms (Wo on B8_S128 = 0.54 GF, qkv on B8_S128 =
-   1.6 GF) in "small"; 2-15 GF spans medium transformer shapes (B4_S512
-   qkv ~7 GF); above is large. */
+   1.6 GF) in "small"; 2-10 GF spans medium transformer shapes; 10-100 GF
+   is large (2048^3 at 17 GF, wgrad shapes); >= 100 GF is vlarge. */
 #define GEMM_REGIME_SMALL_FLOPS  2000000000LL    /*  2 GF */
-#define GEMM_REGIME_MED_FLOPS    15000000000LL   /* 15 GF */
+#define GEMM_REGIME_MED_FLOPS    10000000000LL   /* 10 GF */
+#define GEMM_REGIME_VLARGE_FLOPS 100000000000LL  /* 100 GF */
 
 /* per-regime dispatch is gated: apply_tiles_for_shape() is a no-op
    until the gemm-tile calibration finishes (or the cache load applies
@@ -580,7 +584,8 @@ static inline void apply_tiles_for_shape(int64_t M, int64_t N, int64_t K) {
     const gemm_tile_set_t *t;
     if (flops < GEMM_REGIME_SMALL_FLOPS)     t = &g_tiles_small;
     else if (flops < GEMM_REGIME_MED_FLOPS)  t = &g_tiles_med;
-    else                                      t = &g_tiles_large;
+    else if (flops < GEMM_REGIME_VLARGE_FLOPS) t = &g_tiles_large;
+    else                                       t = &g_tiles_vlarge;
     GEMM_MC = t->mc;
     GEMM_NC = t->nc;
     GEMM_KC = t->kc;
@@ -710,8 +715,9 @@ static int ax_gemm_threads_for_shape(int64_t m, int64_t n, int64_t k) {
 
     int64_t total_flops = 2 * m * n * k;
 
-    /* tiny: fork-join amortization threshold */
-    if (total_flops < 1000000) return 1;
+    /* tiny: fork-join overhead exceeds parallel benefit below ~10M flops
+       (at 100+ gflops serial, 10M is ~100us; omp fork-join is 10-20us). */
+    if (total_flops < 10000000) return 1;
 
     /* if non-hybrid, just return all (fast == all) */
     if (all == fast) return all;
@@ -1087,6 +1093,8 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
         { mc_orig * 2,         nc_orig,           kc_orig      },
         { mc_orig,             nc_orig,           kc_orig * 2  },
         { mc_orig * 2,         nc_orig,           kc_orig * 2  },
+        { mc_orig,             nc_orig * 2,       kc_orig      },
+        { mc_orig,             (int64_t)GEMM_NR * 16, kc_orig  },
     };
     int nc_configs = (int)(sizeof(base_configs) / sizeof(base_configs[0]));
     int nc_extended = (int)(sizeof(extended_configs) / sizeof(extended_configs[0]));
@@ -1139,7 +1147,8 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
            shape regime where we currently lag TF most. */
         sh[5].M = 1024; sh[5].N = 512;  sh[5].K = 512;   /* B8_S128_D512 Wo */
         sh[6].M = 4096; sh[6].N = 3072; sh[6].K = 1024;  /* B8_S512_D1024 qkv */
-        n_sh = 7;
+        sh[7].M = sh[7].N = sh[7].K = 4096;               /* 137G flops, vlarge regime */
+        n_sh = 8;
     }
     uint32_t s = 2463534242u;
     for (int sh_i = 0; sh_i < n_sh; sh_i++) {
@@ -1203,6 +1212,18 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     double base_score = 1e30;
     double t_start = ax_tile_cal_now_ms();
 
+    /* flops-weighted geomean: weight each probe by log2(flops) so larger
+       shapes (which dominate wall time) have proportionally more influence.
+       4096^3 (137G) counts ~1.2x more than 1024^3 (2G) within a regime. */
+    double shape_wt[8];
+    double wt_sum = 0.0;
+    for (int sh_i = 0; sh_i < n_sh; sh_i++) {
+        double flops = 2.0 * (double)sh[sh_i].M * (double)sh[sh_i].N * (double)sh[sh_i].K;
+        shape_wt[sh_i] = log2(flops);
+        wt_sum += shape_wt[sh_i];
+    }
+    for (int sh_i = 0; sh_i < n_sh; sh_i++) shape_wt[sh_i] /= wt_sum;
+
     for (int i = 0; i < nc_configs; i++) {
         GEMM_MC = configs[i].mc;
         GEMM_NC = configs[i].nc;
@@ -1220,15 +1241,15 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
             }
             per_shape_per_config[i][sh_i] = mn;
         }
-        /* score: geometric mean of all shape times. equal weight per shape. */
-        double prod = 1.0;
-        for (int sh_i = 0; sh_i < n_sh; sh_i++) prod *= per_shape_per_config[i][sh_i];
-        double score = pow(prod, 1.0 / (double)n_sh);
+        double score = 0.0;
+        for (int sh_i = 0; sh_i < n_sh; sh_i++)
+            score += shape_wt[sh_i] * log(per_shape_per_config[i][sh_i]);
+        score = exp(score);
         if (i == 0) base_score = score;
     }
 
     /* conservative selection: only switch if the proposed config beats
-       baseline by the configured margin on the geometric mean across the
+       baseline by the configured margin on the weighted geomean across the
        probe shapes. default 6 % (margin = 0.94) sits between 5 % (too
        loose, triggered NC=128 swap that cost large-shape) and 8 % (too
        tight, missed MC=24 swap that helped narrow-N by 13 %). users on
@@ -1236,9 +1257,10 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
        resolved by ax_attn_tunables_init_early() before this function. */
     const double switch_margin = ax_attn_tunable_gemm_tile_switch_margin();
     for (int i = 1; i < nc_configs; i++) {
-        double prod = 1.0;
-        for (int sh_i = 0; sh_i < n_sh; sh_i++) prod *= per_shape_per_config[i][sh_i];
-        double cand_score = pow(prod, 1.0 / (double)n_sh);
+        double score = 0.0;
+        for (int sh_i = 0; sh_i < n_sh; sh_i++)
+            score += shape_wt[sh_i] * log(per_shape_per_config[i][sh_i]);
+        double cand_score = exp(score);
         if (cand_score < base_score * switch_margin) {
             best_i = i;
             base_score = cand_score;
@@ -1257,36 +1279,48 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
        small-bucket noise from a single shape doesn't corrupt the
        calibration. */
     int regime_idx[8];
-    int n_per_regime[3] = {0, 0, 0};
+    int n_per_regime[4] = {0, 0, 0, 0};
     for (int sh_i = 0; sh_i < n_sh; sh_i++) {
         int64_t flops = 2 * (int64_t)sh[sh_i].M * (int64_t)sh[sh_i].N * (int64_t)sh[sh_i].K;
-        if (flops < GEMM_REGIME_SMALL_FLOPS)      regime_idx[sh_i] = 0;
-        else if (flops < GEMM_REGIME_MED_FLOPS)   regime_idx[sh_i] = 1;
-        else                                       regime_idx[sh_i] = 2;
+        if (flops < GEMM_REGIME_SMALL_FLOPS)       regime_idx[sh_i] = 0;
+        else if (flops < GEMM_REGIME_MED_FLOPS)    regime_idx[sh_i] = 1;
+        else if (flops < GEMM_REGIME_VLARGE_FLOPS)  regime_idx[sh_i] = 2;
+        else                                        regime_idx[sh_i] = 3;
         n_per_regime[regime_idx[sh_i]]++;
     }
 
-    int regime_best[3] = { best_i, best_i, best_i };
-    for (int reg = 0; reg < 3; reg++) {
+    int regime_best[4] = { best_i, best_i, best_i, best_i };
+    for (int reg = 0; reg < 4; reg++) {
         if (n_per_regime[reg] < 2) continue;  /* not enough probes */
-        double base_reg = 1.0;
+        /* per-regime flops-weighted geomean */
+        double rw[8];
+        double rw_sum = 0.0;
         int n_in_reg = 0;
         for (int sh_i = 0; sh_i < n_sh; sh_i++) {
             if (regime_idx[sh_i] != reg) continue;
-            base_reg *= per_shape_per_config[0][sh_i];
+            double flops = 2.0 * (double)sh[sh_i].M * (double)sh[sh_i].N * (double)sh[sh_i].K;
+            rw[sh_i] = log2(flops);
+            rw_sum += rw[sh_i];
             n_in_reg++;
         }
         if (n_in_reg < 2) continue;
-        base_reg = pow(base_reg, 1.0 / (double)n_in_reg);
+        for (int sh_i = 0; sh_i < n_sh; sh_i++)
+            if (regime_idx[sh_i] == reg) rw[sh_i] /= rw_sum;
+        double base_reg = 0.0;
+        for (int sh_i = 0; sh_i < n_sh; sh_i++) {
+            if (regime_idx[sh_i] != reg) continue;
+            base_reg += rw[sh_i] * log(per_shape_per_config[0][sh_i]);
+        }
+        base_reg = exp(base_reg);
         int reg_best = 0;
         double reg_best_score = base_reg;
         for (int i = 1; i < nc_configs; i++) {
-            double prod = 1.0;
+            double score = 0.0;
             for (int sh_i = 0; sh_i < n_sh; sh_i++) {
                 if (regime_idx[sh_i] != reg) continue;
-                prod *= per_shape_per_config[i][sh_i];
+                score += rw[sh_i] * log(per_shape_per_config[i][sh_i]);
             }
-            double cand = pow(prod, 1.0 / (double)n_in_reg);
+            double cand = exp(score);
             if (cand < reg_best_score * switch_margin) {
                 reg_best = i;
                 reg_best_score = cand;
@@ -1300,9 +1334,12 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     g_tiles_med.mc   = configs[regime_best[1]].mc;
     g_tiles_med.nc   = configs[regime_best[1]].nc;
     g_tiles_med.kc   = configs[regime_best[1]].kc;
-    g_tiles_large.mc = configs[regime_best[2]].mc;
-    g_tiles_large.nc = configs[regime_best[2]].nc;
-    g_tiles_large.kc = configs[regime_best[2]].kc;
+    g_tiles_large.mc  = configs[regime_best[2]].mc;
+    g_tiles_large.nc  = configs[regime_best[2]].nc;
+    g_tiles_large.kc  = configs[regime_best[2]].kc;
+    g_tiles_vlarge.mc = configs[regime_best[3]].mc;
+    g_tiles_vlarge.nc = configs[regime_best[3]].nc;
+    g_tiles_vlarge.kc = configs[regime_best[3]].kc;
 
     double total_ms = ax_tile_cal_now_ms() - t_start;
 
@@ -1336,10 +1373,12 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
         extended ? ", extended" : "");
     fprintf(stderr,
         "axiom: gemm regimes — small(<2GF): MC=%ld NC=%ld KC=%ld; "
-        "med(<15GF): MC=%ld NC=%ld KC=%ld; large: MC=%ld NC=%ld KC=%ld\n",
+        "med(<10GF): MC=%ld NC=%ld KC=%ld; large(<100GF): MC=%ld NC=%ld KC=%ld; "
+        "vlarge: MC=%ld NC=%ld KC=%ld\n",
         (long)g_tiles_small.mc, (long)g_tiles_small.nc, (long)g_tiles_small.kc,
         (long)g_tiles_med.mc,   (long)g_tiles_med.nc,   (long)g_tiles_med.kc,
-        (long)g_tiles_large.mc, (long)g_tiles_large.nc, (long)g_tiles_large.kc);
+        (long)g_tiles_large.mc, (long)g_tiles_large.nc, (long)g_tiles_large.kc,
+        (long)g_tiles_vlarge.mc,(long)g_tiles_vlarge.nc,(long)g_tiles_vlarge.kc);
 #endif
 
     for (int sh_i = 0; sh_i < n_sh; sh_i++) {
@@ -1399,6 +1438,8 @@ void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
         { 512, 1536,1024, "mha_dwqkv_small"},  /* B=8 S=128 D=512: tn(512, 1536, 1024) */
         {1024, 3072, 512, "mha_dwqkv_med"  },  /* B=1 S=512 D=1024: tn(1024, 3072, 512) */
         { 768, 2304,2048, "mha_dwqkv_long" },  /* B=1 S=2048 D=768: tn(768, 2304, 2048) */
+        {4096,4096,4096, "large_sq_4k"   },  /* 137G flops, vlarge regime */
+        {2048,4096,2048, "wide_2kx4k"    },  /* wide N, tests jc tile balance */
     };
     int n_shapes = (int)(sizeof(probe_shapes) / sizeof(probe_shapes[0]));
     if (n_shapes > AX_MAX_THREAD_PROBES) n_shapes = AX_MAX_THREAD_PROBES;
@@ -1669,8 +1710,9 @@ static bool ensure_tl_pack_bufs(void) {
        eliminates a heap re-alloc when adaptive KC kicks in. */
     int64_t kc_alloc = (GEMM_KC > AX_GEMM_MAX_KC) ? GEMM_KC : AX_GEMM_MAX_KC;
     if (!tl_pack_a_buf) {
-        size_t pa = (size_t)GEMM_MC * (size_t)kc_alloc;
-        if (pa / (size_t)GEMM_MC != (size_t)kc_alloc) return false; /* overflow */
+        size_t mc_rounded = (size_t)((GEMM_MC + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+        size_t pa = mc_rounded * (size_t)kc_alloc;
+        if (pa / mc_rounded != (size_t)kc_alloc) return false;
         if (pa > SIZE_MAX / sizeof(float)) return false;
         tl_pack_a_buf = (float *)ax_aligned_alloc(pa * sizeof(float), 64);
     }
@@ -2845,6 +2887,317 @@ static void micro_kernel_unpacked_a(int64_t kc,
 
 #endif
 
+/* transposed-A unpacked micro-kernel: reads A^T directly from [k, m]
+   storage without pack_a_t. at k-step p the MR rows are contiguous at
+   a_base + p*col_stride + {0..MR-1}. col_stride = lda = M.
+   used by opt_gemm_tn when K <= unpacked_a_max_k. */
+
+#if defined(AX_SIMD_AVX512)
+
+/* avx-512 14×32 transposed-A unpacked micro-kernel. MR rows contiguous
+   at each k-step, k-steps col_stride apart. */
+static void micro_kernel_unpacked_a_t(int64_t kc,
+                                        const float *restrict a_base,
+                                        int64_t col_stride,
+                                        const float *restrict bp,
+                                        float *restrict c, int64_t ldc,
+                                        int64_t mr, int64_t nr)
+{
+#if !defined(AX_NO_JIT)
+    if (mr == GEMM_MR && nr == GEMM_NR && kc >= 1 && kc <= 256) {
+        ax_jit_gemm_zmm_stridedA_kernel_fn fn =
+            ax_jit_gemm_avx512_get_14x32_stridedA_kc(kc);
+        if (fn) {
+            fn(kc, a_base, col_stride * (int64_t)sizeof(float),
+               bp, c, ldc * (int64_t)sizeof(float));
+            return;
+        }
+    }
+#endif
+    __m512 c00=_mm512_setzero_ps(), c01=_mm512_setzero_ps();
+    __m512 c10=_mm512_setzero_ps(), c11=_mm512_setzero_ps();
+    __m512 c20=_mm512_setzero_ps(), c21=_mm512_setzero_ps();
+    __m512 c30=_mm512_setzero_ps(), c31=_mm512_setzero_ps();
+    __m512 c40=_mm512_setzero_ps(), c41=_mm512_setzero_ps();
+    __m512 c50=_mm512_setzero_ps(), c51=_mm512_setzero_ps();
+    __m512 c60=_mm512_setzero_ps(), c61=_mm512_setzero_ps();
+    __m512 c70=_mm512_setzero_ps(), c71=_mm512_setzero_ps();
+    __m512 c80=_mm512_setzero_ps(), c81=_mm512_setzero_ps();
+    __m512 c90=_mm512_setzero_ps(), c91=_mm512_setzero_ps();
+    __m512 cA0=_mm512_setzero_ps(), cA1=_mm512_setzero_ps();
+    __m512 cB0=_mm512_setzero_ps(), cB1=_mm512_setzero_ps();
+    __m512 cC0=_mm512_setzero_ps(), cC1=_mm512_setzero_ps();
+    __m512 cD0=_mm512_setzero_ps(), cD1=_mm512_setzero_ps();
+
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 16) __builtin_prefetch(c + row * ldc + 16, 0, 3);
+    }
+    __builtin_prefetch(a_base, 0, 3);
+
+    #define AVX512_BODY_UAT(p_off) {                                     \
+        const float *ap = a_base + (p_off) * col_stride;                  \
+        __m512 b0 = _mm512_load_ps(bp + (p_off) * GEMM_NR);              \
+        __m512 b1 = _mm512_load_ps(bp + (p_off) * GEMM_NR + 16);         \
+        __m512 a;                                                        \
+        a=_mm512_set1_ps(ap[ 0]); c00=_mm512_fmadd_ps(a,b0,c00); c01=_mm512_fmadd_ps(a,b1,c01); \
+        a=_mm512_set1_ps(ap[ 1]); c10=_mm512_fmadd_ps(a,b0,c10); c11=_mm512_fmadd_ps(a,b1,c11); \
+        a=_mm512_set1_ps(ap[ 2]); c20=_mm512_fmadd_ps(a,b0,c20); c21=_mm512_fmadd_ps(a,b1,c21); \
+        a=_mm512_set1_ps(ap[ 3]); c30=_mm512_fmadd_ps(a,b0,c30); c31=_mm512_fmadd_ps(a,b1,c31); \
+        a=_mm512_set1_ps(ap[ 4]); c40=_mm512_fmadd_ps(a,b0,c40); c41=_mm512_fmadd_ps(a,b1,c41); \
+        a=_mm512_set1_ps(ap[ 5]); c50=_mm512_fmadd_ps(a,b0,c50); c51=_mm512_fmadd_ps(a,b1,c51); \
+        a=_mm512_set1_ps(ap[ 6]); c60=_mm512_fmadd_ps(a,b0,c60); c61=_mm512_fmadd_ps(a,b1,c61); \
+        a=_mm512_set1_ps(ap[ 7]); c70=_mm512_fmadd_ps(a,b0,c70); c71=_mm512_fmadd_ps(a,b1,c71); \
+        a=_mm512_set1_ps(ap[ 8]); c80=_mm512_fmadd_ps(a,b0,c80); c81=_mm512_fmadd_ps(a,b1,c81); \
+        a=_mm512_set1_ps(ap[ 9]); c90=_mm512_fmadd_ps(a,b0,c90); c91=_mm512_fmadd_ps(a,b1,c91); \
+        a=_mm512_set1_ps(ap[10]); cA0=_mm512_fmadd_ps(a,b0,cA0); cA1=_mm512_fmadd_ps(a,b1,cA1); \
+        a=_mm512_set1_ps(ap[11]); cB0=_mm512_fmadd_ps(a,b0,cB0); cB1=_mm512_fmadd_ps(a,b1,cB1); \
+        a=_mm512_set1_ps(ap[12]); cC0=_mm512_fmadd_ps(a,b0,cC0); cC1=_mm512_fmadd_ps(a,b1,cC1); \
+        a=_mm512_set1_ps(ap[13]); cD0=_mm512_fmadd_ps(a,b0,cD0); cD1=_mm512_fmadd_ps(a,b1,cD1); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR,      0, 3);
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR + 16, 0, 3);
+        __builtin_prefetch(a_base + (p + 8) * col_stride, 0, 3);
+        AVX512_BODY_UAT(p);
+        AVX512_BODY_UAT(p + 1);
+    }
+    if (p < kc) {
+        AVX512_BODY_UAT(p);
+    }
+    #undef AVX512_BODY_UAT
+
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define STORE_ROW(row, lo, hi) \
+            _mm512_storeu_ps(c + (row)*ldc,      _mm512_add_ps(lo, _mm512_loadu_ps(c + (row)*ldc))); \
+            _mm512_storeu_ps(c + (row)*ldc + 16, _mm512_add_ps(hi, _mm512_loadu_ps(c + (row)*ldc + 16)));
+        STORE_ROW( 0,c00,c01); STORE_ROW( 1,c10,c11); STORE_ROW( 2,c20,c21); STORE_ROW( 3,c30,c31);
+        STORE_ROW( 4,c40,c41); STORE_ROW( 5,c50,c51); STORE_ROW( 6,c60,c61); STORE_ROW( 7,c70,c71);
+        STORE_ROW( 8,c80,c81); STORE_ROW( 9,c90,c91); STORE_ROW(10,cA0,cA1); STORE_ROW(11,cB0,cB1);
+        STORE_ROW(12,cC0,cC1); STORE_ROW(13,cD0,cD1);
+        #undef STORE_ROW
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define EXT_ROW(row, lo, hi) \
+            _mm512_store_ps(buf + (row)*GEMM_NR,      lo); \
+            _mm512_store_ps(buf + (row)*GEMM_NR + 16, hi);
+        EXT_ROW( 0,c00,c01); EXT_ROW( 1,c10,c11); EXT_ROW( 2,c20,c21); EXT_ROW( 3,c30,c31);
+        EXT_ROW( 4,c40,c41); EXT_ROW( 5,c50,c51); EXT_ROW( 6,c60,c61); EXT_ROW( 7,c70,c71);
+        EXT_ROW( 8,c80,c81); EXT_ROW( 9,c90,c91); EXT_ROW(10,cA0,cA1); EXT_ROW(11,cB0,cB1);
+        EXT_ROW(12,cC0,cC1); EXT_ROW(13,cD0,cD1);
+        #undef EXT_ROW
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
+#elif defined(AX_SIMD_AVX2)
+
+/* avx2 6×16 transposed-A unpacked micro-kernel. */
+static void micro_kernel_unpacked_a_t(int64_t kc,
+                                        const float *restrict a_base,
+                                        int64_t col_stride,
+                                        const float *restrict bp,
+                                        float *restrict c, int64_t ldc,
+                                        int64_t mr, int64_t nr)
+{
+#if !defined(AX_NO_JIT)
+    if (mr == GEMM_MR && nr == GEMM_NR && kc >= 1 && kc <= 256) {
+        ax_jit_gemm_stridedA_kernel_fn fn =
+            ax_jit_gemm_avx2_get_6x16_stridedA_kc(kc);
+        if (fn) {
+            fn(kc, a_base, col_stride * (int64_t)sizeof(float),
+               bp, c, ldc * (int64_t)sizeof(float));
+            return;
+        }
+    }
+#endif
+    __m256 c00 = _mm256_setzero_ps(), c01 = _mm256_setzero_ps();
+    __m256 c10 = _mm256_setzero_ps(), c11 = _mm256_setzero_ps();
+    __m256 c20 = _mm256_setzero_ps(), c21 = _mm256_setzero_ps();
+    __m256 c30 = _mm256_setzero_ps(), c31 = _mm256_setzero_ps();
+    __m256 c40 = _mm256_setzero_ps(), c41 = _mm256_setzero_ps();
+    __m256 c50 = _mm256_setzero_ps(), c51 = _mm256_setzero_ps();
+
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 8) __builtin_prefetch(c + row * ldc + 8, 0, 3);
+    }
+    __builtin_prefetch(a_base, 0, 3);
+
+    #define KERNEL_BODY_UAT(p_off) {                                      \
+        const float *ap = a_base + (p_off) * col_stride;                   \
+        __m256 b0 = _mm256_load_ps(bp + (p_off) * GEMM_NR);               \
+        __m256 b1 = _mm256_load_ps(bp + (p_off) * GEMM_NR + 8);           \
+        __m256 av0 = _mm256_broadcast_ss(ap + 0);                          \
+        c00 = _mm256_fmadd_ps(av0, b0, c00); c01 = _mm256_fmadd_ps(av0, b1, c01); \
+        __m256 av1 = _mm256_broadcast_ss(ap + 1);                          \
+        c10 = _mm256_fmadd_ps(av1, b0, c10); c11 = _mm256_fmadd_ps(av1, b1, c11); \
+        __m256 av2 = _mm256_broadcast_ss(ap + 2);                          \
+        c20 = _mm256_fmadd_ps(av2, b0, c20); c21 = _mm256_fmadd_ps(av2, b1, c21); \
+        __m256 av3 = _mm256_broadcast_ss(ap + 3);                          \
+        c30 = _mm256_fmadd_ps(av3, b0, c30); c31 = _mm256_fmadd_ps(av3, b1, c31); \
+        __m256 av4 = _mm256_broadcast_ss(ap + 4);                          \
+        c40 = _mm256_fmadd_ps(av4, b0, c40); c41 = _mm256_fmadd_ps(av4, b1, c41); \
+        __m256 av5 = _mm256_broadcast_ss(ap + 5);                          \
+        c50 = _mm256_fmadd_ps(av5, b0, c50); c51 = _mm256_fmadd_ps(av5, b1, c51); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
+        __builtin_prefetch(bp + (p + 16) * GEMM_NR,     0, 3);
+        __builtin_prefetch(bp + (p + 16) * GEMM_NR + 8, 0, 3);
+        __builtin_prefetch(a_base + (p + 8) * col_stride, 0, 3);
+        KERNEL_BODY_UAT(p);
+        KERNEL_BODY_UAT(p + 1);
+    }
+    if (p < kc) {
+        KERNEL_BODY_UAT(p);
+    }
+    #undef KERNEL_BODY_UAT
+
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define STORE_ROW(row, lo, hi) \
+            _mm256_storeu_ps(c + (row)*ldc,     _mm256_add_ps(lo, _mm256_loadu_ps(c + (row)*ldc))); \
+            _mm256_storeu_ps(c + (row)*ldc + 8, _mm256_add_ps(hi, _mm256_loadu_ps(c + (row)*ldc + 8)));
+        STORE_ROW(0, c00, c01); STORE_ROW(1, c10, c11);
+        STORE_ROW(2, c20, c21); STORE_ROW(3, c30, c31);
+        STORE_ROW(4, c40, c41); STORE_ROW(5, c50, c51);
+        #undef STORE_ROW
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define EXTRACT_ROW(row, lo, hi) \
+            _mm256_store_ps(buf + (row)*GEMM_NR,     lo); \
+            _mm256_store_ps(buf + (row)*GEMM_NR + 8, hi);
+        EXTRACT_ROW(0, c00, c01); EXTRACT_ROW(1, c10, c11);
+        EXTRACT_ROW(2, c20, c21); EXTRACT_ROW(3, c30, c31);
+        EXTRACT_ROW(4, c40, c41); EXTRACT_ROW(5, c50, c51);
+        #undef EXTRACT_ROW
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
+#elif defined(AX_SIMD_NEON)
+
+/* neon 8×12 transposed-A unpacked micro-kernel. uses vfmaq_n_f32 for
+   scalar-broadcast FMA — MR rows are contiguous at each k-step so
+   the scalar loads are sequential. */
+static void micro_kernel_unpacked_a_t(int64_t kc,
+                                        const float *restrict a_base,
+                                        int64_t col_stride,
+                                        const float *restrict bp,
+                                        float *restrict c, int64_t ldc,
+                                        int64_t mr, int64_t nr)
+{
+    float32x4_t c00=vdupq_n_f32(0), c01=vdupq_n_f32(0), c02=vdupq_n_f32(0);
+    float32x4_t c10=vdupq_n_f32(0), c11=vdupq_n_f32(0), c12=vdupq_n_f32(0);
+    float32x4_t c20=vdupq_n_f32(0), c21=vdupq_n_f32(0), c22=vdupq_n_f32(0);
+    float32x4_t c30=vdupq_n_f32(0), c31=vdupq_n_f32(0), c32=vdupq_n_f32(0);
+    float32x4_t c40=vdupq_n_f32(0), c41=vdupq_n_f32(0), c42=vdupq_n_f32(0);
+    float32x4_t c50=vdupq_n_f32(0), c51=vdupq_n_f32(0), c52=vdupq_n_f32(0);
+    float32x4_t c60=vdupq_n_f32(0), c61=vdupq_n_f32(0), c62=vdupq_n_f32(0);
+    float32x4_t c70=vdupq_n_f32(0), c71=vdupq_n_f32(0), c72=vdupq_n_f32(0);
+
+    for (int64_t row = 0; row < mr; row++) {
+        __builtin_prefetch(c + row * ldc, 0, 3);
+        if (nr > 4) __builtin_prefetch(c + row * ldc + 4, 0, 3);
+        if (nr > 8) __builtin_prefetch(c + row * ldc + 8, 0, 3);
+    }
+    __builtin_prefetch(a_base, 0, 3);
+
+    #define NEON_BODY_UAT(p_off) {                                         \
+        const float *ap = a_base + (p_off) * col_stride;                    \
+        float32x4_t b0 = vld1q_f32(bp + (p_off) * GEMM_NR);               \
+        float32x4_t b1 = vld1q_f32(bp + (p_off) * GEMM_NR + 4);           \
+        float32x4_t b2 = vld1q_f32(bp + (p_off) * GEMM_NR + 8);           \
+        c00=vfmaq_n_f32(c00,b0,ap[0]); c01=vfmaq_n_f32(c01,b1,ap[0]); c02=vfmaq_n_f32(c02,b2,ap[0]); \
+        c10=vfmaq_n_f32(c10,b0,ap[1]); c11=vfmaq_n_f32(c11,b1,ap[1]); c12=vfmaq_n_f32(c12,b2,ap[1]); \
+        c20=vfmaq_n_f32(c20,b0,ap[2]); c21=vfmaq_n_f32(c21,b1,ap[2]); c22=vfmaq_n_f32(c22,b2,ap[2]); \
+        c30=vfmaq_n_f32(c30,b0,ap[3]); c31=vfmaq_n_f32(c31,b1,ap[3]); c32=vfmaq_n_f32(c32,b2,ap[3]); \
+        c40=vfmaq_n_f32(c40,b0,ap[4]); c41=vfmaq_n_f32(c41,b1,ap[4]); c42=vfmaq_n_f32(c42,b2,ap[4]); \
+        c50=vfmaq_n_f32(c50,b0,ap[5]); c51=vfmaq_n_f32(c51,b1,ap[5]); c52=vfmaq_n_f32(c52,b2,ap[5]); \
+        c60=vfmaq_n_f32(c60,b0,ap[6]); c61=vfmaq_n_f32(c61,b1,ap[6]); c62=vfmaq_n_f32(c62,b2,ap[6]); \
+        c70=vfmaq_n_f32(c70,b0,ap[7]); c71=vfmaq_n_f32(c71,b1,ap[7]); c72=vfmaq_n_f32(c72,b2,ap[7]); \
+    }
+
+    int64_t p = 0;
+    int64_t kc2 = kc - (kc & 1);
+    for (; p < kc2; p += 2) {
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR,     0, 3);
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR + 4, 0, 3);
+        __builtin_prefetch(bp + (p + 8) * GEMM_NR + 8, 0, 3);
+        __builtin_prefetch(a_base + (p + 8) * col_stride, 0, 3);
+        NEON_BODY_UAT(p);
+        NEON_BODY_UAT(p + 1);
+    }
+    if (p < kc) {
+        NEON_BODY_UAT(p);
+    }
+    #undef NEON_BODY_UAT
+
+    if (mr == GEMM_MR && nr == GEMM_NR) {
+        #define NEON_ST(row, v0, v1, v2) \
+            vst1q_f32(c + (row)*ldc,     vaddq_f32(v0, vld1q_f32(c + (row)*ldc))); \
+            vst1q_f32(c + (row)*ldc + 4, vaddq_f32(v1, vld1q_f32(c + (row)*ldc + 4))); \
+            vst1q_f32(c + (row)*ldc + 8, vaddq_f32(v2, vld1q_f32(c + (row)*ldc + 8)));
+        NEON_ST(0, c00, c01, c02); NEON_ST(1, c10, c11, c12);
+        NEON_ST(2, c20, c21, c22); NEON_ST(3, c30, c31, c32);
+        NEON_ST(4, c40, c41, c42); NEON_ST(5, c50, c51, c52);
+        NEON_ST(6, c60, c61, c62); NEON_ST(7, c70, c71, c72);
+        #undef NEON_ST
+    } else {
+        float buf[GEMM_MR * GEMM_NR] __attribute__((aligned(64)));
+        #define NEON_EXT(row, v0, v1, v2) \
+            vst1q_f32(buf + (row)*GEMM_NR,     v0); \
+            vst1q_f32(buf + (row)*GEMM_NR + 4, v1); \
+            vst1q_f32(buf + (row)*GEMM_NR + 8, v2);
+        NEON_EXT(0, c00, c01, c02); NEON_EXT(1, c10, c11, c12);
+        NEON_EXT(2, c20, c21, c22); NEON_EXT(3, c30, c31, c32);
+        NEON_EXT(4, c40, c41, c42); NEON_EXT(5, c50, c51, c52);
+        NEON_EXT(6, c60, c61, c62); NEON_EXT(7, c70, c71, c72);
+        #undef NEON_EXT
+        for (int64_t ii = 0; ii < mr; ii++)
+            for (int64_t jj = 0; jj < nr; jj++)
+                c[ii * ldc + jj] += buf[ii * GEMM_NR + jj];
+    }
+}
+
+#else
+
+/* scalar fallback transposed-A unpacked micro-kernel. */
+static void micro_kernel_unpacked_a_t(int64_t kc,
+                                        const float *restrict a_base,
+                                        int64_t col_stride,
+                                        const float *restrict bp,
+                                        float *restrict c, int64_t ldc,
+                                        int64_t mr, int64_t nr)
+{
+    float acc[GEMM_MR * GEMM_NR];
+    memset(acc, 0, sizeof(acc));
+
+    for (int64_t p = 0; p < kc; p++) {
+        const float *ap = a_base + p * col_stride;
+        for (int ii = 0; ii < mr; ii++) {
+            float av = ap[ii];
+            for (int jj = 0; jj < nr; jj++)
+                acc[ii * GEMM_NR + jj] += av * bp[p * GEMM_NR + jj];
+        }
+    }
+
+    for (int64_t ii = 0; ii < mr; ii++)
+        for (int64_t jj = 0; jj < nr; jj++)
+            c[ii * ldc + jj] += acc[ii * GEMM_NR + jj];
+}
+
+#endif
+
 /* compute an effective NC that ensures at least max_threads JC tiles
    when the default GEMM_NC would leave threads idle. rounds to GEMM_NR. */
 static inline int64_t ax_adaptive_nc(int64_t n, int max_threads) {
@@ -3166,16 +3519,20 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
         return AX_OK;
     }
 
-    /* per-thread pack buffers — guarded against nested parallel regions.
-       on hybrid cpus, large GEMMs use all cores (P+E), small ones use
-       only P-cores for lower latency. */
+    /* inner_mode: caller wrapped us in an existing omp parallel team.
+       hoisted before path selection so max_threads reflects the real team. */
+#ifdef _OPENMP
+    const bool inner_mode = tl_gemm_inner_team;
+#else
+    const bool inner_mode = false;
+#endif
+
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
+#ifdef _OPENMP
+    if (inner_mode) max_threads = omp_get_num_threads();
+#endif
 
-    /* adaptive KC: when k fits in AX_GEMM_MAX_KC, use kc_eff=k (single pc tile)
-       to halve pack_b launches on shapes like dense_*_S128 with k=512 or
-       conv 3x3 with K=576-1024. pack buffers are sized for AX_GEMM_MAX_KC so
-       no realloc; if k > AX_GEMM_MAX_KC fall back to the original GEMM_KC. */
     int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
 
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
@@ -3266,11 +3623,6 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
 #else
     if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 #endif
-#ifdef _OPENMP
-    const bool inner_mode = tl_gemm_inner_team;
-#else
-    const bool inner_mode = false;
-#endif
 
     if (use_hybrid) {
         /* hybrid jc+pc+ic for opt_gemm. structure: collapse(3) over (jct, pct,
@@ -3298,7 +3650,7 @@ static ax_status_t opt_gemm(const ax_tensor_t *a, const ax_tensor_t *b, ax_tenso
             float *pack_b_buf = tl_pack_b_buf;                                   \
             int64_t last_jct = -1;                                               \
             int64_t last_pct = -1;                                               \
-            _Pragma("omp for collapse(3) schedule(static)")                      \
+            _Pragma("omp for collapse(3) schedule(runtime)")                     \
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {                     \
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {                 \
                     for (int64_t ict = 0; ict < n_ic_tiles; ict++) {             \
@@ -3507,7 +3859,7 @@ jc_par_done:;
                 const float *pack_b_buf = main_pack_b;  /* shared read-only in parallel region */
 
                 #ifdef _OPENMP
-                if (inner_mode && use_ic_par) {
+                if (inner_mode) {
                     #pragma omp for schedule(static)
                     for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
                         ensure_tl_pack_bufs();
@@ -3817,6 +4169,179 @@ static ax_status_t opt_conv_gemm(const ax_tensor_t *weight,
     return AX_OK;
 }
 
+/* implicit im2col conv GEMM_NT for weight gradient (dW).
+
+   computes dW[C_out, K] += grad_out[C_out, M] @ im2col(input)[K, M]^T
+   without materializing the im2col buffer. pack_b gathers input patches
+   on-the-fly in pack_b_t layout (transposed: B is [K, M] walked as [M, K]).
+
+   for GEMM_NT(A[m,k], B[n,k]) → C[m,n]:
+     A = grad_out, m = C_out, k = M (spatial positions)
+     B = im2col(input), n = K (filter elements), k = M (spatial)
+     C = dW, shape [C_out, K]
+
+   pack_b_t processes NR-strips of filter elements (n dimension).
+   within each strip, the KC inner dimension steps through spatial positions.
+   each element at (filter_elem j, spatial_pos p) maps to:
+     ci = j / (kh*kw), rem = j % (kh*kw), ky = rem / kw, kx = rem % kw
+     oh = p / out_w, ow = p % out_w
+     ih = oh*sh - ph + ky, iw = ow*sw - pw + kx
+     value = input[ci*H*W + ih*W + iw] if in-bounds, else 0 */
+
+static void pack_b_im2col_t(const ax_conv_params_t *p,
+                              int64_t kc, int64_t nc_pack, int64_t nc,
+                              int64_t jc, int64_t pc,
+                              float *packed)
+{
+    const float *input = p->input;
+    const int64_t H = p->H, W = p->W;
+    const int kh = p->kh, kw = p->kw;
+    const int sh = p->sh, sw = p->sw;
+    const int ph = p->ph, pw = p->pw;
+    const int64_t out_w = p->out_w;
+    const int64_t khkw = (int64_t)kh * (int64_t)kw;
+    const int64_t HW = H * W;
+
+    for (int64_t j = 0; j < nc_pack; j += GEMM_NR) {
+        int64_t nr = (j + GEMM_NR <= nc) ? GEMM_NR : (nc > j ? nc - j : 0);
+
+        for (int64_t r = 0; r < kc; r++) {
+            int64_t gm = pc + r;
+            int64_t oh = gm / out_w;
+            int64_t ow = gm - oh * out_w;
+
+            for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                float val = 0.0f;
+                if (jj < nr) {
+                    int64_t gk = jc + j + jj;
+                    int64_t ci = gk / khkw;
+                    int64_t rem = gk - ci * khkw;
+                    int ky = (int)(rem / kw);
+                    int kx = (int)(rem - (int64_t)ky * kw);
+                    int64_t ih = oh * sh - ph + ky;
+                    int64_t iw = ow * sw - pw + kx;
+                    if (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                        val = input[ci * HW + ih * W + iw];
+                }
+                packed[jj] = val;
+            }
+            packed += GEMM_NR;
+        }
+    }
+}
+
+static ax_status_t opt_conv_gemm_nt_dw(const ax_tensor_t *grad_out,
+                                         const ax_conv_params_t *params,
+                                         ax_tensor_t *dw)
+{
+    if (!grad_out || !params || !dw) {
+        ax_err_set(AX_ERR_NULL_ARG, "conv_gemm_nt_dw: NULL arg");
+        return AX_ERR_NULL_ARG;
+    }
+    if (grad_out->dtype != AX_FLOAT32 || dw->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (grad_out->ndim != 2 || dw->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+
+    int64_t C_out = grad_out->shape[0];
+    int64_t M = grad_out->shape[1];
+    int64_t K = params->C_in * params->kh * params->kw;
+    int64_t M_expected = params->out_h * params->out_w;
+    if (M != M_expected || dw->shape[0] != C_out || dw->shape[1] != K)
+        return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(grad_out) < 0 || validate_contig_f32(dw) < 0 || !params->input)
+        return AX_ERR_BACKEND;
+
+    int64_t m = C_out, n = K, k = M;
+    const float *ad = raw_f32(grad_out);
+    float *od = raw_f32(dw);
+
+    /* small fallback: scalar im2col gather */
+    if (m * n * k < 100000) {
+        if (!tl_gemm_skip_init)
+            memset(od, 0, (size_t)(m * n) * sizeof(float));
+        const int64_t H = params->H, W = params->W;
+        const int kh = params->kh, kw = params->kw;
+        const int sh = params->sh, sw = params->sw;
+        const int ph = params->ph, pw = params->pw;
+        const int64_t out_w = params->out_w;
+        const int64_t khkw = (int64_t)kh * (int64_t)kw;
+        const int64_t HW = H * W;
+        const float *input = params->input;
+
+        for (int64_t i = 0; i < m; i++) {
+            const float *ai = ad + i * k;
+            float *oi = od + i * n;
+            for (int64_t j = 0; j < n; j++) {
+                int64_t ci = j / khkw;
+                int64_t rem = j - ci * khkw;
+                int ky = (int)(rem / kw);
+                int kx = (int)(rem - (int64_t)ky * kw);
+                float dot = 0.0f;
+                for (int64_t p = 0; p < k; p++) {
+                    int64_t oh = p / out_w;
+                    int64_t ow = p - oh * out_w;
+                    int64_t ih = oh * sh - ph + ky;
+                    int64_t iw = ow * sw - pw + kx;
+                    float bv = (ih >= 0 && ih < H && iw >= 0 && iw < W)
+                               ? input[ci * HW + ih * W + iw] : 0.0f;
+                    dot += ai[p] * bv;
+                }
+                oi[j] += dot;
+            }
+        }
+        return AX_OK;
+    }
+
+    apply_tiles_for_shape(m, n, k);
+
+    int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
+    int max_threads = ax_gemm_threads_for_shape(m, n, k);
+    int64_t nc_eff = ax_adaptive_nc(n, max_threads);
+    int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
+
+    if (!tl_gemm_skip_init)
+        memset(od, 0, (size_t)(m * n) * sizeof(float));
+
+    /* jc-parallel: each thread packs its own jc slice of B from the input */
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(max_threads) schedule(static)
+#endif
+    for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
+        ensure_tl_pack_bufs();
+        float *pack_a_buf = tl_pack_a_buf;
+        float *pack_b_buf = tl_pack_b_buf;
+        if (!pack_a_buf || !pack_b_buf) continue;
+
+        int64_t jc = jct * nc_eff;
+        int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
+        int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+
+        for (int64_t pc = 0; pc < k; pc += kc_max) {
+            int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
+
+            pack_b_im2col_t(params, kc, nc_pack, nc, jc, pc, pack_b_buf);
+
+            for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
+                int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
+                int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+                pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+
+                for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
+                    int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
+                    for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
+                        int64_t nrr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
+                        micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                     od + (ic + ir) * n + (jc + jr), n, mr, nrr);
+                    }
+                }
+            }
+        }
+    }
+
+    pack_b_cache_invalidate();
+    return AX_OK;
+}
+
 
 /* helper: SIMD row sum for a contiguous float array of length n.
    uses 4 independent accumulators to hide FP add latency. */
@@ -3917,31 +4442,62 @@ static inline float simd_row_min(const float *d, int64_t n)
 
 
 /* axis-0 reductions for contig tensors: treat shape[0] as rows and the
-   product of the remaining dims as cols. output is a contig [cols]-shape
-   buffer. vectorize the col axis (simd-wide chunks) so each output lane
-   has its own vector accumulator that traverses rows linearly — unit-stride
-   loads, no horizontal reduction. parallel over col chunks (disjoint
-   output writes). used by dense bias gradients (sum axis=0) and
-   classification paths (argmax axis=0). */
+   product of the remaining dims as cols. row-major pass: sequential
+   reads across each row, simd-vectorized inner loop over cols, thread-
+   private accumulators with critical reduction. */
+
+static __thread float *tl_a0s_buf;
+static __thread int64_t tl_a0s_cap;
 
 static void simd_axis0_sum(const float *d, float *od, int64_t rows, int64_t cols) {
-    int64_t vec_end = cols - (cols % AX_VF32_WIDTH);
     int64_t work = rows * cols;
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) if(work > ax_par_threshold())
+    if (work > ax_par_threshold()) {
+        memset(od, 0, (size_t)cols * sizeof(float));
+        #pragma omp parallel
+        {
+            float stk[2048];
+            float *acc = stk;
+            if (cols > 2048) {
+                if (tl_a0s_cap < cols) {
+                    free(tl_a0s_buf);
+                    tl_a0s_buf = (float *)malloc((size_t)cols * sizeof(float));
+                    tl_a0s_cap = cols;
+                }
+                acc = tl_a0s_buf;
+            }
+            memset(acc, 0, (size_t)cols * sizeof(float));
+            #pragma omp for schedule(static)
+            for (int64_t r = 0; r < rows; r++) {
+                const float *row = d + r * cols;
+                int64_t c = 0;
+                for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+                    ax_vf32_storeu(acc + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                         ax_vf32_loadu(row + c)));
+                for (; c < cols; c++) acc[c] += row[c];
+            }
+            #pragma omp critical
+            {
+                int64_t c = 0;
+                for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+                    ax_vf32_storeu(od + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                        ax_vf32_loadu(od + c)));
+                for (; c < cols; c++) od[c] += acc[c];
+            }
+        }
+        return;
+    }
 #else
     (void)work;
 #endif
-    for (int64_t j = 0; j < vec_end; j += AX_VF32_WIDTH) {
-        ax_vf32 acc = ax_vf32_zero();
-        for (int64_t i = 0; i < rows; i++)
-            acc = ax_vf32_add(acc, ax_vf32_loadu(d + i * cols + j));
-        ax_vf32_storeu(od + j, acc);
-    }
-    for (int64_t j = vec_end; j < cols; j++) {
-        float acc = 0.0f;
-        for (int64_t i = 0; i < rows; i++) acc += d[i * cols + j];
-        od[j] = acc;
+    memset(od, 0, (size_t)cols * sizeof(float));
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = d + r * cols;
+        int64_t c = 0;
+        for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(od + c, ax_vf32_add(ax_vf32_loadu(od + c),
+                                                 ax_vf32_loadu(row + c)));
+        for (; c < cols; c++) od[c] += row[c];
     }
 }
 
@@ -4324,9 +4880,17 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     if (!tl_gemm_skip_init) memset(od, 0, (size_t)(m * n) * sizeof(float));
 #endif
 
+#ifdef _OPENMP
+    const bool inner_mode = tl_gemm_inner_team;
+#else
+    const bool inner_mode = false;
+#endif
+
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
-    /* adaptive KC: see opt_gemm */
+#ifdef _OPENMP
+    if (inner_mode) max_threads = omp_get_num_threads();
+#endif
     int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
@@ -4335,14 +4899,12 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
     int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
 
-    /* HYBRID JC+IC: see opt_gemm for rationale. */
     int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
     int64_t n_jc_full = (n + nc_full - 1) / nc_full;
     bool use_hybrid = (max_threads > 1)
                       && (n_jc_full * 4 <= max_threads)
                       && (n_jc_full * n_ic_tiles >= max_threads);
 
-    /* same JC/IC/Fine selection as opt_gemm — see opt_gemm_tn for rationale */
     bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
     bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
     bool use_fine_par = !use_hybrid && !use_jc_par && !use_ic_par && (max_threads > 1)
@@ -4362,19 +4924,10 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
     }
     (void)gemm_threads;
 
-    /* #2 hoisted-omp: same inside-aware pattern as opt_gemm. */
-#ifdef _OPENMP
-    const bool inner_mode = tl_gemm_inner_team;
-#else
-    const bool inner_mode = false;
-#endif
-
     if (use_hybrid) {
         /* hybrid jc+pc+ic for opt_gemm_nt. collapse(3) over (jct, pct, ict).
-           dynamic schedule with chunk = n_ic_tiles preserves pack_b_t cache
-           reuse within a chunk while distributing chunks dynamically across
-           threads (P-cores grab more). same pattern as opt_gemm + opt_gemm_tn_raw
-           use_hybrid (commits bc12ad5 + this iteration). */
+           static schedule: dynamic(n_ic_tiles) starves threads when
+           n_jc * n_pc < num_threads. matches opt_gemm hybrid. */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
         #ifdef _OPENMP
         if (!inner_mode) {
@@ -4385,7 +4938,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
                 float *pack_b_buf = tl_pack_b_buf;
                 int64_t last_jct = -1;
                 int64_t last_pct = -1;
-                #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
+                #pragma omp for collapse(3) schedule(runtime)
                 for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                     for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
                         for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
@@ -4427,7 +4980,7 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
+            #pragma omp for collapse(3) schedule(runtime)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
@@ -4464,6 +5017,8 @@ static ax_status_t opt_gemm_nt(const ax_tensor_t *a, const ax_tensor_t *b, ax_te
 opt_gemm_nt_done:;
 #endif
     } else if (use_jc_par) {
+        const int64_t unpacked_max_k = ax_attn_tunable_gemm_unpacked_a_max_k();
+        const bool use_unpacked_a = (unpacked_max_k > 0) && (k <= unpacked_max_k);
 #ifdef _OPENMP
         if (inner_mode) {
             #pragma omp for schedule(static)
@@ -4471,7 +5026,7 @@ opt_gemm_nt_done:;
                 ensure_tl_pack_bufs();
                 float *pack_a_buf = tl_pack_a_buf;
                 float *pack_b_buf = tl_pack_b_buf;
-                if (!pack_a_buf || !pack_b_buf) continue;
+                if ((!use_unpacked_a && !pack_a_buf) || !pack_b_buf) continue;
                 int64_t jc = jct * nc_eff;
                 int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
                 int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -4481,13 +5036,19 @@ opt_gemm_nt_done:;
                     for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                         int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                         int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                        if (!use_unpacked_a)
+                            pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
                         for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                             int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                             for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                                 int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
-                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                if (use_unpacked_a)
+                                    micro_kernel_unpacked_a(kc, ad + (ic + ir) * k + pc, k,
+                                                              pack_b_buf + jr * kc,
+                                                              od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                                else
+                                    micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                                 od + (ic + ir) * n + (jc + jr), n, mr, nr);
                             }
                         }
                     }
@@ -4501,7 +5062,7 @@ opt_gemm_nt_done:;
             ensure_tl_pack_bufs();
             float *pack_a_buf = tl_pack_a_buf;
             float *pack_b_buf = tl_pack_b_buf;
-            if (!pack_a_buf || !pack_b_buf) continue;
+            if ((!use_unpacked_a && !pack_a_buf) || !pack_b_buf) continue;
 
             int64_t jc = jct * nc_eff;
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
@@ -4512,13 +5073,19 @@ opt_gemm_nt_done:;
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                     int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                    pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
+                    if (!use_unpacked_a)
+                        pack_a(ad + ic * k + pc, k, mc_pack, kc, mc, pack_a_buf);
                     for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                         int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                         for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                             int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
-                            micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                         od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            if (use_unpacked_a)
+                                micro_kernel_unpacked_a(kc, ad + (ic + ir) * k + pc, k,
+                                                          pack_b_buf + jr * kc,
+                                                          od + (ic + ir) * n + (jc + jr), n, mr, nr);
+                            else
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od + (ic + ir) * n + (jc + jr), n, mr, nr);
                         }
                     }
                 }
@@ -4581,7 +5148,7 @@ opt_gemm_nt_jc_done:;
                 pack_b_t(bd + jc * k + pc, k, kc, nc_pack, nc, main_pack_b);
                 const float *pack_b_buf = main_pack_b;
                 #ifdef _OPENMP
-                if (inner_mode && use_ic_par) {
+                if (inner_mode) {
                     #pragma omp for schedule(static)
                     for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
                         ensure_tl_pack_bufs();
@@ -4718,9 +5285,17 @@ static ax_status_t opt_gemm_tn_raw(
     }
 #endif
 
+#ifdef _OPENMP
+    const bool inner_mode = tl_gemm_inner_team;
+#else
+    const bool inner_mode = false;
+#endif
+
     int64_t total_flops_est = 2 * m * n * k;
     int max_threads = ax_gemm_threads_for_shape(m, n, k);
-    /* adaptive KC: see opt_gemm */
+#ifdef _OPENMP
+    if (inner_mode) max_threads = omp_get_num_threads();
+#endif
     int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
     int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
@@ -4729,25 +5304,12 @@ static ax_status_t opt_gemm_tn_raw(
     int64_t n_nr_tiles_first_jc = ((n < GEMM_NC ? n : GEMM_NC) + GEMM_NR - 1) / GEMM_NR;
     int64_t fine_units = n_mr_tiles * n_nr_tiles_first_jc;
 
-    /* HYBRID JC+IC mode: when full-NC gives few jc tiles but plenty of
-       ic tiles, parallelize over (jct, ict) tile pairs. each thread takes
-       one tile pair → uses full NC (32 jr per ic for good pack_a reuse)
-       AND fills all threads. avoids the adaptive_nc shrinking trade-off
-       that loses pack_a reuse for thread parallelism.
-
-       per-thread pack_b is cached across consecutive iterations with the
-       same (jct, pc) — collapse(2) schedule(static) gives contiguous
-       (jct, ict) pairs to each thread, so jct stays constant for a
-       sub-range. pack_b refreshes only at jct transitions. */
     int64_t nc_full = (n < GEMM_NC) ? n : GEMM_NC;
     int64_t n_jc_full = (n + nc_full - 1) / nc_full;
     bool use_hybrid = (max_threads > 1)
                       && (n_jc_full < max_threads)
                       && (n_jc_full * n_ic_tiles >= max_threads);
 
-    /* mirror opt_gemm strategy: JC parallel when N is wide; IC parallel when
-       N is narrow but M is wide; fine (ir, jr) parallel when both are
-       narrow. */
     bool use_jc_par = !use_hybrid && (max_threads > 1) && (n_jc_tiles >= 2);
     bool use_ic_par = !use_hybrid && !use_jc_par && (max_threads > 1) && (n_ic_tiles >= 2);
     bool use_fine_par = !use_hybrid && !use_jc_par && !use_ic_par && (max_threads > 1)
@@ -4756,7 +5318,6 @@ static ax_status_t opt_gemm_tn_raw(
     int gemm_threads = 1;
     if (use_hybrid) {
         gemm_threads = max_threads;
-        /* override nc_eff to full NC for hybrid mode. */
         nc_eff = nc_full;
         n_jc_tiles = n_jc_full;
     } else if (use_jc_par) {
@@ -4768,22 +5329,13 @@ static ax_status_t opt_gemm_tn_raw(
     }
     (void)gemm_threads;
 
-    /* #2 hoisted-omp: same inside-aware pattern as opt_gemm. */
-#ifdef _OPENMP
-    const bool inner_mode = tl_gemm_inner_team;
-#else
-    const bool inner_mode = false;
-#endif
-
     if (use_hybrid) {
         /* hybrid jc+pc+ic for opt_gemm_tn. collapse(3) over (jct, pct, ict).
-           dynamic schedule with chunk = n_ic_tiles: each thread grabs one
-           (jct, pct) "row" of n_ic_tiles iterations. preserves pack_b
-           cache reuse within the chunk (cache keyed on jct, pct — within
-           chunk these are constant). between chunks, fast threads grab
-           additional (jct, pct) pairs from the dynamic queue, giving
-           implicit weighted distribution on hybrid CPUs (P-cores process
-           more chunks than E-cores). */
+           static schedule: spreads iterations evenly across threads.
+           dynamic(n_ic_tiles) was tried but starves threads when
+           n_jc * n_pc < num_threads (e.g. 2048x768x768: 3*3=9 chunks
+           for 16 threads → 44% idle). pack_b reuse tracked per-thread
+           via last_jct/last_pct. matches opt_gemm hybrid. */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
 #ifdef _OPENMP
         if (!inner_mode) {
@@ -4794,7 +5346,7 @@ static ax_status_t opt_gemm_tn_raw(
                 float *pack_b_buf = tl_pack_b_buf;
                 int64_t last_jct = -1;
                 int64_t last_pct = -1;
-                #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
+                #pragma omp for collapse(3) schedule(runtime)
                 for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                     for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
                         for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
@@ -4836,7 +5388,7 @@ static ax_status_t opt_gemm_tn_raw(
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(dynamic, n_ic_tiles)
+            #pragma omp for collapse(3) schedule(runtime)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
@@ -4873,16 +5425,8 @@ static ax_status_t opt_gemm_tn_raw(
 opt_gemm_tn_done:;
 #endif
     } else if (use_jc_par) {
-        /* dynamic schedule for hybrid CPU implicit weighting on
-           opt_gemm_tn_raw — this path uses pack_b directly per-iter
-           (no pack_b_cache like opt_gemm), so threads grabbing
-           different jct values doesn't break cache reuse. each pc
-           iteration packs B fresh into the calling thread's TLS
-           buffer either way; dynamic just affects which thread runs
-           which (jct, pc) pair. won 5-7 % on mha_train_B2_S1024 /
-           B1_S512 in earlier measurement and was reverted only
-           because opt_gemm — which DOES have pack_b_cache — also
-           lost the cache benefit. opt_gemm_tn_raw is safe. */
+        const int64_t unpacked_max_k = ax_attn_tunable_gemm_unpacked_a_max_k();
+        const bool use_unpacked_a = (unpacked_max_k > 0) && (k <= unpacked_max_k);
 #ifdef _OPENMP
         if (inner_mode) {
             #pragma omp for schedule(dynamic, 1)
@@ -4890,7 +5434,7 @@ opt_gemm_tn_done:;
                 ensure_tl_pack_bufs();
                 float *pack_a_buf = tl_pack_a_buf;
                 float *pack_b_buf = tl_pack_b_buf;
-                if (!pack_a_buf || !pack_b_buf) continue;
+                if ((!use_unpacked_a && !pack_a_buf) || !pack_b_buf) continue;
                 int64_t jc = jct * nc_eff;
                 int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
                 int64_t nc_pack = ((nc + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
@@ -4900,13 +5444,19 @@ opt_gemm_tn_done:;
                     for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                         int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                         int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                        pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
+                        if (!use_unpacked_a)
+                            pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
                         for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                             int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                             for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                                 int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
-                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                             od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
+                                if (use_unpacked_a)
+                                    micro_kernel_unpacked_a_t(kc, ad + pc * lda + (ic + ir), lda,
+                                                                pack_b_buf + jr * kc,
+                                                                od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
+                                else
+                                    micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                                 od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
                             }
                         }
                     }
@@ -4920,7 +5470,7 @@ opt_gemm_tn_done:;
             ensure_tl_pack_bufs();
             float *pack_a_buf = tl_pack_a_buf;
             float *pack_b_buf = tl_pack_b_buf;
-            if (!pack_a_buf || !pack_b_buf) continue;
+            if ((!use_unpacked_a && !pack_a_buf) || !pack_b_buf) continue;
 
             int64_t jc = jct * nc_eff;
             int64_t nc = (jc + nc_eff <= n) ? nc_eff : (n - jc);
@@ -4931,13 +5481,19 @@ opt_gemm_tn_done:;
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                     int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                    pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
+                    if (!use_unpacked_a)
+                        pack_a_t(ad + pc * lda + ic, lda, mc_pack, kc, mc, pack_a_buf);
                     for (int64_t ir = 0; ir < mc_pack; ir += GEMM_MR) {
                         int64_t mr = (ir + GEMM_MR <= mc) ? GEMM_MR : (mc - ir);
                         for (int64_t jr = 0; jr < nc_pack; jr += GEMM_NR) {
                             int64_t nr = (jr + GEMM_NR <= nc) ? GEMM_NR : (nc - jr);
-                            micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
-                                         od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
+                            if (use_unpacked_a)
+                                micro_kernel_unpacked_a_t(kc, ad + pc * lda + (ic + ir), lda,
+                                                            pack_b_buf + jr * kc,
+                                                            od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
+                            else
+                                micro_kernel(kc, pack_a_buf + ir * kc, pack_b_buf + jr * kc,
+                                             od + (ic + ir) * ldc + (jc + jr), ldc, mr, nr);
                         }
                     }
                 }
@@ -5003,7 +5559,7 @@ opt_gemm_tn_jc_done:;
                 pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
                 const float *pack_b_buf = main_pack_b;
                 #ifdef _OPENMP
-                if (inner_mode && use_ic_par) {
+                if (inner_mode) {
                     #pragma omp for schedule(static)
                     for (int64_t ict = 0; ict < n_ic_tiles; ict++) {
                         ensure_tl_pack_bufs();
@@ -5125,75 +5681,101 @@ extern void ax_attn_head_interleave_qkv_split_bias(const float *src, const float
                                                      int64_t B, int64_t S, int64_t H, int64_t dk,
                                                      int64_t D);
 
-/* fused dwqkv weight-grad: dWq += X^T @ dQKV[:, 0:D],
-                            dWk += X^T @ dQKV[:, D:2D],
-                            dWv += X^T @ dQKV[:, 2D:3D].
+/* b-panel source abstraction for dwqkv_split_acc. flat mode reads
+   from a contiguous [K, 3D] dQKV buffer; head-major mode reads from
+   three separate [BH, S, dk] head-major tensors (dQh, dKh, dVh). */
+typedef struct {
+    const float *flat;       /* base of [K, 3D] or NULL for head-major */
+    int64_t flat_ldb;        /* 3D when flat, unused otherwise */
+    const float *hm[3];      /* dQh, dKh, dVh pointers or NULLs */
+    int64_t hm_B, hm_S, hm_H, hm_dk, hm_D;
+} dwqkv_bsrc_t;
 
-   replaces the materialise-then-split pattern (gemm_tn into [D, 3D]
-   intermediate, then 3 ACC passes). the proper fused kernel runs ONE
-   gemm with N=3D — preserving full N-axis parallelism — but writes
-   each per-jc tile to one of dWq/dWk/dWv directly, eliminating the
-   12 MB intermediate buffer + its read on the way out.
-
-   the structure mirrors opt_gemm_tn_raw exactly (same 4 parallel
-   strategies, same hybrid CPU dispatch, same JIT micro-kernel reuse)
-   with one substitution: at the per-jc-tile level, the output base
-   pointer + ldc + column offset are computed from `jc / D` (which
-   selects dWq/dWk/dWv) and `jc % D` (the local column). the inner
-   (ir, jr) micro-kernel writes are otherwise byte-identical.
-
-   constraint: jc tile boundaries must align with D boundaries —
-   otherwise a single tile would straddle two output tensors. on every
-   shape we care about (D ∈ {512, 768, 1024} all multiples of the 256
-   nc_eff default), this holds. when it doesn't, we fall back to 3
-   sequential opt_gemm_tn_raw calls (the prior implementation).
-
-   accumulate=true in all paths since callers pass pre-allocated grad
-   tensors with existing values. */
-static ax_status_t opt_dwqkv_split_acc(
-    const ax_tensor_t *x_flat,
-    const ax_tensor_t *dQKV,
-    ax_tensor_t *dWq, ax_tensor_t *dWk, ax_tensor_t *dWv)
+static void pack_b_from_hm(const float *const srcs[3],
+                             int64_t B, int64_t S, int64_t H, int64_t dk, int64_t D,
+                             int64_t pc, int64_t jc,
+                             int64_t kc, int64_t nc_pack, int64_t nc,
+                             float *packed)
 {
-    if (!x_flat || !dQKV || !dWq || !dWk || !dWv) {
-        ax_err_set(AX_ERR_NULL_ARG, "dwqkv_split_acc: NULL");
-        return AX_ERR_NULL_ARG;
+    int64_t which = jc / D;
+    int64_t lcj = jc - which * D;
+    const float *src = srcs[which];
+    int64_t Sdk = S * dk;
+    for (int64_t j = 0; j < nc_pack; j += GEMM_NR) {
+        int64_t nr = (j + GEMM_NR <= nc) ? GEMM_NR : (nc > j ? nc - j : 0);
+        int64_t abs_col = lcj + j;
+        int64_t h0 = abs_col / dk;
+        int64_t dk0 = abs_col % dk;
+        int full_nr = (nr == GEMM_NR && dk0 + GEMM_NR <= dk);
+        for (int64_t p = 0; p < kc; p++) {
+            int64_t r = pc + p;
+            int64_t b = r / S;
+            int64_t s = r - b * S;
+            if (full_nr) {
+                int64_t base = (b * H + h0) * Sdk + s * dk + dk0;
+                memcpy(packed, src + base, (size_t)GEMM_NR * sizeof(float));
+            } else {
+                for (int64_t jj = 0; jj < GEMM_NR; jj++) {
+                    if (jj < nr) {
+                        int64_t col = abs_col + jj;
+                        int64_t h = col / dk;
+                        int64_t di = col - h * dk;
+                        packed[jj] = src[(b * H + h) * Sdk + s * dk + di];
+                    } else {
+                        packed[jj] = 0.0f;
+                    }
+                }
+            }
+            packed += GEMM_NR;
+        }
     }
-    if (x_flat->dtype != AX_FLOAT32 || dQKV->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
-    if (dWq->dtype != AX_FLOAT32 || dWk->dtype != AX_FLOAT32 || dWv->dtype != AX_FLOAT32)
-        return AX_ERR_DTYPE_MISMATCH;
-    if (x_flat->ndim != 2 || dQKV->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
-    if (dWq->ndim != 2 || dWk->ndim != 2 || dWv->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+}
 
-    int64_t K = x_flat->shape[0];
-    int64_t D = x_flat->shape[1];
-    if (dQKV->shape[0] != K || dQKV->shape[1] != 3 * D) return AX_ERR_SHAPE_MISMATCH;
-    if (dWq->shape[0] != D || dWq->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
-    if (dWk->shape[0] != D || dWk->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
-    if (dWv->shape[0] != D || dWv->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
-    if (validate_contig_f32(x_flat) < 0 || validate_contig_f32(dQKV) < 0) return AX_ERR_BACKEND;
-    if (validate_contig_f32(dWq) < 0 || validate_contig_f32(dWk) < 0 || validate_contig_f32(dWv) < 0)
-        return AX_ERR_BACKEND;
+static inline void dwqkv_pack_b(const dwqkv_bsrc_t *src,
+                                  int64_t pc, int64_t jc,
+                                  int64_t kc, int64_t nc_pack, int64_t nc,
+                                  float *out)
+{
+    if (src->flat)
+        pack_b(src->flat + pc * src->flat_ldb + jc, src->flat_ldb, kc, nc_pack, nc, out);
+    else
+        pack_b_from_hm(src->hm, src->hm_B, src->hm_S, src->hm_H,
+                        src->hm_dk, src->hm_D, pc, jc, kc, nc_pack, nc, out);
+}
 
-    const float *ad = raw_f32(x_flat);    /* X    [K, D] */
-    const float *bd = raw_f32(dQKV);      /* dQKV [K, 3D] */
-    float *outs[3] = { raw_f32(dWq), raw_f32(dWk), raw_f32(dWv) };
+static inline float dwqkv_b_elem(const dwqkv_bsrc_t *src,
+                                   int64_t row, int64_t col)
+{
+    if (src->flat) return src->flat[row * src->flat_ldb + col];
+    int64_t D = src->hm_D, dk = src->hm_dk;
+    int64_t which = col / D;
+    int64_t lc = col - which * D;
+    int64_t h = lc / dk, di = lc - h * dk;
+    int64_t b = row / src->hm_S, s = row - b * src->hm_S;
+    return src->hm[which][(b * src->hm_H + h) * src->hm_S * dk + s * dk + di];
+}
 
+/* fused dwqkv weight-grad inner driver. parameterized by bsrc so both
+   the flat [K, 3D] and head-major [BH, S, dk] paths share the GEMM
+   driver logic. */
+static ax_status_t opt_dwqkv_split_acc_core(
+    const float *ad, int64_t lda,
+    const dwqkv_bsrc_t *bsrc,
+    float *outs[3],
+    int64_t D, int64_t K)
+{
     int64_t m = D, n = 3 * D, k = K;
-    int64_t lda = D, ldb = 3 * D, ldc = D;
+    int64_t ldc = D;
 
-    /* small-shape fast path — single-thread scalar fallback */
     if (m * n * k < 100000) {
         for (int64_t p = 0; p < k; p++) {
-            const float *bp = bd + p * ldb;
             const float *ap = ad + p * lda;
             for (int64_t i = 0; i < m; i++) {
                 float ai = ap[i];
-                /* walk the full N=3D, dispatching per-j to the right dest */
                 for (int64_t j = 0; j < n; j++) {
                     int64_t dest_idx = j / D;
                     int64_t j_local = j - dest_idx * D;
-                    outs[dest_idx][i * ldc + j_local] += ai * bp[j];
+                    outs[dest_idx][i * ldc + j_local] += ai * dwqkv_b_elem(bsrc, p, j);
                 }
             }
         }
@@ -5209,18 +5791,19 @@ static ax_status_t opt_dwqkv_split_acc(
     int64_t kc_max = (k <= AX_GEMM_MAX_KC) ? k : GEMM_KC;
     int64_t nc_eff = ax_adaptive_nc(n, max_threads);
 
-    /* require D % nc_eff == 0 so jc tiles never straddle dWq/dWk/dWv
-       boundaries — else fall back to 3 sequential gemm calls. on the
-       shapes we ship this never triggers (D ∈ {512, 768, 1024}, nc_eff
-       defaults to 256, all clean divisions). */
     if (D % nc_eff != 0) {
-        ax_status_t st;
-        st = opt_gemm_tn_raw(ad, lda, bd + 0 * D, ldb, outs[0], ldc, D, D, k, true);
-        if (st != AX_OK) return st;
-        st = opt_gemm_tn_raw(ad, lda, bd + 1 * D, ldb, outs[1], ldc, D, D, k, true);
-        if (st != AX_OK) return st;
-        st = opt_gemm_tn_raw(ad, lda, bd + 2 * D, ldb, outs[2], ldc, D, D, k, true);
-        return st;
+        if (bsrc->flat) {
+            const float *bd = bsrc->flat;
+            int64_t ldb = bsrc->flat_ldb;
+            ax_status_t st;
+            st = opt_gemm_tn_raw(ad, lda, bd + 0 * D, ldb, outs[0], ldc, D, D, k, true);
+            if (st != AX_OK) return st;
+            st = opt_gemm_tn_raw(ad, lda, bd + 1 * D, ldb, outs[1], ldc, D, D, k, true);
+            if (st != AX_OK) return st;
+            st = opt_gemm_tn_raw(ad, lda, bd + 2 * D, ldb, outs[2], ldc, D, D, k, true);
+            return st;
+        }
+        return AX_ERR_SHAPE_MISMATCH;
     }
 
     int64_t n_jc_tiles = (n + nc_eff - 1) / nc_eff;
@@ -5246,13 +5829,18 @@ static ax_status_t opt_dwqkv_split_acc(
         n_jc_tiles = n_jc_full;
         /* re-check the alignment invariant under the hybrid override */
         if (D % nc_eff != 0) {
-            ax_status_t st;
-            st = opt_gemm_tn_raw(ad, lda, bd + 0 * D, ldb, outs[0], ldc, D, D, k, true);
-            if (st != AX_OK) return st;
-            st = opt_gemm_tn_raw(ad, lda, bd + 1 * D, ldb, outs[1], ldc, D, D, k, true);
-            if (st != AX_OK) return st;
-            st = opt_gemm_tn_raw(ad, lda, bd + 2 * D, ldb, outs[2], ldc, D, D, k, true);
-            return st;
+            if (bsrc->flat) {
+                const float *bd = bsrc->flat;
+                int64_t ldb = bsrc->flat_ldb;
+                ax_status_t st;
+                st = opt_gemm_tn_raw(ad, lda, bd + 0 * D, ldb, outs[0], ldc, D, D, k, true);
+                if (st != AX_OK) return st;
+                st = opt_gemm_tn_raw(ad, lda, bd + 1 * D, ldb, outs[1], ldc, D, D, k, true);
+                if (st != AX_OK) return st;
+                st = opt_gemm_tn_raw(ad, lda, bd + 2 * D, ldb, outs[2], ldc, D, D, k, true);
+                return st;
+            }
+            return AX_ERR_SHAPE_MISMATCH;
         }
     } else if (use_jc_par) {
         gemm_threads = (int)(n_jc_tiles < (int64_t)max_threads ? n_jc_tiles : (int64_t)max_threads);
@@ -5273,10 +5861,6 @@ static ax_status_t opt_dwqkv_split_acc(
         } while (0)
 
     if (use_hybrid) {
-        /* kept as schedule(static); see opt_gemm use_hybrid for the
-           rationale of why dynamic-chunk hurts low-iteration-count cases
-           on this CPU (forward y gemm with n_jc_full=2, n_pc_tiles=2,
-           only 4 chunks for 16 threads). */
         int64_t n_pc_tiles = (k + kc_max - 1) / kc_max;
         #ifdef _OPENMP
         #pragma omp parallel num_threads(gemm_threads)
@@ -5289,7 +5873,7 @@ static ax_status_t opt_dwqkv_split_acc(
             int64_t last_pct = -1;
 
             #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(static)
+            #pragma omp for collapse(3) schedule(runtime)
             #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
@@ -5305,7 +5889,7 @@ static ax_status_t opt_dwqkv_split_acc(
                         int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
 
                         if (jct != last_jct || pct != last_pct) {
-                            pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
+                            dwqkv_pack_b(bsrc, pc, jc, kc, nc_pack, nc, pack_b_buf);
                             last_jct = jct;
                             last_pct = pct;
                         }
@@ -5342,7 +5926,7 @@ static ax_status_t opt_dwqkv_split_acc(
             DEST_FOR_JC(jc, od_dest, jc_local);
             for (int64_t pc = 0; pc < k; pc += kc_max) {
                 int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
-                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, pack_b_buf);
+                dwqkv_pack_b(bsrc, pc, jc, kc, nc_pack, nc, pack_b_buf);
                 for (int64_t ic = 0; ic < m; ic += GEMM_MC) {
                     int64_t mc = (ic + GEMM_MC <= m) ? GEMM_MC : (m - ic);
                     int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
@@ -5370,7 +5954,7 @@ static ax_status_t opt_dwqkv_split_acc(
                 int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
                 int64_t mc = m;
                 int64_t mc_pack = ((mc + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
+                dwqkv_pack_b(bsrc, pc, jc, kc, nc_pack, nc, main_pack_b);
                 pack_a_t(ad + pc * lda, lda, mc_pack, kc, mc, main_pack_a);
                 int64_t ir_tiles = mc_pack / GEMM_MR;
                 int64_t jr_tiles = nc_pack / GEMM_NR;
@@ -5398,7 +5982,7 @@ static ax_status_t opt_dwqkv_split_acc(
             DEST_FOR_JC(jc, od_dest, jc_local);
             for (int64_t pc = 0; pc < k; pc += kc_max) {
                 int64_t kc = (pc + kc_max <= k) ? kc_max : (k - pc);
-                pack_b(bd + pc * ldb + jc, ldb, kc, nc_pack, nc, main_pack_b);
+                dwqkv_pack_b(bsrc, pc, jc, kc, nc_pack, nc, main_pack_b);
                 const float *pack_b_buf = main_pack_b;
                 #ifdef _OPENMP
                 #pragma omp parallel for num_threads(gemm_threads) schedule(static) if(use_ic_par)
@@ -5426,6 +6010,65 @@ static ax_status_t opt_dwqkv_split_acc(
     pack_b_cache_invalidate();
     #undef DEST_FOR_JC
     return AX_OK;
+}
+
+static ax_status_t opt_dwqkv_split_acc(
+    const ax_tensor_t *x_flat,
+    const ax_tensor_t *dQKV,
+    ax_tensor_t *dWq, ax_tensor_t *dWk, ax_tensor_t *dWv)
+{
+    if (!x_flat || !dQKV || !dWq || !dWk || !dWv) {
+        ax_err_set(AX_ERR_NULL_ARG, "dwqkv_split_acc: NULL");
+        return AX_ERR_NULL_ARG;
+    }
+    if (x_flat->dtype != AX_FLOAT32 || dQKV->dtype != AX_FLOAT32) return AX_ERR_DTYPE_MISMATCH;
+    if (dWq->dtype != AX_FLOAT32 || dWk->dtype != AX_FLOAT32 || dWv->dtype != AX_FLOAT32)
+        return AX_ERR_DTYPE_MISMATCH;
+    if (x_flat->ndim != 2 || dQKV->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    if (dWq->ndim != 2 || dWk->ndim != 2 || dWv->ndim != 2) return AX_ERR_SHAPE_MISMATCH;
+    int64_t K = x_flat->shape[0];
+    int64_t D = x_flat->shape[1];
+    if (dQKV->shape[0] != K || dQKV->shape[1] != 3 * D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWq->shape[0] != D || dWq->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWk->shape[0] != D || dWk->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWv->shape[0] != D || dWv->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(x_flat) < 0 || validate_contig_f32(dQKV) < 0) return AX_ERR_BACKEND;
+    if (validate_contig_f32(dWq) < 0 || validate_contig_f32(dWk) < 0 || validate_contig_f32(dWv) < 0)
+        return AX_ERR_BACKEND;
+    dwqkv_bsrc_t bsrc = { .flat = raw_f32(dQKV), .flat_ldb = 3 * D };
+    float *outs[3] = { raw_f32(dWq), raw_f32(dWk), raw_f32(dWv) };
+    return opt_dwqkv_split_acc_core(raw_f32(x_flat), D, &bsrc, outs, D, K);
+}
+
+static ax_status_t opt_dwqkv_split_acc_hm(
+    const ax_tensor_t *x_flat,
+    const ax_tensor_t *dQh, const ax_tensor_t *dKh, const ax_tensor_t *dVh,
+    int64_t B, int64_t S, int64_t H, int64_t dk,
+    ax_tensor_t *dWq, ax_tensor_t *dWk, ax_tensor_t *dWv)
+{
+    if (!x_flat || !dQh || !dKh || !dVh || !dWq || !dWk || !dWv) {
+        ax_err_set(AX_ERR_NULL_ARG, "dwqkv_split_acc_hm: NULL");
+        return AX_ERR_NULL_ARG;
+    }
+    int64_t D = H * dk;
+    int64_t K = B * S;
+    if (x_flat->ndim != 2 || x_flat->shape[0] != K || x_flat->shape[1] != D)
+        return AX_ERR_SHAPE_MISMATCH;
+    if (dWq->shape[0] != D || dWq->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWk->shape[0] != D || dWk->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (dWv->shape[0] != D || dWv->shape[1] != D) return AX_ERR_SHAPE_MISMATCH;
+    if (validate_contig_f32(x_flat) < 0) return AX_ERR_BACKEND;
+    if (validate_contig_f32(dQh) < 0 || validate_contig_f32(dKh) < 0 || validate_contig_f32(dVh) < 0)
+        return AX_ERR_BACKEND;
+    if (validate_contig_f32(dWq) < 0 || validate_contig_f32(dWk) < 0 || validate_contig_f32(dWv) < 0)
+        return AX_ERR_BACKEND;
+    dwqkv_bsrc_t bsrc = {
+        .flat = NULL, .flat_ldb = 0,
+        .hm = { raw_f32(dQh), raw_f32(dKh), raw_f32(dVh) },
+        .hm_B = B, .hm_S = S, .hm_H = H, .hm_dk = dk, .hm_D = D,
+    };
+    float *outs[3] = { raw_f32(dWq), raw_f32(dWk), raw_f32(dWv) };
+    return opt_dwqkv_split_acc_core(raw_f32(x_flat), D, &bsrc, outs, D, K);
 }
 
 /* ================================================================
@@ -5665,7 +6308,7 @@ static ax_status_t opt_qkv_head_gemm(
             int64_t last_pct = -1;
 
 #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(static)
+            #pragma omp for collapse(3) schedule(runtime)
 #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
@@ -5962,7 +6605,7 @@ static ax_status_t opt_dattn_head_gemm_nt(
             int64_t last_pct = -1;
 
 #ifdef _OPENMP
-            #pragma omp for collapse(3) schedule(static)
+            #pragma omp for collapse(3) schedule(runtime)
 #endif
             for (int64_t jct = 0; jct < n_jc_tiles; jct++) {
                 for (int64_t pct = 0; pct < n_pc_tiles; pct++) {
@@ -6845,6 +7488,7 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .gemm_nt    = opt_gemm_nt,
     .gemm_tn    = opt_gemm_tn,
     .dwqkv_split_acc = opt_dwqkv_split_acc,
+    .dwqkv_split_acc_hm = opt_dwqkv_split_acc_hm,
     .qkv_head_gemm           = opt_qkv_head_gemm,
     .dattn_head_gemm_nt      = opt_dattn_head_gemm_nt,
     .mha_output_proj_fused   = opt_mha_output_proj_fused,
@@ -6853,6 +7497,7 @@ const ax_backend_ops_t AX_SYM(ax_cpu_opt_ops) = {
     .softmax_rowwise = opt_softmax_rowwise,
     .bias_add   = opt_bias_add,
     .conv_gemm  = opt_conv_gemm,
+    .conv_gemm_nt_dw = opt_conv_gemm_nt_dw,
     .sum        = opt_sum,
     .mean       = opt_mean,
     .max_op     = opt_max,
@@ -6993,15 +7638,17 @@ void AX_SYM(ax_cpu_opt_set_gemm_tiles)(int64_t mc, int64_t nc, int64_t kc) {
 }
 
 /* A3: per-regime tile getters/setters for the calibration cache.
-   "regime" is 0=small, 1=med, 2=large to match apply_tiles_for_shape's
-   classification. setters apply the same defensive clamping as
-   set_gemm_tiles to keep a stale cache from inducing OOB. */
+   "regime" is 0=small, 1=med, 2=large, 3=vlarge to match
+   apply_tiles_for_shape's classification. setters apply the same
+   defensive clamping as set_gemm_tiles to keep a stale cache from
+   inducing OOB. */
 void AX_SYM(ax_cpu_opt_get_gemm_tiles_regime)(int regime,
                                                 int64_t *mc, int64_t *nc, int64_t *kc) {
     const gemm_tile_set_t *t;
     if      (regime == 0) t = &g_tiles_small;
     else if (regime == 1) t = &g_tiles_med;
-    else                  t = &g_tiles_large;
+    else if (regime == 2) t = &g_tiles_large;
+    else                  t = &g_tiles_vlarge;
     if (mc) *mc = t->mc;
     if (nc) *nc = t->nc;
     if (kc) *kc = t->kc;
@@ -7023,7 +7670,8 @@ void AX_SYM(ax_cpu_opt_set_gemm_tiles_regime)(int regime,
     gemm_tile_set_t *t;
     if      (regime == 0) t = &g_tiles_small;
     else if (regime == 1) t = &g_tiles_med;
-    else                  t = &g_tiles_large;
+    else if (regime == 2) t = &g_tiles_large;
+    else                  t = &g_tiles_vlarge;
     t->mc = mc; t->nc = nc; t->kc = kc;
     /* once any regime is set externally (cache load or env override),
        arm runtime per-regime dispatch. */

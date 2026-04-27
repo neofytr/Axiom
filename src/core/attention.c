@@ -478,20 +478,64 @@ static float *param_grad_ptr(ax_tensor_t *p)
     return (float *)p->grad->storage->data;
 }
 
-/* SIMD-width row-vector sum reduction: out[c] += sum_r M[r, c] for c<cols.
-   one pass over M, writes directly into the (possibly already populated) bias
-   grad. parallelized over column tiles to stay within a single memory pass. */
+/* tls scratch for col-sum when cols exceeds stack limit */
+static __thread float *tl_csa_buf;
+static __thread int64_t tl_csa_cap;
+
+/* row-major col-sum body: private accumulator per thread, omp for over
+   rows, critical reduction. sequential access + simd inner loop. */
+static void col_sum_inner_(const float *M, float *out,
+                            int64_t rows, int64_t cols)
+{
+    float stk[2048];
+    float *acc = stk;
+    if (cols > 2048) {
+        if (tl_csa_cap < cols) {
+            free(tl_csa_buf);
+            tl_csa_buf = (float *)malloc((size_t)cols * sizeof(float));
+            tl_csa_cap = cols;
+        }
+        acc = tl_csa_buf;
+    }
+    memset(acc, 0, (size_t)cols * sizeof(float));
+#ifdef _OPENMP
+    #pragma omp for schedule(static)
+#endif
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = M + r * cols;
+        int64_t c = 0;
+#if defined(AX_HAS_SIMD)
+        for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(acc + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                 ax_vf32_loadu(row + c)));
+#endif
+        for (; c < cols; c++) acc[c] += row[c];
+    }
+#ifdef _OPENMP
+    #pragma omp critical
+#endif
+    {
+        int64_t c = 0;
+#if defined(AX_HAS_SIMD)
+        for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(out + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                 ax_vf32_loadu(out + c)));
+#endif
+        for (; c < cols; c++) out[c] += acc[c];
+    }
+}
+
+/* row-major col-sum: out[c] += sum_r M[r, c] for c<cols. */
 static void sum_rows_acc(const float *M, float *out,
                          int64_t rows, int64_t cols)
 {
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    if (omp_in_parallel()) { col_sum_inner_(M, out, rows, cols); return; }
+    #pragma omp parallel
+    col_sum_inner_(M, out, rows, cols);
+#else
+    col_sum_inner_(M, out, rows, cols);
 #endif
-    for (int64_t c = 0; c < cols; c++) {
-        float s = 0.0f;
-        for (int64_t r = 0; r < rows; r++) s += M[r * cols + c];
-        out[c] += s;
-    }
 }
 
 /* accumulate src into dst (SIMD). used where gemm_tn/nt returns into a

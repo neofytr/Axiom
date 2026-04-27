@@ -22,6 +22,7 @@
    (P-cores only). on non-hybrid, both are equal. set by ax_autotune_threads. */
 int ax_gemm_fast_threads = 0;
 int ax_gemm_all_threads = 0;
+int g_heterogeneous_cores = 0;
 
 #ifdef __linux__
 #include <sched.h>
@@ -484,6 +485,35 @@ int ax_compute_has_dwqkv_split_acc(void) {
     return (active_ops && active_ops->dwqkv_split_acc) ? 1 : 0;
 }
 
+ax_status_t ax_compute_dwqkv_split_acc_hm(const ax_tensor_t *x_flat,
+                                            const ax_tensor_t *dQh,
+                                            const ax_tensor_t *dKh,
+                                            const ax_tensor_t *dVh,
+                                            int64_t B, int64_t S, int64_t H, int64_t dk,
+                                            ax_tensor_t *dWq,
+                                            ax_tensor_t *dWk,
+                                            ax_tensor_t *dWv)
+{
+    ensure_compute_init();
+    if (!active_ops || !active_ops->dwqkv_split_acc_hm) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "dwqkv_split_acc_hm not implemented in %s",
+                   active_ops ? active_ops->name : "none");
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    ax_status_t st = active_ops->dwqkv_split_acc_hm(x_flat, dQh, dKh, dVh,
+                                                      B, S, H, dk, dWq, dWk, dWv);
+    if (st == AX_OK) {
+        if (dWq && dWq->storage) ax_storage_touch(dWq->storage);
+        if (dWk && dWk->storage) ax_storage_touch(dWk->storage);
+        if (dWv && dWv->storage) ax_storage_touch(dWv->storage);
+    }
+    return st;
+}
+int ax_compute_has_dwqkv_split_acc_hm(void) {
+    ensure_compute_init();
+    return (active_ops && active_ops->dwqkv_split_acc_hm) ? 1 : 0;
+}
+
 /* F.3.a fused forward QKV projection + head_interleave_split.
    computes Qh/Kh/Vh = head_split(X @ Wqkv + bqkv) in one pass.
    backends that lack the slot return AX_ERR_NOT_IMPLEMENTED so callers
@@ -707,6 +737,25 @@ int ax_compute_has_conv_gemm(void)
 {
     ensure_compute_init();
     return (active_ops && active_ops->conv_gemm) ? 1 : 0;
+}
+
+ax_status_t ax_compute_conv_gemm_nt_dw(const ax_tensor_t *grad_out,
+                                        const ax_conv_params_t *params,
+                                        ax_tensor_t *dw)
+{
+    ensure_compute_init();
+    if (!active_ops) { ax_err_set(AX_ERR_BACKEND, "compute not initialized"); return AX_ERR_BACKEND; }
+    if (!active_ops->conv_gemm_nt_dw) {
+        ax_err_set(AX_ERR_NOT_IMPLEMENTED, "conv_gemm_nt_dw not implemented in %s", active_ops->name);
+        return AX_ERR_NOT_IMPLEMENTED;
+    }
+    return dispatch_touch_on_ok(dw, active_ops->conv_gemm_nt_dw(grad_out, params, dw));
+}
+
+int ax_compute_has_conv_gemm_nt_dw(void)
+{
+    ensure_compute_init();
+    return (active_ops && active_ops->conv_gemm_nt_dw) ? 1 : 0;
 }
 
 /* reduction ops */
@@ -1113,6 +1162,8 @@ int ax_autotune_threads(void)
         omp_set_num_threads(n_cpus);
         ax_gemm_fast_threads = fast_count;
         ax_gemm_all_threads = n_cpus;
+        g_heterogeneous_cores = 1;
+        omp_set_schedule(omp_sched_dynamic, 1);
 #ifndef AX_NO_STDIO
         fprintf(stderr, "axiom: hybrid cpu detected: %d fast + %d slow = %d total (%.1fms)\n",
                 fast_count, n_cpus - fast_count, n_cpus, total_ms);
@@ -1131,6 +1182,7 @@ int ax_autotune_threads(void)
     omp_set_num_threads(fast_count);
     ax_gemm_fast_threads = fast_count;
     ax_gemm_all_threads = fast_count;
+    omp_set_schedule(omp_sched_static, 0);
 
     int pin_failures = 0;
     bool should_pin = (fast_count < n_cpus);
@@ -1176,6 +1228,8 @@ int ax_autotune_threads(void)
 #endif /* _OPENMP */
 }
 
+int ax_compute_cores_heterogeneous(void) { return g_heterogeneous_cores; }
+
 /* ======================================================================
    calibration (B): omp fork/join overhead + derived parallelism thresholds.
 
@@ -1204,6 +1258,7 @@ double  ax_omp_overhead_ms     = 0.0;
    heavy  = ax_par_threshold_elems / 4 (parallel wins sooner). */
 int64_t ax_par_threshold_elems_light  = 65536 * 4;
 int64_t ax_par_threshold_elems_heavy  = 65536 / 4;
+int64_t ax_par_threshold_bw_bytes     = 0;
 
 /* per-thread flag: when true, opt_gemm + opt_gemm_tn + opt_gemm_nt skip
    their internal memset(C, 0) and accumulate into the existing buffer.
@@ -1297,15 +1352,51 @@ void ax_calibrate_thresholds(void) {
     ax_par_threshold_batch = work_thresh / 256;
     if (ax_par_threshold_batch < 2) ax_par_threshold_batch = 2;
 
+    /* bandwidth-bound threshold: for memory-bound kernels (batchnorm,
+       layernorm) where more threads don't increase effective bandwidth,
+       the fork/join cost must be amortized per-thread. measure single-
+       thread memcpy bandwidth on an L2-resident buffer, then compute:
+       min_bytes_per_thread = overhead_us * bw_bytes_per_us
+       total_threshold = nt * min_bytes_per_thread */
+    {
+        const size_t probe_sz = 256 * 1024;
+        char *bw_src = (char *)malloc(probe_sz);
+        char *bw_dst = (char *)malloc(probe_sz);
+        if (bw_src && bw_dst) {
+            memset(bw_src, 0x42, probe_sz);
+            for (int w = 0; w < 10; w++) memcpy(bw_dst, bw_src, probe_sz);
+            int bw_reps = 200;
+            double bt0 = ax_autotune_now_ms();
+            for (int r = 0; r < bw_reps; r++) {
+                memcpy(bw_dst, bw_src, probe_sz);
+                __asm__ volatile("" ::: "memory");
+            }
+            double bt1 = ax_autotune_now_ms();
+            double per_copy_us = (bt1 - bt0) * 1000.0 / bw_reps;
+            if (per_copy_us > 0.0) {
+                double bw_bytes_per_us = (double)probe_sz / per_copy_us;
+                double overhead_us = overhead_ms * 1000.0;
+                double min_per_thread = overhead_us * bw_bytes_per_us;
+                ax_par_threshold_bw_bytes = (int64_t)((double)nt * min_per_thread);
+                if (ax_par_threshold_bw_bytes < 65536)
+                    ax_par_threshold_bw_bytes = 65536;
+            }
+        }
+        free(bw_src);
+        free(bw_dst);
+    }
+
 #ifndef AX_NO_STDIO
     fprintf(stderr,
-        "axiom: omp overhead %.3fms → thresholds flops=%ld elems=%ld (light=%ld heavy=%ld) batch=%ld\n",
+        "axiom: omp overhead %.3fms → thresholds flops=%ld elems=%ld "
+        "(light=%ld heavy=%ld) batch=%ld bw_bytes=%ld\n",
         overhead_ms,
         (long)ax_par_threshold_flops,
         (long)ax_par_threshold_elems,
         (long)ax_par_threshold_elems_light,
         (long)ax_par_threshold_elems_heavy,
-        (long)ax_par_threshold_batch);
+        (long)ax_par_threshold_batch,
+        (long)ax_par_threshold_bw_bytes);
 #endif
 #endif
 }

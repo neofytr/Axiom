@@ -42,7 +42,9 @@ static ax_tensor_t *slab_tensor_alloc(void) {
         memset(t, 0, sizeof(ax_tensor_t));
         return t;
     }
-    return (ax_tensor_t *)calloc(1, sizeof(ax_tensor_t));
+    t = (ax_tensor_t *)calloc(1, sizeof(ax_tensor_t));
+    if (t) ax_alloc_count_inc();
+    return t;
 }
 
 static void slab_tensor_free(ax_tensor_t *t) {
@@ -57,7 +59,9 @@ static ax_storage_t *slab_storage_alloc(void) {
         storage_freelist = *(ax_storage_t **)s;
         return s;
     }
-    return (ax_storage_t *)malloc(sizeof(ax_storage_t));
+    s = (ax_storage_t *)malloc(sizeof(ax_storage_t));
+    if (s) ax_alloc_count_inc();
+    return s;
 }
 
 static void slab_storage_free(ax_storage_t *s) {
@@ -78,6 +82,7 @@ static void slab_storage_free(ax_storage_t *s) {
 #define AX_POOL_MAX_BITS    28       /* 256 MB */
 #define AX_POOL_NUM_BUCKETS (AX_POOL_MAX_BITS - AX_POOL_MIN_BITS + 1)
 #define AX_POOL_BUCKET_CAP  64       /* raised from 16 per agent report point 9 */
+static int g_pool_bucket_cap = AX_POOL_BUCKET_CAP;
 
 typedef struct pool_node {
     ax_storage_t *storage;
@@ -129,7 +134,7 @@ static bool pool_put(ax_storage_t *s) {
     if (s->device != AX_DEVICE_CPU) return false;
     int idx = pool_bucket_for(s->size_bytes);
     if (idx < 0) return false;
-    if (pool_bucket_count[idx] >= AX_POOL_BUCKET_CAP) return false;
+    if (pool_bucket_count[idx] >= g_pool_bucket_cap) return false;
 
     pool_node_t *n = node_freelist;
     if (n) {
@@ -137,6 +142,7 @@ static bool pool_put(ax_storage_t *s) {
     } else {
         n = (pool_node_t *)malloc(sizeof(pool_node_t));
         if (!n) return false;
+        ax_alloc_count_inc();
     }
     n->storage = s;
     n->next = pool_buckets[idx];
@@ -145,6 +151,52 @@ static bool pool_put(ax_storage_t *s) {
     return true;
 }
 #endif /* !AX_NO_STORAGE_POOL */
+
+void ax_set_pool_bucket_cap(int cap) {
+#ifndef AX_NO_STORAGE_POOL
+    if (cap > 0) g_pool_bucket_cap = cap;
+#else
+    (void)cap;
+#endif
+}
+
+int ax_get_pool_bucket_cap(void) {
+#ifndef AX_NO_STORAGE_POOL
+    return g_pool_bucket_cap;
+#else
+    return 0;
+#endif
+}
+
+void ax_pool_prewarm(const size_t *byte_sizes, int n) {
+#ifndef AX_NO_STORAGE_POOL
+    for (int i = 0; i < n; i++) {
+        if (byte_sizes[i] == 0) continue;
+        ax_storage_t *s = slab_storage_alloc();
+        if (!s) continue;
+        s->data = ax_aligned_alloc(byte_sizes[i], AX_DEFAULT_ALIGNMENT);
+        if (!s->data) { slab_storage_free(s); continue; }
+        s->size_bytes = byte_sizes[i];
+        atomic_init(&s->refcount, 1);
+        s->device = AX_DEVICE_CPU;
+        s->is_arena_temp = false;
+        s->generation = 1;
+        if (!pool_put(s)) {
+            ax_aligned_free(s->data);
+            slab_storage_free(s);
+        }
+    }
+#else
+    (void)byte_sizes; (void)n;
+#endif
+}
+
+void ax_configure_embedded(size_t sram_budget) {
+    size_t arena_bs = sram_budget / 8;
+    if (arena_bs < 64 * 1024) arena_bs = 64 * 1024;
+    ax_set_arena_block_size(arena_bs);
+    ax_set_pool_bucket_cap(4);
+}
 
 ax_storage_t *ax_storage_create(size_t size_bytes, ax_device_t device) {
     /* non-cpu devices are owned by a backend module; route allocation

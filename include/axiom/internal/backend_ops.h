@@ -80,6 +80,19 @@ struct ax_backend_ops {
                                     ax_tensor_t *dWk,
                                     ax_tensor_t *dWv);
 
+    /* optional: head-major variant of dwqkv_split_acc. reads dQ/dK/dV
+       directly from [B*H, S, dk] head-major layout, eliminating the
+       [rows, 3D] dQKV merge. B*S == x_flat->shape[0], D == H*dk.
+       NULL when unimplemented — callers merge then use dwqkv_split_acc. */
+    ax_status_t (*dwqkv_split_acc_hm)(const ax_tensor_t *x_flat,
+                                       const ax_tensor_t *dQh,
+                                       const ax_tensor_t *dKh,
+                                       const ax_tensor_t *dVh,
+                                       int64_t B, int64_t S, int64_t H, int64_t dk,
+                                       ax_tensor_t *dWq,
+                                       ax_tensor_t *dWk,
+                                       ax_tensor_t *dWv);
+
     /* optional: F.3.a fused forward QKV projection + head_interleave_split.
        computes:
          qkv = X @ Wqkv (+ bqkv)
@@ -186,6 +199,15 @@ struct ax_backend_ops {
     ax_status_t (*conv_gemm)(const ax_tensor_t *weight,
                               const ax_conv_params_t *params,
                               ax_tensor_t *out);
+
+    /* optional: fused im2col GEMM_NT for conv weight gradient (dW).
+       computes dW[C_out, K] += grad_out[C_out, M] @ im2col(input)[K, M]^T
+       without materializing the col buffer. uses same gather strategy as
+       conv_gemm but with transposed pack layout. NULL when unimplemented —
+       backward.c falls back to im2col + gemm_nt. */
+    ax_status_t (*conv_gemm_nt_dw)(const ax_tensor_t *grad_out,
+                                    const ax_conv_params_t *params,
+                                    ax_tensor_t *dw);
 
     /* reduction ops */
     /* axis=-1 means reduce all dimensions */

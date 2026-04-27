@@ -47,6 +47,15 @@ extern double  ax_omp_overhead_ms;       /* measured fork/join cost */
 extern int64_t ax_par_threshold_elems_light;
 extern int64_t ax_par_threshold_elems_heavy;
 
+/* bandwidth-bound parallelism threshold. total tensor bytes below which
+   omp fork/join overhead exceeds the gain for memory-bound kernels
+   (batchnorm, layernorm). calibrated via L2-resident memcpy probe. */
+extern int64_t ax_par_threshold_bw_bytes;
+
+/* returns 1 if the CPU has heterogeneous cores (P+E, big.LITTLE).
+   GEMM uses this to select dynamic scheduling for load balance. */
+int ax_compute_cores_heterogeneous(void);
+
 /* measure omp fork/join overhead and derive the thresholds above. cheap
    (<50ms). called lazily from ax_compute_init(). safe to call multiple
    times (idempotent). no-op under AX_NO_AUTOTUNE=1 or without openmp. */

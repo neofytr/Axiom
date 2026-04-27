@@ -246,6 +246,22 @@ ax_tensor_t *ax_tensor_to_cuda(ax_tensor_t *t);
 /* move a tensor to CPU (nop + retain if already on CPU). */
 ax_tensor_t *ax_tensor_to_cpu(ax_tensor_t *t);
 
+/* pool and embedded configuration. call before ax_init. */
+
+/* set the per-bucket cap for the storage data pool.
+   default 64 (desktop). lower values conserve memory. */
+void ax_set_pool_bucket_cap(int cap);
+int  ax_get_pool_bucket_cap(void);
+
+/* pre-allocate pool entries for the given buffer byte sizes.
+   eliminates first-call allocations when the model's buffer sizes
+   are known ahead of time. respects the current bucket cap. */
+void ax_pool_prewarm(const size_t *byte_sizes, int n);
+
+/* convenience: right-size arenas and pool for a given sram budget.
+   sets arena block size to budget/8 (min 64 KB) and pool cap to 4. */
+void ax_configure_embedded(size_t sram_budget);
+
 /* printing */
 
 /* print tensor shape and a few elements for debugging */

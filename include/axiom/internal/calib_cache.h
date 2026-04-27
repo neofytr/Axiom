@@ -66,6 +66,8 @@ typedef struct ax_calib_payload {
     int64_t gemm_mc_small, gemm_nc_small, gemm_kc_small;
     int64_t gemm_mc_med,   gemm_nc_med,   gemm_kc_med;
     int64_t gemm_mc_large, gemm_nc_large, gemm_kc_large;
+    /* unpacked-A micro-kernel max K crossover */
+    int64_t gemm_unpacked_a_max_k;
 } ax_calib_payload_t;
 
 /* attempt to load a cached payload matching the current host. returns

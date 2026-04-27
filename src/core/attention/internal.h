@@ -12,10 +12,23 @@
 
 #include "axiom/tensor.h"
 #include "axiom/attention.h"
+#include "axiom/memory.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ================================================================
+   shared per-thread scratch arena for all train_step variants.
+   the three variants (train_step, train_step_fused, train_step_v4)
+   are mutually exclusive per call — only one runs at a time on a
+   given thread. sharing one TLS arena saves 2 × 16 MB per thread
+   vs the original three separate arenas.
+   defined in train_step.c.
+   ================================================================ */
+
+extern __thread ax_arena_t *tl_train_shared_arena;
+ax_arena_t *ax_train_get_scratch_arena(void);
 
 /* ================================================================
    layout helpers (defined in attention/layout.c)

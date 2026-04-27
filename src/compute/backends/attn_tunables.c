@@ -30,6 +30,50 @@
 #include <omp.h>
 #endif
 
+#if defined(__linux__)
+#include <unistd.h>
+#elif defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
+static int64_t detect_llc_bytes(void) {
+#if defined(__linux__)
+    long l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
+    if (l3 > 0) return (int64_t)l3;
+    for (int idx = 0; idx < 8; idx++) {
+        char path[128];
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/level", idx);
+        FILE *fl = fopen(path, "r");
+        if (!fl) continue;
+        int lvl = 0;
+        if (fscanf(fl, "%d", &lvl) != 1 || lvl < 3) { fclose(fl); continue; }
+        fclose(fl);
+        snprintf(path, sizeof(path),
+                 "/sys/devices/system/cpu/cpu0/cache/index%d/size", idx);
+        FILE *fs = fopen(path, "r");
+        if (!fs) continue;
+        long sz = 0; char unit = 0;
+        if (fscanf(fs, "%ld%c", &sz, &unit) >= 1) {
+            fclose(fs);
+            if (unit == 'K' || unit == 'k') sz *= 1024;
+            else if (unit == 'M' || unit == 'm') sz *= 1024 * 1024;
+            if (sz > 0) return (int64_t)sz;
+        } else {
+            fclose(fs);
+        }
+    }
+#elif defined(__APPLE__)
+    int64_t l3 = 0;
+    size_t sz = sizeof(l3);
+    if (sysctlbyname("hw.l3cachesize", &l3, &sz, NULL, 0) == 0 && l3 > 0)
+        return l3;
+#endif
+    return 0;
+}
+
+static int64_t g_llc_bytes = 0;
+
 /* ============================================================
    calibrated state — written once by ax_attn_tunables_calibrate(),
    read by ax_attn_tunable_*() getters thereafter. defaults match the
@@ -46,8 +90,8 @@ static struct {
     /* F.3.c fused dwqkv split-acc: enable when D >= thresh */
     int64_t f3c_d_threshold;              /* default: 1024 */
 
-    /* save_p memory budget */
-    int64_t save_p_max_bytes;             /* default: 8 MB */
+    /* save_p memory budget — default: 0.4 * LLC when detected, else 8 MB */
+    int64_t save_p_max_bytes;
     int64_t save_p_small_exclusion_sk;    /* S*dk threshold; default: 8192 (== 128*64) */
     int64_t save_p_small_exclusion_s;     /* S threshold;    default: 128 */
 
@@ -89,7 +133,7 @@ static struct {
 } g_attn = {
     .calibrated = false,
     .f3a_qkv_bytes_threshold = (int64_t)8 * 1024 * 1024,
-    .f3c_d_threshold = 1024,
+    .f3c_d_threshold = 512,
     .save_p_max_bytes = (int64_t)8 * 1024 * 1024,
     .save_p_small_exclusion_sk = 8192,
     .save_p_small_exclusion_s = 128,
@@ -165,6 +209,10 @@ double ax_attn_tunable_gemm_tile_switch_margin(void) {
 
 int64_t ax_attn_tunable_gemm_unpacked_a_max_k(void) {
     return g_attn.gemm_unpacked_a_max_k;
+}
+
+int64_t ax_attn_tunable_llc_bytes(void) {
+    return g_llc_bytes;
 }
 
 /* ============================================================
@@ -1000,6 +1048,84 @@ static void calibrate_sdpa_fused_regimes(bool *lt, bool *eq, bool *gt) {
 }
 
 /* ============================================================
+   unpacked-A max-K crossover calibration
+
+   the unpacked-A micro-kernel skips pack_a, reading A directly from
+   row-major memory with stride lda=K. this saves pack_a write+read
+   traffic but loads strided data into L1. for large K the strided
+   access blows L1, so packed wins. sweep representative K values
+   and find the crossover.
+   ============================================================ */
+
+typedef struct {
+    ax_tensor_t *a_tv;
+    ax_tensor_t *b_tv;
+    ax_tensor_t *c_tv;
+} unpacked_a_ctx_t;
+
+static ax_status_t unpacked_a_run_gemm(void *p) {
+    unpacked_a_ctx_t *c = (unpacked_a_ctx_t *)p;
+    return ax_compute_gemm(c->a_tv, c->b_tv, c->c_tv);
+}
+
+static int64_t calibrate_gemm_unpacked_a_max_k(void) {
+    static const int64_t cand_k[] = { 128, 256, 384, 512, 768, 1024 };
+    static const int n_cand = (int)(sizeof(cand_k) / sizeof(cand_k[0]));
+    const int64_t M = 1024;
+    const int64_t N = 512;
+    const int warm = 2;
+    const int timed = 8;
+
+    int64_t best_max_k = 0;
+    int64_t saved = g_attn.gemm_unpacked_a_max_k;
+
+    for (int i = 0; i < n_cand; i++) {
+        int64_t K = cand_k[i];
+        size_t a_bytes = (size_t)M * K * sizeof(float);
+        size_t b_bytes = (size_t)K * N * sizeof(float);
+        size_t c_bytes = (size_t)M * N * sizeof(float);
+        float *a_buf = (float *)ax_aligned_alloc(a_bytes, 64);
+        float *b_buf = (float *)ax_aligned_alloc(b_bytes, 64);
+        float *c_buf = (float *)ax_aligned_alloc(c_bytes, 64);
+        if (!a_buf || !b_buf || !c_buf) {
+            ax_aligned_free(a_buf); ax_aligned_free(b_buf); ax_aligned_free(c_buf);
+            continue;
+        }
+        meas_fill_rand(a_buf, M * K);
+        meas_fill_rand(b_buf, K * N);
+        memset(c_buf, 0, c_bytes);
+
+        meas_tensor_t a_t, b_t, c_t;
+        int64_t a_sh[] = { M, K };
+        int64_t b_sh[] = { K, N };
+        int64_t c_sh[] = { M, N };
+        meas_tensor_init(&a_t, a_sh, 2, a_buf, (int64_t)a_bytes);
+        meas_tensor_init(&b_t, b_sh, 2, b_buf, (int64_t)b_bytes);
+        meas_tensor_init(&c_t, c_sh, 2, c_buf, (int64_t)c_bytes);
+
+        unpacked_a_ctx_t ctx = { &a_t.tv, &b_t.tv, &c_t.tv };
+
+        /* measure with unpacked enabled */
+        g_attn.gemm_unpacked_a_max_k = K;
+        double t_unpacked = meas_trimmed_mean_ms(unpacked_a_run_gemm, &ctx, warm, timed);
+
+        /* measure with packed only */
+        g_attn.gemm_unpacked_a_max_k = 0;
+        double t_packed = meas_trimmed_mean_ms(unpacked_a_run_gemm, &ctx, warm, timed);
+
+        ax_aligned_free(a_buf); ax_aligned_free(b_buf); ax_aligned_free(c_buf);
+
+        if (t_unpacked < 1.0e29 && t_packed < 1.0e29
+            && t_unpacked < t_packed * 0.95) {
+            best_max_k = K;
+        }
+    }
+
+    g_attn.gemm_unpacked_a_max_k = saved;
+    return best_max_k;
+}
+
+/* ============================================================
    driver — calls each gate's calibrator and stores the result.
 
    contract: each calibrate_* function returns either a measured
@@ -1017,9 +1143,9 @@ static void calibrate_sdpa_fused_regimes(bool *lt, bool *eq, bool *gt) {
        L2 in [256 KB, 4 MB] and L3 ≥ 8 MB. covers x86 + ARM.
      - 32 KB fused-bh per-head: most x86 L1d sizes (32-48 KB);
        conservative on Apple M (L1d 128-192 KB).
-     - 1024 D-threshold for F.3.c: where the [D, 3D]
-       intermediate (~6 MB at D=1024) starts spilling L3 on
-       typical 4-8 MB L3 hosts.
+     - 512 D-threshold for F.3.c: the fused kernel wins by
+       measurement at D>=512 on typical hosts; the calibrator
+       raises the threshold if the fallback is faster.
      - 126 ATTN_BQ/BK: MR-aligned tile size that fits L2
        across the AVX2/AVX-512 micro-kernel ABIs.
    the calibrator refines these where measurement is confident;
@@ -1053,6 +1179,9 @@ static void calibrate_all_gates(void) {
     calibrate_sdpa_fused_regimes(&g_attn.sdpa_fused_use_when_bh_lt_nt,
                                   &g_attn.sdpa_fused_use_when_bh_eq_nt,
                                   &g_attn.sdpa_fused_use_when_bh_gt_nt);
+
+    v = calibrate_gemm_unpacked_a_max_k();
+    if (v > 0) g_attn.gemm_unpacked_a_max_k = v;
 }
 #endif
 
@@ -1085,6 +1214,15 @@ void ax_attn_tunables_init_early(void) {
     static bool inited = false;
     if (inited) return;
     inited = true;
+
+    /* detect LLC once. used by the save_p default and available to
+       callers via ax_attn_tunable_llc_bytes(). */
+    g_llc_bytes = detect_llc_bytes();
+    if (g_llc_bytes > 0) {
+        int64_t llc_default = (int64_t)((double)g_llc_bytes * 0.4);
+        if (llc_default > 0)
+            g_attn.save_p_max_bytes = llc_default;
+    }
 
     /* register pack-stats atexit hook once. cheap (one libc call). */
     atexit(pack_stats_atexit_hook);
@@ -1178,6 +1316,7 @@ void ax_attn_tunables_calibrate(void) {
 #ifndef AX_NO_STDIO
         fprintf(stderr,
             "axiom: attn tunables calibrated:\n"
+            "  llc_bytes               = %ld\n"
             "  f3a_qkv_bytes_threshold = %ld\n"
             "  f3c_d_threshold         = %ld\n"
             "  save_p_max_bytes        = %ld\n"
@@ -1185,6 +1324,7 @@ void ax_attn_tunables_calibrate(void) {
             "  sdpa_fused use<,=,> NT  = %d, %d, %d\n"
             "  gemm_tn pretranspose    = %ld flops\n"
             "  attn_bq, attn_bk        = %ld, %ld\n",
+            (long)g_llc_bytes,
             (long)g_attn.f3a_qkv_bytes_threshold,
             (long)g_attn.f3c_d_threshold,
             (long)g_attn.save_p_max_bytes,
@@ -1239,6 +1379,8 @@ bool ax_calib_cache_try_apply(void) {
        didn't change it. */
     if (g_attn.gemm_tile_switch_margin == 0.94)  /* default unchanged */
         g_attn.gemm_tile_switch_margin = pl.gemm_tile_switch_margin;
+    if (g_attn.gemm_unpacked_a_max_k == 512)   /* default unchanged */
+        g_attn.gemm_unpacked_a_max_k = pl.gemm_unpacked_a_max_k;
 
     /* push attn tile sizes into cpu_opt's static so attn fwd/bwd take
        effect immediately. gemm tiles ditto via the resolved setter,
@@ -1293,6 +1435,8 @@ void ax_calib_cache_save_current(void) {
     pl.gemm_mc_med   = mc; pl.gemm_nc_med   = nc; pl.gemm_kc_med   = kc;
     ax_gemm_tiles_get_regime_resolved(2, &mc, &nc, &kc);
     pl.gemm_mc_large = mc; pl.gemm_nc_large = nc; pl.gemm_kc_large = kc;
+
+    pl.gemm_unpacked_a_max_k = g_attn.gemm_unpacked_a_max_k;
 
     (void)ax_calib_cache_save(&pl);
 }

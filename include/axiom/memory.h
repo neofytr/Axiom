@@ -76,11 +76,22 @@ void *ax_aligned_alloc(size_t size, size_t alignment);
    thread-safety: concurrent-safe (each pointer freed by one thread). */
 void ax_aligned_free(void *ptr);
 
-/* allocation counting (compile with -DAX_COUNT_ALLOCS to enable) */
+/* allocation counting (compile with -DAX_COUNT_ALLOCS to enable).
+   tracks every heap allocation: ax_aligned_alloc, slab misses, arena
+   block growth, pool node creation. */
 #ifdef AX_COUNT_ALLOCS
 #include <stdint.h>
 uint64_t ax_get_alloc_count(void);
 void ax_reset_alloc_count(void);
+void ax_alloc_count_inc(void);
+#else
+static inline void ax_alloc_count_inc(void) { (void)0; }
 #endif
+
+/* configurable arena block size. default 16 MB (desktop). call before
+   ax_init to right-size for embedded targets. affects arenas created
+   with ax_arena_create(0). */
+void ax_set_arena_block_size(size_t block_size);
+size_t ax_get_arena_block_size(void);
 
 #endif /* AX_MEMORY_H */

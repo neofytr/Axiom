@@ -44,20 +44,11 @@
 /* same contract as train_step.c / train_step_fused.c — tells the gemm
    backends to accumulate into dst rather than overwrite. */
 extern void ax_gemm_set_skip_init(bool v);
-
-/* per-thread scratch arena, reset per call. separate TLS slot so v4
-   and _fused can coexist without aliasing. */
-static __thread ax_arena_t *tl_train_v4_arena = NULL;
+extern void ax_gemm_set_inner_team(bool v);
 
 static ax_arena_t *get_scratch_arena(void)
 {
-    if (!tl_train_v4_arena) {
-        tl_train_v4_arena = ax_arena_create(16 * 1024 * 1024);
-        if (!tl_train_v4_arena) return NULL;
-    } else {
-        ax_arena_reset(tl_train_v4_arena);
-    }
-    return tl_train_v4_arena;
+    return ax_train_get_scratch_arena();
 }
 
 static inline void make_stack_view(ax_tensor_t *tv, ax_storage_t *st,
@@ -104,16 +95,85 @@ static void acc_f32(const float *src, float *dst, int64_t n)
     for (; i < n; i++) dst[i] += src[i];
 }
 
+/* tls scratch for col-sum when cols exceeds stack limit */
+static __thread float *tl_csa_buf;
+static __thread int64_t tl_csa_cap;
+
+/* row-major col-sum body: private accumulator per thread, omp for over
+   rows, critical reduction. sequential access + simd inner loop. */
+static void col_sum_inner_(const float *M, float *out,
+                            int64_t rows, int64_t cols)
+{
+    float stk[2048];
+    float *acc = stk;
+    if (cols > 2048) {
+        if (tl_csa_cap < cols) {
+            free(tl_csa_buf);
+            tl_csa_buf = (float *)malloc((size_t)cols * sizeof(float));
+            tl_csa_cap = cols;
+        }
+        acc = tl_csa_buf;
+    }
+    memset(acc, 0, (size_t)cols * sizeof(float));
+#ifdef _OPENMP
+    #pragma omp for schedule(static)
+#endif
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = M + r * cols;
+        int64_t c = 0;
+#if defined(AX_HAS_SIMD)
+        for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(acc + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                 ax_vf32_loadu(row + c)));
+#endif
+        for (; c < cols; c++) acc[c] += row[c];
+    }
+#ifdef _OPENMP
+    #pragma omp critical
+#endif
+    {
+        int64_t c = 0;
+#if defined(AX_HAS_SIMD)
+        for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(out + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                 ax_vf32_loadu(out + c)));
+#endif
+        for (; c < cols; c++) out[c] += acc[c];
+    }
+}
+
 static void col_sum_acc(const float *M, float *out,
                          int64_t rows, int64_t cols)
 {
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    if (omp_in_parallel()) { col_sum_inner_(M, out, rows, cols); return; }
+    #pragma omp parallel
+    col_sum_inner_(M, out, rows, cols);
+#else
+    col_sum_inner_(M, out, rows, cols);
 #endif
-    for (int64_t c = 0; c < cols; c++) {
-        float s = 0.0f;
-        for (int64_t r = 0; r < rows; r++) s += M[r * cols + c];
-        out[c] += s;
+}
+
+/* col_sum directly from head-major [B*H, S, dk] layout into [D] bias grad.
+   avoids materializing the [rows, D] flat merge just for bias accumulation.
+   each bh-row contributes to out[h*dk .. h*dk+dk-1] where h = bh % H. */
+static void col_sum_hm_one(const float *src, float *out,
+                             int64_t B, int64_t S, int64_t H, int64_t dk)
+{
+    int64_t BH = B * H;
+    for (int64_t bh = 0; bh < BH; bh++) {
+        int64_t h = bh % H;
+        float *dst = out + h * dk;
+        for (int64_t s = 0; s < S; s++) {
+            const float *row = src + (bh * S + s) * dk;
+            int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+            for (int64_t ve = dk - dk % AX_VF32_WIDTH; d < ve; d += AX_VF32_WIDTH)
+                ax_vf32_storeu(dst + d, ax_vf32_add(ax_vf32_loadu(dst + d),
+                                                     ax_vf32_loadu(row + d)));
+#endif
+            for (; d < dk; d++) dst[d] += row[d];
+        }
     }
 }
 
@@ -358,8 +418,14 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
     int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
     bool save_p = (p_save_bytes <= ax_attn_tunable_save_p_max_bytes());
     if (save_p && S <= ax_attn_tunable_save_p_small_exclusion_s() && (S * dk) <= ax_attn_tunable_save_p_small_exclusion_sk()) save_p = false;
-    const char *env_save_p = getenv("AX_MHA_SAVE_P");
-    if (env_save_p) save_p = (env_save_p[0] == '1');
+    static int env_save_p_resolved = 0;
+    static int env_save_p_val = -1;
+    if (!env_save_p_resolved) {
+        const char *e = getenv("AX_MHA_SAVE_P");
+        env_save_p_val = e ? (e[0] == '1' ? 1 : 0) : -1;
+        env_save_p_resolved = 1;
+    }
+    if (env_save_p_val >= 0) save_p = (bool)env_save_p_val;
     if (save_p) {
         int64_t P_sh[] = {bh, S, S};
         P_save_t = ax_tensor_arena_create(arena, P_sh, 3, AX_FLOAT32);
@@ -526,50 +592,136 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
     }
     (void)d_attn;  /* only used in the non-F.3.d fallback above */
 
-    /* (5) fwd y = attn_flat @ Wo + bo (full-rows — all attn_flat rows are
-       filled by now). T1.5 bias-fuse via skip_init: pre-fill output with
-       broadcast bias, then accumulate gemm into it. */
-    if (m->use_bias) {
-        const float *bd = (const float *)m->bo->storage->data;
-        float *od = (float *)y_flat_v.storage->data;
+    /* (5)-(7) output-projection fwd + bwd wrapped in a single parallel
+       region. eliminates two fork-joins (Wo gemm, dWo gemm_tn) and keeps
+       per-thread pack buffers warm across both gemms. the gemm backends
+       detect inner_mode and workshare via omp-for instead of spawning. */
+    {
+        const bool do_dWo = m->Wo->requires_grad;
+        float *dWo_ptr = do_dWo ? ensure_grad_ptr(m->Wo) : NULL;
+        const bool do_dbo = m->use_bias && m->bo->requires_grad;
+        float *dbo_ptr = do_dbo ? ensure_grad_ptr(m->bo) : NULL;
+        ax_status_t wrap_st = AX_OK;
+
 #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-#endif
-        for (int64_t r = 0; r < rows; r++) {
-            memcpy(od + r * D, bd, (size_t)D * sizeof(float));
-        }
-        ax_gemm_set_skip_init(true);
-        ax_status_t s = ax_compute_gemm(attn_flat, m->Wo, &y_flat_v);
-        ax_gemm_set_skip_init(false);
-        if (s != AX_OK) return AX_ERR_BACKEND;
-    } else {
-        if (ax_compute_gemm(attn_flat, m->Wo, &y_flat_v) != AX_OK) return AX_ERR_BACKEND;
-    }
-    ax_storage_touch(y_out->storage);
+        #pragma omp parallel
+        {
+            ax_gemm_set_inner_team(true);
 
-    /* (6) dWo += attn_flat^T @ dout (full-rows). accumulates into existing
-       grad — caller is expected to have zero_grad'd before the train step. */
-    if (m->Wo->requires_grad) {
-        float *dWo = ensure_grad_ptr(m->Wo);
-        if (dWo) {
+            /* (5) fwd y = attn_flat @ Wo + bo */
+            if (m->use_bias) {
+                const float *bd = (const float *)m->bo->storage->data;
+                float *od = (float *)y_flat_v.storage->data;
+                #pragma omp for schedule(static)
+                for (int64_t r = 0; r < rows; r++)
+                    memcpy(od + r * D, bd, (size_t)D * sizeof(float));
+                ax_gemm_set_skip_init(true);
+            }
+            {
+                ax_status_t s = ax_compute_gemm(attn_flat, m->Wo, &y_flat_v);
+                if (m->use_bias) ax_gemm_set_skip_init(false);
+                if (s != AX_OK) wrap_st = s;
+            }
+
+            /* (6) dWo += attn_flat^T @ dout */
+            if (do_dWo && dWo_ptr) {
+                ax_gemm_set_skip_init(true);
+                ax_status_t s = ax_compute_gemm_tn(attn_flat, dout_flat, m->Wo->grad);
+                ax_gemm_set_skip_init(false);
+                if (s != AX_OK) wrap_st = s;
+            }
+
+            /* (7) dbo += colsum(dout) */
+            if (do_dbo && dbo_ptr) {
+                col_sum_acc((const float *)dout_flat->storage->data, dbo_ptr, rows, D);
+            }
+
+            ax_gemm_set_inner_team(false);
+        }
+#else
+        /* single-threaded: same logic, no omp. */
+        if (m->use_bias) {
+            const float *bd = (const float *)m->bo->storage->data;
+            float *od = (float *)y_flat_v.storage->data;
+            for (int64_t r = 0; r < rows; r++)
+                memcpy(od + r * D, bd, (size_t)D * sizeof(float));
             ax_gemm_set_skip_init(true);
-            ax_status_t s = ax_compute_gemm_tn(attn_flat, dout_flat, m->Wo->grad);
+            wrap_st = ax_compute_gemm(attn_flat, m->Wo, &y_flat_v);
             ax_gemm_set_skip_init(false);
-            if (s != AX_OK) return s;
-            ax_storage_touch(m->Wo->grad->storage);
+        } else {
+            wrap_st = ax_compute_gemm(attn_flat, m->Wo, &y_flat_v);
+        }
+        if (wrap_st == AX_OK && do_dWo && dWo_ptr) {
+            ax_gemm_set_skip_init(true);
+            wrap_st = ax_compute_gemm_tn(attn_flat, dout_flat, m->Wo->grad);
+            ax_gemm_set_skip_init(false);
+        }
+        if (wrap_st == AX_OK && do_dbo && dbo_ptr)
+            col_sum_acc((const float *)dout_flat->storage->data, dbo_ptr, rows, D);
+#endif
+        if (wrap_st != AX_OK) return wrap_st;
+        ax_storage_touch(y_out->storage);
+        if (do_dWo && m->Wo->grad) ax_storage_touch(m->Wo->grad->storage);
+        if (do_dbo && m->bo->grad) ax_storage_touch(m->bo->grad->storage);
+    }
+
+    /* (8-10) weight grads dWq/dWk/dWv and bias grads dbq/dbk/dbv.
+       head-major path: reads dQh/dKh/dVh directly, skips the [rows, 3D]
+       dQKV merge + its allocation (~18 MB at B1_S2048_D768).
+       flat fallback: merges dQKV then uses the existing split-acc or
+       gemm_tn paths. */
+    bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad ||
+                         m->Wv->requires_grad;
+    bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad &&
+                         m->Wv->requires_grad;
+    bool need_bias_grad = m->use_bias && (m->bq->requires_grad ||
+                          m->bk->requires_grad || m->bv->requires_grad);
+
+    /* try head-major weight grad path — eliminates dQKV merge entirely */
+    bool hm_wgrad_done = false;
+    if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold()
+        && ax_compute_has_dwqkv_split_acc_hm()) {
+        float *dq_init = ensure_grad_ptr(m->Wq);
+        float *dk_init = ensure_grad_ptr(m->Wk);
+        float *dv_init = ensure_grad_ptr(m->Wv);
+        (void)dq_init; (void)dk_init; (void)dv_init;
+        if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
+            if (ax_compute_dwqkv_split_acc_hm(&x_flat_v, dQh, dKh, dVh,
+                                               B, S, H, dk,
+                                               m->Wq->grad, m->Wk->grad,
+                                               m->Wv->grad) != AX_OK)
+                return AX_ERR_BACKEND;
+            ax_storage_touch(m->Wq->grad->storage);
+            ax_storage_touch(m->Wk->grad->storage);
+            ax_storage_touch(m->Wv->grad->storage);
+            hm_wgrad_done = true;
         }
     }
 
-    /* (7) dbo += colsum(dout) */
-    if (m->use_bias && m->bo->requires_grad) {
-        float *dbo = ensure_grad_ptr(m->bo);
-        if (dbo) {
-            col_sum_acc((const float *)dout_flat->storage->data, dbo, rows, D);
-            ax_storage_touch(m->bo->grad->storage);
-        }
+    /* head-major bias grad path — colsum from dQh/dKh/dVh directly */
+    bool hm_bgrad_done = false;
+    if (hm_wgrad_done && need_bias_grad) {
+        #define ACC_BIAS_HM(src_tensor, W) do {                               \
+            if ((W)->requires_grad) {                                         \
+                float *dp = ensure_grad_ptr(W);                               \
+                if (dp) {                                                     \
+                    col_sum_hm_one((const float *)(src_tensor)->storage->data, \
+                                   dp, B, S, H, dk);                          \
+                    ax_storage_touch((W)->grad->storage);                     \
+                }                                                             \
+            }                                                                 \
+        } while (0)
+        ACC_BIAS_HM(dQh, m->bq);
+        ACC_BIAS_HM(dKh, m->bk);
+        ACC_BIAS_HM(dVh, m->bv);
+        #undef ACC_BIAS_HM
+        hm_bgrad_done = true;
     }
 
-    /* (8) head_deinterleave merge dQh/dKh/dVh → dQKV [rows, 3D] */
+    if (hm_wgrad_done && (!need_bias_grad || hm_bgrad_done))
+        return AX_OK;
+
+    /* flat path: merge dQh/dKh/dVh → dQKV [rows, 3D] */
     ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
     if (!dQKV) return AX_ERR_ALLOC;
     ax_attn_head_deinterleave_qkv_merge(
@@ -579,21 +731,9 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
         (float *)dQKV->storage->data,
         B, S, H, dk, D);
 
-    /* (9) dWqkv = x^T @ dQKV, split → dWq / dWk / dWv (accumulate into grads).
-       F.3.c (opt_dwqkv_split_acc) writes the gemm output directly into
-       the three separate grad tensors, eliminating the [D, 3D] intermediate
-       (~6 MB on D=1024). gated D >= 1024 because measured regression on
-       smaller D (the [D, 3D] intermediate fits L3 cheaply on D<=768 and
-       per-jc dest dispatch adds overhead). when active, requires all three
-       Wq/Wk/Wv grads (the kernel doesn't support partial). this mirrors
-       attention.c's autograd path which has had F.3.c since commit 408600e —
-       train_step_v4 was missing it until this commit. */
-    bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad ||
-                         m->Wv->requires_grad;
-    bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad &&
-                         m->Wv->requires_grad;
-    if (any_wqkv_grad) {
-        if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold() && ax_compute_has_dwqkv_split_acc()) {
+    if (any_wqkv_grad && !hm_wgrad_done) {
+        if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold()
+            && ax_compute_has_dwqkv_split_acc()) {
             float *dq_init = ensure_grad_ptr(m->Wq);
             float *dk_init = ensure_grad_ptr(m->Wk);
             float *dv_init = ensure_grad_ptr(m->Wv);
@@ -610,7 +750,6 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
             }
         }
 
-        /* fallback: materialize then split */
         int64_t dW_sh[] = {D, 3 * D};
         ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
         if (!dWqkv) return AX_ERR_ALLOC;
@@ -636,9 +775,7 @@ ax_status_t ax_mha_train_step_v4(ax_layer_t *layer,
         dwqkv_done_v4: ;
     }
 
-    /* (10) dbqkv = colsum(dQKV), split → dbq / dbk / dbv */
-    if (m->use_bias && (m->bq->requires_grad || m->bk->requires_grad ||
-                         m->bv->requires_grad)) {
+    if (need_bias_grad && !hm_bgrad_done) {
         int64_t db_sh[] = {3 * D};
         ax_tensor_t *dbqkv = ax_tensor_arena_zeros(arena, db_sh, 1, AX_FLOAT32);
         if (!dbqkv) return AX_ERR_ALLOC;

@@ -18,6 +18,9 @@ static inline size_t align_up(size_t val, size_t alignment) {
     return (val + alignment - 1) & ~(alignment - 1);
 }
 
+/* runtime-configurable default for ax_arena_create(0) */
+static size_t g_arena_block_size = 16 * 1024 * 1024;
+
 /* allocate a new arena block with at least min_size usable bytes */
 static ax_arena_block_t *arena_block_create(size_t min_size) {
     /* check for overflow in alloc_size computation */
@@ -25,6 +28,7 @@ static ax_arena_block_t *arena_block_create(size_t min_size) {
     size_t alloc_size = sizeof(ax_arena_block_t) + min_size;
     ax_arena_block_t *block = (ax_arena_block_t *)malloc(alloc_size);
     if (!block) return NULL;
+    ax_alloc_count_inc();
 
     block->next = NULL;
     block->size = min_size;
@@ -38,7 +42,7 @@ ax_arena_t *ax_arena_create(size_t block_size) {
     ax_arena_t *arena = (ax_arena_t *)malloc(sizeof(ax_arena_t));
     if (!arena) return NULL;
 
-    if (block_size == 0) block_size = AX_ARENA_DEFAULT_BLOCK_SIZE;
+    if (block_size == 0) block_size = g_arena_block_size;
 
     ax_arena_block_t *first = arena_block_create(block_size);
     if (!first) {
@@ -130,6 +134,14 @@ void ax_arena_destroy(ax_arena_t *arena) {
     free(arena);
 }
 
+void ax_set_arena_block_size(size_t bs) {
+    if (bs > 0) g_arena_block_size = bs;
+}
+
+size_t ax_get_arena_block_size(void) {
+    return g_arena_block_size;
+}
+
 /* aligned alloc wrappers */
 
 #ifdef AX_COUNT_ALLOCS
@@ -137,6 +149,7 @@ void ax_arena_destroy(ax_arena_t *arena) {
 static _Atomic uint64_t g_alloc_count = 0;
 uint64_t ax_get_alloc_count(void) { return atomic_load(&g_alloc_count); }
 void ax_reset_alloc_count(void) { atomic_store(&g_alloc_count, 0); }
+void ax_alloc_count_inc(void) { atomic_fetch_add(&g_alloc_count, 1); }
 #endif
 
 void *ax_aligned_alloc(size_t size, size_t alignment) {

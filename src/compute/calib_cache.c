@@ -34,8 +34,9 @@
 #endif
 
 /* bump when the payload struct layout changes incompatibly.
-   v2: A3 added per-regime gemm tiles (gemm_{mc,nc,kc}_{small,med,large}). */
-#define AX_CALIB_SCHEMA_VERSION 2u
+   v2: A3 added per-regime gemm tiles (gemm_{mc,nc,kc}_{small,med,large}).
+   v3: added gemm_unpacked_a_max_k. */
+#define AX_CALIB_SCHEMA_VERSION 3u
 
 #define AX_CALIB_MAGIC "AXIOMCAL"
 #define AX_CALIB_MAGIC_LEN 8

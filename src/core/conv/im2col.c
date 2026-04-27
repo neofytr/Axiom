@@ -57,66 +57,123 @@ void ax_conv_im2col_into(const float *id, int64_t C, int64_t H, int64_t W,
     }
 
     /* fast path: stride_w == 1 lets each oh row be a contiguous memcpy
-       of the input row, with memset zeroing the pad regions. */
+       of the input row, with memset zeroing the pad regions.
+       parallelized over col rows (K = C*kh*kw) when the buffer is large
+       enough to amortize OMP fork overhead (~1M floats threshold). each
+       row writes a disjoint [1, M] slice of cd, so no synchronization. */
     if (stride_w == 1)
     {
-        for (int64_t c = 0; c < C; c++)
-        {
-            for (int ky = 0; ky < kh; ky++)
+        const int64_t K = C * (int64_t)kh * (int64_t)kw;
+        const int khkw = kh * kw;
+#ifdef _OPENMP
+        const bool par = (K * M > (int64_t)(1024 * 1024));
+        if (ax_gemm_get_inner_team()) {
+            /* inner_team mode: workshare within the existing team */
+            #pragma omp for schedule(static)
+            for (int64_t ci = 0; ci < K; ci++)
             {
-                for (int kx = 0; kx < kw; kx++)
+                int64_t c  = ci / khkw;
+                int64_t rem = ci % khkw;
+                int ky = (int)(rem / kw);
+                int kx = (int)(rem % kw);
+
+                const int64_t iw_start = (int64_t)kx - (int64_t)pad_w;
+
+                int64_t ow_lo = 0;
+                if (iw_start < 0) ow_lo = -iw_start;
+                int64_t ow_hi = out_w;
+                const int64_t iw_last = iw_start + out_w - 1;
+                if (iw_last >= W) ow_hi = W - iw_start;
+                if (ow_lo > out_w) ow_lo = out_w;
+                if (ow_hi < 0) ow_hi = 0;
+                if (ow_lo > ow_hi) ow_lo = ow_hi;
+
+                const int64_t lead_bytes = ow_lo * (int64_t)sizeof(float);
+                const int64_t mid_len = ow_hi - ow_lo;
+                const int64_t mid_bytes = mid_len * (int64_t)sizeof(float);
+                const int64_t tail_n = out_w - ow_hi;
+                const int64_t tail_bytes = tail_n * (int64_t)sizeof(float);
+
+                for (int64_t oh = 0; oh < out_h; oh++)
                 {
-                    /* iw as a function of ow: iw = ow + iw_start */
-                    const int64_t iw_start = (int64_t)kx - (int64_t)pad_w;
+                    const int64_t ih = oh * stride_h - pad_h + ky;
+                    float *dst_row = cd + ci * M + oh * out_w;
 
-                    /* valid ow range where iw in [0, W) */
-                    int64_t ow_lo = 0;
-                    if (iw_start < 0) ow_lo = -iw_start;
-                    int64_t ow_hi = out_w;
-                    const int64_t iw_last = iw_start + out_w - 1;
-                    if (iw_last >= W) ow_hi = W - iw_start;
-                    if (ow_lo > out_w) ow_lo = out_w;
-                    if (ow_hi < 0) ow_hi = 0;
-                    if (ow_lo > ow_hi) ow_lo = ow_hi;
-
-                    const int64_t lead_bytes = ow_lo * (int64_t)sizeof(float);
-                    const int64_t mid_len = ow_hi - ow_lo;
-                    const int64_t mid_bytes = mid_len * (int64_t)sizeof(float);
-                    const int64_t tail_n = out_w - ow_hi;
-                    const int64_t tail_bytes = tail_n * (int64_t)sizeof(float);
-
-                    for (int64_t oh = 0; oh < out_h; oh++)
+                    if (ih < 0 || ih >= H)
                     {
-                        const int64_t ih = oh * stride_h - pad_h + ky;
-                        float *dst_row = cd + col_idx * M + oh * out_w;
-
-                        if (ih < 0 || ih >= H)
-                        {
-                            /* whole row is pad */
-                            memset(dst_row, 0, (size_t)(out_w * (int64_t)sizeof(float)));
-                            continue;
-                        }
-
-                        const int64_t src_row_base = c * H * W + ih * W;
-
-                        /* leading pad zone */
-                        if (lead_bytes > 0)
-                            memset(dst_row, 0, (size_t)lead_bytes);
-
-                        /* valid middle zone */
-                        if (mid_len > 0)
-                        {
-                            memcpy(dst_row + ow_lo,
-                                   id + src_row_base + (iw_start + ow_lo),
-                                   (size_t)mid_bytes);
-                        }
-
-                        /* trailing pad zone */
-                        if (tail_bytes > 0)
-                            memset(dst_row + ow_hi, 0, (size_t)tail_bytes);
+                        memset(dst_row, 0, (size_t)(out_w * (int64_t)sizeof(float)));
+                        continue;
                     }
-                    col_idx++;
+
+                    const int64_t src_row_base = c * H * W + ih * W;
+
+                    if (lead_bytes > 0)
+                        memset(dst_row, 0, (size_t)lead_bytes);
+
+                    if (mid_len > 0)
+                    {
+                        memcpy(dst_row + ow_lo,
+                               id + src_row_base + (iw_start + ow_lo),
+                               (size_t)mid_bytes);
+                    }
+
+                    if (tail_bytes > 0)
+                        memset(dst_row + ow_hi, 0, (size_t)tail_bytes);
                 }
+            }
+            return;
+        }
+        #pragma omp parallel for schedule(static) if(par)
+#endif
+        for (int64_t ci = 0; ci < K; ci++)
+        {
+            int64_t c  = ci / khkw;
+            int64_t rem = ci % khkw;
+            int ky = (int)(rem / kw);
+            int kx = (int)(rem % kw);
+
+            const int64_t iw_start = (int64_t)kx - (int64_t)pad_w;
+
+            int64_t ow_lo = 0;
+            if (iw_start < 0) ow_lo = -iw_start;
+            int64_t ow_hi = out_w;
+            const int64_t iw_last = iw_start + out_w - 1;
+            if (iw_last >= W) ow_hi = W - iw_start;
+            if (ow_lo > out_w) ow_lo = out_w;
+            if (ow_hi < 0) ow_hi = 0;
+            if (ow_lo > ow_hi) ow_lo = ow_hi;
+
+            const int64_t lead_bytes = ow_lo * (int64_t)sizeof(float);
+            const int64_t mid_len = ow_hi - ow_lo;
+            const int64_t mid_bytes = mid_len * (int64_t)sizeof(float);
+            const int64_t tail_n = out_w - ow_hi;
+            const int64_t tail_bytes = tail_n * (int64_t)sizeof(float);
+
+            for (int64_t oh = 0; oh < out_h; oh++)
+            {
+                const int64_t ih = oh * stride_h - pad_h + ky;
+                float *dst_row = cd + ci * M + oh * out_w;
+
+                if (ih < 0 || ih >= H)
+                {
+                    memset(dst_row, 0, (size_t)(out_w * (int64_t)sizeof(float)));
+                    continue;
+                }
+
+                const int64_t src_row_base = c * H * W + ih * W;
+
+                if (lead_bytes > 0)
+                    memset(dst_row, 0, (size_t)lead_bytes);
+
+                if (mid_len > 0)
+                {
+                    memcpy(dst_row + ow_lo,
+                           id + src_row_base + (iw_start + ow_lo),
+                           (size_t)mid_bytes);
+                }
+
+                if (tail_bytes > 0)
+                    memset(dst_row + ow_hi, 0, (size_t)tail_bytes);
             }
         }
         return;
@@ -320,19 +377,179 @@ void ax_conv_col2im_into(const float *cd, int64_t channels,
                           int pad_h, int pad_w, int64_t out_h, int64_t out_w,
                           float *id)
 {
-    int64_t col_idx = 0;
     const int64_t M = out_h * out_w;
+    const int khkw = kh * kw;
+
+    /* parallelize over input channels. within a channel, ky/kx iterations
+       overlap on the same pixels so they must stay serial, but different
+       channels write to disjoint slices of id. threshold matches im2col. */
+#ifdef _OPENMP
+    const bool par = (channels * (int64_t)khkw * M > (int64_t)(1024 * 1024));
+    if (ax_gemm_get_inner_team()) {
+        /* inner_team mode: workshare within the existing team */
+        #pragma omp for schedule(static)
+        for (int64_t c = 0; c < channels; c++)
+        {
+            float *img_plane = id + c * height * width;
+
+            for (int ky = 0; ky < kh; ky++)
+            {
+                for (int kx = 0; kx < kw; kx++)
+                {
+                    int64_t col_idx = c * khkw + ky * kw + kx;
+
+                    int64_t oh_lo = 0, oh_hi = out_h;
+                    {
+                        int64_t num_lo = pad_h - ky;
+                        int64_t num_hi = height + pad_h - ky;
+                        if (num_lo > 0) {
+                            oh_lo = (num_lo + stride_h - 1) / stride_h;
+                        }
+                        if (num_hi <= 0) { oh_hi = 0; }
+                        else {
+                            int64_t hi_cand = (num_hi + stride_h - 1) / stride_h;
+                            if (hi_cand < oh_hi) oh_hi = hi_cand;
+                        }
+                        if (oh_lo > oh_hi) oh_lo = oh_hi;
+                    }
+
+                    int64_t ow_lo = 0, ow_hi = out_w;
+                    {
+                        int64_t num_lo = pad_w - kx;
+                        int64_t num_hi = width + pad_w - kx;
+                        if (num_lo > 0) {
+                            ow_lo = (num_lo + stride_w - 1) / stride_w;
+                        }
+                        if (num_hi <= 0) { ow_hi = 0; }
+                        else {
+                            int64_t hi_cand = (num_hi + stride_w - 1) / stride_w;
+                            if (hi_cand < ow_hi) ow_hi = hi_cand;
+                        }
+                        if (ow_lo > ow_hi) ow_lo = ow_hi;
+                    }
+
+                    const float *col_plane = cd + col_idx * M;
+
+                    if (stride_w == 1) {
+                        for (int64_t oh = oh_lo; oh < oh_hi; oh++) {
+                            int64_t ih = oh * stride_h - pad_h + ky;
+                            const float *col_row = col_plane + oh * out_w;
+                            float *img_row = img_plane + ih * width + (ow_lo - pad_w + kx);
+                            int64_t len = ow_hi - ow_lo;
+                            int64_t i = 0;
+                            int64_t ve = len - (len % AX_VF32_WIDTH);
+                            for (; i < ve; i += AX_VF32_WIDTH) {
+                                ax_vf32 a = ax_vf32_loadu(img_row + i);
+                                ax_vf32 b = ax_vf32_loadu(col_row + ow_lo + i);
+                                ax_vf32_storeu(img_row + i, ax_vf32_add(a, b));
+                            }
+                            for (; i < len; i++)
+                                img_row[i] += col_row[ow_lo + i];
+                        }
+                    } else if (stride_w == 2) {
+#if defined(AX_SIMD_AVX512)
+                        const __m512i s2idx16 = _mm512_setr_epi32(
+                            0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30);
+                        const __m256i s2idx8 = _mm256_setr_epi32(0,2,4,6,8,10,12,14);
+#elif defined(AX_SIMD_AVX2)
+                        const __m256i s2idx8 = _mm256_setr_epi32(0,2,4,6,8,10,12,14);
+#endif
+                        for (int64_t oh = oh_lo; oh < oh_hi; oh++) {
+                            int64_t ih = oh * stride_h - pad_h + ky;
+                            const float *col_row = col_plane + oh * out_w;
+                            float *img_row = img_plane + ih * width;
+                            int64_t ow = ow_lo;
+#if defined(AX_SIMD_AVX512)
+                            for (; ow + 16 <= ow_hi; ow += 16) {
+                                int64_t iw = ow * 2 - pad_w + kx;
+                                __m512 cv = _mm512_loadu_ps(col_row + ow);
+                                __m512 iv = _mm512_i32gather_ps(s2idx16, img_row + iw, 4);
+                                _mm512_i32scatter_ps(img_row + iw, s2idx16,
+                                                     _mm512_add_ps(iv, cv), 4);
+                            }
+                            for (; ow + 8 <= ow_hi; ow += 8) {
+                                int64_t iw = ow * 2 - pad_w + kx;
+                                __m256 cv = _mm256_loadu_ps(col_row + ow);
+                                __m256 iv = _mm256_i32gather_ps(img_row + iw, s2idx8, 4);
+                                __m256 sv = _mm256_add_ps(iv, cv);
+                                float buf[8];
+                                _mm256_storeu_ps(buf, sv);
+                                for (int k = 0; k < 8; k++)
+                                    img_row[iw + 2*k] = buf[k];
+                            }
+#elif defined(AX_SIMD_AVX2)
+                            for (; ow + 8 <= ow_hi; ow += 8) {
+                                int64_t iw = ow * 2 - pad_w + kx;
+                                __m256 cv = _mm256_loadu_ps(col_row + ow);
+                                __m256 iv = _mm256_i32gather_ps(img_row + iw, s2idx8, 4);
+                                __m256 sv = _mm256_add_ps(iv, cv);
+                                float buf[8];
+                                _mm256_storeu_ps(buf, sv);
+                                for (int k = 0; k < 8; k++)
+                                    img_row[iw + 2*k] = buf[k];
+                            }
+#elif defined(AX_SIMD_NEON)
+                            for (; ow + 4 <= ow_hi; ow += 4) {
+                                int64_t iw = ow * 2 - pad_w + kx;
+                                float32x4_t cv = vld1q_f32(col_row + ow);
+                                float gi[4] = {img_row[iw], img_row[iw+2],
+                                               img_row[iw+4], img_row[iw+6]};
+                                float32x4_t sv = vaddq_f32(vld1q_f32(gi), cv);
+                                float so[4];
+                                vst1q_f32(so, sv);
+                                img_row[iw]     = so[0]; img_row[iw + 2] = so[1];
+                                img_row[iw + 4] = so[2]; img_row[iw + 6] = so[3];
+                            }
+#else
+                            for (; ow + 8 <= ow_hi; ow += 8) {
+                                int64_t iw = ow * 2 - pad_w + kx;
+                                img_row[iw]      += col_row[ow];
+                                img_row[iw + 2]  += col_row[ow + 1];
+                                img_row[iw + 4]  += col_row[ow + 2];
+                                img_row[iw + 6]  += col_row[ow + 3];
+                                img_row[iw + 8]  += col_row[ow + 4];
+                                img_row[iw + 10] += col_row[ow + 5];
+                                img_row[iw + 12] += col_row[ow + 6];
+                                img_row[iw + 14] += col_row[ow + 7];
+                            }
+#endif
+                            for (; ow < ow_hi; ow++) {
+                                int64_t iw = ow * 2 - pad_w + kx;
+                                img_row[iw] += col_row[ow];
+                            }
+                        }
+                    } else {
+                        for (int64_t oh = oh_lo; oh < oh_hi; oh++) {
+                            int64_t ih = oh * stride_h - pad_h + ky;
+                            const float *col_row = col_plane + oh * out_w;
+                            float *img_row = img_plane + ih * width;
+                            for (int64_t ow = ow_lo; ow < ow_hi; ow++) {
+                                int64_t iw = ow * stride_w - pad_w + kx;
+                                img_row[iw] += col_row[ow];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    #pragma omp parallel for schedule(static) if(par)
+#endif
     for (int64_t c = 0; c < channels; c++)
     {
+        float *img_plane = id + c * height * width;
+
         for (int ky = 0; ky < kh; ky++)
         {
             for (int kx = 0; kx < kw; kx++)
             {
-                /* precompute valid oh range: ih = oh*sh - ph + ky in [0,height) */
+                int64_t col_idx = c * khkw + ky * kw + kx;
+
                 int64_t oh_lo = 0, oh_hi = out_h;
                 {
-                    int64_t num_lo = pad_h - ky;  /* oh*sh >= num_lo */
-                    int64_t num_hi = height + pad_h - ky;  /* oh*sh < num_hi */
+                    int64_t num_lo = pad_h - ky;
+                    int64_t num_hi = height + pad_h - ky;
                     if (num_lo > 0) {
                         oh_lo = (num_lo + stride_h - 1) / stride_h;
                     }
@@ -344,7 +561,6 @@ void ax_conv_col2im_into(const float *cd, int64_t channels,
                     if (oh_lo > oh_hi) oh_lo = oh_hi;
                 }
 
-                /* precompute valid ow range similarly */
                 int64_t ow_lo = 0, ow_hi = out_w;
                 {
                     int64_t num_lo = pad_w - kx;
@@ -361,11 +577,8 @@ void ax_conv_col2im_into(const float *cd, int64_t channels,
                 }
 
                 const float *col_plane = cd + col_idx * M;
-                float *img_plane = id + c * height * width;
 
                 if (stride_w == 1) {
-                    /* unit stride in ow means unit stride in both col read and img write.
-                       simd-add overlapping segments of the row. */
                     for (int64_t oh = oh_lo; oh < oh_hi; oh++) {
                         int64_t ih = oh * stride_h - pad_h + ky;
                         const float *col_row = col_plane + oh * out_w;
@@ -381,8 +594,79 @@ void ax_conv_col2im_into(const float *cd, int64_t channels,
                         for (; i < len; i++)
                             img_row[i] += col_row[ow_lo + i];
                     }
+                } else if (stride_w == 2) {
+#if defined(AX_SIMD_AVX512)
+                    const __m512i s2idx16 = _mm512_setr_epi32(
+                        0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30);
+                    const __m256i s2idx8 = _mm256_setr_epi32(0,2,4,6,8,10,12,14);
+#elif defined(AX_SIMD_AVX2)
+                    const __m256i s2idx8 = _mm256_setr_epi32(0,2,4,6,8,10,12,14);
+#endif
+                    for (int64_t oh = oh_lo; oh < oh_hi; oh++) {
+                        int64_t ih = oh * stride_h - pad_h + ky;
+                        const float *col_row = col_plane + oh * out_w;
+                        float *img_row = img_plane + ih * width;
+                        int64_t ow = ow_lo;
+#if defined(AX_SIMD_AVX512)
+                        for (; ow + 16 <= ow_hi; ow += 16) {
+                            int64_t iw = ow * 2 - pad_w + kx;
+                            __m512 cv = _mm512_loadu_ps(col_row + ow);
+                            __m512 iv = _mm512_i32gather_ps(s2idx16, img_row + iw, 4);
+                            _mm512_i32scatter_ps(img_row + iw, s2idx16,
+                                                 _mm512_add_ps(iv, cv), 4);
+                        }
+                        for (; ow + 8 <= ow_hi; ow += 8) {
+                            int64_t iw = ow * 2 - pad_w + kx;
+                            __m256 cv = _mm256_loadu_ps(col_row + ow);
+                            __m256 iv = _mm256_i32gather_ps(img_row + iw, s2idx8, 4);
+                            __m256 sv = _mm256_add_ps(iv, cv);
+                            float buf[8];
+                            _mm256_storeu_ps(buf, sv);
+                            for (int k = 0; k < 8; k++)
+                                img_row[iw + 2*k] = buf[k];
+                        }
+#elif defined(AX_SIMD_AVX2)
+                        for (; ow + 8 <= ow_hi; ow += 8) {
+                            int64_t iw = ow * 2 - pad_w + kx;
+                            __m256 cv = _mm256_loadu_ps(col_row + ow);
+                            __m256 iv = _mm256_i32gather_ps(img_row + iw, s2idx8, 4);
+                            __m256 sv = _mm256_add_ps(iv, cv);
+                            float buf[8];
+                            _mm256_storeu_ps(buf, sv);
+                            for (int k = 0; k < 8; k++)
+                                img_row[iw + 2*k] = buf[k];
+                        }
+#elif defined(AX_SIMD_NEON)
+                        for (; ow + 4 <= ow_hi; ow += 4) {
+                            int64_t iw = ow * 2 - pad_w + kx;
+                            float32x4_t cv = vld1q_f32(col_row + ow);
+                            float gi[4] = {img_row[iw], img_row[iw+2],
+                                           img_row[iw+4], img_row[iw+6]};
+                            float32x4_t sv = vaddq_f32(vld1q_f32(gi), cv);
+                            float so[4];
+                            vst1q_f32(so, sv);
+                            img_row[iw]     = so[0]; img_row[iw + 2] = so[1];
+                            img_row[iw + 4] = so[2]; img_row[iw + 6] = so[3];
+                        }
+#else
+                        for (; ow + 8 <= ow_hi; ow += 8) {
+                            int64_t iw = ow * 2 - pad_w + kx;
+                            img_row[iw]      += col_row[ow];
+                            img_row[iw + 2]  += col_row[ow + 1];
+                            img_row[iw + 4]  += col_row[ow + 2];
+                            img_row[iw + 6]  += col_row[ow + 3];
+                            img_row[iw + 8]  += col_row[ow + 4];
+                            img_row[iw + 10] += col_row[ow + 5];
+                            img_row[iw + 12] += col_row[ow + 6];
+                            img_row[iw + 14] += col_row[ow + 7];
+                        }
+#endif
+                        for (; ow < ow_hi; ow++) {
+                            int64_t iw = ow * 2 - pad_w + kx;
+                            img_row[iw] += col_row[ow];
+                        }
+                    }
                 } else {
-                    /* general strided fallback — skip the bounds check now that ranges are pruned */
                     for (int64_t oh = oh_lo; oh < oh_hi; oh++) {
                         int64_t ih = oh * stride_h - pad_h + ky;
                         const float *col_row = col_plane + oh * out_w;
@@ -393,7 +677,6 @@ void ax_conv_col2im_into(const float *cd, int64_t channels,
                         }
                     }
                 }
-                col_idx++;
             }
         }
     }

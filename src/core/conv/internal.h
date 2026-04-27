@@ -27,8 +27,25 @@
 extern "C" {
 #endif
 
-/* from dispatch.c — accumulate-into-pre-filled-C flag for opt_gemm */
+/* conv path identifiers — used by the autotuner to cache the fastest
+   path per shape and by forward.c to dispatch. */
+typedef enum {
+    AX_CONV_PATH_AUTO = -1,
+    AX_CONV_PATH_WINOGRAD = 0,
+    AX_CONV_PATH_DIRECT_3X3,
+    AX_CONV_PATH_SMALLCIN,
+    AX_CONV_PATH_IMPLICIT,
+    AX_CONV_PATH_IM2COL,
+    AX_CONV_PATH_BATCHED,
+    AX_CONV_PATH_1X1_FAST,
+    AX_CONV_PATH_WINOGRAD_F43,
+    AX_CONV_PATH_COUNT
+} ax_conv_path_t;
+
+/* from dispatch.c — thread-local GEMM control flags */
 extern void ax_gemm_set_skip_init(bool v);
+extern void ax_gemm_set_inner_team(bool v);
+extern bool ax_gemm_get_inner_team(void);
 
 /* batched conv heuristic thresholds. file-scope so forward, backward, and
    the cbr fused layer share definitions without depending on translation-
@@ -79,6 +96,15 @@ struct ax_conv_scratch {
     ax_tensor_t *wino_V;
     ax_tensor_t *wino_M;
     int64_t wino_num_tiles;     /* N * Ty * Tx; 0 if winograd not allocated */
+
+    /* winograd F(4,3) buffers (same structure as F(2,3), 36 ij planes, 4x4 output tiles) */
+    ax_tensor_t *wino43_U;
+    ax_tensor_t *wino43_V;
+    ax_tensor_t *wino43_M;
+    int64_t wino43_num_tiles;
+
+    /* autotuner result for this shape (AX_CONV_PATH_AUTO = not yet calibrated) */
+    ax_conv_path_t calibrated_path;
 
     /* NHWC path scratch (allocated lazily on first NHWC forward call):
        wt_nhwc: weight transposed to [K=Cin*kh*kw, Cout] for cache-friendly
@@ -233,12 +259,62 @@ int ax_conv_winograd_f23_forward(struct ax_conv_scratch *s,
                                   int64_t N, int64_t C_in, int64_t H, int64_t W,
                                   int64_t C_out, int64_t out_h, int64_t out_w, int T);
 
+/* winograd F(2,3) backward dX: dX = conv(grad_out, W_rot180, s=1, p=1).
+   reuses forward's wino_U/V/M buffers. accumulates into dx. */
+int ax_conv_winograd_f23_backward_dx(struct ax_conv_scratch *s,
+                                      const float *grad_out, const float *wd,
+                                      float *dx,
+                                      int64_t N, int64_t C_in, int64_t H, int64_t W,
+                                      int64_t C_out, int64_t out_h, int64_t out_w,
+                                      int T);
+
+/* ================================================================
+   winograd F(4,3) — defined in winograd.c
+   ================================================================ */
+
+void ax_conv_wino43_input_transform_tile(const float *d, float *v);
+void ax_conv_wino43_kernel_transform_filter(const float *g, float *u);
+void ax_conv_wino43_output_transform_tile(const float *m, float *y);
+
+bool ax_conv_prefer_winograd_f43(int kh, int kw, int sh, int sw, int ph, int pw,
+                                  int64_t N, int64_t C_in, int64_t C_out,
+                                  int64_t out_h, int64_t out_w);
+
+int ax_conv_winograd_f43_forward(struct ax_conv_scratch *s,
+                                  const float *id, const float *wd, const float *bias,
+                                  float *od,
+                                  int64_t N, int64_t C_in, int64_t H, int64_t W,
+                                  int64_t C_out, int64_t out_h, int64_t out_w, int T);
+
+int ax_conv_winograd_f43_backward_dx(struct ax_conv_scratch *s,
+                                      const float *grad_out, const float *wd,
+                                      float *dx,
+                                      int64_t N, int64_t C_in, int64_t H, int64_t W,
+                                      int64_t C_out, int64_t out_h, int64_t out_w,
+                                      int T);
+
 /* ================================================================
    path selection — defined in path_selection.c
    ================================================================ */
 
 /* implicit GEMM path predicate (gather-on-the-fly into pack_b). */
 bool ax_conv_prefer_implicit_gemm(int64_t K, int64_t M);
+
+/* ================================================================
+   autotuner — defined in autotune.c
+   ================================================================ */
+
+/* trial eligible paths for a conv shape and return the fastest.
+   writes the winning trial's output into od. called from forward.c
+   on the first forward for a new shape. no-op under AX_NO_AUTOTUNE=1
+   (returns the static cascade's pick). */
+ax_conv_path_t ax_conv_autotune_select(
+    struct ax_conv_scratch *s,
+    const float *id, const float *wd, const float *bias, float *od,
+    int64_t N, int64_t C_in, int64_t H, int64_t W,
+    int64_t C_out, int64_t out_h, int64_t out_w,
+    int kh, int kw, int sh, int sw, int ph, int pw, int T,
+    ax_conv_path_t static_pick);
 
 /* ================================================================
    NHWC kernels — defined in forward.c (forward) and backward.c (backward)

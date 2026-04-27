@@ -54,6 +54,9 @@ typedef struct
 
 ax_layer_t *ax_dropout_create(float p);
 
+/* release per-thread scratch used by norm kernels (optional cleanup) */
+void ax_norm_scratch_cleanup(void);
+
 /* gradient clipping */
 void ax_clip_grad_value(ax_tensor_t **params, int n_params, float max_val);
 float ax_clip_grad_norm(ax_tensor_t **params, int n_params, float max_norm);

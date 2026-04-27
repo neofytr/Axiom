@@ -60,19 +60,9 @@
    when the next gemm writes there. */
 extern void ax_gemm_set_skip_init(bool v);
 
-/* per-thread scratch arena, reset per call. mirror of train_step.c
-   but separate TLS slot so the two entries don't alias. */
-static __thread ax_arena_t *tl_train_fused_arena = NULL;
-
 static ax_arena_t *get_scratch_arena(void)
 {
-    if (!tl_train_fused_arena) {
-        tl_train_fused_arena = ax_arena_create(16 * 1024 * 1024);
-        if (!tl_train_fused_arena) return NULL;
-    } else {
-        ax_arena_reset(tl_train_fused_arena);
-    }
-    return tl_train_fused_arena;
+    return ax_train_get_scratch_arena();
 }
 
 static inline void make_stack_view(ax_tensor_t *tv, ax_storage_t *st,
@@ -119,16 +109,82 @@ static void acc_f32(const float *src, float *dst, int64_t n)
     for (; i < n; i++) dst[i] += src[i];
 }
 
+/* tls scratch for col-sum when cols exceeds stack limit */
+static __thread float *tl_csa_buf;
+static __thread int64_t tl_csa_cap;
+
+/* row-major col-sum body: private accumulator per thread, omp for over
+   rows, critical reduction. sequential access + simd inner loop. */
+static void col_sum_inner_(const float *M, float *out,
+                            int64_t rows, int64_t cols)
+{
+    float stk[2048];
+    float *acc = stk;
+    if (cols > 2048) {
+        if (tl_csa_cap < cols) {
+            free(tl_csa_buf);
+            tl_csa_buf = (float *)malloc((size_t)cols * sizeof(float));
+            tl_csa_cap = cols;
+        }
+        acc = tl_csa_buf;
+    }
+    memset(acc, 0, (size_t)cols * sizeof(float));
+#ifdef _OPENMP
+    #pragma omp for schedule(static)
+#endif
+    for (int64_t r = 0; r < rows; r++) {
+        const float *row = M + r * cols;
+        int64_t c = 0;
+#if defined(AX_HAS_SIMD)
+        for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(acc + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                 ax_vf32_loadu(row + c)));
+#endif
+        for (; c < cols; c++) acc[c] += row[c];
+    }
+#ifdef _OPENMP
+    #pragma omp critical
+#endif
+    {
+        int64_t c = 0;
+#if defined(AX_HAS_SIMD)
+        for (int64_t ve = cols - cols % AX_VF32_WIDTH; c < ve; c += AX_VF32_WIDTH)
+            ax_vf32_storeu(out + c, ax_vf32_add(ax_vf32_loadu(acc + c),
+                                                 ax_vf32_loadu(out + c)));
+#endif
+        for (; c < cols; c++) out[c] += acc[c];
+    }
+}
+
 static void col_sum_acc(const float *M, float *out,
                          int64_t rows, int64_t cols)
 {
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
+    if (omp_in_parallel()) { col_sum_inner_(M, out, rows, cols); return; }
+    #pragma omp parallel
+    col_sum_inner_(M, out, rows, cols);
+#else
+    col_sum_inner_(M, out, rows, cols);
 #endif
-    for (int64_t c = 0; c < cols; c++) {
-        float s = 0.0f;
-        for (int64_t r = 0; r < rows; r++) s += M[r * cols + c];
-        out[c] += s;
+}
+
+static void col_sum_hm_one(const float *src, float *out,
+                             int64_t B, int64_t S, int64_t H, int64_t dk)
+{
+    int64_t BH = B * H;
+    for (int64_t bh = 0; bh < BH; bh++) {
+        int64_t h = bh % H;
+        float *dst = out + h * dk;
+        for (int64_t s = 0; s < S; s++) {
+            const float *row = src + (bh * S + s) * dk;
+            int64_t d = 0;
+#if defined(AX_HAS_SIMD)
+            for (int64_t ve = dk - dk % AX_VF32_WIDTH; d < ve; d += AX_VF32_WIDTH)
+                ax_vf32_storeu(dst + d, ax_vf32_add(ax_vf32_loadu(dst + d),
+                                                     ax_vf32_loadu(row + d)));
+#endif
+            for (; d < dk; d++) dst[d] += row[d];
+        }
     }
 }
 
@@ -255,8 +311,14 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
     int64_t p_save_bytes = bh * S * S * (int64_t)sizeof(float);
     bool save_p = (p_save_bytes <= ax_attn_tunable_save_p_max_bytes());
     if (save_p && S <= ax_attn_tunable_save_p_small_exclusion_s() && (S * dk) <= ax_attn_tunable_save_p_small_exclusion_sk()) save_p = false;
-    const char *env = getenv("AX_MHA_SAVE_P");
-    if (env) save_p = (env[0] == '1');
+    static int env_save_p_resolved = 0;
+    static int env_save_p_val = -1;
+    if (!env_save_p_resolved) {
+        const char *e = getenv("AX_MHA_SAVE_P");
+        env_save_p_val = e ? (e[0] == '1' ? 1 : 0) : -1;
+        env_save_p_resolved = 1;
+    }
+    if (env_save_p_val >= 0) save_p = (bool)env_save_p_val;
     if (save_p) {
         int64_t P_sh[] = {bh, S, S};
         P_save_t = ax_tensor_arena_create(arena, P_sh, 3, AX_FLOAT32);
@@ -448,92 +510,127 @@ ax_status_t ax_mha_train_step_fused(ax_layer_t *layer,
             B, S, H, dk, scale, m->causal);
     }
 
-    /* step 3 — head-deinterleave + merge → [rows, 3D] dQKV */
-    ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
-    if (!dQKV) return AX_ERR_ALLOC;
-    ax_attn_head_deinterleave_qkv_merge(
-        (const float *)dQh->storage->data,
-        (const float *)dKh->storage->data,
-        (const float *)dVh->storage->data,
-        (float *)dQKV->storage->data,
-        B, S, H, dk, D);
-
-    /* step 4 — fused weight grad: dWqkv = x_flat^T @ dQKV.
-       F.3.c (opt_dwqkv_split_acc) writes the gemm output directly into
-       the three separate grad tensors when D >= 1024 — eliminates the
-       [D, 3D] intermediate (~6 MB on D=1024). matches autograd's wiring;
-       train_step_fused was missing it before. fallback path (D<1024 or
-       partial grads) merges the 3 split passes into one parallel region
-       so we pay omp spawn/join once instead of three times. */
+    /* steps 3-5: weight grads dWq/dWk/dWv and bias grads dbq/dbk/dbv.
+       head-major path reads dQh/dKh/dVh directly, skips [rows, 3D] merge. */
     bool any_wqkv_grad = m->Wq->requires_grad || m->Wk->requires_grad ||
                          m->Wv->requires_grad;
     bool all_wqkv_grad = m->Wq->requires_grad && m->Wk->requires_grad &&
                          m->Wv->requires_grad;
-    if (any_wqkv_grad) {
-        if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold() && ax_compute_has_dwqkv_split_acc()) {
-            (void)ensure_grad_ptr(m->Wq);
-            (void)ensure_grad_ptr(m->Wk);
-            (void)ensure_grad_ptr(m->Wv);
-            if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
-                if (ax_compute_dwqkv_split_acc(&x_flat_v, dQKV,
-                                                m->Wq->grad, m->Wk->grad,
-                                                m->Wv->grad) != AX_OK)
-                    return AX_ERR_BACKEND;
-                ax_storage_touch(m->Wq->grad->storage);
-                ax_storage_touch(m->Wk->grad->storage);
-                ax_storage_touch(m->Wv->grad->storage);
-                goto dwqkv_done_tsf;
-            }
+    bool need_bias_grad = m->use_bias && (m->bq->requires_grad ||
+                          m->bk->requires_grad || m->bv->requires_grad);
+
+    bool hm_wgrad_done = false;
+    if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold()
+        && ax_compute_has_dwqkv_split_acc_hm()) {
+        (void)ensure_grad_ptr(m->Wq);
+        (void)ensure_grad_ptr(m->Wk);
+        (void)ensure_grad_ptr(m->Wv);
+        if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
+            if (ax_compute_dwqkv_split_acc_hm(&x_flat_v, dQh, dKh, dVh,
+                                               B, S, H, dk,
+                                               m->Wq->grad, m->Wk->grad,
+                                               m->Wv->grad) != AX_OK)
+                return AX_ERR_BACKEND;
+            ax_storage_touch(m->Wq->grad->storage);
+            ax_storage_touch(m->Wk->grad->storage);
+            ax_storage_touch(m->Wv->grad->storage);
+            hm_wgrad_done = true;
         }
-
-        /* fallback: materialize then split */
-        int64_t dW_sh[] = {D, 3 * D};
-        ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
-        if (!dWqkv) return AX_ERR_ALLOC;
-        if (ax_compute_gemm_tn(&x_flat_v, dQKV, dWqkv) != AX_OK) return AX_ERR_BACKEND;
-
-        const float *dw = (const float *)dWqkv->storage->data;
-        float *dp_q = m->Wq->requires_grad ? ensure_grad_ptr(m->Wq) : NULL;
-        float *dp_k = m->Wk->requires_grad ? ensure_grad_ptr(m->Wk) : NULL;
-        float *dp_v = m->Wv->requires_grad ? ensure_grad_ptr(m->Wv) : NULL;
-
-#ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-#endif
-        for (int64_t i = 0; i < D; i++) {
-            if (dp_q) acc_f32(dw + i * 3 * D,         dp_q + i * D, D);
-            if (dp_k) acc_f32(dw + i * 3 * D + D,     dp_k + i * D, D);
-            if (dp_v) acc_f32(dw + i * 3 * D + 2 * D, dp_v + i * D, D);
-        }
-
-        if (dp_q) ax_storage_touch(m->Wq->grad->storage);
-        if (dp_k) ax_storage_touch(m->Wk->grad->storage);
-        if (dp_v) ax_storage_touch(m->Wv->grad->storage);
-        dwqkv_done_tsf: ;
     }
 
-    /* step 5 — bias grads */
-    if (m->use_bias && (m->bq->requires_grad || m->bk->requires_grad ||
-                         m->bv->requires_grad)) {
-        int64_t db_sh[] = {3 * D};
-        ax_tensor_t *dbqkv = ax_tensor_arena_zeros(arena, db_sh, 1, AX_FLOAT32);
-        if (!dbqkv) return AX_ERR_ALLOC;
-        col_sum_acc((const float *)dQKV->storage->data,
-                     (float *)dbqkv->storage->data, rows, 3 * D);
-        const float *db = (const float *)dbqkv->storage->data;
-        #define ACC_BIAS(W, col_off) do {                                     \
+    bool hm_bgrad_done = false;
+    if (hm_wgrad_done && need_bias_grad) {
+        #define ACC_BIAS_HM(src_tensor, W) do {                               \
             if ((W)->requires_grad) {                                         \
                 float *dp = ensure_grad_ptr(W);                               \
                 if (dp) {                                                     \
-                    acc_f32(db + (col_off), dp, D);                           \
+                    col_sum_hm_one((const float *)(src_tensor)->storage->data, \
+                                   dp, B, S, H, dk);                          \
                     ax_storage_touch((W)->grad->storage);                     \
                 }                                                             \
             }                                                                 \
         } while (0)
-        ACC_BIAS(m->bq, 0);
-        ACC_BIAS(m->bk, D);
-        ACC_BIAS(m->bv, 2 * D);
-        #undef ACC_BIAS
+        ACC_BIAS_HM(dQh, m->bq);
+        ACC_BIAS_HM(dKh, m->bk);
+        ACC_BIAS_HM(dVh, m->bv);
+        #undef ACC_BIAS_HM
+        hm_bgrad_done = true;
+    }
+
+    if (!(hm_wgrad_done && (!need_bias_grad || hm_bgrad_done))) {
+        ax_tensor_t *dQKV = ax_tensor_arena_create(arena, qkv_sh, 2, AX_FLOAT32);
+        if (!dQKV) return AX_ERR_ALLOC;
+        ax_attn_head_deinterleave_qkv_merge(
+            (const float *)dQh->storage->data,
+            (const float *)dKh->storage->data,
+            (const float *)dVh->storage->data,
+            (float *)dQKV->storage->data,
+            B, S, H, dk, D);
+
+        if (any_wqkv_grad && !hm_wgrad_done) {
+            if (all_wqkv_grad && D >= ax_attn_tunable_f3c_d_threshold()
+                && ax_compute_has_dwqkv_split_acc()) {
+                (void)ensure_grad_ptr(m->Wq);
+                (void)ensure_grad_ptr(m->Wk);
+                (void)ensure_grad_ptr(m->Wv);
+                if (m->Wq->grad && m->Wk->grad && m->Wv->grad) {
+                    if (ax_compute_dwqkv_split_acc(&x_flat_v, dQKV,
+                                                    m->Wq->grad, m->Wk->grad,
+                                                    m->Wv->grad) != AX_OK)
+                        return AX_ERR_BACKEND;
+                    ax_storage_touch(m->Wq->grad->storage);
+                    ax_storage_touch(m->Wk->grad->storage);
+                    ax_storage_touch(m->Wv->grad->storage);
+                    goto dwqkv_done_tsf;
+                }
+            }
+
+            int64_t dW_sh[] = {D, 3 * D};
+            ax_tensor_t *dWqkv = ax_tensor_arena_create(arena, dW_sh, 2, AX_FLOAT32);
+            if (!dWqkv) return AX_ERR_ALLOC;
+            if (ax_compute_gemm_tn(&x_flat_v, dQKV, dWqkv) != AX_OK) return AX_ERR_BACKEND;
+
+            const float *dw = (const float *)dWqkv->storage->data;
+            float *dp_q = m->Wq->requires_grad ? ensure_grad_ptr(m->Wq) : NULL;
+            float *dp_k = m->Wk->requires_grad ? ensure_grad_ptr(m->Wk) : NULL;
+            float *dp_v = m->Wv->requires_grad ? ensure_grad_ptr(m->Wv) : NULL;
+
+#ifdef _OPENMP
+            #pragma omp parallel for schedule(static)
+#endif
+            for (int64_t i = 0; i < D; i++) {
+                if (dp_q) acc_f32(dw + i * 3 * D,         dp_q + i * D, D);
+                if (dp_k) acc_f32(dw + i * 3 * D + D,     dp_k + i * D, D);
+                if (dp_v) acc_f32(dw + i * 3 * D + 2 * D, dp_v + i * D, D);
+            }
+
+            if (dp_q) ax_storage_touch(m->Wq->grad->storage);
+            if (dp_k) ax_storage_touch(m->Wk->grad->storage);
+            if (dp_v) ax_storage_touch(m->Wv->grad->storage);
+            dwqkv_done_tsf: ;
+        }
+
+        if (need_bias_grad && !hm_bgrad_done) {
+            int64_t db_sh[] = {3 * D};
+            ax_tensor_t *dbqkv = ax_tensor_arena_zeros(arena, db_sh, 1, AX_FLOAT32);
+            if (!dbqkv) return AX_ERR_ALLOC;
+            col_sum_acc((const float *)dQKV->storage->data,
+                         (float *)dbqkv->storage->data, rows, 3 * D);
+            const float *db = (const float *)dbqkv->storage->data;
+            #define ACC_BIAS(W, col_off) do {                                     \
+                if ((W)->requires_grad) {                                         \
+                    float *dp = ensure_grad_ptr(W);                               \
+                    if (dp) {                                                     \
+                        acc_f32(db + (col_off), dp, D);                           \
+                        ax_storage_touch((W)->grad->storage);                     \
+                    }                                                             \
+                }                                                                 \
+            } while (0)
+            ACC_BIAS(m->bq, 0);
+            ACC_BIAS(m->bk, D);
+            ACC_BIAS(m->bv, 2 * D);
+            #undef ACC_BIAS
+        }
     }
 
     return AX_OK;

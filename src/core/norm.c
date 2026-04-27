@@ -17,6 +17,26 @@
 #include <omp.h>
 #endif
 
+/* tls scratch for norm ops: one buffer per thread, grows lazily to
+   the max shape seen. never freed in the hot path. */
+static __thread float *tl_norm_buf;
+static __thread size_t tl_norm_cap;
+
+static float *norm_scratch(size_t bytes) {
+    bytes = (bytes + 63u) & ~(size_t)63u;
+    if (tl_norm_cap >= bytes) return tl_norm_buf;
+    free(tl_norm_buf);
+    tl_norm_buf = (float *)aligned_alloc(64, bytes);
+    tl_norm_cap = tl_norm_buf ? bytes : 0;
+    return tl_norm_buf;
+}
+
+void ax_norm_scratch_cleanup(void) {
+    free(tl_norm_buf);
+    tl_norm_buf = NULL;
+    tl_norm_cap = 0;
+}
+
 
 /* context saved during batchnorm forward for the backward pass */
 typedef struct {
@@ -45,124 +65,180 @@ static int bn_nhwc_forward_impl(
     int TC = AX_VF32_WIDTH;
     int64_t cv_end = C - (C % TC);
 
-    /* per-channel mean & invstd. */
-    float *mean = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
-    float *invstd = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
-    if (!mean || !invstd) { free(mean); free(invstd); return -1; }
+    /* tls scratch: [mean | invstd | thr_sum/scale_eff | thr_sum2/shift_eff] */
+    size_t C_al = ((size_t)C + 15) & ~(size_t)15;
+#ifdef _OPENMP
+    int64_t data_bytes = NHW * C * (int64_t)sizeof(float);
+    int par_ok = (data_bytes >= ax_par_threshold_bw_bytes);
+    int n_threads = (training && par_ok) ? omp_get_max_threads() : 1;
+#else
+    int n_threads = 1;
+#endif
+    size_t flex = (size_t)(training ? 2 * n_threads : 2) * C_al;
+    float *buf = norm_scratch((2 * C_al + flex) * sizeof(float));
+    if (!buf) return -1;
+    float *mean   = buf;
+    float *invstd = buf + C_al;
 
     if (training) {
-        /* per-thread reduction buffers. */
-#ifdef _OPENMP
-        int n_threads = omp_get_max_threads();
-#else
-        int n_threads = 1;
-#endif
-        size_t per_t_floats = ((size_t)C + 15) & ~(size_t)15u;
-        float *thr_sum  = (float *)aligned_alloc(64, n_threads * per_t_floats * sizeof(float));
-        float *thr_sum2 = (float *)aligned_alloc(64, n_threads * per_t_floats * sizeof(float));
-        if (!thr_sum || !thr_sum2) {
-            free(mean); free(invstd); free(thr_sum); free(thr_sum2);
-            return -1;
-        }
-        memset(thr_sum,  0, n_threads * per_t_floats * sizeof(float));
-        memset(thr_sum2, 0, n_threads * per_t_floats * sizeof(float));
-
-        /* pass 1+2 fused: per (n, h, w), accumulate sum and sum-of-squares
-           into per-thread channel accumulators using SIMD across C. */
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-        #endif
-        for (int64_t i = 0; i < NHW; i++) {
-    #ifdef _OPENMP
-        int tid = omp_get_thread_num();
-#else
-        int tid = 0;
-#endif
-            float *s1 = thr_sum  + tid * per_t_floats;
-            float *s2 = thr_sum2 + tid * per_t_floats;
-            const float *pos = id + i * C;
-            int64_t c = 0;
-            for (; c < cv_end; c += TC) {
-                ax_vf32 v = ax_vf32_loadu(pos + c);
-                ax_vf32 a1 = ax_vf32_loadu(s1 + c);
-                ax_vf32 a2 = ax_vf32_loadu(s2 + c);
-                ax_vf32_storeu(s1 + c, ax_vf32_add(a1, v));
-                ax_vf32_storeu(s2 + c, ax_vf32_fmadd(v, v, a2));
-            }
-            for (; c < C; c++) {
-                float v = pos[c];
-                s1[c] += v;
-                s2[c] += v * v;
-            }
-        }
-
-        /* reduce per-thread → mean, var. */
+        float *thr_sum  = buf + 2 * C_al;
+        float *thr_sum2 = buf + (2 + (size_t)n_threads) * C_al;
+        memset(thr_sum,  0, (size_t)n_threads * C_al * sizeof(float));
+        memset(thr_sum2, 0, (size_t)n_threads * C_al * sizeof(float));
         float scale_n = 1.0f / (float)NHW;
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-        #endif
-        for (int64_t c = 0; c < C; c++) {
-            float s1 = 0, s2 = 0;
-            for (int t = 0; t < n_threads; t++) {
-                s1 += thr_sum [t * per_t_floats + c];
-                s2 += thr_sum2[t * per_t_floats + c];
+        float *scale_eff = buf + 2 * C_al;
+        float *shift_eff = buf + 3 * C_al;
+
+#ifdef _OPENMP
+        #pragma omp parallel if(par_ok)
+#endif
+        {
+#ifdef _OPENMP
+            int tid = omp_get_thread_num();
+            int nt  = omp_get_num_threads();
+#else
+            int tid = 0;
+            int nt  = 1;
+#endif
+
+            /* pass 1: accumulate sum, sum-of-squares per thread */
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int64_t i = 0; i < NHW; i++) {
+                float *s1 = thr_sum  + tid * C_al;
+                float *s2 = thr_sum2 + tid * C_al;
+                const float *pos = id + i * C;
+                int64_t c = 0;
+                for (; c < cv_end; c += TC) {
+                    ax_vf32 v = ax_vf32_loadu(pos + c);
+                    ax_vf32 a1 = ax_vf32_loadu(s1 + c);
+                    ax_vf32 a2 = ax_vf32_loadu(s2 + c);
+                    ax_vf32_storeu(s1 + c, ax_vf32_add(a1, v));
+                    ax_vf32_storeu(s2 + c, ax_vf32_fmadd(v, v, a2));
+                }
+                for (; c < C; c++) {
+                    float v = pos[c];
+                    s1[c] += v;
+                    s2[c] += v * v;
+                }
             }
-            float m = s1 * scale_n;
-            float var = s2 * scale_n - m * m;
-            mean[c]   = m;
-            invstd[c] = 1.0f / sqrtf(var + eps);
-            running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * m;
-            running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * var;
+
+            /* tree reduction: log2(nt) butterfly rounds */
+            for (int stride = 1; stride < nt; stride *= 2) {
+#ifdef _OPENMP
+                #pragma omp barrier
+#endif
+                if (tid % (2 * stride) == 0 && tid + stride < nt) {
+                    float *d1 = thr_sum  + tid * C_al;
+                    float *r1 = thr_sum  + (tid + stride) * C_al;
+                    float *d2 = thr_sum2 + tid * C_al;
+                    float *r2 = thr_sum2 + (tid + stride) * C_al;
+                    int64_t c = 0;
+                    for (; c < cv_end; c += TC) {
+                        ax_vf32_storeu(d1 + c, ax_vf32_add(
+                            ax_vf32_loadu(d1 + c), ax_vf32_loadu(r1 + c)));
+                        ax_vf32_storeu(d2 + c, ax_vf32_add(
+                            ax_vf32_loadu(d2 + c), ax_vf32_loadu(r2 + c)));
+                    }
+                    for (; c < C; c++) {
+                        d1[c] += r1[c];
+                        d2[c] += r2[c];
+                    }
+                }
+            }
+#ifdef _OPENMP
+            #pragma omp barrier
+#endif
+
+            /* single: mean, invstd, running stats, scale/shift */
+#ifdef _OPENMP
+            #pragma omp single
+#endif
+            {
+                for (int64_t c = 0; c < C; c++) {
+                    float m   = thr_sum[c] * scale_n;
+                    float var = thr_sum2[c] * scale_n - m * m;
+                    mean[c]   = m;
+                    invstd[c] = 1.0f / sqrtf(var + eps);
+                    running_mean[c] = (1.0f - momentum) * running_mean[c] + momentum * m;
+                    running_var[c]  = (1.0f - momentum) * running_var[c]  + momentum * var;
+                }
+                if (inv_std_save)
+                    memcpy(inv_std_save, invstd, (size_t)C * sizeof(float));
+                for (int64_t c = 0; c < C; c++) {
+                    scale_eff[c] = gd[c] * invstd[c];
+                    shift_eff[c] = bd[c] - scale_eff[c] * mean[c];
+                }
+            }
+
+            /* pass 3: normalize */
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int64_t i = 0; i < NHW; i++) {
+                const float *in_pos = id + i * C;
+                float *out_pos = od + i * C;
+                float *xh_pos = x_hat_save ? x_hat_save + i * C : NULL;
+                int64_t c = 0;
+                for (; c < cv_end; c += TC) {
+                    ax_vf32 vin = ax_vf32_loadu(in_pos + c);
+                    ax_vf32 vsc = ax_vf32_loadu(scale_eff + c);
+                    ax_vf32 vsh = ax_vf32_loadu(shift_eff + c);
+                    ax_vf32_storeu(out_pos + c, ax_vf32_fmadd(vsc, vin, vsh));
+                    if (xh_pos) {
+                        ax_vf32 vm = ax_vf32_loadu(mean + c);
+                        ax_vf32 vi = ax_vf32_loadu(invstd + c);
+                        ax_vf32_storeu(xh_pos + c,
+                            ax_vf32_mul(ax_vf32_sub(vin, vm), vi));
+                    }
+                }
+                for (; c < C; c++) {
+                    out_pos[c] = scale_eff[c] * in_pos[c] + shift_eff[c];
+                    if (xh_pos) xh_pos[c] = (in_pos[c] - mean[c]) * invstd[c];
+                }
+            }
         }
-        free(thr_sum); free(thr_sum2);
     } else {
         for (int64_t c = 0; c < C; c++) {
             mean[c]   = running_mean[c];
             invstd[c] = 1.0f / sqrtf(running_var[c] + eps);
         }
-    }
-
-    if (inv_std_save) memcpy(inv_std_save, invstd, (size_t)C * sizeof(float));
-
-    /* pre-compute fused (scale, shift) = (gamma*invstd, beta - gamma*invstd*mean).
-       lets the normalize loop be a single FMA per element. */
-    float *scale_eff = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
-    float *shift_eff = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
-    if (!scale_eff || !shift_eff) {
-        free(scale_eff); free(shift_eff); free(mean); free(invstd); return -1;
-    }
-    for (int64_t c = 0; c < C; c++) {
-        scale_eff[c] = gd[c] * invstd[c];
-        shift_eff[c] = bd[c] - scale_eff[c] * mean[c];
-    }
-
-    /* pass 3: normalize. SIMD across C per (n, h, w). */
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (int64_t i = 0; i < NHW; i++) {
-        const float *in_pos = id + i * C;
-        float *out_pos = od + i * C;
-        float *xh_pos = x_hat_save ? x_hat_save + i * C : NULL;
-        int64_t c = 0;
-        for (; c < cv_end; c += TC) {
-            ax_vf32 vin = ax_vf32_loadu(in_pos + c);
-            ax_vf32 vsc = ax_vf32_loadu(scale_eff + c);
-            ax_vf32 vsh = ax_vf32_loadu(shift_eff + c);
-            ax_vf32_storeu(out_pos + c, ax_vf32_fmadd(vsc, vin, vsh));
-            if (xh_pos) {
-                ax_vf32 vm = ax_vf32_loadu(mean + c);
-                ax_vf32 vi = ax_vf32_loadu(invstd + c);
-                ax_vf32_storeu(xh_pos + c, ax_vf32_mul(ax_vf32_sub(vin, vm), vi));
+        if (inv_std_save)
+            memcpy(inv_std_save, invstd, (size_t)C * sizeof(float));
+        float *scale_eff = buf + 2 * C_al;
+        float *shift_eff = buf + 3 * C_al;
+        for (int64_t c = 0; c < C; c++) {
+            scale_eff[c] = gd[c] * invstd[c];
+            shift_eff[c] = bd[c] - scale_eff[c] * mean[c];
+        }
+#ifdef _OPENMP
+        #pragma omp parallel for schedule(static) if(par_ok)
+#endif
+        for (int64_t i = 0; i < NHW; i++) {
+            const float *in_pos = id + i * C;
+            float *out_pos = od + i * C;
+            float *xh_pos = x_hat_save ? x_hat_save + i * C : NULL;
+            int64_t c = 0;
+            for (; c < cv_end; c += TC) {
+                ax_vf32 vin = ax_vf32_loadu(in_pos + c);
+                ax_vf32 vsc = ax_vf32_loadu(scale_eff + c);
+                ax_vf32 vsh = ax_vf32_loadu(shift_eff + c);
+                ax_vf32_storeu(out_pos + c, ax_vf32_fmadd(vsc, vin, vsh));
+                if (xh_pos) {
+                    ax_vf32 vm = ax_vf32_loadu(mean + c);
+                    ax_vf32 vi = ax_vf32_loadu(invstd + c);
+                    ax_vf32_storeu(xh_pos + c,
+                        ax_vf32_mul(ax_vf32_sub(vin, vm), vi));
+                }
+            }
+            for (; c < C; c++) {
+                out_pos[c] = scale_eff[c] * in_pos[c] + shift_eff[c];
+                if (xh_pos) xh_pos[c] = (in_pos[c] - mean[c]) * invstd[c];
             }
         }
-        for (; c < C; c++) {
-            out_pos[c] = scale_eff[c] * in_pos[c] + shift_eff[c];
-            if (xh_pos) xh_pos[c] = (in_pos[c] - mean[c]) * invstd[c];
-        }
     }
 
-    free(scale_eff); free(shift_eff); free(mean); free(invstd);
     return 0;
 }
 
@@ -177,106 +253,134 @@ static void bn_nhwc_backward_impl(
     int TC = AX_VF32_WIDTH;
     int64_t cv_end = C - (C % TC);
 
-    /* per-thread accumulators for sum_go and sum_go_xh per channel. */
+    /* tls scratch: [sum_go | sum_go_xh | thr_sgo | thr_sgx] */
 #ifdef _OPENMP
-    int n_threads = omp_get_max_threads();
+    int64_t data_bytes = NHW * C * (int64_t)sizeof(float);
+    int par_ok = (data_bytes >= ax_par_threshold_bw_bytes);
+    int n_threads = par_ok ? omp_get_max_threads() : 1;
 #else
     int n_threads = 1;
 #endif
-    size_t per_t = ((size_t)C + 15) & ~(size_t)15u;
-    float *thr_sgo = (float *)aligned_alloc(64, n_threads * per_t * sizeof(float));
-    float *thr_sgx = (float *)aligned_alloc(64, n_threads * per_t * sizeof(float));
-    if (!thr_sgo || !thr_sgx) { free(thr_sgo); free(thr_sgx); return; }
-    memset(thr_sgo, 0, n_threads * per_t * sizeof(float));
-    memset(thr_sgx, 0, n_threads * per_t * sizeof(float));
+    size_t C_al = ((size_t)C + 15) & ~(size_t)15;
+    float *buf = norm_scratch((2 + 2 * (size_t)n_threads) * C_al * sizeof(float));
+    if (!buf) return;
+    float *sum_go    = buf;
+    float *sum_go_xh = buf + C_al;
+    float *thr_sgo   = buf + 2 * C_al;
+    float *thr_sgx   = buf + (2 + (size_t)n_threads) * C_al;
+    memset(thr_sgo, 0, (size_t)n_threads * C_al * sizeof(float));
+    memset(thr_sgx, 0, (size_t)n_threads * C_al * sizeof(float));
 
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (int64_t i = 0; i < NHW; i++) {
+    float *coeff = thr_sgo;
+
+#ifdef _OPENMP
+    #pragma omp parallel if(par_ok)
+#endif
+    {
 #ifdef _OPENMP
         int tid = omp_get_thread_num();
+        int nt  = omp_get_num_threads();
 #else
         int tid = 0;
+        int nt  = 1;
 #endif
-        float *s1 = thr_sgo + tid * per_t;
-        float *s2 = thr_sgx + tid * per_t;
-        const float *gpos = go + i * C;
-        const float *xpos = xh + i * C;
-        int64_t c = 0;
-        for (; c < cv_end; c += TC) {
-            ax_vf32 g = ax_vf32_loadu(gpos + c);
-            ax_vf32 x = ax_vf32_loadu(xpos + c);
-            ax_vf32_storeu(s1 + c, ax_vf32_add(ax_vf32_loadu(s1 + c), g));
-            ax_vf32_storeu(s2 + c, ax_vf32_fmadd(g, x, ax_vf32_loadu(s2 + c)));
-        }
-        for (; c < C; c++) {
-            float g = gpos[c];
-            s1[c] += g;
-            s2[c] += g * xpos[c];
-        }
-    }
 
-    /* sum_go, sum_go_xh per channel; also write d_gamma, d_beta. */
-    float *sum_go    = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
-    float *sum_go_xh = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
-    if (!sum_go || !sum_go_xh) {
-        free(sum_go); free(sum_go_xh); free(thr_sgo); free(thr_sgx); return;
-    }
-    #ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-    #endif
-    for (int64_t c = 0; c < C; c++) {
-        float s1 = 0, s2 = 0;
-        for (int t = 0; t < n_threads; t++) {
-            s1 += thr_sgo[t * per_t + c];
-            s2 += thr_sgx[t * per_t + c];
-        }
-        sum_go[c]    = s1;
-        sum_go_xh[c] = s2;
-        if (dg) dg[c] += s2;
-        if (db) db[c] += s1;
-    }
-    free(thr_sgo); free(thr_sgx);
-
-    /* d_input. SIMD across C per (n, h, w):
-       dx[i, c] = (gd[c] * istd[c] / N) * (N*go[i,c] - sum_go[c] - xh[i,c]*sum_go_xh[c]) */
-    if (ig) {
-        /* pre-compute coeff[c] = gd[c] * istd[c] / N */
-        float *coeff = (float *)aligned_alloc(64, ((C + 15) & ~15u) * sizeof(float));
-        if (!coeff) { free(sum_go); free(sum_go_xh); return; }
-        for (int64_t c = 0; c < C; c++) coeff[c] = gd[c] * istd[c] / Nf;
-
-        ax_vf32 v_N = ax_vf32_set1(Nf);
-        #ifdef _OPENMP
-        #pragma omp parallel for schedule(static)
-        #endif
+        /* pass 1: accumulate per-thread sums */
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
         for (int64_t i = 0; i < NHW; i++) {
+            float *s1 = thr_sgo + tid * C_al;
+            float *s2 = thr_sgx + tid * C_al;
             const float *gpos = go + i * C;
             const float *xpos = xh + i * C;
-            float *ipos = ig + i * C;
             int64_t c = 0;
             for (; c < cv_end; c += TC) {
                 ax_vf32 g = ax_vf32_loadu(gpos + c);
                 ax_vf32 x = ax_vf32_loadu(xpos + c);
-                ax_vf32 vc = ax_vf32_loadu(coeff + c);
-                ax_vf32 vsg = ax_vf32_loadu(sum_go + c);
-                ax_vf32 vsx = ax_vf32_loadu(sum_go_xh + c);
-                /* dx = vc * (N*g - vsg - x*vsx) */
-                ax_vf32 t1 = ax_vf32_sub(ax_vf32_mul(v_N, g), vsg);
-                ax_vf32 t2 = ax_vf32_sub(t1, ax_vf32_mul(x, vsx));
-                ax_vf32 dx = ax_vf32_mul(vc, t2);
-                ax_vf32_storeu(ipos + c, ax_vf32_add(ax_vf32_loadu(ipos + c), dx));
+                ax_vf32_storeu(s1 + c, ax_vf32_add(ax_vf32_loadu(s1 + c), g));
+                ax_vf32_storeu(s2 + c, ax_vf32_fmadd(g, x, ax_vf32_loadu(s2 + c)));
             }
             for (; c < C; c++) {
-                float dx = coeff[c] * (Nf * gpos[c] - sum_go[c] - xpos[c] * sum_go_xh[c]);
-                ipos[c] += dx;
+                float g = gpos[c];
+                s1[c] += g;
+                s2[c] += g * xpos[c];
             }
         }
-        free(coeff);
-    }
 
-    free(sum_go); free(sum_go_xh);
+        /* tree reduction: log2(nt) butterfly rounds */
+        for (int stride = 1; stride < nt; stride *= 2) {
+#ifdef _OPENMP
+            #pragma omp barrier
+#endif
+            if (tid % (2 * stride) == 0 && tid + stride < nt) {
+                float *d1 = thr_sgo + tid * C_al;
+                float *r1 = thr_sgo + (tid + stride) * C_al;
+                float *d2 = thr_sgx + tid * C_al;
+                float *r2 = thr_sgx + (tid + stride) * C_al;
+                int64_t c = 0;
+                for (; c < cv_end; c += TC) {
+                    ax_vf32_storeu(d1 + c, ax_vf32_add(
+                        ax_vf32_loadu(d1 + c), ax_vf32_loadu(r1 + c)));
+                    ax_vf32_storeu(d2 + c, ax_vf32_add(
+                        ax_vf32_loadu(d2 + c), ax_vf32_loadu(r2 + c)));
+                }
+                for (; c < C; c++) {
+                    d1[c] += r1[c];
+                    d2[c] += r2[c];
+                }
+            }
+        }
+#ifdef _OPENMP
+        #pragma omp barrier
+#endif
+
+        /* single: finalize sums, dg/db, coeff */
+#ifdef _OPENMP
+        #pragma omp single
+#endif
+        {
+            for (int64_t c = 0; c < C; c++) {
+                sum_go[c]    = thr_sgo[c];
+                sum_go_xh[c] = thr_sgx[c];
+                if (dg) dg[c] += thr_sgx[c];
+                if (db) db[c] += thr_sgo[c];
+            }
+            if (ig) {
+                for (int64_t c = 0; c < C; c++)
+                    coeff[c] = gd[c] * istd[c] / Nf;
+            }
+        }
+
+        /* pass 2: d_input */
+        if (ig) {
+            ax_vf32 v_N = ax_vf32_set1(Nf);
+#ifdef _OPENMP
+            #pragma omp for schedule(static)
+#endif
+            for (int64_t i = 0; i < NHW; i++) {
+                const float *gpos = go + i * C;
+                const float *xpos = xh + i * C;
+                float *ipos = ig + i * C;
+                int64_t c = 0;
+                for (; c < cv_end; c += TC) {
+                    ax_vf32 g = ax_vf32_loadu(gpos + c);
+                    ax_vf32 x = ax_vf32_loadu(xpos + c);
+                    ax_vf32 vc = ax_vf32_loadu(coeff + c);
+                    ax_vf32 vsg = ax_vf32_loadu(sum_go + c);
+                    ax_vf32 vsx = ax_vf32_loadu(sum_go_xh + c);
+                    ax_vf32 t1 = ax_vf32_sub(ax_vf32_mul(v_N, g), vsg);
+                    ax_vf32 t2 = ax_vf32_sub(t1, ax_vf32_mul(x, vsx));
+                    ax_vf32 dx = ax_vf32_mul(vc, t2);
+                    ax_vf32_storeu(ipos + c, ax_vf32_add(ax_vf32_loadu(ipos + c), dx));
+                }
+                for (; c < C; c++) {
+                    float dx = coeff[c] * (Nf * gpos[c] - sum_go[c] - xpos[c] * sum_go_xh[c]);
+                    ipos[c] += dx;
+                }
+            }
+        }
+    }
 }
 
 static void batchnorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
@@ -552,42 +656,38 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
         float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
-        /* scratch: mean[F], invstd[F], scale[F], bias_out[F] */
-        size_t chan_scratch = 4 * (size_t)feat * sizeof(float);
-        float *chan_buf = (float *)aligned_alloc(64, (chan_scratch + 63u) & ~(size_t)63u);
+        /* tls scratch: [mean | invstd | scale | biasout | redbuf(training)] */
+#ifdef _OPENMP
+        int64_t data_bytes_2d = batch * feat * (int64_t)sizeof(float);
+        int par_ok_2d = (data_bytes_2d >= ax_par_threshold_bw_bytes);
+        int n_threads = (self->training && par_ok_2d) ? omp_get_max_threads() : 1;
+#else
+        int n_threads = 1;
+#endif
+        size_t feat_al = (size_t)feat;
+        size_t total_2d = (4 + (self->training ? 2 * (size_t)n_threads : 0)) * feat_al * sizeof(float);
+        float *chan_buf = norm_scratch(total_2d);
         if (!chan_buf) {
             ax_tensor_destroy(out);
             if (inp != input) ax_tensor_destroy(inp);
             return NULL;
         }
-        float *mean_arr   = chan_buf;
-        float *invstd_arr = chan_buf + feat;
-        float *scale_arr  = chan_buf + 2 * feat;
+        float *mean_arr    = chan_buf;
+        float *invstd_arr  = chan_buf + feat;
+        float *scale_arr   = chan_buf + 2 * feat;
         float *biasout_arr = chan_buf + 3 * feat;
 
         if (self->training) {
-            /* per-thread sum + sum^2 arrays for reduction across rows. */
-#ifdef _OPENMP
-            int n_threads = omp_get_max_threads();
-#else
-            int n_threads = 1;
-#endif
-            size_t per_thread = (size_t)feat;
+            size_t per_thread = feat_al;
             size_t total = 2u * (size_t)n_threads * per_thread * sizeof(float);
-            float *redbuf = (float *)aligned_alloc(64, (total + 63u) & ~(size_t)63u);
-            if (!redbuf) {
-                free(chan_buf);
-                ax_tensor_destroy(out);
-                if (inp != input) ax_tensor_destroy(inp);
-                return NULL;
-            }
+            float *redbuf = chan_buf + 4 * feat;
             memset(redbuf, 0, total);
             float *sum_all  = redbuf;
             float *sum2_all = redbuf + (size_t)n_threads * per_thread;
 
             /* pass 1: per-thread row-major accumulation. */
 #ifdef _OPENMP
-            #pragma omp parallel
+            #pragma omp parallel if(par_ok_2d)
 #endif
             {
 #ifdef _OPENMP
@@ -666,7 +766,6 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
                 rm[c] = one_minus_mom * rm[c] + mom * mean;
                 rv[c] = one_minus_mom * rv[c] + mom * unbiased;
             }
-            free(redbuf);
         } else {
             /* eval: derive scale/bias from running stats. */
             float eps = bn->eps;
@@ -707,7 +806,6 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
             }
         }
 
-        free(chan_buf);
     }
     else
     {
@@ -729,8 +827,17 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         float *xh_d = record ? (float *)x_hat_save->storage->data : NULL;
         float *is_d = record ? (float *)inv_std_save->storage->data : NULL;
 
-        size_t chan_scratch = 4 * (size_t)feat * sizeof(float);
-        float *chan_buf = (float *)aligned_alloc(64, (chan_scratch + 63u) & ~(size_t)63u);
+        /* tls scratch: [mean | invstd | scale | biasout | redbuf(training)] */
+#ifdef _OPENMP
+        int64_t data_bytes_4d = batch * feat * spatial * (int64_t)sizeof(float);
+        int par_ok_4d = (data_bytes_4d >= ax_par_threshold_bw_bytes);
+        int n_threads = (self->training && par_ok_4d) ? omp_get_max_threads() : 1;
+#else
+        int n_threads = 1;
+#endif
+        size_t feat_al = (size_t)feat;
+        size_t total_4d = (4 + (self->training ? 2 * (size_t)n_threads : 0)) * feat_al * sizeof(float);
+        float *chan_buf = norm_scratch(total_4d);
         if (!chan_buf) {
             ax_tensor_destroy(out);
             if (inp != input) ax_tensor_destroy(inp);
@@ -742,20 +849,9 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
         float *biasout_arr = chan_buf + 3 * feat;
 
         if (self->training) {
-#ifdef _OPENMP
-            int n_threads = omp_get_max_threads();
-#else
-            int n_threads = 1;
-#endif
-            size_t per_thread = (size_t)feat;
+            size_t per_thread = feat_al;
             size_t total = 2u * (size_t)n_threads * per_thread * sizeof(float);
-            float *redbuf = (float *)aligned_alloc(64, (total + 63u) & ~(size_t)63u);
-            if (!redbuf) {
-                free(chan_buf);
-                ax_tensor_destroy(out);
-                if (inp != input) ax_tensor_destroy(inp);
-                return NULL;
-            }
+            float *redbuf = chan_buf + 4 * feat;
             memset(redbuf, 0, total);
             float *sum_all  = redbuf;
             float *sum2_all = redbuf + (size_t)n_threads * per_thread;
@@ -766,7 +862,7 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
                local sum_l[c] / sum2_l[c]. spatial is HW which is almost
                always a multiple of AX_VF32_WIDTH (e.g. 196, 784, 3136). */
 #ifdef _OPENMP
-            #pragma omp parallel
+            #pragma omp parallel if(par_ok_4d)
 #endif
             {
 #ifdef _OPENMP
@@ -850,7 +946,6 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
                 rm[c] = one_minus_mom * rm[c] + mom * mean;
                 rv[c] = one_minus_mom * rv[c] + mom * unbiased;
             }
-            free(redbuf);
         } else {
             /* eval path: fold running stats into scale/biasout. */
             float eps = bn->eps;
@@ -892,7 +987,6 @@ static ax_tensor_t *batchnorm_forward(ax_layer_t *self, ax_tensor_t *input)
             }
         }
 
-        free(chan_buf);
     }
 
     /* hook up backward */
@@ -1029,8 +1123,8 @@ static void layernorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         int n_threads = 1;
 #endif
         size_t per_thread = (size_t)feat;
-        float *redbuf = (float *)aligned_alloc(64,
-            (2u * (size_t)n_threads * per_thread * sizeof(float) + 63u) & ~(size_t)63u);
+        float *redbuf = norm_scratch(
+            2u * (size_t)n_threads * per_thread * sizeof(float));
         if (redbuf) {
             memset(redbuf, 0, 2u * (size_t)n_threads * per_thread * sizeof(float));
             float *sg_all  = redbuf;
@@ -1092,7 +1186,6 @@ static void layernorm_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 if (dg) dg[f] += sgx_all[f];
                 if (db) db[f] += sg_all[f];
             }
-            free(redbuf);
         } else {
             /* fallback: scalar strided (allocation failed) */
             for (int64_t f = 0; f < feat; f++) {
@@ -1245,7 +1338,8 @@ static ax_tensor_t *layernorm_forward(ax_layer_t *self, ax_tensor_t *input)
        E[x^2] - E[x]^2 is numerically adequate for LN's typical working
        range (activations after embedding / attention, magnitudes < 10). */
     #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic, 1)
+    int64_t ln_bytes = batch * feat * (int64_t)sizeof(float);
+    #pragma omp parallel for schedule(dynamic, 1) if(ln_bytes >= ax_par_threshold_bw_bytes)
     #endif
     for (int64_t b = 0; b < batch; b++)
     {

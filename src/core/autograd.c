@@ -29,7 +29,7 @@ ax_arena_t *ax_backward_arena(void)
     if (ax_get_default_device() != AX_DEVICE_CPU)
         return NULL;
     if (!backward_arena)
-        backward_arena = ax_arena_create(16 * 1024 * 1024); /* 16 MB — deep_mlp backward temps can exceed 1 MB per tensor */
+        backward_arena = ax_arena_create(0);
     return backward_arena;
 }
 
@@ -44,7 +44,7 @@ ax_arena_t *ax_forward_arena(void)
     if (ax_get_default_device() != AX_DEVICE_CPU)
         return NULL;
     if (!forward_arena)
-        forward_arena = ax_arena_create(16 * 1024 * 1024); /* 16 MB — matches backward */
+        forward_arena = ax_arena_create(0);
     return forward_arena;
 }
 

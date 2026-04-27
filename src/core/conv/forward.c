@@ -69,6 +69,7 @@
 #define conv2d_nhwc_forward_impl      ax_conv_nhwc_forward_impl
 #define conv2d_nhwc_backward_impl     ax_conv_nhwc_backward_impl
 #define conv2d_winograd_f23_forward   ax_conv_winograd_f23_forward
+#define conv2d_winograd_f43_forward  ax_conv_winograd_f43_forward
 #define wino_input_transform_tile     ax_conv_wino_input_transform_tile
 #define wino_kernel_transform_filter  ax_conv_wino_kernel_transform_filter
 #define wino_output_transform_tile    ax_conv_wino_output_transform_tile
@@ -76,6 +77,7 @@
 #define can_direct_3x3_s2             ax_conv_can_direct_3x3_s2
 #define can_direct_smallcin           ax_conv_can_direct_smallcin
 #define prefer_winograd_f23           ax_conv_prefer_winograd_f23
+#define prefer_winograd_f43          ax_conv_prefer_winograd_f43
 #define prefer_implicit_gemm          ax_conv_prefer_implicit_gemm
 
 void scratch_destroy(struct ax_conv_scratch *s)
@@ -103,6 +105,9 @@ void scratch_destroy(struct ax_conv_scratch *s)
     if (s->wino_U) ax_tensor_destroy(s->wino_U);
     if (s->wino_V) ax_tensor_destroy(s->wino_V);
     if (s->wino_M) ax_tensor_destroy(s->wino_M);
+    if (s->wino43_U) ax_tensor_destroy(s->wino43_U);
+    if (s->wino43_V) ax_tensor_destroy(s->wino43_V);
+    if (s->wino43_M) ax_tensor_destroy(s->wino43_M);
     if (s->wt_nhwc) ax_tensor_destroy(s->wt_nhwc);
     if (s->im2col_nhwc) ax_tensor_destroy(s->im2col_nhwc);
     free(s);
@@ -125,16 +130,20 @@ static ax_tensor_t **alloc_buf_array(int T, const int64_t *shape, int ndim)
 }
 
 /* construct a zero-overhead 2-D stack tensor view over an existing float buffer.
-   storage and tensor must be caller-allocated locals; no heap touched. */
+   storage and tensor must be caller-allocated locals; no heap touched.
+   each view gets a globally unique generation so the gemm pack_b cache
+   (keyed on bptr + generation) correctly invalidates when the same
+   buffer is reused with different contents (batched conv chunks, etc). */
 void make_stack_view(ax_tensor_t *tv, ax_storage_t *st,
                                    float *data, int64_t rows, int64_t cols)
 {
+    static _Atomic uint64_t g_stack_gen = 1;
     st->data         = data;
     st->size_bytes   = (size_t)(rows * cols) * sizeof(float);
     atomic_store(&st->refcount, 0);
     st->device       = AX_DEVICE_CPU;
     st->is_arena_temp = true;
-    st->generation   = 1;
+    st->generation   = atomic_fetch_add_explicit(&g_stack_gen, 1, memory_order_relaxed);
     memset(tv, 0, sizeof(*tv));
     tv->storage      = st;
     tv->ndim         = 2;
@@ -202,6 +211,7 @@ struct ax_conv_scratch *ensure_scratch(ax_conv2d_t *conv,
     s = (struct ax_conv_scratch *)calloc(1, sizeof(struct ax_conv_scratch));
     if (!s) return NULL;
     s->N = N; s->H = H; s->W = W; s->T = T;
+    s->calibrated_path = AX_CONV_PATH_AUTO;
 
     int64_t col_shape[] = {K, M};
     int64_t res_shape[] = {C_out, M};
@@ -280,6 +290,19 @@ struct ax_conv_scratch *ensure_scratch(ax_conv2d_t *conv,
         s->wino_U = ax_tensor_create(U_shape, 3, AX_FLOAT32);
         s->wino_V = ax_tensor_create(V_shape, 3, AX_FLOAT32);
         s->wino_M = ax_tensor_create(M_shape, 3, AX_FLOAT32);
+    }
+
+    if (ax_conv_prefer_winograd_f43(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)) {
+        const int64_t Ty = (out_h + 3) / 4;
+        const int64_t Tx = (out_w + 3) / 4;
+        const int64_t num_tiles = N * Ty * Tx;
+        s->wino43_num_tiles = num_tiles;
+        int64_t U43_shape[] = {36, C_out, C_in};
+        int64_t V43_shape[] = {36, C_in,  num_tiles};
+        int64_t M43_shape[] = {36, C_out, num_tiles};
+        s->wino43_U = ax_tensor_create(U43_shape, 3, AX_FLOAT32);
+        s->wino43_V = ax_tensor_create(V43_shape, 3, AX_FLOAT32);
+        s->wino43_M = ax_tensor_create(M43_shape, 3, AX_FLOAT32);
     }
 
     conv->scratch = s;
@@ -622,37 +645,70 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     const float *bias_data = (conv->use_bias && conv->bias)
         ? (const float *)conv->bias->storage->data : NULL;
 
-    /* shape-aware path selection. winograd F(2,3) wins on 3x3 stride=1 pad=1
-       with mid-large Cin/Cout (16 muls per 2x2 output tile vs 36 for direct).
-       direct 3x3 wins for small kernels (mnist: both convs hit this).
-       small-C_in direct beats im2col+gemm on the first layer of image nets
-       (C_in=3, K=27 too small for GEMM). implicit gemm wins for large K +
-       large M. otherwise fall back to explicit im2col + gemm. */
-    bool use_winograd = prefer_winograd_f23(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)
+    /* static path cascade — determines the highest-priority eligible path.
+       the autotuner may override this with a calibrated winner. */
+    bool use_winograd_f43 = prefer_winograd_f43(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)
+                            && s->wino43_U && s->wino43_V && s->wino43_M;
+    bool use_winograd = !use_winograd_f43
+                        && prefer_winograd_f23(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)
                         && s->wino_U && s->wino_V && s->wino_M;
-    bool use_direct = !use_winograd && can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
-    /* batch D ATTEMPT (disabled): direct 3x3 stride=2 pad=1 kernel exists
-       below as conv2d_direct_3x3_s2_sample but the (ci, ky, kx) outer loop
-       order touches the full output buffer Cin*9 times, causing cache
-       thrashing on shapes with Cin >= ~32. measured 55 GFLOPS vs 310 for
-       implicit-gemm on conv_64x112_128_s2. needs (oh, ow_blk) outer +
-       register-accumulator rewrite to be competitive — deferred. */
+    bool use_direct = !use_winograd_f43 && !use_winograd && can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
     bool use_direct_s2 = false;
     (void)can_direct_3x3_s2;
-    bool use_smallcin = !use_winograd && !use_direct && !use_direct_s2 && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
-    bool use_implicit = !use_winograd && !use_direct && !use_direct_s2 && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
-    /* 1×1 stride=1 pad=0 routes to per-sample (zero-copy stack tensor),
-       not batched (which pays an im2col-as-transpose cost for no GEMM gain). */
+    bool use_smallcin = !use_winograd_f43 && !use_winograd && !use_direct && !use_direct_s2 && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
+    bool use_implicit = !use_winograd_f43 && !use_winograd && !use_direct && !use_direct_s2 && !use_smallcin && ax_compute_has_conv_gemm() && prefer_implicit_gemm(K, M);
     bool is_1x1_fast = is_1x1_pad0_stride1(kh, kw, sh, sw, ph, pw) && (H == out_h) && (W == out_w);
-    bool use_batched = !use_winograd && !use_direct && !use_direct_s2 && !use_smallcin && !use_implicit && !is_1x1_fast
+    bool use_batched = !use_winograd_f43 && !use_winograd && !use_direct && !use_direct_s2 && !use_smallcin && !use_implicit && !is_1x1_fast
                        && N > 1 && M < AX_CONV_BATCH_M_THRESH
                        && s->batch_col_buf && s->batch_aux_buf;
 
-    if (use_winograd) {
+    /* autotuner: on first forward for this shape, trial eligible paths
+       and cache the winner. the selected output is written directly
+       into od, so we skip the dispatch below. */
+    bool output_filled = false;
+    if (s->calibrated_path == AX_CONV_PATH_AUTO) {
+        ax_conv_path_t sp = use_winograd_f43 ? AX_CONV_PATH_WINOGRAD_F43 :
+                            use_winograd  ? AX_CONV_PATH_WINOGRAD :
+                            use_direct    ? AX_CONV_PATH_DIRECT_3X3 :
+                            use_smallcin  ? AX_CONV_PATH_SMALLCIN :
+                            use_implicit  ? AX_CONV_PATH_IMPLICIT :
+                            is_1x1_fast   ? AX_CONV_PATH_1X1_FAST :
+                            use_batched   ? AX_CONV_PATH_BATCHED :
+                                            AX_CONV_PATH_IM2COL;
+
+        s->calibrated_path = ax_conv_autotune_select(
+            s, ind, wd, bias_data, od,
+            N, C_in, H, W, C_out, out_h, out_w,
+            kh, kw, sh, sw, ph, pw, T, sp);
+        output_filled = true;
+    }
+
+    if (!output_filled) {
+        /* apply calibrated path override */
+        use_winograd_f43 = (s->calibrated_path == AX_CONV_PATH_WINOGRAD_F43);
+        use_winograd = (s->calibrated_path == AX_CONV_PATH_WINOGRAD);
+        use_direct   = (s->calibrated_path == AX_CONV_PATH_DIRECT_3X3);
+        use_smallcin = (s->calibrated_path == AX_CONV_PATH_SMALLCIN);
+        use_implicit = (s->calibrated_path == AX_CONV_PATH_IMPLICIT);
+        is_1x1_fast  = (s->calibrated_path == AX_CONV_PATH_1X1_FAST);
+        use_batched  = (s->calibrated_path == AX_CONV_PATH_BATCHED)
+                       && s->batch_col_buf && s->batch_aux_buf;
+    }
+
+    if (!output_filled && use_winograd_f43) {
+        int rc = conv2d_winograd_f43_forward(s, ind, wd, bias_data, od,
+                                              N, C_in, H, W, C_out, out_h, out_w, T);
+        if (rc != 0) {
+            use_winograd_f43 = false;
+            use_winograd = prefer_winograd_f23(kh, kw, sh, sw, ph, pw, N, C_in, C_out, out_h, out_w)
+                           && s->wino_U && s->wino_V && s->wino_M;
+        }
+    }
+
+    if (!output_filled && use_winograd) {
         int rc = conv2d_winograd_f23_forward(s, ind, wd, bias_data, od,
                                               N, C_in, H, W, C_out, out_h, out_w, T);
         if (rc != 0) {
-            /* shape mismatch (e.g. resized between forward calls) — fall back */
             use_winograd = false;
             use_direct = can_direct_3x3(kh, kw, sh, sw, ph, pw, C_in);
             use_smallcin = !use_direct && can_direct_smallcin(kh, kw, sh, sw, C_in, out_w);
@@ -663,9 +719,8 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         }
     }
 
-    if (use_winograd) {
-        /* output already filled by conv2d_winograd_f23_forward; skip the
-           im2col+gemm + scatter paths below. */
+    if (output_filled || use_winograd_f43 || use_winograd) {
+        /* output already filled by autotuner trial or winograd; skip below. */
     } else if (use_batched) {
         /* sub-batched: loop over n_batch-sample chunks, each fitting ≤8 MB.
            im2col → wide GEMM → scatter-with-bias per chunk.
@@ -714,6 +769,85 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
                 }
             }
         }
+    } else if (N > 1 && N < AX_OMP_MAX_THREADS()
+               && !use_direct && !use_direct_s2 && !use_smallcin && !use_implicit) {
+
+    /* N > 1 but N < max_threads: inner_team mode. full thread team
+       cooperates on each sample's im2col + GEMM + bias via worksharing,
+       instead of N threads each running single-threaded GEMMs. */
+    ax_tensor_t *col = s->col_bufs[0];
+    ax_tensor_t *res = s->res_bufs[0];
+    float *rd = (float *)res->storage->data;
+
+    #ifdef _OPENMP
+    #pragma omp parallel
+    {
+        ax_gemm_set_inner_team(true);
+
+        for (int64_t n = 0; n < N; n++)
+        {
+            if (is_1x1_fast) {
+                ax_storage_t in_st;
+                ax_tensor_t  in_tv;
+                make_stack_view(&in_tv, &in_st, ind + n * C_in * H * W, C_in, M);
+                ax_compute_gemm(w2d, &in_tv, res);
+            } else {
+                float *cd = (float *)col->storage->data;
+                im2col_into(ind + n * C_in * H * W, C_in, H, W,
+                             kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
+                #pragma omp single
+                ax_storage_touch(col->storage);
+                ax_compute_gemm(w2d, col, res);
+            }
+
+            #pragma omp for schedule(static)
+            for (int64_t co = 0; co < C_out; co++)
+            {
+                float bias_val = bias_data ? bias_data[co] : 0.0f;
+                float *dst = od + (n * C_out + co) * M;
+                const float *src = rd + co * M;
+                ax_vf32 vb = ax_vf32_set1(bias_val);
+                int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
+                for (; m < ve; m += AX_VF32_WIDTH)
+                    ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), vb));
+                for (; m < M; m++)
+                    dst[m] = src[m] + bias_val;
+            }
+        }
+
+        ax_gemm_set_inner_team(false);
+    }
+    #else
+    /* non-OMP fallback */
+    for (int64_t n = 0; n < N; n++)
+    {
+        if (is_1x1_fast) {
+            ax_storage_t in_st;
+            ax_tensor_t  in_tv;
+            make_stack_view(&in_tv, &in_st, ind + n * C_in * H * W, C_in, M);
+            ax_compute_gemm(w2d, &in_tv, res);
+        } else {
+            float *cd = (float *)col->storage->data;
+            im2col_into(ind + n * C_in * H * W, C_in, H, W,
+                         kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
+            ax_storage_touch(col->storage);
+            ax_compute_gemm(w2d, col, res);
+        }
+        for (int64_t co = 0; co < C_out; co++)
+        {
+            float bias_val = bias_data ? bias_data[co] : 0.0f;
+            float *dst = od + (n * C_out + co) * M;
+            const float *src = rd + co * M;
+            ax_vf32 vb = ax_vf32_set1(bias_val);
+            int64_t m = 0, ve = M - (M % AX_VF32_WIDTH);
+            for (; m < ve; m += AX_VF32_WIDTH)
+                ax_vf32_storeu(dst + m, ax_vf32_add(ax_vf32_loadu(src + m), vb));
+            for (; m < M; m++)
+                dst[m] = src[m] + bias_val;
+        }
+    }
+    #endif
+
     } else {
     /* num_threads(T) caps the team to the number of per-thread scratch slots
        so workers never share col_bufs/res_bufs[0] with the tid>=T fallback. */
@@ -723,23 +857,18 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
     for (int64_t n = 0; n < N; n++)
     {
         if (use_direct) {
-            /* writes directly into output[n], bias folded in. no scratch needed. */
             conv2d_direct_3x3_sample(
                 ind + n * C_in * H * W, wd, bias_data,
                 od + n * C_out * M, C_in, C_out, H, W);
             continue;
         }
         if (use_direct_s2) {
-            /* batch D: 3x3 stride=2 pad=1 direct kernel — bypasses im2col */
             conv2d_direct_3x3_s2_sample(
                 ind + n * C_in * H * W, wd, bias_data,
                 od + n * C_out * M, C_in, C_out, H, W, out_h, out_w);
             continue;
         }
         if (use_smallcin) {
-            /* first-layer-style conv (C_in ≤ 4): direct loop with
-               register accumulator beats im2col+gemm because K_gemm = C_in*kh*kw
-               is too small to amortize pack overhead. bias folded in. */
             conv2d_direct_smallcin_sample(
                 ind + n * C_in * H * W, wd, bias_data,
                 od + n * C_out * M,
@@ -749,15 +878,12 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
         }
 
         int tid = AX_OMP_THREAD_NUM();
-        if (tid >= T) tid = 0; /* defensive */
+        if (tid >= T) tid = 0;
         ax_tensor_t *col = s->col_bufs[tid];
         ax_tensor_t *res = s->res_bufs[tid];
         float *rd = (float *)res->storage->data;
 
         if (use_implicit) {
-            /* gather im2col patches on-the-fly inside packed b buffers.
-               wins on large convs (C_in >= 64 with 3x3+) where the explicit
-               im2col copy dominates over the gather overhead. */
             ax_conv_params_t cp = {
                 .input = ind + n * C_in * H * W,
                 .C_in = C_in, .H = H, .W = W,
@@ -768,25 +894,18 @@ static ax_tensor_t *conv2d_forward(ax_layer_t *self, ax_tensor_t *input)
             };
             ax_compute_conv_gemm(w2d, &cp, res);
         } else if (is_1x1_fast) {
-            /* 1×1 stride=1 pad=0: im2col is the identity layout. zero-copy
-               stack view over the input slice [C_in, M] saves a C_in*H*W
-               memcpy per sample (400 kb+ on vgg shapes). opt_gemm zero-fills
-               C internally; no explicit memset needed. */
             ax_storage_t in_st;
             ax_tensor_t  in_tv;
             make_stack_view(&in_tv, &in_st, ind + n * C_in * H * W, C_in, M);
             ax_compute_gemm(w2d, &in_tv, res);
         } else {
             float *cd = (float *)col->storage->data;
-            /* explicit im2col + dispatch gemm. fastest for medium K. */
             im2col_into(ind + n * C_in * H * W, C_in, H, W,
                          kh, kw, sh, sw, ph, pw, out_h, out_w, cd);
-            /* opt_gemm zero-fills C internally; skip our memset. */
+            ax_storage_touch(col->storage);
             ax_compute_gemm(w2d, col, res);
         }
 
-        /* copy to output with bias — disjoint output region per n.
-           SIMD broadcast-add of bias along the M=out_h*out_w axis. */
         for (int64_t co = 0; co < C_out; co++)
         {
             float bias_val = bias_data ? bias_data[co] : 0.0f;

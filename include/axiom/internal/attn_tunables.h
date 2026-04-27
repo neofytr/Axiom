@@ -82,7 +82,7 @@ int64_t ax_attn_tunable_f3c_d_threshold(void);
 
 /* save_p memory budget: enable forward P-save when
    bh * S * S * sizeof(float) <= this. the saved scores let bwd skip
-   QK^T recompute. tuned to half-L3 typical. */
+   QK^T recompute. default = 0.4 * LLC when detected, else 8 MB. */
 int64_t ax_attn_tunable_save_p_max_bytes(void);
 
 /* save_p small-shape exclusion: skip save_p when (S * dk) <= this AND
@@ -132,6 +132,10 @@ double  ax_attn_tunable_gemm_tile_switch_margin(void);
    from A would blow L1d, so packed remains the default. zero disables
    the unpacked path entirely. calibrated per host. */
 int64_t ax_attn_tunable_gemm_unpacked_a_max_k(void);
+
+/* detected LLC (L3) size in bytes. 0 when detection failed. used by
+   the save_p default and exposed for logging / debugging. */
+int64_t ax_attn_tunable_llc_bytes(void);
 
 /* override / debug: AX_ATTN_TUNABLES_LOG=1 prints chosen values to
    stderr at calibration time. AX_NO_ATTN_CALIB=1 forces fallback to
