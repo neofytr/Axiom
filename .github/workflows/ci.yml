@@ -1,9 +1,5 @@
 name: CI
 
-# correctness — runs on every push + PR. fast (~5 min) so it doesn't
-# block iteration. perf vs TensorFlow lives in bench.yml (opt-in via
-# `run-benchmarks` PR label, plus nightly cron).
-
 on:
   push:
     branches: [main]
@@ -15,22 +11,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ====================================================================
-  # full ctest across every (host, ISA) combination that has its own
-  # code path. one matrix entry per surface that needs independent
-  # coverage:
-  #   x86-avx2:    ubuntu-latest with ISA dispatch — auto-picks AVX-512
-  #                if the runner CPU supports it, else AVX2; full SIMD
-  #                + JIT path
-  #   x86-scalar:  ubuntu-latest with -mno-* + AX_OPENMP=OFF — exercises
-  #                the generic scalar fallback paths (catches accidental
-  #                requirements on AVX/NEON without a scalar fallback)
-  #   arm64-neon:  ubuntu-24.04-arm — NEON intrinsics + 8x12 JIT kernel
-  #   arm64-nojit: same hardware with AX_NO_JIT — regression guard for
-  #                the AAPCS64 callee-save bug fixed in 70cdc04 (kernel
-  #                clobbered v8..v15 without saving them, only the JIT
-  #                path was affected)
-  # ====================================================================
   test:
     name: test (${{ matrix.isa }})
     runs-on: ${{ matrix.host }}
@@ -58,17 +38,30 @@ jobs:
             cflags: "-DAX_NO_JIT"
             cmake-extra: ""
             apt: "build-essential cmake libomp-dev"
+          - isa: macos-arm64
+            host: macos-14
+            cflags: ""
+            cmake-extra: ""
+            apt: ""
     steps:
       - uses: actions/checkout@v4
 
       - name: install apt deps
-        if: matrix.apt != ''
+        if: matrix.apt != '' && !startsWith(matrix.host, 'macos')
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ${{ matrix.apt }}
+
+      - name: install brew deps (macos)
+        if: startsWith(matrix.host, 'macos')
+        run: brew install libomp
 
       - name: hardware
         run: |
-          lscpu | head -15
-          free -h
+          if command -v lscpu &>/dev/null; then
+            lscpu | head -15
+          else
+            sysctl -n machdep.cpu.brand_string
+            sysctl -n hw.ncpu
+          fi
 
       - name: build
         run: |
@@ -76,17 +69,14 @@ jobs:
           cmake -DCMAKE_BUILD_TYPE=Release \
                 -DCMAKE_C_FLAGS="${{ matrix.cflags }}" \
                 ${{ matrix.cmake-extra }} ..
-          cmake --build . -j$(nproc)
+          cmake --build . -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
       - name: ctest
-        run: cd build && ctest -j$(nproc) --output-on-failure --timeout 300
+        run: |
+          cd build
+          ctest -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) \
+                --output-on-failure --timeout 300
 
-  # ====================================================================
-  # ASan + UBSan, debug build, ctest under strict halt-on-error.
-  # gates merges; previous workflow ran sanitizers with `|| true` so
-  # findings were ignored. detect_leaks=0 because tests intentionally
-  # leave intermediate autograd tensors for ax_graph_cleanup.
-  # ====================================================================
   sanitize:
     name: sanitize (asan+ubsan)
     runs-on: ubuntu-latest
@@ -104,13 +94,6 @@ jobs:
           UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
             ctest -j$(nproc) --output-on-failure --timeout 600
 
-  # ====================================================================
-  # AX_PROFILE=embedded-baremetal builds the static archive sized for
-  # cortex-m-class targets (24x32x64 GEMM tiles, no OMP, no stdio,
-  # no autotune). compile-only — no execution environment for cortex-m
-  # in CI. post-build: scan libaxiom.a for stdio symbols; any leak
-  # would force the toolchain to link ~20 kB stdio into the firmware.
-  # ====================================================================
   embedded:
     name: embedded baremetal
     runs-on: ubuntu-latest
@@ -130,22 +113,45 @@ jobs:
           fi
           echo "ok: no stdio symbols in embedded build"
 
-  # ====================================================================
-  # valgrind memcheck on a curated subset of tests. catches leaks and
-  # invalid-memory bugs that ASan can miss (e.g. uninitialised reads
-  # from heap blocks that ASan only spots on free). built with
-  # AX_OPENMP=OFF + AX_NO_AUTOTUNE=1 to keep the (~30x slowdown of
-  # memcheck) under the 600 s/test budget.
-  #
-  # subset rationale — tests are picked to exercise allocator + jit
-  # encoder + error-handling paths in a few seconds each. compute-
-  # heavy tests (test_compute, test_attention, test_grad_verify,
-  # test_optim, test_lr_sched) blow the budget, or report 'possibly
-  # lost' noise from process-lifetime per-thread pack buffers in
-  # cpu_opt.c (ensure_tl_pack_bufs) that would force suppressing
-  # axiom's own allocations — masking real future leaks. asan + the
-  # main test job already cover those code paths.
-  # ====================================================================
+  perf-smoke:
+    name: perf smoke (quick regression check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_BUILD_TYPE=Release -DAX_CPU_ISA_DISPATCH=ON ..
+          cmake --build . -j$(nproc)
+      - name: run bench_comprehensive (subset)
+        run: |
+          cd build
+          AX_GEMM_CALIBRATE=0 timeout 120 ./bench_comprehensive 2>&1 | tee /tmp/bench.txt
+      - name: check no catastrophic regression
+        run: |
+          python3 -c "
+          import sys
+          lines = open('/tmp/bench.txt').readlines()
+          fails = []
+          for line in lines:
+              parts = line.split()
+              if len(parts) < 7: continue
+              try:
+                  tp = float(parts[-2])
+                  unit = parts[-1]
+              except (ValueError, IndexError):
+                  continue
+              bench = parts[0]
+              shape = parts[1] if len(parts) > 1 else ''
+              if unit == 'GFLOPS' and tp < 1.0 and 'tiny' not in shape and 'cls' not in shape:
+                  fails.append(f'{bench} {shape}: {tp} GFLOPS (suspiciously low)')
+          if fails:
+              print('PERF SMOKE FAILURES:')
+              for f in fails: print(f'  {f}')
+              sys.exit(1)
+          print(f'ok: checked {len(lines)} lines, no catastrophic regressions')
+          "
+
   valgrind:
     name: valgrind (memcheck)
     runs-on: ubuntu-latest
@@ -157,15 +163,11 @@ jobs:
         run: |
           mkdir build && cd build
           cmake -DCMAKE_BUILD_TYPE=RelWithDebInfo -DAX_OPENMP=OFF ..
-          # only build the binaries we'll actually run under valgrind
           cmake --build . -j$(nproc) --target \
             test_memory test_error test_jit_arm64_bytes
       - name: memcheck
         run: |
           cd build
-          # AX_NO_AUTOTUNE=1 + OMP_NUM_THREADS=1 keep startup probes
-          # off so each binary fits comfortably under the 600 s budget
-          # (locally these run in ~0.3 s each under valgrind).
           export AX_NO_AUTOTUNE=1
           export OMP_NUM_THREADS=1
           for t in test_memory test_error test_jit_arm64_bytes; do
@@ -179,11 +181,6 @@ jobs:
             echo "::endgroup::"
           done
 
-  # ====================================================================
-  # cppcheck warnings + the portability scan (catches x86-only
-  # intrinsics outside __x86_64__ guards before they reach a cross-
-  # arch build — three regressions in a row had this shape).
-  # ====================================================================
   lint:
     name: lint
     runs-on: ubuntu-latest
@@ -198,22 +195,10 @@ jobs:
                    --suppress=missingIncludeSystem \
                    -I include src/ 2>&1 | tail -30 || true
 
-  # ====================================================================
-  # M.6: gcov / lcov line-coverage report. builds with --coverage
-  # (gcc adds -fprofile-arcs -ftest-coverage), runs the full ctest
-  # suite, then aggregates into one HTML report uploaded as artefact.
-  # also fails the job if line coverage drops below MIN_COVERAGE_PCT
-  # so we get a quality gate, not just a vanity number.
-  # ====================================================================
   coverage:
     name: coverage (gcov+lcov)
     runs-on: ubuntu-latest
     env:
-      # gate at 8 % — current measured coverage is ~10 %, so this acts as
-      # a regression-prevention floor while we incrementally add tests.
-      # the 70 % aspirational target stays in PRODUCTION_PLAN as the
-      # eventual goal; raise this number whenever a meaningful test
-      # batch lands. NEVER lower it.
       MIN_COVERAGE_PCT: "8"
     steps:
       - uses: actions/checkout@v4
@@ -222,10 +207,6 @@ jobs:
       - name: build with --coverage
         run: |
           mkdir build && cd build
-          # Debug + --coverage: gcc emits .gcno files alongside object
-          # files; tests' execution writes .gcda files at exit. avoid
-          # ISA dispatch (would compile cpu_opt 3x and inflate the
-          # gcov output without measuring different lines).
           cmake -DCMAKE_BUILD_TYPE=Debug \
                 -DCMAKE_C_FLAGS="--coverage -O0 -g" \
                 -DCMAKE_EXE_LINKER_FLAGS="--coverage" \
@@ -234,19 +215,11 @@ jobs:
       - name: run tests
         run: |
           cd build
-          # ctest produces .gcda files for every test that ran. failures
-          # don't gate the coverage report — we still want the partial
-          # picture so devs can see what slipped — but fail-on-tests-fail
-          # at the very end via the saved exit code.
           ctest -j$(nproc) --output-on-failure --timeout 600 || echo "TEST_FAILED" > .test_failed
       - name: aggregate with lcov
         run: |
           cd build
-          # filter: keep only axiom source files; drop /usr/include + tests
           lcov --capture --directory . --output-file coverage.info --quiet
-          # --ignore-errors unused: newer lcov 2.x errors when an exclude
-          # pattern matches nothing (e.g. */benchmarks/* if no benchmark
-          # binaries were built into the coverage tree). harmless here.
           lcov --remove coverage.info '/usr/*' '*/tests/*' '*/benchmarks/*' \
                --ignore-errors unused \
                --output-file coverage.info --quiet
@@ -254,14 +227,11 @@ jobs:
       - name: gate on MIN_COVERAGE_PCT
         run: |
           cd build
-          # parse `Total:|TOTAL` row from lcov --list output for line%
           pct=$(grep -oE 'Total:\|.*' coverage.summary | grep -oE '[0-9.]+%' | head -1 | tr -d '%')
           if [ -z "$pct" ]; then
-            # newer lcov uses different format; try alternative parse
             pct=$(awk '/lines\.*:/ {print $2}' coverage.summary | tr -d '%')
           fi
-          echo "line coverage: $pct%  (gate: ≥${MIN_COVERAGE_PCT}%)"
-          # bash arithmetic compare on floats: pad to int (×100) and compare
+          echo "line coverage: $pct%  (gate: >=${MIN_COVERAGE_PCT}%)"
           gate100=$(echo "$MIN_COVERAGE_PCT * 100" | bc)
           got100=$(printf "%.0f" $(echo "$pct * 100" | bc))
           if [ "$got100" -lt "$gate100" ]; then
