@@ -542,7 +542,8 @@ if(NOT AX_INFERENCE_ONLY)
     foreach(suite_bench
             bench_gemm_suite bench_ops_suite bench_conv_suite
             bench_transformer bench_stress bench_parity bench_qgemm bench_hotpaths
-            bench_scalability bench_embedded bench_memory bench_comprehensive)
+            bench_scalability bench_embedded bench_memory bench_comprehensive
+            bench_direct_bwd)
         if(EXISTS "${CMAKE_SOURCE_DIR}/benchmarks/${suite_bench}.c")
             add_executable(${suite_bench} benchmarks/${suite_bench}.c)
             target_include_directories(${suite_bench} PRIVATE benchmarks)

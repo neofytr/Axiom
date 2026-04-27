@@ -341,8 +341,10 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                        && ph == 1 && pw == 1
                        && ((s->wino_U && s->wino_V && s->wino_M)
                            || (s->wino43_U && s->wino43_V && s->wino43_M));
+    bool use_direct_bwd = (M < 128) && !is_1x1_fast_bwd && !use_wino_dx;
     bool use_batched_bwd = N > 1 && M < AX_CONV_BATCH_M_THRESH && !is_1x1_fast_bwd
-                           && s->batch_col_buf && s->batch_aux_buf && !use_wino_dx;
+                           && s->batch_col_buf && s->batch_aux_buf && !use_wino_dx
+                           && !use_direct_bwd;
     bool swap_dw = have_gemm_nt && (K > C_out) && !is_1x1_fast_bwd;
     bool implicit_dw_eligible = have_conv_dw && weight->requires_grad
                                 && kh <= 3 && kw <= 3 && sh == 1 && sw == 1;
@@ -476,6 +478,18 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
                 else              ax_compute_gemm(wt_contig, &go_tv, &ig_tv);
                 ax_gemm_set_skip_init(false);
             }
+        } else if (use_direct_bwd) {
+            if (weight->requires_grad)
+                direct_backward_dw(ind, grd,
+                                   (float *)s->dw_bufs[0]->storage->data,
+                                   C_in, H, W, C_out, out_h, out_w,
+                                   kh, kw, sh, sw, ph, pw);
+            if (input_orig->requires_grad) {
+                float *ig = (float *)input_orig->grad->storage->data;
+                direct_backward_dx(grd, wdata, ig,
+                                   C_in, H, W, C_out, out_h, out_w,
+                                   kh, kw, sh, sw, ph, pw);
+            }
         } else {
             bool need_col_for_dx = input_orig->requires_grad && !use_wino_dx
                                    && (wt_contig || have_gemm_tn);
@@ -557,7 +571,7 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         if (weight->requires_grad) {
             float *wg  = (float *)weight->grad->storage->data;
             float *dwl = (float *)s->dw_bufs[0]->storage->data;
-            bool need_transpose = swap_dw && !implicit_dw_eligible;
+            bool need_transpose = swap_dw && !implicit_dw_eligible && !use_direct_bwd;
             if (need_transpose) {
                 dw_transpose_add(wg, dwl, C_out, K);
             } else {
@@ -581,10 +595,22 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
 
     } else if (N < AX_OMP_MAX_THREADS() && !is_1x1_fast_bwd) {
 
-    /* N > 1 but N < max_threads: inner_team mode. instead of N threads
-       each running single-threaded GEMMs, one full team cooperates on
-       each sample sequentially. all threads workshare im2col, GEMM,
-       and col2im via omp-for inside the existing parallel region. */
+    if (use_direct_bwd) {
+        for (int64_t n = 0; n < N; n++) {
+            if (weight->requires_grad)
+                direct_backward_dw(ind + n * C_in * H * W, grd + n * C_out * M,
+                                   (float *)s->dw_bufs[0]->storage->data,
+                                   C_in, H, W, C_out, out_h, out_w,
+                                   kh, kw, sh, sw, ph, pw);
+            if (input_orig->requires_grad) {
+                float *ig = (float *)input_orig->grad->storage->data + n * C_in * H * W;
+                direct_backward_dx(grd + n * C_out * M, wdata, ig,
+                                   C_in, H, W, C_out, out_h, out_w,
+                                   kh, kw, sh, sw, ph, pw);
+            }
+        }
+    } else {
+
     #ifdef _OPENMP
     #pragma omp parallel
     {
@@ -748,12 +774,13 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     }
     }
     #endif
+    } /* end !use_direct_bwd */
 
     /* single-buffer dW reduction (all samples accumulated into dw_bufs[0]) */
     if (weight->requires_grad) {
         float *wg  = (float *)weight->grad->storage->data;
         float *dwl = (float *)s->dw_bufs[0]->storage->data;
-        if (swap_dw) {
+        if (swap_dw && !use_direct_bwd) {
             dw_transpose_add(wg, dwl, C_out, K);
         } else {
             int64_t wn = C_out * K, wi = 0, wve = wn - (wn % AX_VF32_WIDTH);
@@ -815,6 +842,21 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
         bool need_col_for_dx_pt = input_orig->requires_grad && !use_wino_dx
                                    && (wt_contig || have_gemm_tn);
         bool use_implicit_dw_pt = false;
+
+        if (use_direct_bwd) {
+            if (weight->requires_grad)
+                direct_backward_dw(ind + n * C_in * H * W, grd + n * C_out * M,
+                                   (float *)s->dw_bufs[tid]->storage->data,
+                                   C_in, H, W, C_out, out_h, out_w,
+                                   kh, kw, sh, sw, ph, pw);
+            if (input_orig->requires_grad) {
+                float *ig = (float *)input_orig->grad->storage->data + n * C_in * H * W;
+                direct_backward_dx(grd + n * C_out * M, wdata, ig,
+                                   C_in, H, W, C_out, out_h, out_w,
+                                   kh, kw, sh, sw, ph, pw);
+            }
+            continue;
+        }
 
         ax_storage_t go_st;
         ax_tensor_t  go_tv;
@@ -894,7 +936,7 @@ void ax_conv_conv2d_backward(ax_grad_fn_t *self, ax_tensor_t *grad_out)
     /* parallel T-buffer reduction */
     if (weight->requires_grad) {
         float *wg = (float *)weight->grad->storage->data;
-        if (swap_dw) {
+        if (swap_dw && !use_direct_bwd) {
             #ifdef _OPENMP
             #pragma omp parallel for num_threads(T) schedule(static)
             #endif

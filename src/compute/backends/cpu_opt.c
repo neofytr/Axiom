@@ -142,7 +142,9 @@ static inline int64_t ax_par_threshold(void) { return (int64_t)1 << 62; }
    reused on every call. eliminates ~16 malloc/free per GEMM invocation.
    uses AX_TLS so single-threaded baremetal builds drop the _Thread_local. */
 AX_TLS float *tl_pack_a_buf = NULL;  /* ceil(MC/MR)*MR * max(KC, MAX_KC) floats */
+AX_TLS size_t tl_pack_a_cap = 0;    /* allocated capacity in floats */
 AX_TLS float *tl_pack_b_buf = NULL;  /* GEMM_NC * GEMM_KC floats */
+AX_TLS size_t tl_pack_b_cap = 0;    /* allocated capacity in floats */
 
 /* per-thread scratch for SDPA softmax (row_max, row_sum) and attn packing
    (Kt, V). reused across calls so sdpa forward doesn't malloc 128+ times
@@ -1194,8 +1196,8 @@ void AX_SYM(ax_cpu_opt_calibrate_tiles)(void) {
     }
     #pragma omp parallel
     {
-        if (tl_pack_a_buf) { ax_aligned_free(tl_pack_a_buf); tl_pack_a_buf = NULL; }
-        if (tl_pack_b_buf) { ax_aligned_free(tl_pack_b_buf); tl_pack_b_buf = NULL; }
+        if (tl_pack_a_buf) { ax_aligned_free(tl_pack_a_buf); tl_pack_a_buf = NULL; tl_pack_a_cap = 0; }
+        if (tl_pack_b_buf) { ax_aligned_free(tl_pack_b_buf); tl_pack_b_buf = NULL; tl_pack_b_cap = 0; }
         pack_b_cache_invalidate();
     }
     GEMM_MC = max_mc; GEMM_NC = max_nc; GEMM_KC = max_kc;
@@ -1707,25 +1709,40 @@ static bool ensure_tl_pack_bufs(void) {
     /* size buffers for AX_GEMM_MAX_KC so per-call kc_eff can grow up to that
        limit when k fits in a single pc tile. costs extra memory for shapes
        that don't use the larger KC (~2× over a strict-fit allocation), but
-       eliminates a heap re-alloc when adaptive KC kicks in. */
-    int64_t kc_alloc = (GEMM_KC > AX_GEMM_MAX_KC) ? GEMM_KC : AX_GEMM_MAX_KC;
-    if (!tl_pack_a_buf) {
-        size_t mc_rounded = (size_t)((GEMM_MC + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
-        size_t pa = mc_rounded * (size_t)kc_alloc;
+       eliminates a heap re-alloc when adaptive KC kicks in.
+       when per-regime tiles are active, use the max MC/NC across all regimes
+       so a concurrent apply_tiles_for_shape from another thread can't push
+       GEMM_MC past the allocated capacity. */
+    int64_t mc_eff = GEMM_MC, nc_eff = GEMM_NC, kc_eff = GEMM_KC;
+    if (g_per_regime_active) {
+        const gemm_tile_set_t *r[] = {
+            &g_tiles_small, &g_tiles_med, &g_tiles_large, &g_tiles_vlarge
+        };
+        for (int i = 0; i < 4; i++) {
+            if (r[i]->mc > mc_eff) mc_eff = r[i]->mc;
+            if (r[i]->nc > nc_eff) nc_eff = r[i]->nc;
+            if (r[i]->kc > kc_eff) kc_eff = r[i]->kc;
+        }
+    }
+    int64_t kc_alloc = (kc_eff > AX_GEMM_MAX_KC) ? kc_eff : AX_GEMM_MAX_KC;
+    size_t mc_rounded = (size_t)((mc_eff + GEMM_MR - 1) / GEMM_MR) * GEMM_MR;
+    size_t pa = mc_rounded * (size_t)kc_alloc;
+    if (pa > tl_pack_a_cap) {
+        if (tl_pack_a_buf) ax_aligned_free(tl_pack_a_buf);
         if (pa / mc_rounded != (size_t)kc_alloc) return false;
         if (pa > SIZE_MAX / sizeof(float)) return false;
         tl_pack_a_buf = (float *)ax_aligned_alloc(pa * sizeof(float), 64);
+        tl_pack_a_cap = tl_pack_a_buf ? pa : 0;
     }
-    if (!tl_pack_b_buf) {
-        /* round NC up to a multiple of NR for the pack buffer. when NR
-           doesn't evenly divide NC (e.g. NR=12, NC=128 → nc_pack=132),
-           pack_b writes ceil(NC/NR)*NR floats per KC row. without the
-           round-up the buffer overflows. */
-        size_t nc_rounded = (size_t)((GEMM_NC + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
-        size_t pb = nc_rounded * (size_t)kc_alloc;
+    size_t nc_rounded = (size_t)((nc_eff + GEMM_NR - 1) / GEMM_NR) * GEMM_NR;
+    size_t pb = nc_rounded * (size_t)kc_alloc;
+    if (pb > tl_pack_b_cap) {
+        if (tl_pack_b_buf) ax_aligned_free(tl_pack_b_buf);
+        pack_b_cache_invalidate();
         if (pb / nc_rounded != (size_t)kc_alloc) return false;
         if (pb > SIZE_MAX / sizeof(float)) return false;
         tl_pack_b_buf = (float *)ax_aligned_alloc(pb * sizeof(float), 64);
+        tl_pack_b_cap = tl_pack_b_buf ? pb : 0;
     }
     return tl_pack_a_buf && tl_pack_b_buf;
 }
