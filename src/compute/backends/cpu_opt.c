@@ -8848,6 +8848,7 @@ static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
     }
 
     /* debug trace: AX_SDPA_DISPATCH_LOG=1 prints the dispatch decision */
+#ifndef AX_NO_STDIO
     static int dbg_resolved = 0;
     static int dbg_on = 0;
     if (!dbg_resolved) {
@@ -8864,6 +8865,7 @@ static ax_attn_bwd_kj_fn_t ax_attn_bwd_get_impl(bool use_prepack, int64_t BH) {
                 (long)BH, env_mode, use_fused, use_prepack);
 #endif
     }
+#endif
 
     if (use_fused && use_prepack) {
         return (ax_attn_bwd_kj_fn_t)attn_bwd_kj_block_fused;

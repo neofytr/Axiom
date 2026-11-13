@@ -37,7 +37,7 @@
 #endif
 
 static int64_t detect_llc_bytes(void) {
-#if defined(__linux__)
+#if defined(__linux__) && !defined(AX_NO_STDIO)
     long l3 = sysconf(_SC_LEVEL3_CACHE_SIZE);
     if (l3 > 0) return (int64_t)l3;
     for (int idx = 0; idx < 8; idx++) {

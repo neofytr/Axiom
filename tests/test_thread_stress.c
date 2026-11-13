@@ -7,7 +7,9 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <math.h>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 
 /* 1. concurrent tensor create/destroy: 4 threads x 100 tensors each.
    hammers the TLS slab pool allocator for storage. */
@@ -200,7 +202,8 @@ static void *concurrent_bn_fn(void *arg)
     ax_backward(loss);
 
     res->ok = 1;
-    ax_graph_cleanup(loss);
+    ax_graph_cleanup(loss);   /* frees out too: it is an intermediate of loss */
+    out = NULL;
     ax_tensor_destroy(loss);
 
 cleanup:
@@ -305,7 +308,11 @@ static void test_omp_nested_gemm(void)
 
     #pragma omp parallel num_threads(4) reduction(min:ok_all)
     {
+#ifdef _OPENMP
         int tid = omp_get_thread_num();
+#else
+        int tid = 0;    /* serial build: the region runs once */
+#endif
         if (tid < nt) {
             ax_compute_gemm(a_arr[tid], b_arr[tid], c_arr[tid]);
             /* C = A * I = A, so every element should be 1.0 */

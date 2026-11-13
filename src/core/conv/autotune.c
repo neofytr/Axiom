@@ -82,6 +82,7 @@ static void mem_insert(uint64_t h, ax_conv_path_t p)
         g_mem[g_mem_n++] = (mem_entry_t){h, p};
 }
 
+#ifndef AX_NO_STDIO
 /* disk cache: conv_calib.bin alongside calib.bin.
    format: "AXCONVCL" + schema(u32) + host_key(u64) + n(u32) + entries */
 #define CONV_MAGIC     "AXCONVCL"
@@ -240,6 +241,10 @@ static void disk_save(uint64_t sh, ax_conv_path_t path)
     if (ok) rename(tmp, fp);
     else    unlink(tmp);
 }
+#else  /* AX_NO_STDIO: no filesystem, no disk cache */
+static bool disk_lookup(uint64_t sh, ax_conv_path_t *out) { (void)sh; (void)out; return false; }
+static void disk_save(uint64_t sh, ax_conv_path_t path) { (void)sh; (void)path; }
+#endif
 
 static bool autotune_disabled(void)
 {

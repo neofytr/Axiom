@@ -45,6 +45,7 @@ int16_t ax_calib_thread_best[AX_CALIB_MAX_THREAD_PROBES];
 #define AX_CALIB_MAGIC "AXIOMCAL"
 #define AX_CALIB_MAGIC_LEN 8
 
+#ifndef AX_NO_STDIO
 /* fnv-1a 64-bit — small, cheap, good enough for fingerprinting. */
 static uint64_t fnv1a64(const void *data, size_t len) {
     uint64_t h = 0xcbf29ce484222325ULL;
@@ -317,3 +318,9 @@ void ax_calib_cache_fingerprint(char *buf, size_t buf_size) {
              active_isa_label(),
              active_threads());
 }
+
+#else  /* AX_NO_STDIO: no filesystem, so never a cache hit and nothing to save */
+bool ax_calib_cache_load(ax_calib_payload_t *out) { (void)out; return false; }
+bool ax_calib_cache_save(const ax_calib_payload_t *in) { (void)in; return false; }
+void ax_calib_cache_fingerprint(char *buf, size_t buf_size) { if (buf && buf_size) buf[0] = 0; }
+#endif
