@@ -38,6 +38,8 @@
 extern "C" {
 #endif
 
+#define AX_CALIB_MAX_THREAD_PROBES 16
+
 /* every persisted tunable goes here. when adding fields, bump the
    schema version in calib_cache.c so old caches are rejected. */
 typedef struct ax_calib_payload {
@@ -68,7 +70,15 @@ typedef struct ax_calib_payload {
     int64_t gemm_mc_large, gemm_nc_large, gemm_kc_large;
     /* unpacked-A micro-kernel max K crossover */
     int64_t gemm_unpacked_a_max_k;
+    /* hybrid thread-count table: best thread count per probe shape */
+    int32_t thread_n;
+    int16_t thread_best[AX_CALIB_MAX_THREAD_PROBES];
 } ax_calib_payload_t;
+
+/* live thread-count table, filled by the hybrid crossover calibrator and
+   copied into the payload on save. thread_n == 0 means not calibrated. */
+extern int32_t ax_calib_thread_n;
+extern int16_t ax_calib_thread_best[AX_CALIB_MAX_THREAD_PROBES];
 
 /* attempt to load a cached payload matching the current host. returns
    true on hit (out filled), false on miss / disabled / IO error.

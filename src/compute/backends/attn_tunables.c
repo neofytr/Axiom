@@ -1438,5 +1438,8 @@ void ax_calib_cache_save_current(void) {
 
     pl.gemm_unpacked_a_max_k = g_attn.gemm_unpacked_a_max_k;
 
+    pl.thread_n = ax_calib_thread_n;
+    memcpy(pl.thread_best, ax_calib_thread_best, sizeof(pl.thread_best));
+
     (void)ax_calib_cache_save(&pl);
 }

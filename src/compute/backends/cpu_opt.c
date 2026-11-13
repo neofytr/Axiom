@@ -52,6 +52,7 @@
 
 #include "axiom/internal/backend_ops.h"
 #include "axiom/internal/attn_tunables.h"
+#include "axiom/internal/calib_cache.h"
 #include "axiom/tensor.h"
 #include "axiom/error.h"
 #include "axiom/memory.h"
@@ -1446,6 +1447,27 @@ void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
     int n_shapes = (int)(sizeof(probe_shapes) / sizeof(probe_shapes[0]));
     if (n_shapes > AX_MAX_THREAD_PROBES) n_shapes = AX_MAX_THREAD_PROBES;
 
+    /* warm start: the table is keyed on host + thread count, so a cache
+       hit is the same answer the sweep below would produce. */
+    {
+        ax_calib_payload_t pl;
+        if (ax_calib_cache_load(&pl) && pl.thread_n == n_shapes) {
+            for (int si = 0; si < n_shapes; si++) {
+                ax_thread_probes[si].M = probe_shapes[si].M;
+                ax_thread_probes[si].N = probe_shapes[si].N;
+                ax_thread_probes[si].K = probe_shapes[si].K;
+                ax_thread_probes[si].name = probe_shapes[si].name;
+                ax_thread_probes[si].best_threads = pl.thread_best[si];
+                ax_thread_probes[si].best_time_ms = 0.0;
+                ax_calib_thread_best[si] = pl.thread_best[si];
+            }
+            ax_calib_thread_n = n_shapes;
+            ax_n_thread_probes = n_shapes;
+            ax_thread_table_ready = true;
+            return;
+        }
+    }
+
     /* candidate thread counts: 1 (serial), fast/2 if applicable, fast,
        a couple intermediates, all. de-duplicate. */
     int cand[6];
@@ -1520,9 +1542,15 @@ void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
         int    best_th = all;
         double t_per_cand[6] = {0};
 
-        for (int ci = 0; ci < n_cand; ci++) {
+        /* most threads first, so the best time is known early and hopeless
+           candidates (serial on a 137 gflop probe) are cut after one run. */
+        for (int ci = n_cand - 1; ci >= 0; ci--) {
             ax_force_threads_override = cand[ci];
-            for (int w = 0; w < warm; w++) opt_gemm(&ta, &tb, &tc);
+            double tw = ax_tile_cal_now_ms();
+            opt_gemm(&ta, &tb, &tc);
+            tw = ax_tile_cal_now_ms() - tw;
+            if (best_t < 1e30 && tw > 4.0 * best_t) { t_per_cand[ci] = tw; continue; }
+            for (int w = 1; w < warm; w++) opt_gemm(&ta, &tb, &tc);
             /* take MIN of `reps` runs — captures the best-placement case,
                which is what the runtime path will hit when (eventually) the
                OS scheduler settles. median is too sensitive to outliers
@@ -1572,6 +1600,7 @@ void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
         ax_thread_probes[si].name = probe_shapes[si].name;
         ax_thread_probes[si].best_threads = best_th;
         ax_thread_probes[si].best_time_ms = best_t;
+        ax_calib_thread_best[si] = (int16_t)best_th;
 
         /* track for legacy crossover (back-compat with old API consumers) */
         for (int ci = 0; ci < n_cand; ci++) {
@@ -1601,6 +1630,7 @@ void AX_SYM(ax_cpu_opt_calibrate_hybrid_crossover)(void) {
 
     ax_n_thread_probes = n_shapes;
     ax_thread_table_ready = true;
+    ax_calib_thread_n = n_shapes;
 
     /* legacy: keep ax_hybrid_crossover_per_fast_thread updated for any
        old code paths still referencing it. derive from the small_256

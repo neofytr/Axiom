@@ -35,8 +35,12 @@
 
 /* bump when the payload struct layout changes incompatibly.
    v2: A3 added per-regime gemm tiles (gemm_{mc,nc,kc}_{small,med,large}).
-   v3: added gemm_unpacked_a_max_k. */
-#define AX_CALIB_SCHEMA_VERSION 3u
+   v3: added gemm_unpacked_a_max_k.
+   v4: added hybrid thread-count table (thread_n, thread_best). */
+#define AX_CALIB_SCHEMA_VERSION 4u
+
+int32_t ax_calib_thread_n = 0;
+int16_t ax_calib_thread_best[AX_CALIB_MAX_THREAD_PROBES];
 
 #define AX_CALIB_MAGIC "AXIOMCAL"
 #define AX_CALIB_MAGIC_LEN 8
